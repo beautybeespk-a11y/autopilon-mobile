@@ -1,0 +1,47 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 247 248 252;       /* #F7F8FC */
+  --surface: 255 255 255;
+  --elevated: 255 255 255;
+  --line: 230 232 242;
+  --ink: 26 29 46;         /* #1A1D2E */
+  --muted: 107 113 148;    /* #6B7194 */
+  --accent: 109 94 246;    /* #6D5EF6 indigo-violet */
+  --accent2: 45 212 191;   /* #2DD4BF teal */
+}
+
+.dark {
+  --bg: 11 14 26;          /* #0B0E1A */
+  --surface: 20 24 41;     /* #141829 */
+  --elevated: 28 33 53;    /* #1C2135 */
+  --line: 38 44 68;        /* #262C44 */
+  --ink: 231 233 245;      /* #E7E9F5 */
+  --muted: 138 144 176;    /* #8A90B0 */
+  --accent: 124 111 255;
+  --accent2: 45 212 191;
+}
+
+html, body, #root { height: 100%; }
+body {
+  @apply bg-bg text-ink font-sans antialiased;
+  margin: 0;
+}
+
+/* The signature gradient — reserved for hero + active accents only. */
+.aurora {
+  background-image:
+    radial-gradient(60% 80% at 15% 10%, rgb(var(--accent) / 0.28), transparent 60%),
+    radial-gradient(50% 70% at 90% 20%, rgb(var(--accent2) / 0.20), transparent 55%),
+    radial-gradient(70% 90% at 60% 100%, rgb(var(--accent) / 0.14), transparent 60%);
+}
+.accent-gradient { background-image: linear-gradient(120deg, rgb(var(--accent)), rgb(var(--accent2))); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { @apply bg-line rounded-full; }

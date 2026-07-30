@@ -1,0 +1,15 @@
+# First run installs everything, builds the client, and starts the server.
+# After your first successful boot you can simplify this to: run = "npm start"
+run = "npm run install:all && npm run build && npm start"
+entrypoint = "server/index.js"
+
+[nix]
+channel = "stable-24_05"
+
+[env]
+NODE_ENV = "production"
+
+# The server listens on 4000; expose it as the public web port.
+[[ports]]
+localPort = 4000
+externalPort = 80

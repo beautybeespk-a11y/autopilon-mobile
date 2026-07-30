@@ -1,0 +1,48 @@
+// WooCommerce REST API client. Auth is a consumer key/secret pair
+// (WooCommerce → Settings → Advanced → REST API → generate one) sent as
+// query params or Basic Auth — no OAuth dance needed.
+
+async function wcFetch(siteUrl, consumerKey, consumerSecret, path, { method = "GET", body } = {}) {
+  const url = new URL(`${siteUrl.replace(/\/$/, "")}/wp-json/wc/v3${path}`);
+  url.searchParams.set("consumer_key", consumerKey);
+  url.searchParams.set("consumer_secret", consumerSecret);
+  const res = await fetch(url, {
+    method,
+    headers: { "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data?.message || `WooCommerce API error ${res.status}`);
+    err.code = res.status;
+    throw err;
+  }
+  return data;
+}
+
+export async function checkStore(siteUrl, consumerKey, consumerSecret) {
+  const data = await wcFetch(siteUrl, consumerKey, consumerSecret, "/system_status");
+  return { environment: data.environment?.site_url, wcVersion: data.environment?.version };
+}
+
+export const listProducts = (site, k, s, params = {}) => wcFetch(site, k, s, `/products?${new URLSearchParams(params)}`);
+export const getProduct = (site, k, s, id) => wcFetch(site, k, s, `/products/${id}`);
+export const updateProduct = (site, k, s, id, fields) => wcFetch(site, k, s, `/products/${id}`, { method: "PUT", body: fields });
+export const updateInventory = (site, k, s, id, stockQuantity) =>
+  wcFetch(site, k, s, `/products/${id}`, { method: "PUT", body: { stock_quantity: stockQuantity, manage_stock: true } });
+
+export const listOrders = (site, k, s, params = {}) => wcFetch(site, k, s, `/orders?${new URLSearchParams(params)}`);
+export const getOrder = (site, k, s, id) => wcFetch(site, k, s, `/orders/${id}`);
+export const updateOrderStatus = (site, k, s, id, status) => wcFetch(site, k, s, `/orders/${id}`, { method: "PUT", body: { status } });
+export const addOrderNote = (site, k, s, id, note, customerNote = false) =>
+  wcFetch(site, k, s, `/orders/${id}/notes`, { method: "POST", body: { note, customer_note: customerNote } });
+
+export const listCustomers = (site, k, s, params = {}) => wcFetch(site, k, s, `/customers?${new URLSearchParams(params)}`);
+
+export const createCoupon = (site, k, s, { code, discountType = "percent", amount, description }) =>
+  wcFetch(site, k, s, "/coupons", { method: "POST", body: { code, discount_type: discountType, amount: String(amount), description } });
+
+export const listCategories = (site, k, s) => wcFetch(site, k, s, "/products/categories?per_page=100");
+
+export const getSalesReport = (site, k, s, period = "week") => wcFetch(site, k, s, `/reports/sales?period=${period}`);
+export const getTopSellers = (site, k, s, period = "week") => wcFetch(site, k, s, `/reports/top_sellers?period=${period}`);
