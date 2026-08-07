@@ -1,0 +1,50 @@
+name: autopilon_mobile
+description: Autopilon mobile client — Flutter app consuming the existing Autopilon backend APIs.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.5.1
+
+  # Navigation, with auth-aware redirects
+  go_router: ^14.2.0
+
+  # HTTP client + session-cookie persistence. The backend uses cookie-based
+  # sessions (express-session), same as the web client — rather than adding
+  # a parallel token-auth system to the backend (which would duplicate the
+  # existing auth logic), the mobile app carries a real cookie jar, exactly
+  # like a browser does. This is the whole reason cookie_jar/dio_cookie_manager
+  # are here instead of just plain http.
+  dio: ^5.4.3+1
+  cookie_jar: ^4.0.8
+  dio_cookie_manager: ^3.1.1
+
+  # Secure, persistent storage for the cookie jar and light session state
+  # (remember-me flag, last-used base URL) — Keychain on iOS, Keystore-backed
+  # EncryptedSharedPreferences on Android.
+  flutter_secure_storage: ^9.2.2
+
+  # File-based persistence location for the cookie jar (app documents dir).
+  path_provider: ^2.1.3
+
+  # Exact font match with the web client (Space Grotesk / Inter / JetBrains
+  # Mono) without bundling font files by hand — same families, fetched once
+  # and cached.
+  google_fonts: ^6.2.1
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
