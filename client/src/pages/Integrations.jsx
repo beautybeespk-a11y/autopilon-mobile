@@ -145,7 +145,7 @@ export default function Integrations() {
               </div>
               <h3 className="font-display font-semibold">{it.name}</h3>
               <div className="mt-1">
-                {connected ? <Badge tone="success">Connected</Badge> : <Badge>Not connected</Badge>}
+                {it.sharedFromOrg ? <Badge tone="accent">Shared from your organization</Badge> : connected ? <Badge tone="success">Connected</Badge> : <Badge>Not connected</Badge>}
               </div>
               {connected && it.phoneNumber && <p className="mt-1 text-xs text-muted">{it.phoneNumber}</p>}
 
@@ -156,6 +156,8 @@ export default function Integrations() {
               <div className="mt-4">
                 {!it.available ? (
                   <Button variant="subtle" className="w-full" disabled>Coming soon</Button>
+                ) : it.sharedFromOrg ? (
+                  <Button variant="subtle" className="w-full" disabled>Managed by your organization</Button>
                 ) : connected ? (
                   <Button variant="outline" className="w-full" onClick={() => disconnect(it.provider)} disabled={disconnecting}>
                     <Unplug size={16} /> Disconnect
