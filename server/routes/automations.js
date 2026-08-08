@@ -53,18 +53,32 @@ router.get("/:id", (req, res) => {
 });
 
 router.post("/", (req, res) => {
-  const { name, description, triggerType, triggerConfig, variables, agentId, steps } = req.body || {};
+  const { name, description, triggerType, triggerConfig, variables, agentId, orgId, workspaceId, steps } = req.body || {};
   if (!name?.trim()) return res.status(400).json({ error: "Name is required." });
   if (!triggerType) return res.status(400).json({ error: "A trigger type is required." });
-  const id = engine.createAutomation(req.session.userId, { name, description, triggerType, triggerConfig, variables, agentId, steps, status: "draft" });
-  logActivity(db, req.session.userId, "automation_created", `Created automation "${name}"`);
-  res.json({ id });
+  try {
+    const id = engine.createAutomation(req.session.userId, { name, description, triggerType, triggerConfig, variables, agentId, orgId, workspaceId, steps, status: "draft" });
+    logActivity(db, req.session.userId, "automation_created", `Created automation "${name}"`);
+    res.json({ id });
+  } catch (err) {
+    res.status(403).json({ error: err.message });
+  }
 });
 
 router.patch("/:id", (req, res) => {
-  const ok = engine.updateAutomation(req.session.userId, req.params.id, req.body || {});
-  if (!ok) return res.status(404).json({ error: "Automation not found" });
-  res.json({ ok: true });
+  try {
+    const ok = engine.updateAutomation(req.session.userId, req.params.id, req.body || {});
+    if (!ok) return res.status(404).json({ error: "Automation not found" });
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(403).json({ error: err.message });
+  }
+});
+
+router.get("/:id/versions", (req, res) => {
+  const versions = engine.getAutomationVersions(req.session.userId, req.params.id);
+  if (!versions) return res.status(404).json({ error: "Automation not found" });
+  res.json(versions);
 });
 
 router.post("/:id/activate", (req, res) => {

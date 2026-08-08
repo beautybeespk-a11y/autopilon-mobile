@@ -7,12 +7,39 @@ import { orchestrate } from "./index.js";
 // prompt, load + enrich history, run the Orchestrator, persist the reply.
 // Both routes/chat.js and the WhatsApp webhook call this — neither
 // duplicates it.
-export async function handleIncomingMessage({ userId, agentId, conversationId, content, skipUserInsert = false }) {
+// Capped so a large attached file doesn't blow out the LLM's context window
+// (or the API cost) on a single turn. The full text is still saved to the
+// Knowledge Library by the upload endpoint, so nothing is lost — just not
+// all of it is pasted into this one prompt.
+const MAX_ATTACHMENT_CHARS = 8000;
+
+export async function handleIncomingMessage({
+  userId, agentId, conversationId, content, attachmentTitle = null, attachmentText = null, skipUserInsert = false,
+}) {
   const now = new Date().toISOString();
+
+  // What gets stored and shown in the chat transcript stays short — just a
+  // 📎 marker and the user's own words. The full attachment text is only
+  // added to what the LLM sees for THIS turn (below), not persisted into
+  // the visible message, so re-opening the conversation later doesn't show
+  // a wall of pasted file content.
+  const displayContent = attachmentTitle ? `📎 ${attachmentTitle}${content?.trim() ? `\n\n${content}` : ""}` : content;
 
   if (!skipUserInsert) {
     db.prepare("INSERT INTO messages (id, conversationId, role, content, createdAt) VALUES (?, ?, 'user', ?, ?)")
-      .run(cryptoRandom(), conversationId, content, now);
+      .run(cryptoRandom(), conversationId, displayContent, now);
+  }
+
+  // Passed to orchestrate() as `extraContext` — appended to what the MODEL
+  // sees for this turn only (see orchestrator/index.js), not stored in the
+  // DB. `history` below still reflects the short displayContent.
+  let extraContext = null;
+  if (attachmentText) {
+    const truncated = attachmentText.length > MAX_ATTACHMENT_CHARS;
+    const clipped = attachmentText.slice(0, MAX_ATTACHMENT_CHARS);
+    extraContext =
+      `[Attached file: "${attachmentTitle}". Contents:\n"""\n${clipped}` +
+      `${truncated ? "\n[...truncated...]" : ""}\n"""]`;
   }
 
   let systemPrompt = "You are a helpful AI assistant inside the AI Agent Platform.";
@@ -38,9 +65,10 @@ export async function handleIncomingMessage({ userId, agentId, conversationId, c
     userId,
     agentId: agentId || null,
     conversationId,
-    userMessage: content,
+    userMessage: content || "",
     history,
     agentSystemPrompt: systemPrompt,
+    extraContext,
   });
 
   const replyAt = new Date().toISOString();

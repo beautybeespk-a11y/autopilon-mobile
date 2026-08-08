@@ -10,15 +10,24 @@ const PERSONALITIES = ["Professional", "Friendly", "Creative", "Direct", "Custom
 export default function AgentBuilder() {
   const navigate = useNavigate();
   const { id } = useParams(); // present when editing an existing agent
-  const [form, setForm] = useState({ name: "", description: "", personality: "Professional", instructions: "", aiProvider: "", aiModel: "" });
+  const [form, setForm] = useState({ name: "", description: "", personality: "Professional", instructions: "", aiProvider: "", aiModel: "", orgId: "", workspaceId: "" });
   const [skillIds, setSkillIds] = useState([]);
   const [providerOptions, setProviderOptions] = useState([]);
+  const [manageableOrgs, setManageableOrgs] = useState([]);
+  const [orgWorkspaces, setOrgWorkspaces] = useState([]);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(!id);
   const [error, setError] = useState("");
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
 
   useEffect(() => { api.get("/chat/provider-options").then(setProviderOptions).catch(() => {}); }, []);
+  useEffect(() => {
+    api.get("/organizations").then((orgs) => setManageableOrgs(orgs.filter((o) => ["owner", "admin"].includes(o.myRole)))).catch(() => {});
+  }, []);
+  useEffect(() => {
+    if (!form.orgId) { setOrgWorkspaces([]); return; }
+    api.get(`/organizations/${form.orgId}/workspaces`).then(setOrgWorkspaces).catch(() => setOrgWorkspaces([]));
+  }, [form.orgId]);
 
   useEffect(() => {
     if (!id) return;
@@ -30,6 +39,8 @@ export default function AgentBuilder() {
         instructions: a.instructions || "",
         aiProvider: a.aiProvider || "",
         aiModel: a.aiModel || "",
+        orgId: a.orgId || "",
+        workspaceId: a.workspaceId || "",
       });
       setSkillIds((a.skills || []).map((s) => s.id));
       setLoaded(true);
@@ -133,6 +144,39 @@ export default function AgentBuilder() {
           />
         )}
       </Card>
+
+      {manageableOrgs.length > 0 && (
+        <Card className="space-y-4 p-6">
+          <div>
+            <h2 className="font-display font-semibold">Sharing</h2>
+            <p className="mt-1 text-sm text-muted">Keep this agent personal, or share it with an organization (and optionally one workspace within it).</p>
+          </div>
+          <div>
+            <span className="mb-1.5 block text-sm font-medium text-muted">Organization</span>
+            <select
+              value={form.orgId}
+              onChange={(e) => setForm({ ...form, orgId: e.target.value, workspaceId: "" })}
+              className="w-full rounded-xl border border-line bg-surface px-3.5 py-2.5 text-sm"
+            >
+              <option value="">Personal (only you)</option>
+              {manageableOrgs.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+          </div>
+          {form.orgId && (
+            <div>
+              <span className="mb-1.5 block text-sm font-medium text-muted">Workspace (optional)</span>
+              <select
+                value={form.workspaceId}
+                onChange={(e) => setForm({ ...form, workspaceId: e.target.value })}
+                className="w-full rounded-xl border border-line bg-surface px-3.5 py-2.5 text-sm"
+              >
+                <option value="">Whole organization</option>
+                {orgWorkspaces.map((w) => <option key={w.id} value={w.id}>{w.name}</option>)}
+              </select>
+            </div>
+          )}
+        </Card>
+      )}
 
       {error && <p className="rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-500">{error}</p>}
       <div className="flex justify-end gap-2">

@@ -17,5 +17,6 @@ export async function geminiChat({ messages, systemPrompt, apiKey, model: modelO
   });
   if (!res.ok) throw new Error(`Gemini error ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
+  const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";
+  return { text, usage: { promptTokens: data.usageMetadata?.promptTokenCount || 0, completionTokens: data.usageMetadata?.candidatesTokenCount || 0 } };
 }

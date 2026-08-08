@@ -1,31 +1,33 @@
 import db from "../../db.js";
 import { cryptoRandom, logActivity } from "../../middleware.js";
 import { registerTool } from "../registry.js";
+import { hasPermission } from "../../orchestrator/rbac.js";
+import {
+  readableKnowledgeClause, canWriteKnowledgeItem, canDeleteKnowledgeItem,
+} from "../../orchestrator/knowledgeAccess.js";
 
 // Single table backs the Knowledge Library. Reports, notes, saved URLs, and
 // summaries are all "knowledge items" distinguished by `type` — one flexible
 // table instead of four near-duplicate ones, since the fields (title,
 // content, tags, sources, owner, date) are the same shape either way.
 //
-// Visibility model (Phase 8): an item saved without an agent context
-// (ownerAgentId NULL, e.g. plain chat) stays visible/editable to every
-// agent, same as before this was added — nothing existing changes. An item
-// an agent saves as 'private' is visible only to that agent. 'shared' (the
-// default) is visible to every agent; whether OTHER agents may edit it too
-// is a separate `editable` flag ('editable' or 'read_only') — the owner
-// decides both independently.
+// Two independent sharing layers:
+// - Phase 8: sharing between ONE account's own agents (agentId ownership +
+//   visibility/editable) — an item saved without an agent context stays
+//   visible to every agent on the account, same as before Phase 8.
+// - Phase 9: sharing ACROSS accounts via an organization/workspace
+//   (orgId/workspaceId + crossUserVisibility/crossUserEditable) — defaults
+//   to fully private, so nothing becomes newly visible to other people
+//   just because this column exists.
 
-function canRead(row, agentId) {
-  return !row.ownerAgentId || row.ownerAgentId === agentId || row.visibility === "shared";
-}
-function canWrite(row, agentId) {
-  if (!row.ownerAgentId || row.ownerAgentId === agentId) return true; // legacy item, or the owner itself
+function ownAgentCanWrite(row, agentId) {
+  if (!row.ownerAgentId || row.ownerAgentId === agentId) return true; // legacy item, or the owning agent itself
   return row.visibility === "shared" && row.editable === "editable";
 }
 
 registerTool({
   name: "save_research",
-  description: "Permanently saves a research report or note to the Knowledge Library. Private items are visible only to you; shared ones (the default) are visible to all your agents, and can optionally be made editable by them too.",
+  description: "Permanently saves a research report or note to the Knowledge Library. Can be kept private, shared with your other agents, and/or shared with an organization or workspace you belong to.",
   category: "research",
   parameters: {
     type: "object",
@@ -35,8 +37,12 @@ registerTool({
       tags: { type: "array" },
       content: { type: "object" }, // the report object, or { note: "..." }
       sourceUrls: { type: "array" },
-      visibility: { type: "string", description: "'shared' (default) or 'private'" },
-      editable: { type: "string", description: "when shared: 'editable' (default) or 'read_only' for other agents" },
+      visibility: { type: "string", description: "Sharing with your OWN other agents: 'shared' (default) or 'private'" },
+      editable: { type: "string", description: "when shared with your own agents: 'editable' (default) or 'read_only'" },
+      orgId: { type: "string", description: "Share with this organization (must have 'knowledge' permission there)" },
+      workspaceId: { type: "string", description: "Optionally narrow org sharing to one workspace" },
+      crossUserVisibility: { type: "string", description: "'private' (default), 'workspace', 'organization', or 'public'" },
+      crossUserEditable: { type: "string", description: "when shared cross-user: 'editable' or 'read_only' (default)" },
     },
     required: ["title", "content"],
   },
@@ -46,24 +52,35 @@ registerTool({
     const { userId, agentId } = context;
     const visibility = parameters.visibility === "private" ? "private" : "shared";
     const editable = parameters.editable === "read_only" ? "read_only" : "editable";
+    const crossUserVisibility = ["workspace", "organization", "public"].includes(parameters.crossUserVisibility) ? parameters.crossUserVisibility : "private";
+    const crossUserEditable = parameters.crossUserEditable === "editable" ? "editable" : "read_only";
+
+    if (parameters.orgId && !hasPermission(parameters.orgId, userId, "knowledge")) {
+      const err = new Error("You don't have knowledge-sharing permission in that organization.");
+      err.code = "FORBIDDEN";
+      throw err;
+    }
+
     const id = cryptoRandom();
     const now = new Date().toISOString();
     db.prepare(
-      `INSERT INTO knowledge_items (id, userId, type, title, category, tags, content, sourceUrls, ownerAgentId, visibility, editable, createdAt)
-       VALUES (?, ?, 'report', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO knowledge_items
+       (id, userId, type, title, category, tags, content, sourceUrls, ownerAgentId, visibility, editable, orgId, workspaceId, crossUserVisibility, crossUserEditable, createdAt)
+       VALUES (?, ?, 'report', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id, userId, parameters.title, parameters.category || "research",
       JSON.stringify(parameters.tags || []), JSON.stringify(parameters.content),
-      JSON.stringify(parameters.sourceUrls || []), agentId || null, visibility, editable, now
+      JSON.stringify(parameters.sourceUrls || []), agentId || null, visibility, editable,
+      parameters.orgId || null, parameters.workspaceId || null, crossUserVisibility, crossUserEditable, now
     );
     logActivity(db, userId, "research_saved", `Saved research: "${parameters.title}"`);
-    return { itemId: id, title: parameters.title, visibility, editable };
+    return { itemId: id, title: parameters.title, visibility, editable, crossUserVisibility, crossUserEditable };
   },
 });
 
 registerTool({
   name: "search_knowledge",
-  description: "Searches the Knowledge Library items visible to you (your own, plus anything shared) by keyword.",
+  description: "Searches the Knowledge Library items visible to you (your own, plus anything shared with you) by keyword.",
   category: "research",
   parameters: {
     type: "object",
@@ -75,37 +92,42 @@ registerTool({
   async execute(parameters, context) {
     const { userId, agentId } = context;
     const like = `%${parameters.query}%`;
+    const readable = readableKnowledgeClause(userId);
     const rows = db.prepare(
-      `SELECT id, title, category, tags, ownerAgentId, visibility, editable, createdAt FROM knowledge_items
-       WHERE userId = ? AND (title LIKE ? OR content LIKE ? OR tags LIKE ?)
-             AND (ownerAgentId IS NULL OR ownerAgentId = ? OR visibility = 'shared')
+      `SELECT id, title, category, tags, userId AS ownerUserId, ownerAgentId, visibility, editable, orgId, workspaceId, crossUserVisibility, crossUserEditable, createdAt
+       FROM knowledge_items
+       WHERE (title LIKE ? OR content LIKE ? OR tags LIKE ?)
+             AND ${readable.sql}
        ORDER BY createdAt DESC LIMIT 20`
-    ).all(userId, like, like, like, agentId || null);
-    return { query: parameters.query, items: rows.map((r) => ({ ...r, tags: JSON.parse(r.tags || "[]") })), count: rows.length };
+    ).all(like, like, like, ...readable.params);
+    // Own-account items still respect the Phase 8 agent-level filter on top of the Phase 9 cross-user filter above.
+    const visible = rows.filter((r) => r.ownerUserId !== userId || !r.ownerAgentId || r.ownerAgentId === agentId || r.visibility === "shared");
+    return { query: parameters.query, items: visible.map((r) => ({ ...r, tags: JSON.parse(r.tags || "[]") })), count: visible.length };
   },
 });
 
 registerTool({
   name: "list_saved_research",
-  description: "Lists everything in the Knowledge Library visible to you (your own, plus anything shared).",
+  description: "Lists everything in the Knowledge Library visible to you (your own, plus anything shared with you).",
   category: "research",
   parameters: { type: "object", properties: {}, required: [] },
   requiredPermissions: ["knowledge.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
     const { userId, agentId } = context;
+    const readable = readableKnowledgeClause(userId);
     const rows = db.prepare(
-      `SELECT id, title, category, tags, ownerAgentId, visibility, editable, createdAt FROM knowledge_items
-       WHERE userId = ? AND (ownerAgentId IS NULL OR ownerAgentId = ? OR visibility = 'shared')
-       ORDER BY createdAt DESC`
-    ).all(userId, agentId || null);
-    return { items: rows.map((r) => ({ ...r, tags: JSON.parse(r.tags || "[]") })), count: rows.length };
+      `SELECT id, title, category, tags, userId AS ownerUserId, ownerAgentId, visibility, editable, orgId, workspaceId, crossUserVisibility, crossUserEditable, createdAt
+       FROM knowledge_items WHERE ${readable.sql} ORDER BY createdAt DESC`
+    ).all(...readable.params);
+    const visible = rows.filter((r) => r.ownerUserId !== userId || !r.ownerAgentId || r.ownerAgentId === agentId || r.visibility === "shared");
+    return { items: visible.map((r) => ({ ...r, tags: JSON.parse(r.tags || "[]") })), count: visible.length };
   },
 });
 
 registerTool({
   name: "update_knowledge_item",
-  description: "Updates a Knowledge Library item's title, category, tags, or content — allowed if you own it, or it's shared as editable.",
+  description: "Updates a Knowledge Library item's title, category, tags, or content — allowed if you own it, or it's shared as editable (by your own agents, or across your organization/workspace).",
   category: "research",
   parameters: {
     type: "object",
@@ -122,10 +144,11 @@ registerTool({
   requiresConfirmation: true,
   async execute(parameters, context) {
     const { userId, agentId } = context;
-    const row = db.prepare("SELECT * FROM knowledge_items WHERE id = ? AND userId = ?").get(parameters.itemId, userId);
+    const row = db.prepare("SELECT * FROM knowledge_items WHERE id = ?").get(parameters.itemId);
     if (!row) { const err = new Error("Knowledge item not found."); err.code = "NOT_FOUND"; throw err; }
-    if (!canWrite(row, agentId)) {
-      const err = new Error("This item is private to another agent, or shared read-only — you can't edit it.");
+    const allowed = row.userId === userId ? ownAgentCanWrite(row, agentId) : canWriteKnowledgeItem(userId, row);
+    if (!allowed) {
+      const err = new Error("You don't have edit access to this item.");
       err.code = "FORBIDDEN";
       throw err;
     }
@@ -145,7 +168,7 @@ registerTool({
 
 registerTool({
   name: "delete_saved_research",
-  description: "Permanently deletes an item from the Knowledge Library — allowed if you own it (shared visibility does not grant delete rights to other agents).",
+  description: "Permanently deletes an item from the Knowledge Library — allowed if you own it, or you're an owner/admin of the organization it's shared with (sharing alone never grants delete rights).",
   category: "research",
   parameters: {
     type: "object",
@@ -155,16 +178,14 @@ registerTool({
   requiredPermissions: ["knowledge.delete"],
   requiresConfirmation: true, // Deletion is irreversible; must be explicitly confirmed.
   async execute(parameters, context) {
-    const { userId, agentId } = context;
-    const owned = db.prepare(
-      "SELECT id FROM knowledge_items WHERE id = ? AND userId = ? AND (ownerAgentId IS NULL OR ownerAgentId = ?)"
-    ).get(parameters.itemId, userId, agentId || null);
-    if (!owned) {
-      const err = new Error("Knowledge item not found, or it's owned by a different agent.");
+    const { userId } = context;
+    const row = db.prepare("SELECT * FROM knowledge_items WHERE id = ?").get(parameters.itemId);
+    if (!row || !canDeleteKnowledgeItem(userId, row)) {
+      const err = new Error("Knowledge item not found, or you don't have delete rights to it.");
       err.code = "NOT_FOUND";
       throw err;
     }
-    db.prepare("DELETE FROM knowledge_items WHERE id = ? AND userId = ?").run(parameters.itemId, userId);
+    db.prepare("DELETE FROM knowledge_items WHERE id = ?").run(parameters.itemId);
     logActivity(db, userId, "research_deleted", "Deleted a saved research item");
     return { itemId: parameters.itemId, deleted: true };
   },

@@ -16,5 +16,6 @@ export async function anthropicChat({ messages, systemPrompt, apiKey, model: mod
   });
   if (!res.ok) throw new Error(`Anthropic error ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  return data.content?.filter((b) => b.type === "text").map((b) => b.text).join("\n") || "";
+  const text = data.content?.filter((b) => b.type === "text").map((b) => b.text).join("\n") || "";
+  return { text, usage: { promptTokens: data.usage?.input_tokens || 0, completionTokens: data.usage?.output_tokens || 0 } };
 }

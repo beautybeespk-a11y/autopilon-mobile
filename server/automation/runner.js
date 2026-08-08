@@ -1,6 +1,8 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { executeStep } from "./stepExecutor.js";
+import { createNotification } from "../orchestrator/notifications.js";
+import { recordUsage } from "../orchestrator/billing.js";
 
 const now = () => new Date().toISOString();
 
@@ -32,16 +34,33 @@ export function createRun({ automationId, userId, triggerSource, initialVariable
 // on the run itself, since this is called from fire-and-forget contexts
 // (the scheduler, a trigger) as often as from a request handler.
 export async function runWorkflow(automationId, { userId, triggerSource, initialVariables }) {
-  const automation = db.prepare("SELECT * FROM automations WHERE id = ? AND userId = ?").get(automationId, userId);
+  const automation = db.prepare("SELECT * FROM automations WHERE id = ?").get(automationId);
   if (!automation) return { status: "failed", error: "Automation not found" };
+  // Access to a shared automation is validated by the caller (canAccessAutomation
+  // in engine.js), not re-checked here. Unlike Shared Agents (which execute
+  // under whoever is chatting), an automation's tool calls always run as its
+  // configured OWNER (automation.userId, set in driveRun's ctx below) — most
+  // runs have no "current person" to act as at all (schedules, webhooks), so
+  // this stays consistent regardless of who — if anyone — triggered a given
+  // run. `userId` here just records who triggered THIS run for their own history.
 
   const defaultVars = JSON.parse(automation.variables || "{}");
   const runId = createRun({ automationId, userId, triggerSource, initialVariables: { ...defaultVars, ...(initialVariables || {}) } });
 
   db.prepare("UPDATE automations SET lastRunAt = ? WHERE id = ?").run(now(), automationId);
+  if (automation.orgId) recordUsage(automation.orgId, "automation_execution");
   updateRun(runId, { status: "running", startedAt: now() });
 
   const result = await driveRun(runId, automation, 0, JSON.parse(db.prepare("SELECT variables FROM automation_runs WHERE id = ?").get(runId).variables));
+
+  if (result.status === "failed") {
+    createNotification(automation.userId, {
+      type: "automation_failure",
+      title: `"${automation.name}" failed`,
+      body: result.error || "The workflow stopped due to an error.",
+      link: "/app/automations",
+    });
+  }
 
   // Only fire automation_completed/failed for "top-level" runs (started
   // manually or by the scheduler) — never for a run whose own trigger was
@@ -63,7 +82,7 @@ export async function runWorkflow(automationId, { userId, triggerSource, initial
 // The actual step loop, shared between a fresh run and a resumed one.
 async function driveRun(runId, automation, fromStepOrder, variables) {
   const steps = loadSteps(automation.id);
-  const ctx = { runId, userId: automation.userId, agentId: automation.agentId };
+  const ctx = { runId, userId: automation.userId, agentId: automation.agentId, orgId: automation.orgId };
   let currentVars = variables;
 
   for (const step of steps) {

@@ -53,10 +53,10 @@ registerTool({
       .map((f, i) => `Source ${i + 1}: ${f.title || f.url}\nURL: ${f.url}\nExtract: ${(f.extract || "").slice(0, 1500)}`)
       .join("\n\n");
 
-    const raw = await chatComplete({
+    const raw = (await chatComplete({
       systemPrompt: REPORT_SYSTEM_PROMPT,
       messages: [{ role: "user", content: `Topic: ${parameters.topic}\n\n${findingsText || "(no source findings provided)"}` }],
-    });
+    })).text;
 
     const report = safeParseReport(raw);
     return { topic: parameters.topic, report };

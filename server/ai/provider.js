@@ -27,10 +27,11 @@ export function listProviderOptions() {
 }
 
 // messages: [{ role: 'user'|'assistant'|'system', content: string }]
-// provider/model: optional per-call override (an agent's own choice) — when
-// omitted, falls back to the platform-wide AI_PROVIDER default exactly as
-// before this was added.
-export async function chatComplete({ messages, systemPrompt, provider, model }) {
+// provider/model: optional per-call override (an agent's own choice).
+// apiKey: optional BYOK override — when the calling org brought its own key,
+// this is passed in directly and the platform's own env-var key is never
+// touched for that call. Returns { text, usage: { promptTokens, completionTokens } }.
+export async function chatComplete({ messages, systemPrompt, provider, model, apiKey: byokKey }) {
   const providerName = (provider || process.env.AI_PROVIDER || "anthropic").toLowerCase();
   const entry = REGISTRY[providerName];
   if (!entry) {
@@ -38,7 +39,7 @@ export async function chatComplete({ messages, systemPrompt, provider, model }) 
     err.code = "PROVIDER_NOT_CONFIGURED";
     throw err;
   }
-  const apiKey = process.env[entry.keyEnv];
+  const apiKey = byokKey || process.env[entry.keyEnv];
   if (!apiKey) {
     const err = new Error("AI provider not configured");
     err.code = "PROVIDER_NOT_CONFIGURED";

@@ -18,4 +18,5 @@ export const BUILTIN_SKILLS = [
   { id: "sheets", name: "Google Sheets", description: "Create spreadsheets and read/write cell data once your account is connected.", icon: "Table" },
   { id: "shopify", name: "Shopify", description: "Manage products, orders, customers, inventory, discounts, and collections once your store is connected.", icon: "ShoppingBag" },
   { id: "collaboration", name: "Agent Collaboration", description: "Delegate tasks to your other agents and chain them together on multi-step work.", icon: "Share2" },
+  { id: "custom_tools", name: "Custom Tools (Developer)", description: "Use tools you've built and published yourself via the Developer SDK — each one calls a webhook you host.", icon: "Webhook" },
 ];

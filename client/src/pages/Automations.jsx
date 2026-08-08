@@ -252,6 +252,7 @@ export default function Automations() {
                     <span className="font-medium">{a.name}</span>
                     <Badge tone={STATUS_TONE[a.status] || "muted"}>{a.status}</Badge>
                     <Badge>{a.triggerType}</Badge>
+                    {a.orgId && <Badge tone="accent">{a.workspaceId ? "Shared: workspace" : "Shared: org"}</Badge>}
                   </div>
                   <p className="mt-1 text-sm text-muted">{a.description}</p>
                   <div className="mt-1 flex gap-3 font-mono text-xs text-muted">

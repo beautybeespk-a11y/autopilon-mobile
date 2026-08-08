@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { Plus, Send, Paperclip, Mic, Square, Sparkles, AlertTriangle, Bot } from "lucide-react";
+import { Plus, Send, Paperclip, Mic, Square, Sparkles, AlertTriangle, Bot, X, FileText } from "lucide-react";
 import { api } from "../lib/api.js";
 import ToolActivity from "../components/ToolActivity.jsx";
 
@@ -81,7 +81,11 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [providerErr, setProviderErr] = useState(null);
+  const [attachment, setAttachment] = useState(null); // { title, extractedText, note }
+  const [attachUploading, setAttachUploading] = useState(false);
+  const [attachError, setAttachError] = useState(null);
   const scrollRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   const loadConversations = () => api.get("/chat/conversations").then(setConversations).catch(() => {});
 
@@ -105,17 +109,39 @@ export default function Chat() {
     setMessages(d.messages.map((m) => ({ ...m, ...(m.meta || {}) })));
   };
 
-  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); };
+  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); setAttachment(null); };
+
+  const onPickFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setAttachError(null);
+    setAttachUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const result = await api.upload("/research/knowledge/upload", formData);
+      setAttachment({ title: result.title, extractedText: result.extractedText || "", note: result.note });
+    } catch (err) {
+      setAttachError(err.message || "Upload failed.");
+    } finally {
+      setAttachUploading(false);
+    }
+  };
 
   const send = async (text) => {
     const content = (text ?? input).trim();
-    if (!content || sending) return;
+    const hasAttachment = Boolean(attachment);
+    if ((!content && !hasAttachment) || sending) return;
     setInput("");
     setProviderErr(null);
-    setMessages((m) => [...m, { id: "tmp-" + Date.now(), role: "user", content }]);
+    const displayContent = hasAttachment ? `📎 ${attachment.title}${content ? `\n\n${content}` : ""}` : content;
+    setMessages((m) => [...m, { id: "tmp-" + Date.now(), role: "user", content: displayContent }]);
     setSending(true);
+    const attachmentPayload = hasAttachment ? { attachmentTitle: attachment.title, attachmentText: attachment.extractedText } : {};
+    setAttachment(null);
     try {
-      const d = await api.post("/chat/message", { conversationId: activeId, content, agentId: agentId || undefined });
+      const d = await api.post("/chat/message", { conversationId: activeId, content, agentId: agentId || undefined, ...attachmentPayload });
       setActiveId(d.conversationId);
       setMessages((m) => [
         ...m,
@@ -247,21 +273,48 @@ export default function Chat() {
 
         {/* Composer */}
         <div className="border-t border-line p-3">
+          {(attachment || attachUploading || attachError) && (
+            <div className="mb-2 flex items-center gap-2 rounded-xl border border-line bg-bg px-3 py-2 text-sm">
+              <FileText size={14} className="shrink-0 text-accent" />
+              {attachUploading ? (
+                <span className="text-muted">Uploading…</span>
+              ) : attachError ? (
+                <>
+                  <span className="flex-1 truncate text-red-500">{attachError}</span>
+                  <button onClick={() => setAttachError(null)} className="shrink-0 rounded p-0.5 text-muted hover:text-ink"><X size={14} /></button>
+                </>
+              ) : (
+                <>
+                  <span className="flex-1 truncate">{attachment.title}</span>
+                  {attachment.note && <span className="shrink-0 text-xs text-amber-500">not searchable</span>}
+                  <button onClick={() => setAttachment(null)} className="shrink-0 rounded p-0.5 text-muted hover:text-ink"><X size={14} /></button>
+                </>
+              )}
+            </div>
+          )}
           <div className="flex items-end gap-2 rounded-2xl border border-line bg-bg px-3 py-2">
-            <button className="rounded-lg p-2 text-muted hover:bg-elevated" title="Attach file (coming soon)" disabled><Paperclip size={18} /></button>
+            <input ref={fileInputRef} type="file" className="hidden" onChange={onPickFile} />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={attachUploading}
+              className="rounded-lg p-2 text-muted hover:bg-elevated disabled:opacity-40"
+              title="Attach a file"
+            >
+              <Paperclip size={18} />
+            </button>
             <button className="rounded-lg p-2 text-muted hover:bg-elevated" title="Voice input (coming soon)" disabled><Mic size={18} /></button>
             <textarea
               rows={1}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } }}
-              placeholder="Message your assistant…"
+              placeholder={attachment ? "Ask something about this file (optional)…" : "Message your assistant…"}
               className="max-h-32 flex-1 resize-none bg-transparent py-2 text-sm outline-none"
             />
             {sending ? (
               <button className="rounded-xl bg-elevated p-2.5 text-muted" title="Stop"><Square size={16} /></button>
             ) : (
-              <button onClick={() => send()} disabled={!input.trim()} className="rounded-xl accent-gradient p-2.5 text-white disabled:opacity-40"><Send size={16} /></button>
+              <button onClick={() => send()} disabled={!input.trim() && !attachment} className="rounded-xl accent-gradient p-2.5 text-white disabled:opacity-40"><Send size={16} /></button>
             )}
           </div>
         </div>

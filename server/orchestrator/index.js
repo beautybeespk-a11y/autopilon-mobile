@@ -65,7 +65,11 @@ Rules:
 }
 
 function safeParseDecision(text) {
-  const cleaned = text.trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+  // Defensive: some providers can hand back something other than a plain
+  // string (e.g. an array of content parts) — coerce rather than crash the
+  // whole request on a .trim() call.
+  const asString = typeof text === "string" ? text : Array.isArray(text) ? text.map((p) => (typeof p === "string" ? p : p?.text ?? "")).join("") : String(text ?? "");
+  const cleaned = asString.trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
   try {
     return JSON.parse(cleaned);
   } catch {
@@ -118,7 +122,7 @@ function salvageMalformedToolCall(raw, decision) {
  * any tool calls through the executor, and produce a final natural-language
  * response plus a trace of what happened for the ToolActivity UI.
  */
-export async function orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt }) {
+export async function orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt, extraContext }) {
   const trace = [traceStep("planning", null, "active")];
   const skillIds = getAgentSkillIds(agentId);
   const availableTools = listToolsForSkills(skillIds);
@@ -128,6 +132,21 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let planId = null;
   let stepsRun = 0;
   let conversationForModel = [...history];
+
+  // extraContext (e.g. an attached file's extracted text) is appended to
+  // what the MODEL sees for this turn only — it's deliberately not part of
+  // `history` as loaded from the DB, so the stored/displayed transcript
+  // stays short and re-opening the conversation later doesn't replay a
+  // wall of pasted file content.
+  if (extraContext && conversationForModel.length) {
+    const last = conversationForModel[conversationForModel.length - 1];
+    if (last.role === "user") {
+      conversationForModel = [
+        ...conversationForModel.slice(0, -1),
+        { ...last, content: `${last.content}\n\n${extraContext}` },
+      ];
+    }
+  }
   const toolResults = [];
 
   while (stepsRun < MAX_STEPS) {

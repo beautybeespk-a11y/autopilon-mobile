@@ -2,6 +2,7 @@ import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { getTool, validateParameters, toolRequiresConfirmation } from "../tools/registry.js";
 import { toolAvailableToAgent } from "./permissions.js";
+import { createNotification } from "./notifications.js";
 
 const now = () => new Date().toISOString();
 
@@ -37,6 +38,12 @@ export function createConfirmationRequest({ executionId, userId, toolName, reaso
     `INSERT INTO confirmation_requests (id, executionId, userId, toolName, reason, status, createdAt, expiresAt, automationRunId)
      VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`
   ).run(id, executionId, userId, toolName, reason, createdAt, expiresAt, automationRunId || null);
+  createNotification(userId, {
+    type: "approval",
+    title: "Action needs your approval",
+    body: reason || `"${toolName}" is waiting for your confirmation.`,
+    link: automationRunId ? "/app/automations" : "/app/chat",
+  });
   return id;
 }
 
@@ -50,25 +57,25 @@ export async function runTool({ toolName, parameters, userId, agentId, conversat
   const executionId = createExecutionRow({ planId, userId, agentId, conversationId, toolName, parameters });
   setExecutionStatus(executionId, "planning");
 
-  const tool = getTool(toolName);
+  const tool = getTool(toolName, userId);
   if (!tool) {
     setExecutionStatus(executionId, "failed", { error: `Unknown tool "${toolName}"`, completedAt: now() });
     return { executionId, status: "failed", error: `Unknown tool "${toolName}"` };
   }
 
-  const availability = toolAvailableToAgent(toolName, agentId);
+  const availability = toolAvailableToAgent(toolName, agentId, userId);
   if (!availability.available) {
     setExecutionStatus(executionId, "failed", { error: availability.reason, completedAt: now() });
     return { executionId, status: "failed", error: availability.reason };
   }
 
-  const validation = validateParameters(toolName, parameters);
+  const validation = validateParameters(toolName, parameters, userId);
   if (!validation.valid) {
     setExecutionStatus(executionId, "failed", { error: validation.error, completedAt: now() });
     return { executionId, status: "failed", error: validation.error };
   }
 
-  if (toolRequiresConfirmation(toolName)) {
+  if (toolRequiresConfirmation(toolName, userId)) {
     setExecutionStatus(executionId, "awaiting_confirmation");
     const reason = confirmationReason(toolName, parameters);
     const confirmationId = createConfirmationRequest({ executionId, userId, toolName, reason, automationRunId });
@@ -101,7 +108,7 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
     setExecutionStatus(executionId, "failed", { error: "Rejected by user", completedAt: now() });
     return { executionId, status: "failed", error: "Rejected by user" };
   }
-  const tool = getTool(execution.toolName);
+  const tool = getTool(execution.toolName, execution.userId);
   const parameters = JSON.parse(execution.parameters || "{}");
   if (!tool) {
     // Not a real registered tool — this is a pure workflow approval gate

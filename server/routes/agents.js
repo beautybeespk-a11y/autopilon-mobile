@@ -4,26 +4,34 @@ import { requireAuth, logActivity } from "../middleware.js";
 import {
   createAgent, updateAgent, cloneAgent, setAgentStatus, deleteAgent,
   getVersionHistory, restoreVersion, getAgentHealth, getAgentStats,
+  listAccessibleAgents, canAccessAgent, canManageAgent, agentScope,
 } from "../orchestrator/agentManager.js";
 import { listAgentMessages } from "../orchestrator/agentRouter.js";
+import { hasPermission } from "../orchestrator/rbac.js";
 
 const router = Router();
 router.use(requireAuth);
 
 router.get("/", (req, res) => {
-  const agents = db.prepare("SELECT * FROM agents WHERE userId = ? ORDER BY updatedAt DESC").all(req.session.userId);
+  const agents = listAccessibleAgents(req.session.userId).map((a) => ({
+    ...a, scope: agentScope(a), isOwner: a.userId === req.session.userId,
+  }));
   res.json(agents);
 });
 
 router.get("/:id", (req, res) => {
-  const agent = db.prepare("SELECT * FROM agents WHERE id = ? AND userId = ?").get(req.params.id, req.session.userId);
-  if (!agent) return res.status(404).json({ error: "Agent not found" });
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(req.params.id);
+  if (!agent || !canAccessAgent(req.session.userId, agent)) return res.status(404).json({ error: "Agent not found" });
   const skills = db.prepare("SELECT s.* FROM skills s JOIN agent_skills a ON a.skillId = s.id WHERE a.agentId = ?").all(agent.id);
-  res.json({ ...agent, skills });
+  res.json({ ...agent, skills, scope: agentScope(agent), isOwner: agent.userId === req.session.userId, canManage: canManageAgent(req.session.userId, agent) });
 });
 
 router.post("/", (req, res) => {
   try {
+    const { orgId } = req.body || {};
+    if (orgId && !hasPermission(orgId, req.session.userId, "agent_management")) {
+      return res.status(403).json({ error: "You don't have permission to create agents for this organization." });
+    }
     const agent = createAgent(req.session.userId, req.body || {});
     logActivity(db, req.session.userId, "agent_created", `Created agent "${agent.name}"`);
     res.json(agent);
@@ -34,6 +42,10 @@ router.post("/", (req, res) => {
 
 router.patch("/:id", (req, res) => {
   try {
+    const { orgId } = req.body || {};
+    if (orgId && !hasPermission(orgId, req.session.userId, "agent_management")) {
+      return res.status(403).json({ error: "You don't have permission to share agents with this organization." });
+    }
     const agent = updateAgent(req.session.userId, req.params.id, req.body || {});
     logActivity(db, req.session.userId, "agent_updated", `Updated agent "${agent.name}" (v${agent.version})`);
     res.json(agent);

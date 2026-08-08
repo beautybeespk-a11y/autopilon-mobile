@@ -8,5 +8,14 @@ export async function openaiChat({ messages, systemPrompt, apiKey, model: modelO
   });
   if (!res.ok) throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || "";
+  let content = data.choices?.[0]?.message?.content;
+
+  // Some responses come back as an array of content parts (e.g.
+  // [{ type: "text", text: "..." }]) rather than a plain string — flatten
+  // it so callers always get a string, same as the normal case.
+  if (Array.isArray(content)) {
+    content = content.map((part) => (typeof part === "string" ? part : part?.text ?? "")).join("");
+  }
+
+  return content || "";
 }

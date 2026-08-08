@@ -46,10 +46,10 @@ registerTool({
   requiresConfirmation: false, // it lands as a draft, not active — nothing runs until the user reviews and activates it
   async execute(parameters, context) {
     const availableTools = listTools().map((t) => `${t.name}: ${t.description}`).join("\n");
-    const raw = await chatComplete({
+    const raw = (await chatComplete({
       systemPrompt: `${PLANNER_PROMPT}\n\nAvailable tools:\n${availableTools}`,
       messages: [{ role: "user", content: parameters.request }],
-    });
+    })).text;
     const plan = safeParse(raw, null);
     if (!plan?.name || !Array.isArray(plan.steps)) {
       const err = new Error("Could not turn that into a workflow — try describing it more concretely (what should happen, and when).");

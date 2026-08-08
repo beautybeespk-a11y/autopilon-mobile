@@ -28,15 +28,16 @@ router.get("/conversations/:id/messages", (req, res) => {
 
 // Send a message. Creates a conversation if none supplied.
 router.post("/message", async (req, res) => {
-  const { conversationId, content, agentId } = req.body || {};
-  if (!content?.trim()) return res.status(400).json({ error: "Message content is required." });
+  const { conversationId, content, agentId, attachmentTitle, attachmentText } = req.body || {};
+  const hasAttachment = Boolean(attachmentTitle && attachmentText);
+  if (!content?.trim() && !hasAttachment) return res.status(400).json({ error: "Message content is required." });
   const now = new Date().toISOString();
   const userId = req.session.userId;
 
   let convId = conversationId;
   if (!convId) {
     convId = cryptoRandom();
-    const title = content.slice(0, 48);
+    const title = (content?.trim() || attachmentTitle || "New conversation").slice(0, 48);
     db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
       .run(convId, userId, agentId || null, title, now, now);
     logActivity(db, userId, "conversation_started", `Started "${title}"`);
@@ -47,10 +48,15 @@ router.post("/message", async (req, res) => {
 
   try {
     const { reply, trace, toolResults, confirmation, assistantMessageId } = await handleIncomingMessage({
-      userId, agentId: agentId || null, conversationId: convId, content,
+      userId, agentId: agentId || null, conversationId: convId, content: content || "",
+      attachmentTitle: hasAttachment ? attachmentTitle : null,
+      attachmentText: hasAttachment ? attachmentText : null,
     });
     res.json({ conversationId: convId, reply, trace, toolResults, confirmation, assistantMessageId });
   } catch (err) {
+    // Logged so the real cause is visible in the server terminal — the
+    // client only ever sees a generic "AI provider returned an error."
+    console.error("[chat/message] error:", err);
     if (err.code === "PROVIDER_NOT_CONFIGURED") {
       return res.status(503).json({ error: "AI provider not configured", detail: err.detail, conversationId: convId });
     }

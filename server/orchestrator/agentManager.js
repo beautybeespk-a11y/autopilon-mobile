@@ -1,7 +1,58 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
+import { getMembership } from "./rbac.js";
+import { enforceQuota } from "./billing.js";
 
 const now = () => new Date().toISOString();
+
+// An agent is "Personal" (orgId NULL — the only kind that existed before
+// Phase 9, and still the default), "Organization" (orgId set, workspaceId
+// NULL — any active org member can use it), or "Workspace" (both set — only
+// that workspace's members can). Sharing means visibility/skills/
+// instructions are shared; each user's own tool calls still run against
+// their OWN connected integrations/memories — see Shared Integrations
+// (a later Phase 9 slice) for actual cross-user resource sharing.
+export function agentScope(agent) {
+  if (!agent.orgId) return "personal";
+  return agent.workspaceId ? "workspace" : "organization";
+}
+
+export function canAccessAgent(userId, agent) {
+  if (!agent) return false;
+  if (agent.userId === userId) return true;
+  if (!agent.orgId) return false;
+  const orgMembership = getMembership(agent.orgId, userId);
+  if (!orgMembership) return false;
+  if (!agent.workspaceId) return true; // organization-wide
+  return Boolean(db.prepare("SELECT 1 FROM workspace_members WHERE workspaceId = ? AND userId = ?").get(agent.workspaceId, userId));
+}
+
+export function canManageAgent(userId, agent) {
+  if (!agent) return false;
+  if (agent.userId === userId) return true;
+  if (!agent.orgId) return false;
+  const orgMembership = getMembership(agent.orgId, userId);
+  return Boolean(orgMembership && ["owner", "admin"].includes(orgMembership.role));
+}
+
+// Every agent the user can currently use: their own personal agents, plus
+// any organization/workspace agents they have membership access to.
+export function listAccessibleAgents(userId) {
+  const personal = db.prepare("SELECT * FROM agents WHERE userId = ? AND orgId IS NULL ORDER BY updatedAt DESC").all(userId);
+  const orgIds = db.prepare("SELECT orgId FROM organization_members WHERE userId = ? AND status = 'active'").all(userId).map((r) => r.orgId);
+  if (!orgIds.length) return personal;
+  const placeholders = orgIds.map(() => "?").join(",");
+  const orgWide = db.prepare(
+    `SELECT * FROM agents WHERE orgId IN (${placeholders}) AND workspaceId IS NULL ORDER BY updatedAt DESC`
+  ).all(...orgIds);
+  const workspaceIds = db.prepare("SELECT workspaceId FROM workspace_members WHERE userId = ?").all(userId).map((r) => r.workspaceId);
+  const workspaceScoped = workspaceIds.length
+    ? db.prepare(`SELECT * FROM agents WHERE workspaceId IN (${workspaceIds.map(() => "?").join(",")})`).all(...workspaceIds)
+    : [];
+  // De-dupe (an agent could theoretically show up via both org and personal ownership checks if the user is also its creator).
+  const seen = new Set();
+  return [...personal, ...orgWide, ...workspaceScoped].filter((a) => (seen.has(a.id) ? false : (seen.add(a.id), true)));
+}
 
 function loadAgentWithSkills(agentId) {
   const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
@@ -20,6 +71,8 @@ function snapshotOf(agent) {
     category: agent.category,
     aiProvider: agent.aiProvider,
     aiModel: agent.aiModel,
+    orgId: agent.orgId,
+    workspaceId: agent.workspaceId,
     skillIds: agent.skillIds,
   };
 }
@@ -37,14 +90,15 @@ function setSkills(agentId, skillIds) {
 }
 
 export function createAgent(userId, fields) {
-  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, skillIds } = fields;
+  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, skillIds } = fields;
   if (!name?.trim()) throw new Error("Agent name is required.");
+  if (orgId) enforceQuota(orgId, "maxAgents", "agents");
   const id = cryptoRandom();
   const ts = now();
   db.prepare(
-    `INSERT INTO agents (id, userId, name, description, instructions, personality, avatar, category, aiProvider, aiModel, status, version, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`
-  ).run(id, userId, name, description || "", instructions || "", personality || "professional", avatar || null, category || "general", aiProvider || null, aiModel || null, ts, ts);
+    `INSERT INTO agents (id, userId, name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, status, version, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`
+  ).run(id, userId, name, description || "", instructions || "", personality || "professional", avatar || null, category || "general", aiProvider || null, aiModel || null, orgId || null, workspaceId || null, ts, ts);
   setSkills(id, skillIds);
   const agent = loadAgentWithSkills(id);
   recordVersion(id, 1, snapshotOf(agent), "Created");
@@ -55,27 +109,33 @@ export function createAgent(userId, fields) {
 // agent_versions — so history reads as "what it became at each version",
 // and restoring version N just re-applies that snapshot as a new version.
 export function updateAgent(userId, agentId, fields, note) {
-  const existing = db.prepare("SELECT id, version FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
-  if (!existing) throw new Error("Agent not found.");
-  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, skillIds } = fields;
+  const existing = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!existing || !canManageAgent(userId, existing)) throw new Error("Agent not found.");
+  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, skillIds } = fields;
   const newVersion = existing.version + 1;
-  // Empty string means "clear back to platform default" (NULL); undefined
-  // means "leave whatever it already was" — COALESCE only helps for the
-  // latter, so these two are resolved explicitly instead.
+  // Empty string means "clear back to default" (NULL); undefined means
+  // "leave whatever it already was" — COALESCE only helps for the latter,
+  // so these are resolved explicitly instead.
   const nextAiProvider = aiProvider === "" ? null : aiProvider;
   const nextAiModel = aiModel === "" ? null : aiModel;
+  const nextOrgId = orgId === "" ? null : orgId;
+  const nextWorkspaceId = workspaceId === "" ? null : workspaceId;
   db.prepare(
     `UPDATE agents SET
        name = COALESCE(?, name), description = COALESCE(?, description), instructions = COALESCE(?, instructions),
        personality = COALESCE(?, personality), avatar = COALESCE(?, avatar), category = COALESCE(?, category),
        aiProvider = CASE WHEN ? THEN ? ELSE aiProvider END,
        aiModel = CASE WHEN ? THEN ? ELSE aiModel END,
+       orgId = CASE WHEN ? THEN ? ELSE orgId END,
+       workspaceId = CASE WHEN ? THEN ? ELSE workspaceId END,
        version = ?, updatedAt = ?
      WHERE id = ?`
   ).run(
     name, description, instructions, personality, avatar, category,
     aiProvider !== undefined ? 1 : 0, nextAiProvider,
     aiModel !== undefined ? 1 : 0, nextAiModel,
+    orgId !== undefined ? 1 : 0, nextOrgId,
+    workspaceId !== undefined ? 1 : 0, nextWorkspaceId,
     newVersion, now(), agentId
   );
   if (Array.isArray(skillIds)) setSkills(agentId, skillIds);
@@ -86,7 +146,7 @@ export function updateAgent(userId, agentId, fields, note) {
 
 export function cloneAgent(userId, agentId, overrideName) {
   const source = loadAgentWithSkills(agentId);
-  if (!source || source.userId !== userId) throw new Error("Agent not found.");
+  if (!source || !canAccessAgent(userId, source)) throw new Error("Agent not found.");
   const id = cryptoRandom();
   const ts = now();
   const name = overrideName || `${source.name} (Copy)`;
@@ -102,27 +162,29 @@ export function cloneAgent(userId, agentId, overrideName) {
 
 export function setAgentStatus(userId, agentId, status) {
   if (!["active", "inactive"].includes(status)) throw new Error("status must be 'active' or 'inactive'.");
-  const r = db.prepare("UPDATE agents SET status = ?, updatedAt = ? WHERE id = ? AND userId = ?").run(status, now(), agentId, userId);
-  if (!r.changes) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
+  db.prepare("UPDATE agents SET status = ?, updatedAt = ? WHERE id = ?").run(status, now(), agentId);
   return loadAgentWithSkills(agentId);
 }
 
 export function deleteAgent(userId, agentId) {
-  const r = db.prepare("DELETE FROM agents WHERE id = ? AND userId = ?").run(agentId, userId);
-  if (!r.changes) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
+  db.prepare("DELETE FROM agents WHERE id = ?").run(agentId);
   return { deleted: true };
 }
 
 export function getVersionHistory(userId, agentId) {
-  const agent = db.prepare("SELECT id FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
-  if (!agent) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
   return db.prepare("SELECT id, version, note, snapshot, createdAt FROM agent_versions WHERE agentId = ? ORDER BY version DESC").all(agentId)
     .map((v) => ({ ...v, snapshot: JSON.parse(v.snapshot) }));
 }
 
 export function restoreVersion(userId, agentId, version) {
-  const agent = db.prepare("SELECT id FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
-  if (!agent) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
   const row = db.prepare("SELECT snapshot FROM agent_versions WHERE agentId = ? AND version = ?").get(agentId, version);
   if (!row) throw new Error(`Version ${version} not found for this agent.`);
   const snapshot = JSON.parse(row.snapshot);
@@ -130,10 +192,12 @@ export function restoreVersion(userId, agentId, version) {
 }
 
 // Health is a live signal (is it usable right now), distinct from stats
-// (how has it performed historically) — kept separate on purpose.
+// (how has it performed historically) — kept separate on purpose. Any user
+// with access (not just the owner/managers) can check health/stats —
+// "Monitor" is one of the actions Shared Agents explicitly allows.
 export function getAgentHealth(userId, agentId) {
-  const agent = db.prepare("SELECT * FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
-  if (!agent) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canAccessAgent(userId, agent)) throw new Error("Agent not found.");
   const skillCount = db.prepare("SELECT COUNT(*) c FROM agent_skills WHERE agentId = ?").get(agentId).c;
   const recentFailures = db.prepare(
     `SELECT COUNT(*) c FROM tool_executions te
@@ -148,8 +212,8 @@ export function getAgentHealth(userId, agentId) {
 }
 
 export function getAgentStats(userId, agentId) {
-  const agent = db.prepare("SELECT id FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
-  if (!agent) throw new Error("Agent not found.");
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canAccessAgent(userId, agent)) throw new Error("Agent not found.");
 
   const conversationCount = db.prepare("SELECT COUNT(*) c FROM conversations WHERE agentId = ?").get(agentId).c;
   const messageCount = db.prepare(

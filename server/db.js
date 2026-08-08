@@ -397,9 +397,509 @@ if (!agentCols.includes("category")) db.exec("ALTER TABLE agents ADD COLUMN cate
 if (!agentCols.includes("version")) db.exec("ALTER TABLE agents ADD COLUMN version INTEGER NOT NULL DEFAULT 1");
 if (!agentCols.includes("aiProvider")) db.exec("ALTER TABLE agents ADD COLUMN aiProvider TEXT"); // NULL = platform default (AI_PROVIDER env)
 if (!agentCols.includes("aiModel")) db.exec("ALTER TABLE agents ADD COLUMN aiModel TEXT"); // NULL = that provider's default model
+if (!agentCols.includes("orgId")) db.exec("ALTER TABLE agents ADD COLUMN orgId TEXT"); // NULL = personal agent (default, unchanged behavior)
+if (!agentCols.includes("workspaceId")) db.exec("ALTER TABLE agents ADD COLUMN workspaceId TEXT"); // set only when scoped to one workspace, not the whole org
 
 const execCols = db.prepare("PRAGMA table_info(tool_executions)").all().map((c) => c.name);
 if (!execCols.includes("agentId")) db.exec("ALTER TABLE tool_executions ADD COLUMN agentId TEXT");
+
+// Phase 9: Shared Automations — same additive pattern as Shared Agents.
+// A user who never touches organizations keeps every automation exactly
+// as "Personal" (orgId NULL), unchanged from before this migration.
+const automationCols = db.prepare("PRAGMA table_info(automations)").all().map((c) => c.name);
+if (!automationCols.includes("orgId")) db.exec("ALTER TABLE automations ADD COLUMN orgId TEXT");
+if (!automationCols.includes("workspaceId")) db.exec("ALTER TABLE automations ADD COLUMN workspaceId TEXT");
+if (!automationCols.includes("version")) db.exec("ALTER TABLE automations ADD COLUMN version INTEGER NOT NULL DEFAULT 1");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS automation_versions (
+  id            TEXT PRIMARY KEY,
+  automationId  TEXT NOT NULL,
+  version       INTEGER NOT NULL,
+  snapshot      TEXT NOT NULL, -- JSON: {name, description, triggerType, triggerConfig, variables, agentId, orgId, workspaceId, steps}
+  note          TEXT,
+  createdAt     TEXT NOT NULL,
+  FOREIGN KEY (automationId) REFERENCES automations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_automation_versions_automation ON automation_versions(automationId);
+`);
+
+// Phase 9: Shared Integrations. users.activeOrgId is the persisted (not
+// just session-only) "which org am I currently operating in" flag — this
+// lets getConnection() resolve org context from userId alone, so the 80+
+// existing tool call sites (getConnection(userId, provider)) don't need to
+// change at all to benefit from org-shared connections. integrations.orgId
+// marks a connection row as org-owned; NULL (the default, unchanged for
+// every existing row) means personal, exactly as before this migration.
+const userCols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name);
+if (!userCols.includes("activeOrgId")) db.exec("ALTER TABLE users ADD COLUMN activeOrgId TEXT");
+if (!userCols.includes("isPlatformAdmin")) db.exec("ALTER TABLE users ADD COLUMN isPlatformAdmin INTEGER NOT NULL DEFAULT 0");
+if (!userCols.includes("stripeCustomerId")) db.exec("ALTER TABLE users ADD COLUMN stripeCustomerId TEXT"); // for personal Marketplace purchases — distinct from the per-org subscription customer
+
+const integrationOrgCols = db.prepare("PRAGMA table_info(integrations)").all().map((c) => c.name);
+if (!integrationOrgCols.includes("orgId")) db.exec("ALTER TABLE integrations ADD COLUMN orgId TEXT");
+
+// Phase 9: Projects. Belong to a workspace. Rather than adding a projectId
+// column to five different existing tables (tasks, agents, knowledge_items,
+// automations, conversations), one generic link table records "this project
+// includes this item" — additive, and each existing table stays untouched.
+db.exec(`
+CREATE TABLE IF NOT EXISTS projects (
+  id          TEXT PRIMARY KEY,
+  workspaceId TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  description TEXT,
+  status      TEXT NOT NULL DEFAULT 'active', -- active | archived
+  createdAt   TEXT NOT NULL,
+  updatedAt   TEXT NOT NULL,
+  FOREIGN KEY (workspaceId) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_projects_workspace ON projects(workspaceId);
+
+CREATE TABLE IF NOT EXISTS project_items (
+  id        TEXT PRIMARY KEY,
+  projectId TEXT NOT NULL,
+  itemType  TEXT NOT NULL, -- task | agent | knowledge | automation | conversation
+  itemId    TEXT NOT NULL,
+  addedAt   TEXT NOT NULL,
+  FOREIGN KEY (projectId) REFERENCES projects(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_item_unique ON project_items(projectId, itemType, itemId);
+`);
+
+// Phase 9: Audit Logs. Extends the existing activity_logs table (used since
+// Phase 1) rather than creating a parallel table — same events, richer
+// context. All four new columns are nullable/defaulted, so every existing
+// logActivity(db, userId, action, description) call site (there are many)
+// keeps working exactly as before, just without the new fields populated
+// unless the caller opts in to the richer form.
+const activityCols = db.prepare("PRAGMA table_info(activity_logs)").all().map((c) => c.name);
+if (!activityCols.includes("orgId")) db.exec("ALTER TABLE activity_logs ADD COLUMN orgId TEXT");
+if (!activityCols.includes("workspaceId")) db.exec("ALTER TABLE activity_logs ADD COLUMN workspaceId TEXT");
+if (!activityCols.includes("ip")) db.exec("ALTER TABLE activity_logs ADD COLUMN ip TEXT");
+if (!activityCols.includes("result")) db.exec("ALTER TABLE activity_logs ADD COLUMN result TEXT NOT NULL DEFAULT 'success'"); // success | failure
+
+// --- Phase 9: Collaboration — comments (with @mentions), task assignment,
+// and a real Notification Center. All additive; a user who never uses any
+// of this sees an empty notification list and untouched task behavior. ---
+const taskCols = db.prepare("PRAGMA table_info(tasks)").all().map((c) => c.name);
+if (!taskCols.includes("assignedToUserId")) db.exec("ALTER TABLE tasks ADD COLUMN assignedToUserId TEXT");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS comments (
+  id              TEXT PRIMARY KEY,
+  entityType      TEXT NOT NULL, -- task | project | automation | agent | knowledge
+  entityId        TEXT NOT NULL,
+  authorUserId    TEXT NOT NULL,
+  content         TEXT NOT NULL,
+  mentionedUserIds TEXT NOT NULL DEFAULT '[]', -- JSON array, resolved from @mentions at write time
+  createdAt       TEXT NOT NULL,
+  FOREIGN KEY (authorUserId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_comments_entity ON comments(entityType, entityId);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id        TEXT PRIMARY KEY,
+  userId    TEXT NOT NULL,
+  type      TEXT NOT NULL, -- mention | assignment | approval | automation_failure | integration_error | org_invitation
+  title     TEXT NOT NULL,
+  body      TEXT,
+  link      TEXT,          -- client-side path to navigate to, e.g. /app/tasks
+  read      INTEGER NOT NULL DEFAULT 0,
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, read);
+`);
+
+// --- Phase 10: Billing, Subscriptions & Usage ---
+// Deliberate design boundary, consistent with every prior phase: billing is
+// entirely organization-scoped. A user with no organization has no
+// subscription, no quotas, no usage tracking — personal/individual mode
+// stays completely unmetered, exactly as it's always been. Orgs are the
+// billable unit, matching the spec's own "Organization Billing" section.
+db.exec(`
+CREATE TABLE IF NOT EXISTS plans (
+  id                TEXT PRIMARY KEY, -- 'free' | 'starter' | 'professional' | 'business' | 'enterprise'
+  name              TEXT NOT NULL,
+  monthlyPriceCents INTEGER NOT NULL DEFAULT 0,
+  maxUsers          INTEGER,          -- NULL = unlimited
+  maxAgents         INTEGER,
+  maxAutomations    INTEGER,
+  maxIntegrations   INTEGER,
+  maxAiRequests     INTEGER,          -- per billing period
+  apiAccess         INTEGER NOT NULL DEFAULT 0,
+  marketplaceAccess INTEGER NOT NULL DEFAULT 0,
+  stripePriceId     TEXT,             -- Stripe Price object id; NULL = not checkout-able (e.g. Free, Enterprise)
+  createdAt         TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS subscriptions (
+  id                 TEXT PRIMARY KEY,
+  orgId              TEXT NOT NULL UNIQUE,
+  planId             TEXT NOT NULL,
+  status             TEXT NOT NULL DEFAULT 'active', -- trialing | active | past_due | canceled
+  billingMode        TEXT NOT NULL DEFAULT 'platform_managed', -- platform_managed | byok
+  trialEndsAt        TEXT,
+  currentPeriodStart TEXT NOT NULL,
+  currentPeriodEnd   TEXT NOT NULL,
+  cancelAtPeriodEnd  INTEGER NOT NULL DEFAULT 0,
+  stripeCustomerId     TEXT,
+  stripeSubscriptionId TEXT,
+  createdAt          TEXT NOT NULL,
+  updatedAt          TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE,
+  FOREIGN KEY (planId) REFERENCES plans(id)
+);
+
+-- Raw event-level usage log — one row per metered event. Kept separate from
+-- the rollup table below so nothing is ever lost even if the rollup logic
+-- changes later; the rollup is a derived cache, this is the source of truth.
+CREATE TABLE IF NOT EXISTS usage_records (
+  id        TEXT PRIMARY KEY,
+  orgId     TEXT NOT NULL,
+  type      TEXT NOT NULL, -- ai_request | prompt_tokens | completion_tokens | automation_execution | tool_call | api_call
+  quantity  INTEGER NOT NULL DEFAULT 1,
+  metadata  TEXT,           -- JSON: e.g. { provider, model, toolName }
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_usage_org_period ON usage_records(orgId, createdAt);
+
+-- Per-org, per-billing-period rollup — what quota checks actually read, so
+-- checking a quota never means scanning the full usage_records history.
+CREATE TABLE IF NOT EXISTS organization_usage (
+  orgId               TEXT NOT NULL,
+  period              TEXT NOT NULL, -- 'YYYY-MM'
+  aiRequests          INTEGER NOT NULL DEFAULT 0,
+  promptTokens        INTEGER NOT NULL DEFAULT 0,
+  completionTokens    INTEGER NOT NULL DEFAULT 0,
+  automationExecutions INTEGER NOT NULL DEFAULT 0,
+  toolCalls           INTEGER NOT NULL DEFAULT 0,
+  apiCalls            INTEGER NOT NULL DEFAULT 0,
+  updatedAt           TEXT NOT NULL,
+  PRIMARY KEY (orgId, period)
+);
+
+-- BYOK. Keys are AES-256-GCM encrypted at rest (see orchestrator/apiKeys.js)
+-- — the raw key is never stored, logged, or returned by any API response.
+CREATE TABLE IF NOT EXISTS api_keys (
+  id            TEXT PRIMARY KEY,
+  orgId         TEXT NOT NULL,
+  provider      TEXT NOT NULL, -- openai | anthropic | gemini
+  encryptedKey  TEXT NOT NULL, -- iv:authTag:ciphertext, all hex
+  createdAt     TEXT NOT NULL,
+  updatedAt     TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_api_keys_org_provider ON api_keys(orgId, provider);
+
+-- Platform-issued coupons (trials, discounts). Created by a platform admin
+-- (see users.isPlatformAdmin), redeemed by any org owner/admin for their
+-- own org. Discount coupons record the intended discount for the eventual
+-- Stripe checkout flow to apply — no real charge exists yet to discount.
+CREATE TABLE IF NOT EXISTS coupon_codes (
+  id             TEXT PRIMARY KEY,
+  code           TEXT NOT NULL UNIQUE,
+  type           TEXT NOT NULL, -- trial | percent_discount | fixed_discount
+  value          INTEGER NOT NULL, -- trial: days; percent_discount: 0-100; fixed_discount: cents
+  targetPlanId   TEXT,           -- for trial coupons: which plan the trial is on; NULL = current plan
+  maxRedemptions INTEGER,        -- NULL = unlimited
+  redemptionCount INTEGER NOT NULL DEFAULT 0,
+  expiresAt      TEXT,
+  active         INTEGER NOT NULL DEFAULT 1,
+  createdBy      TEXT NOT NULL,
+  createdAt      TEXT NOT NULL,
+  FOREIGN KEY (createdBy) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS coupon_redemptions (
+  id         TEXT PRIMARY KEY,
+  couponId   TEXT NOT NULL,
+  orgId      TEXT NOT NULL,
+  redeemedAt TEXT NOT NULL,
+  FOREIGN KEY (couponId) REFERENCES coupon_codes(id) ON DELETE CASCADE,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_coupon_redemption_unique ON coupon_redemptions(couponId, orgId);
+
+-- Populated by the Stripe webhook handler (invoice.paid /
+-- invoice.payment_failed) — never written to directly by any user action,
+-- since these mirror what Stripe itself says happened.
+CREATE TABLE IF NOT EXISTS invoices (
+  id              TEXT PRIMARY KEY,
+  orgId           TEXT NOT NULL,
+  stripeInvoiceId TEXT NOT NULL UNIQUE,
+  amountCents     INTEGER NOT NULL,
+  status          TEXT NOT NULL, -- paid | open | void | uncollectible
+  invoiceNumber   TEXT,
+  pdfUrl          TEXT,
+  periodStart     TEXT,
+  periodEnd       TEXT,
+  createdAt       TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_invoices_org ON invoices(orgId);
+
+-- Dedupes quota-threshold notifications — without this, every single quota
+-- check above 50% would fire another notification, which would be useless
+-- noise. One row per (org, billing period, quota type, threshold) means
+-- "already warned this org about this quota crossing this line this month."
+CREATE TABLE IF NOT EXISTS quota_warnings_sent (
+  orgId     TEXT NOT NULL,
+  period    TEXT NOT NULL,
+  quotaType TEXT NOT NULL,
+  threshold INTEGER NOT NULL, -- 50 | 75 | 90 | 100
+  sentAt    TEXT NOT NULL,
+  PRIMARY KEY (orgId, period, quotaType, threshold)
+);
+
+-- Local audit trail for credit grants — the running balance is just
+-- SUM(amountCents) for an org. When Stripe is configured, a grant is also
+-- applied as a real Stripe Customer Balance transaction (see
+-- stripeService.applyCustomerBalance) so it actually reduces what they owe;
+-- this table is what survives regardless of whether that sync succeeds, and
+-- is the only source of truth when Stripe isn't connected at all.
+CREATE TABLE IF NOT EXISTS organization_credits (
+  id           TEXT PRIMARY KEY,
+  orgId        TEXT NOT NULL,
+  amountCents  INTEGER NOT NULL, -- positive = credit granted
+  reason       TEXT,
+  grantedBy    TEXT NOT NULL,
+  stripeSynced INTEGER NOT NULL DEFAULT 0,
+  createdAt    TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE,
+  FOREIGN KEY (grantedBy) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_org_credits_org ON organization_credits(orgId);
+
+-- Phase 11: Marketplace Core + Publishing. Scoped to the four asset types
+-- that are already fully data-driven in this codebase (agent configs,
+-- automation configs, prompt text, and knowledge item bundles) — none of
+-- them need new execution infrastructure to exist as a catalog entry.
+-- "Skill"/"Plugin"/"Integration Connector" assets need the Developer SDK
+-- (a later Phase 11 slice) to mean anything beyond a name in a list.
+CREATE TABLE IF NOT EXISTS marketplace_categories (
+  id          TEXT PRIMARY KEY,
+  name        TEXT NOT NULL,
+  slug        TEXT NOT NULL UNIQUE,
+  description TEXT,
+  createdAt   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS marketplace_assets (
+  id                   TEXT PRIMARY KEY,
+  creatorUserId        TEXT NOT NULL,
+  assetType            TEXT NOT NULL, -- agent | automation | prompt | knowledge_pack
+  name                 TEXT NOT NULL,
+  slug                 TEXT NOT NULL UNIQUE,
+  description          TEXT,
+  categoryId           TEXT,
+  tags                 TEXT NOT NULL DEFAULT '[]', -- JSON array
+  pricingType          TEXT NOT NULL DEFAULT 'free', -- free | one_time | subscription
+  priceCents           INTEGER NOT NULL DEFAULT 0,
+  license              TEXT,
+  visibility           TEXT NOT NULL DEFAULT 'public', -- public | unlisted | private
+  status               TEXT NOT NULL DEFAULT 'draft', -- draft | published | unpublished
+  currentVersionId     TEXT,
+  platformVersionNote  TEXT, -- free-text compatibility note; no real platform-version scheme exists to check against yet
+  downloadCount        INTEGER NOT NULL DEFAULT 0,
+  ratingSum            INTEGER NOT NULL DEFAULT 0,
+  ratingCount          INTEGER NOT NULL DEFAULT 0,
+  createdAt            TEXT NOT NULL,
+  updatedAt            TEXT NOT NULL,
+  FOREIGN KEY (creatorUserId) REFERENCES users(id),
+  FOREIGN KEY (categoryId) REFERENCES marketplace_categories(id)
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_assets_creator ON marketplace_assets(creatorUserId);
+CREATE INDEX IF NOT EXISTS idx_marketplace_assets_status ON marketplace_assets(status, visibility);
+CREATE INDEX IF NOT EXISTS idx_marketplace_assets_type ON marketplace_assets(assetType);
+
+-- One row per published version — the manifest is the actual asset
+-- content (agent config, automation steps, prompt text, or knowledge item
+-- bundle), shaped differently depending on assetType. Snapshotted at
+-- publish time, not a live link back to the source agent/automation, so
+-- editing your own agent later doesn't retroactively change what people
+-- already installed.
+CREATE TABLE IF NOT EXISTS asset_versions (
+  id           TEXT PRIMARY KEY,
+  assetId      TEXT NOT NULL,
+  version      TEXT NOT NULL, -- semver-ish string, e.g. '1.0.0'
+  releaseNotes TEXT,
+  manifest     TEXT NOT NULL, -- JSON, shape depends on assetType
+  createdAt    TEXT NOT NULL,
+  FOREIGN KEY (assetId) REFERENCES marketplace_assets(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_asset_versions_asset ON asset_versions(assetId);
+
+-- Tracks what got installed, from which version, and what REAL entity it
+-- created (an actual agent/automation row, or knowledge_items rows) — this
+-- is what update/rollback/enable/disable/uninstall operate on. Installing
+-- never creates a parallel "marketplace copy" of anything; it always
+-- creates the same kind of row a normal create action would, through the
+-- same creation functions (agentManager.createAgent, automation
+-- engine.createAutomation, knowledge_items inserts).
+CREATE TABLE IF NOT EXISTS marketplace_installs (
+  id                  TEXT PRIMARY KEY,
+  assetId             TEXT NOT NULL,
+  installedVersionId  TEXT NOT NULL,
+  installedByUserId   TEXT NOT NULL,
+  installedEntityType TEXT NOT NULL, -- agent | automation | knowledge_item
+  installedEntityIds  TEXT NOT NULL, -- JSON array — usually one id, multiple for a knowledge_pack
+  status              TEXT NOT NULL DEFAULT 'active', -- active | disabled | uninstalled
+  createdAt           TEXT NOT NULL,
+  updatedAt           TEXT NOT NULL,
+  FOREIGN KEY (assetId) REFERENCES marketplace_assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (installedByUserId) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_installs_user ON marketplace_installs(installedByUserId);
+CREATE INDEX IF NOT EXISTS idx_marketplace_installs_asset ON marketplace_installs(assetId);
+
+-- Phase 11: Ratings & Reviews. One review per (asset, user) — reviewing
+-- again edits the existing one rather than creating a duplicate. Rating
+-- aggregates on marketplace_assets (ratingSum/ratingCount) are recomputed
+-- from this table directly on every write, not maintained incrementally,
+-- since review writes are rare and a direct recompute can never drift out
+-- of sync the way an increment/decrement dance could.
+CREATE TABLE IF NOT EXISTS asset_reviews (
+  id               TEXT PRIMARY KEY,
+  assetId          TEXT NOT NULL,
+  userId           TEXT NOT NULL,
+  rating           INTEGER NOT NULL, -- 1-5
+  reviewText       TEXT,
+  developerReply   TEXT,
+  developerReplyAt TEXT,
+  helpfulCount     INTEGER NOT NULL DEFAULT 0,
+  createdAt        TEXT NOT NULL,
+  updatedAt        TEXT NOT NULL,
+  FOREIGN KEY (assetId) REFERENCES marketplace_assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (userId) REFERENCES users(id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_reviews_unique ON asset_reviews(assetId, userId);
+CREATE INDEX IF NOT EXISTS idx_asset_reviews_asset ON asset_reviews(assetId);
+
+CREATE TABLE IF NOT EXISTS asset_review_votes (
+  reviewId TEXT NOT NULL,
+  userId   TEXT NOT NULL,
+  createdAt TEXT NOT NULL,
+  PRIMARY KEY (reviewId, userId)
+);
+
+-- Phase 11: Payments. Only one-time purchases are supported — Stripe
+-- Checkout can price a one-time payment dynamically (price_data) with no
+-- pre-created Price object, so a creator never has to touch the Stripe
+-- dashboard. Subscription-priced assets would need a real Stripe Price
+-- object per asset (Checkout can't do dynamic recurring prices) — that's a
+-- disclosed scope cut, not built here.
+CREATE TABLE IF NOT EXISTS asset_purchases (
+  id                      TEXT PRIMARY KEY,
+  assetId                 TEXT NOT NULL,
+  buyerUserId             TEXT NOT NULL,
+  sellerUserId            TEXT NOT NULL,
+  amountCents             INTEGER NOT NULL,
+  platformCommissionCents INTEGER NOT NULL,
+  sellerNetCents          INTEGER NOT NULL,
+  stripeCheckoutSessionId TEXT UNIQUE,
+  status                  TEXT NOT NULL DEFAULT 'completed', -- completed | refunded
+  createdAt               TEXT NOT NULL,
+  FOREIGN KEY (assetId) REFERENCES marketplace_assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (buyerUserId) REFERENCES users(id),
+  FOREIGN KEY (sellerUserId) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_purchases_buyer ON asset_purchases(buyerUserId);
+CREATE INDEX IF NOT EXISTS idx_asset_purchases_seller ON asset_purchases(sellerUserId);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_asset_purchases_buyer_asset ON asset_purchases(buyerUserId, assetId);
+
+-- Phase 11: Moderation. Abuse reports — any user can file one; platform
+-- admins resolve or dismiss.
+CREATE TABLE IF NOT EXISTS asset_reports (
+  id           TEXT PRIMARY KEY,
+  assetId      TEXT NOT NULL,
+  reporterUserId TEXT NOT NULL,
+  reason       TEXT NOT NULL,
+  details      TEXT,
+  status       TEXT NOT NULL DEFAULT 'open', -- open | resolved | dismissed
+  resolvedBy   TEXT,
+  resolvedAt   TEXT,
+  createdAt    TEXT NOT NULL,
+  FOREIGN KEY (assetId) REFERENCES marketplace_assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (reporterUserId) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_reports_status ON asset_reports(status);
+
+-- Phase 11: Developer SDK. A "custom tool" is a webhook — when an agent
+-- calls it, this platform POSTs the parameters to the developer's own
+-- endpoint (HMAC-signed so they can verify it's really us) and uses
+-- whatever JSON that endpoint returns as the result. This is the only
+-- safe way to let third parties extend agent behavior without running
+-- arbitrary third-party code on this server — the developer's actual
+-- logic runs on THEIR infrastructure, not ours.
+CREATE TABLE IF NOT EXISTS custom_tools (
+  id                  TEXT PRIMARY KEY,
+  creatorUserId       TEXT NOT NULL,
+  name                TEXT NOT NULL UNIQUE, -- 'custom.<slug>' — the '.' prefix keeps it visually distinct from built-in tools everywhere it's listed
+  description         TEXT NOT NULL,
+  parametersSchema    TEXT NOT NULL DEFAULT '{"type":"object","properties":{},"required":[]}',
+  webhookUrl          TEXT NOT NULL,
+  webhookSecret       TEXT NOT NULL, -- used to HMAC-sign the outbound request body
+  requiresConfirmation INTEGER NOT NULL DEFAULT 1, -- developer's own safety knob for their tool
+  status              TEXT NOT NULL DEFAULT 'draft', -- draft | published | disabled
+  createdAt           TEXT NOT NULL,
+  updatedAt           TEXT NOT NULL,
+  FOREIGN KEY (creatorUserId) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_custom_tools_creator ON custom_tools(creatorUserId);
+`);
+
+// moderationStatus defaults to 'approved' — every asset published before
+// Moderation existed stays exactly as visible as it always was. Only NEW
+// publishes (from here forward) actually enter the 'pending' review queue;
+// see marketplace.js's setAssetStatus.
+const marketplaceAssetCols = db.prepare("PRAGMA table_info(marketplace_assets)").all().map((c) => c.name);
+if (!marketplaceAssetCols.includes("moderationStatus")) db.exec("ALTER TABLE marketplace_assets ADD COLUMN moderationStatus TEXT NOT NULL DEFAULT 'approved'");
+if (!marketplaceAssetCols.includes("moderationNote")) db.exec("ALTER TABLE marketplace_assets ADD COLUMN moderationNote TEXT");
+
+const seedCategories = [
+  ["marketing", "Marketing", "Campaign planning, ad copy, content agents and automations."],
+  ["sales", "Sales", "Lead handling, outreach, and pipeline automations."],
+  ["support", "Customer Support", "Support agents, ticket automations, response templates."],
+  ["ecommerce", "E-commerce", "Store management for WooCommerce, Shopify, and similar."],
+  ["seo", "SEO & Content", "Content writing, SEO research, and publishing workflows."],
+  ["productivity", "Productivity", "General task, email, and workflow automation."],
+  ["analytics", "Analytics & Reporting", "Business analysis and reporting agents/automations."],
+  ["developer", "Developer Tools", "Automation building blocks and technical workflows."],
+];
+const insertCategory = db.prepare("INSERT OR IGNORE INTO marketplace_categories (id, name, slug, description, createdAt) VALUES (?, ?, ?, ?, ?)");
+for (const [slug, name, description] of seedCategories) {
+  insertCategory.run(slug, name, slug, description, new Date().toISOString());
+}
+
+// Seed the five plans from the spec (idempotent — INSERT OR IGNORE so
+// re-running never clobbers an admin's manual price/limit edits).
+// Migrate existing plans/subscriptions rows (CREATE TABLE IF NOT EXISTS above
+// only affects a fresh database — anyone who already has these tables from
+// an earlier phase needs the new Stripe columns added explicitly).
+const planCols = db.prepare("PRAGMA table_info(plans)").all().map((c) => c.name);
+if (!planCols.includes("stripePriceId")) db.exec("ALTER TABLE plans ADD COLUMN stripePriceId TEXT");
+
+const subCols = db.prepare("PRAGMA table_info(subscriptions)").all().map((c) => c.name);
+if (!subCols.includes("stripeCustomerId")) db.exec("ALTER TABLE subscriptions ADD COLUMN stripeCustomerId TEXT");
+if (!subCols.includes("stripeSubscriptionId")) db.exec("ALTER TABLE subscriptions ADD COLUMN stripeSubscriptionId TEXT");
+
+const seedPlans = [
+  ["free", "Free", 0, 3, 2, 3, 1, 50, 0, 0],
+  ["starter", "Starter", 2900, 10, 10, 10, 5, 500, 0, 0],
+  ["professional", "Professional", 9900, 25, 30, 30, 20, 2500, 1, 0],
+  ["business", "Business", 29900, 100, 100, 100, 100, 10000, 1, 1],
+  ["enterprise", "Enterprise", 0, null, null, null, null, null, 1, 1], // NULL = unlimited; enterprise pricing is custom (0 = "contact us"), not a real $0 plan
+];
+const insertPlan = db.prepare(
+  `INSERT OR IGNORE INTO plans (id, name, monthlyPriceCents, maxUsers, maxAgents, maxAutomations, maxIntegrations, maxAiRequests, apiAccess, marketplaceAccess, createdAt)
+   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+);
+for (const [id, name, price, maxUsers, maxAgents, maxAutomations, maxIntegrations, maxAiRequests, apiAccess, marketplaceAccess] of seedPlans) {
+  insertPlan.run(id, name, price, maxUsers, maxAgents, maxAutomations, maxIntegrations, maxAiRequests, apiAccess, marketplaceAccess, new Date().toISOString());
+}
 
 // --- Phase 8: per-agent memory isolation + knowledge sharing controls.
 // agentId/ownerAgentId is nullable — NULL means "general", created outside
@@ -415,6 +915,83 @@ const knowledgeCols = db.prepare("PRAGMA table_info(knowledge_items)").all().map
 if (!knowledgeCols.includes("ownerAgentId")) db.exec("ALTER TABLE knowledge_items ADD COLUMN ownerAgentId TEXT");
 if (!knowledgeCols.includes("visibility")) db.exec("ALTER TABLE knowledge_items ADD COLUMN visibility TEXT NOT NULL DEFAULT 'shared'");
 if (!knowledgeCols.includes("editable")) db.exec("ALTER TABLE knowledge_items ADD COLUMN editable TEXT NOT NULL DEFAULT 'editable'"); // 'editable' | 'read_only' — only meaningful when visibility = 'shared'
+
+// Phase 9: cross-USER sharing (org/workspace), layered on top of the
+// Phase 8 columns above which govern sharing between one account's OWN
+// agents. These are independent concerns — a knowledge item can be
+// 'shared' among your own agents (Phase 8) while still being 'private'
+// across other people (Phase 9), or vice versa. Defaults are the most
+// restrictive (private, read_only), so nothing existing becomes newly
+// visible to other accounts just from this migration running.
+if (!knowledgeCols.includes("orgId")) db.exec("ALTER TABLE knowledge_items ADD COLUMN orgId TEXT");
+if (!knowledgeCols.includes("workspaceId")) db.exec("ALTER TABLE knowledge_items ADD COLUMN workspaceId TEXT");
+if (!knowledgeCols.includes("crossUserVisibility")) db.exec("ALTER TABLE knowledge_items ADD COLUMN crossUserVisibility TEXT NOT NULL DEFAULT 'private'"); // private|workspace|organization|public
+if (!knowledgeCols.includes("crossUserEditable")) db.exec("ALTER TABLE knowledge_items ADD COLUMN crossUserEditable TEXT NOT NULL DEFAULT 'read_only'"); // editable|read_only — only meaningful when crossUserVisibility isn't 'private'
+
+// --- Phase 9: Organizations, Workspaces, RBAC core ---
+// Nothing existing is touched by this — a user who never creates or joins
+// an organization keeps working exactly as before ("personal mode").
+// Organization scoping for agents/knowledge/automations/integrations is a
+// deliberately separate, later slice — this just lays the foundation.
+db.exec(`
+CREATE TABLE IF NOT EXISTS organizations (
+  id        TEXT PRIMARY KEY,
+  name      TEXT NOT NULL,
+  logoUrl   TEXT,
+  ownerId   TEXT NOT NULL,
+  status    TEXT NOT NULL DEFAULT 'active', -- active | suspended
+  settings  TEXT NOT NULL DEFAULT '{}',      -- JSON, org-level preferences
+  createdAt TEXT NOT NULL,
+  updatedAt TEXT NOT NULL,
+  FOREIGN KEY (ownerId) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS organization_members (
+  id           TEXT PRIMARY KEY,
+  orgId        TEXT NOT NULL,
+  userId       TEXT,          -- NULL until an invitation is matched/accepted
+  invitedEmail TEXT,          -- set for invitations; kept even after userId is filled in, for history
+  role         TEXT NOT NULL DEFAULT 'member', -- owner | admin | manager | member | viewer | <custom role id>
+  status       TEXT NOT NULL DEFAULT 'active', -- active | invited | suspended
+  invitedAt    TEXT,
+  joinedAt     TEXT,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_org_members_org ON organization_members(orgId);
+CREATE INDEX IF NOT EXISTS idx_org_members_user ON organization_members(userId);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_org_member_unique ON organization_members(orgId, userId) WHERE userId IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS custom_roles (
+  id          TEXT PRIMARY KEY,
+  orgId       TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  permissions TEXT NOT NULL, -- JSON array of permission keys, e.g. ["agent_management","knowledge"]
+  createdAt   TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS workspaces (
+  id          TEXT PRIMARY KEY,
+  orgId       TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  description TEXT,
+  category    TEXT NOT NULL DEFAULT 'general', -- marketing|sales|support|finance|development|hr|general
+  createdAt   TEXT NOT NULL,
+  updatedAt   TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_workspaces_org ON workspaces(orgId);
+
+CREATE TABLE IF NOT EXISTS workspace_members (
+  id          TEXT PRIMARY KEY,
+  workspaceId TEXT NOT NULL,
+  userId      TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT 'member',
+  createdAt   TEXT NOT NULL,
+  FOREIGN KEY (workspaceId) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_workspace_member_unique ON workspace_members(workspaceId, userId);
+`);
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS agent_versions (
@@ -470,6 +1047,7 @@ const seedSkills = [
   ["sheets", "Google Sheets", "Create spreadsheets and read/write cell data once your Google account is connected.", "integration"],
   ["shopify", "Shopify", "Manage products, orders, customers, inventory, discounts, and collections once your store is connected.", "integration"],
   ["collaboration", "Agent Collaboration", "Delegate tasks to your other agents and chain them together on multi-step work.", "core"],
+  ["custom_tools", "Custom Tools (Developer)", "Use tools you've built and published yourself via the Developer SDK — each one calls a webhook you host.", "core"],
 ];
 const insertSkill = db.prepare(
   "INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')"

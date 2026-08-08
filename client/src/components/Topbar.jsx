@@ -1,6 +1,7 @@
 import { Moon, Sun, LogOut } from "lucide-react";
 import { useTheme } from "../lib/theme.jsx";
 import { useAuth } from "../lib/auth.jsx";
+import NotificationBell from "./NotificationBell.jsx";
 
 export default function Topbar() {
   const { theme, toggle } = useTheme();
@@ -9,6 +10,7 @@ export default function Topbar() {
 
   return (
     <header className="hidden items-center justify-end gap-2 border-b border-line bg-surface/70 px-6 py-3 backdrop-blur md:flex">
+      <NotificationBell />
       <button onClick={toggle} className="rounded-xl p-2.5 text-muted hover:bg-elevated" aria-label="Toggle theme">
         {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
       </button>

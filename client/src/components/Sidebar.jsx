@@ -1,8 +1,10 @@
 import { NavLink } from "react-router-dom";
-import { Sparkles } from "lucide-react";
+import { Sparkles, Shield } from "lucide-react";
 import { NAV } from "./nav-items.js";
+import { useAuth } from "../lib/auth.jsx";
 
 export default function Sidebar() {
+  const { user } = useAuth();
   return (
     <aside className="hidden w-64 shrink-0 flex-col border-r border-line bg-surface md:flex">
       <div className="flex items-center gap-2.5 px-5 py-5">
@@ -28,6 +30,19 @@ export default function Sidebar() {
             {label}
           </NavLink>
         ))}
+        {user?.isPlatformAdmin && (
+          <NavLink
+            to="/app/admin"
+            className={({ isActive }) =>
+              `group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition ${
+                isActive ? "bg-accent/10 text-accent" : "text-muted hover:bg-elevated hover:text-ink"
+              }`
+            }
+          >
+            <Shield size={18} className="shrink-0" />
+            Admin Panel
+          </NavLink>
+        )}
       </nav>
 
       <div className="px-4 py-4">

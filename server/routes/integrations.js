@@ -4,6 +4,7 @@ import { requireAuth } from "../middleware.js";
 import { metaOAuthStatus } from "../integrations/meta/oauth.js";
 import { googleOAuthStatus } from "../integrations/gmail/oauth.js";
 import { googleOAuthStatus as googleServiceOAuthStatus } from "../integrations/google/oauth.js";
+import { connectionHealth } from "../integrations/manager.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -26,15 +27,15 @@ const CATALOG = [
 ];
 
 router.get("/", (req, res) => {
-  const mine = db.prepare("SELECT provider, status FROM integrations WHERE userId = ?").all(req.session.userId);
-  const map = Object.fromEntries(mine.map((r) => [r.provider, r.status]));
+  const health = Object.fromEntries(CATALOG.map((c) => [c.provider, connectionHealth(req.session.userId, c.provider)]));
   const metaStatus = metaOAuthStatus();
   const gmailStatus = googleOAuthStatus();
   const whatsappWebhookConfigured = Boolean(process.env.WHATSAPP_VERIFY_TOKEN && process.env.META_APP_SECRET);
   res.json(
     CATALOG.map((c) => ({
       ...c,
-      status: map[c.provider] || "not_connected",
+      status: health[c.provider]?.connected ? "connected" : "not_connected",
+      sharedFromOrg: Boolean(health[c.provider]?.sharedFromOrg),
       // Meta Ads/Gmail are "available" as features, but still need the app
       // owner (you) to have set the right env vars — surface that
       // distinction so the UI can explain rather than just fail on click.

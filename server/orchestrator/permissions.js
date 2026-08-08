@@ -47,9 +47,12 @@ export function checkPermission({ agentId, permission }) {
 }
 
 // A tool is available to an agent only if: registered, the agent has the
-// tool's skill enabled, and every required permission checks out.
-export function toolAvailableToAgent(toolName, agentId) {
-  const tool = getTool(toolName);
+// tool's skill enabled, and every required permission checks out. userId is
+// needed to resolve a caller's own custom (Developer SDK) tools — optional
+// and additive, every existing call site without one still works exactly
+// as before for the ~140 static tools.
+export function toolAvailableToAgent(toolName, agentId, userId) {
+  const tool = getTool(toolName, userId);
   if (!tool) return { available: false, reason: `Tool "${toolName}" is not registered` };
 
   const skillIds = getAgentSkillIds(agentId);

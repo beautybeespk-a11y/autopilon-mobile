@@ -1,13 +1,47 @@
 import { useEffect, useState } from "react";
-import { ListChecks, Plus } from "lucide-react";
+import { ListChecks, Plus, MessageSquare } from "lucide-react";
 import { Card, Input, Button, Badge, EmptyState } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
 const PRIORITY_TONE = { high: "warn", medium: "accent", low: "muted" };
 
+function CommentThread({ taskId }) {
+  const [comments, setComments] = useState([]);
+  const [text, setText] = useState("");
+
+  const load = () => api.get(`/entities/task/${taskId}/comments`).then(setComments).catch(() => {});
+  useEffect(() => { load(); }, [taskId]);
+
+  const send = async () => {
+    if (!text.trim()) return;
+    await api.post(`/entities/task/${taskId}/comments`, { content: text });
+    setText(""); load();
+  };
+
+  return (
+    <div className="border-t border-line bg-elevated/50 px-5 py-3">
+      <div className="space-y-2">
+        {comments.map((c) => (
+          <div key={c.id} className="text-sm">
+            <span className="font-medium">{c.authorName}</span>{" "}
+            <span className="text-xs text-muted">{new Date(c.createdAt).toLocaleString()}</span>
+            <p className="text-muted">{c.content}</p>
+          </div>
+        ))}
+        {comments.length === 0 && <p className="text-xs text-muted">No comments yet.</p>}
+      </div>
+      <div className="mt-2 flex gap-2">
+        <Input value={text} onChange={(e) => setText(e.target.value)} onKeyDown={(e) => e.key === "Enter" && send()} placeholder="Add a comment — use @name to mention a teammate" className="flex-1" />
+        <Button onClick={send}>Send</Button>
+      </div>
+    </div>
+  );
+}
+
 export default function Tasks() {
   const [tasks, setTasks] = useState([]);
   const [title, setTitle] = useState("");
+  const [openTaskId, setOpenTaskId] = useState(null);
 
   const load = () => api.get("/tasks").then(setTasks).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -35,12 +69,18 @@ export default function Tasks() {
       ) : (
         <Card className="divide-y divide-line">
           {tasks.map((t) => (
-            <div key={t.id} className="flex items-center justify-between px-5 py-3">
-              <span className="text-sm">{t.title}</span>
-              <div className="flex items-center gap-2">
-                <Badge tone={PRIORITY_TONE[t.priority] || "muted"}>{t.priority}</Badge>
-                <Badge>{t.status}</Badge>
+            <div key={t.id}>
+              <div className="flex items-center justify-between px-5 py-3">
+                <span className="text-sm">{t.title}</span>
+                <div className="flex items-center gap-2">
+                  <Badge tone={PRIORITY_TONE[t.priority] || "muted"}>{t.priority}</Badge>
+                  <Badge>{t.status}</Badge>
+                  <button onClick={() => setOpenTaskId(openTaskId === t.id ? null : t.id)} className="rounded-lg p-1.5 text-muted hover:bg-elevated hover:text-ink" title="Comments">
+                    <MessageSquare size={16} />
+                  </button>
+                </div>
               </div>
+              {openTaskId === t.id && <CommentThread taskId={t.id} />}
             </div>
           ))}
         </Card>
