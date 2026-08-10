@@ -14,6 +14,10 @@ import '../../features/more/presentation/more_screen.dart';
 import '../../features/automations/presentation/automations_screen.dart';
 import '../../features/integrations/presentation/integrations_screen.dart';
 import '../../features/settings/presentation/settings_screen.dart';
+import '../../features/marketplace/presentation/marketplace_screen.dart';
+import '../../features/marketplace/presentation/marketplace_asset_detail_screen.dart';
+import '../../features/marketplace/presentation/marketplace_installs_screen.dart';
+import '../../features/billing/presentation/billing_screen.dart';
 
 /// A Listenable that pings go_router's `refreshListenable` whenever auth
 /// status changes, so login/logout immediately re-evaluates `redirect`
@@ -58,6 +62,20 @@ final routerProvider = Provider<GoRouter>((ref) {
               GoRoute(path: 'automations', builder: (context, state) => const AutomationsScreen()),
               GoRoute(path: 'integrations', builder: (context, state) => const IntegrationsScreen()),
               GoRoute(path: 'settings', builder: (context, state) => const SettingsScreen()),
+              GoRoute(
+                path: 'marketplace',
+                builder: (context, state) => const MarketplaceScreen(),
+                routes: [
+                  // 'installs' must be declared before ':id' so it's matched
+                  // as the literal segment, not swallowed as an asset id.
+                  GoRoute(path: 'installs', builder: (context, state) => const MarketplaceInstallsScreen()),
+                  GoRoute(
+                    path: ':id',
+                    builder: (context, state) => MarketplaceAssetDetailScreen(assetId: state.pathParameters['id']!),
+                  ),
+                ],
+              ),
+              GoRoute(path: 'billing', builder: (context, state) => const BillingScreen()),
             ],
           ),
         ],

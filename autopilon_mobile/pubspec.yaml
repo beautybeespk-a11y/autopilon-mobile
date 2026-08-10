@@ -41,6 +41,11 @@ dependencies:
   # in the Replit project per REPLIT_SETUP.md), so add those entries there.
   image_picker: ^1.1.2
 
+  # Opens Stripe checkout/portal URLs (marketplace purchases, billing plan
+  # changes) in the device browser — payment itself stays off-app, same as
+  # the web client's window.location redirect to Stripe.
+  url_launcher: ^6.3.0
+
   # Exact font match with the web client (Space Grotesk / Inter / JetBrains
   # Mono) without bundling font files by hand — same families, fetched once
   # and cached.

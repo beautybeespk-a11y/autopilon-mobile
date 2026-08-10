@@ -111,7 +111,10 @@ class CostData {
   });
   factory CostData.fromJson(Map<String, dynamic> json) => CostData(
         estimatedCostCents: json['estimatedCostCents'] ?? 0,
-        byokUsageCents: json['byokUsageCents'] ?? 0,
+        // Server key is byokCostCents (server/orchestrator/costEngine.js) —
+        // this used to read a key that doesn't exist, so BYOK cost always
+        // showed $0 regardless of actual usage.
+        byokUsageCents: json['byokCostCents'] ?? 0,
         byProvider: (json['byProvider'] as List? ?? [])
             .map((e) => ProviderCost.fromJson(e as Map<String, dynamic>))
             .toList(),

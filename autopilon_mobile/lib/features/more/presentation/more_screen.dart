@@ -9,9 +9,11 @@ class MoreScreen extends StatelessWidget {
     final sections = [
       (Icons.bolt_outlined, 'Automations', 'Workflows on a schedule or trigger', '/more/automations'),
       (Icons.power_outlined, 'Integrations', 'Connect the tools your agents use', '/more/integrations'),
-      (Icons.storefront_outlined, 'Marketplace', 'Browse and publish agents & automations', null),
-      (Icons.receipt_long_outlined, 'Billing', 'Plan, usage, and payment details', null),
-      (Icons.insights_outlined, 'Analytics', 'Usage and performance across your org', null),
+      (Icons.storefront_outlined, 'Marketplace', 'Browse and install agents & automations', '/more/marketplace'),
+      (Icons.receipt_long_outlined, 'Billing', 'Plan, usage, and payment details', '/more/billing'),
+      // Analytics already lives on the Home tab (dashboard_screen.dart) —
+      // pointing here instead of building a second copy of the same screen.
+      (Icons.insights_outlined, 'Analytics', 'Usage and performance across your org', '/'),
       (Icons.settings_outlined, 'Settings', 'Account, appearance, and provider status', '/more/settings'),
     ];
 
