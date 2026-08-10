@@ -8,12 +8,12 @@ import '../../notifications/presentation/notification_bell.dart';
 
 /// The persistent frame for the authenticated part of the app — top bar
 /// (app name + org switcher + notifications + logout) and a bottom nav
-/// across Home/Chat/Agents/Tasks.
+/// across Home/Chat/Agents/Tasks/More.
 class AppShell extends ConsumerWidget {
   const AppShell({super.key, required this.child});
   final Widget child;
 
-  static const _tabs = ['/', '/chat', '/agents', '/tasks'];
+  static const _tabs = ['/', '/chat', '/agents', '/tasks', '/more'];
 
   int _indexForLocation(String location) {
     final i = _tabs.indexWhere((t) => location == t || (t != '/' && location.startsWith(t)));
@@ -56,6 +56,7 @@ class AppShell extends ConsumerWidget {
           NavigationDestination(icon: Icon(Icons.chat_bubble_outline), selectedIcon: Icon(Icons.chat_bubble), label: 'Chat'),
           NavigationDestination(icon: Icon(Icons.smart_toy_outlined), selectedIcon: Icon(Icons.smart_toy), label: 'Agents'),
           NavigationDestination(icon: Icon(Icons.checklist_outlined), selectedIcon: Icon(Icons.checklist), label: 'Tasks'),
+          NavigationDestination(icon: Icon(Icons.more_horiz_outlined), selectedIcon: Icon(Icons.more_horiz), label: 'More'),
         ],
       ),
     );
