@@ -59,6 +59,13 @@ export async function handleIncomingMessage({
         extraImage = { mimeType: meta.mimeType, base64: fs.readFileSync(meta.storagePath).toString("base64") };
       }
     }
+    // Temporary diagnostic — remove once image attachments are confirmed
+    // working end-to-end.
+    console.log("[conversationService] resolving attachmentImageId:", {
+      attachmentImageId,
+      foundKnowledgeRow: Boolean(row),
+      resolvedImage: extraImage ? { mimeType: extraImage.mimeType, base64Length: extraImage.base64.length } : null,
+    });
   }
 
   let systemPrompt = "You are a helpful AI assistant inside the AI Agent Platform.";

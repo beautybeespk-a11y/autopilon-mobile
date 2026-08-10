@@ -152,6 +152,13 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         { ...last, content: [{ type: "text", text: text || "" }, { type: "image", mimeType: extraImage.mimeType, data: extraImage.base64 }] },
       ];
     }
+    // Temporary diagnostic — remove once image attachments are confirmed
+    // working end-to-end.
+    console.log("[orchestrate] built multimodal content:", {
+      lastRoleWasUser: last.role === "user",
+      provider: modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic",
+      model: modelChoice?.aiModel || null,
+    });
   } else if (extraContext && conversationForModel.length) {
     const last = conversationForModel[conversationForModel.length - 1];
     if (last.role === "user") {

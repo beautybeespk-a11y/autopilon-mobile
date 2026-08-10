@@ -30,6 +30,15 @@ router.get("/conversations/:id/messages", (req, res) => {
 router.post("/message", async (req, res) => {
   const { conversationId, content, agentId, attachmentTitle, attachmentText, attachmentImageId } = req.body || {};
   const hasAttachment = Boolean(attachmentTitle && (attachmentText || attachmentImageId));
+  // Temporary diagnostic — remove once image attachments are confirmed
+  // working end-to-end. Shows exactly what the client sent for this field,
+  // without dumping the (large) attachmentText/body itself.
+  console.log("[chat/message] attachment fields:", {
+    attachmentTitle: attachmentTitle || null,
+    hasAttachmentText: Boolean(attachmentText),
+    attachmentImageId: attachmentImageId || null,
+    hasAttachment,
+  });
   if (!content?.trim() && !hasAttachment) return res.status(400).json({ error: "Message content is required." });
   const now = new Date().toISOString();
   const userId = req.session.userId;
