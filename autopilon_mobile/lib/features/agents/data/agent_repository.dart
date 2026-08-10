@@ -34,4 +34,86 @@ class AgentRepository {
         body: {'name': name, 'description': description},
         parse: (data) => data as Map<String, dynamic>,
       );
+
+  Future<ApiResult<AgentDetail>> detail(String id) => _api.get<AgentDetail>(
+        '/agents/$id',
+        parse: (data) => AgentDetail.fromJson(data as Map<String, dynamic>),
+      );
+
+  Future<ApiResult<List<AiProviderOption>>> providerOptions() => _api.get<List<AiProviderOption>>(
+        '/chat/provider-options',
+        parse: (data) => (data as List).map((p) => AiProviderOption.fromJson(p)).toList(),
+      );
+
+  Future<ApiResult<List<Workspace>>> workspaces(String orgId) => _api.get<List<Workspace>>(
+        '/organizations/$orgId/workspaces',
+        parse: (data) => (data as List).map((w) => Workspace.fromJson(w)).toList(),
+      );
+
+  /// Shared by create() and update() below — the request body shape is
+  /// identical, only the HTTP verb/path differ (POST /agents to create,
+  /// PATCH /agents/:id to update an existing one).
+  Map<String, dynamic> _payload({
+    required String name,
+    required String description,
+    required String personality,
+    required String instructions,
+    String? aiProvider,
+    String? aiModel,
+    String? orgId,
+    String? workspaceId,
+    required List<String> skillIds,
+  }) =>
+      {
+        'name': name,
+        'description': description,
+        'personality': personality,
+        'instructions': instructions,
+        'aiProvider': aiProvider,
+        'aiModel': aiModel,
+        'orgId': orgId,
+        'workspaceId': workspaceId,
+        'skillIds': skillIds,
+      };
+
+  Future<ApiResult<Agent>> create({
+    required String name,
+    required String description,
+    required String personality,
+    required String instructions,
+    String? aiProvider,
+    String? aiModel,
+    String? orgId,
+    String? workspaceId,
+    required List<String> skillIds,
+  }) =>
+      _api.post<Agent>(
+        '/agents',
+        body: _payload(
+          name: name, description: description, personality: personality, instructions: instructions,
+          aiProvider: aiProvider, aiModel: aiModel, orgId: orgId, workspaceId: workspaceId, skillIds: skillIds,
+        ),
+        parse: (data) => Agent.fromJson(data as Map<String, dynamic>),
+      );
+
+  Future<ApiResult<Agent>> update(
+    String id, {
+    required String name,
+    required String description,
+    required String personality,
+    required String instructions,
+    String? aiProvider,
+    String? aiModel,
+    String? orgId,
+    String? workspaceId,
+    required List<String> skillIds,
+  }) =>
+      _api.patch<Agent>(
+        '/agents/$id',
+        body: _payload(
+          name: name, description: description, personality: personality, instructions: instructions,
+          aiProvider: aiProvider, aiModel: aiModel, orgId: orgId, workspaceId: workspaceId, skillIds: skillIds,
+        ),
+        parse: (data) => Agent.fromJson(data as Map<String, dynamic>),
+      );
 }

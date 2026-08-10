@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import '../data/agent_models.dart';
 import '../providers/agent_provider.dart';
 
@@ -23,14 +24,14 @@ class AgentsScreen extends ConsumerWidget {
         ],
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () => _notBuiltYet(context, 'New agent builder'),
+        onPressed: () => context.push('/agents/new'),
         icon: const Icon(Icons.add),
         label: const Text('New agent'),
       ),
       body: state.loading
           ? const Center(child: CircularProgressIndicator())
           : state.agents.isEmpty
-              ? _EmptyAgents(onCreate: () => _notBuiltYet(context, 'New agent builder'))
+              ? _EmptyAgents(onCreate: () => context.push('/agents/new'))
               : RefreshIndicator(
                   onRefresh: controller.load,
                   child: ListView.builder(
@@ -89,7 +90,10 @@ class _AgentCard extends ConsumerWidget {
     final controller = ref.read(agentsControllerProvider.notifier);
     return Card(
       margin: const EdgeInsets.only(bottom: 10),
-      child: Padding(
+      child: InkWell(
+        borderRadius: BorderRadius.circular(12),
+        onTap: () => context.push('/agents/${agent.id}/edit'),
+        child: Padding(
         padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -125,6 +129,9 @@ class _AgentCard extends ConsumerWidget {
                   PopupMenuButton<String>(
                     onSelected: (v) {
                       switch (v) {
+                        case 'edit':
+                          context.push('/agents/${agent.id}/edit');
+                          break;
                         case 'toggle':
                           controller.toggleStatus(agent);
                           break;
@@ -140,6 +147,7 @@ class _AgentCard extends ConsumerWidget {
                       }
                     },
                     itemBuilder: (_) => [
+                      const PopupMenuItem(value: 'edit', child: Text('Edit')),
                       PopupMenuItem(value: 'toggle', child: Text(agent.status == 'active' ? 'Deactivate' : 'Activate')),
                       const PopupMenuItem(value: 'clone', child: Text('Clone')),
                       if (agent.isOwner) const PopupMenuItem(value: 'publish', child: Text('Publish to Marketplace')),
@@ -161,6 +169,7 @@ class _AgentCard extends ConsumerWidget {
               ],
             ),
           ],
+        ),
         ),
       ),
     );

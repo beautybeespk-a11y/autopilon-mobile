@@ -9,6 +9,7 @@ import '../../features/shell/presentation/app_shell.dart';
 import '../../features/dashboard/presentation/dashboard_screen.dart';
 import '../../features/chat/presentation/chat_screen.dart';
 import '../../features/agents/presentation/agents_screen.dart';
+import '../../features/agents/presentation/agent_builder_screen.dart';
 import '../../features/tasks/presentation/tasks_screen.dart';
 import '../../features/more/presentation/more_screen.dart';
 import '../../features/automations/presentation/automations_screen.dart';
@@ -53,7 +54,19 @@ final routerProvider = Provider<GoRouter>((ref) {
         routes: [
           GoRoute(path: '/', builder: (context, state) => const DashboardScreen()),
           GoRoute(path: '/chat', builder: (context, state) => const ChatScreen()),
-          GoRoute(path: '/agents', builder: (context, state) => const AgentsScreen()),
+          GoRoute(
+            path: '/agents',
+            builder: (context, state) => const AgentsScreen(),
+            routes: [
+              // 'new' must be declared before ':id' so it's matched as the
+              // literal segment, not swallowed as an agent id.
+              GoRoute(path: 'new', builder: (context, state) => const AgentBuilderScreen()),
+              GoRoute(
+                path: ':id/edit',
+                builder: (context, state) => AgentBuilderScreen(agentId: state.pathParameters['id']!),
+              ),
+            ],
+          ),
           GoRoute(path: '/tasks', builder: (context, state) => const TasksScreen()),
           GoRoute(
             path: '/more',
