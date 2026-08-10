@@ -10,6 +10,10 @@ import '../../features/dashboard/presentation/dashboard_screen.dart';
 import '../../features/chat/presentation/chat_screen.dart';
 import '../../features/agents/presentation/agents_screen.dart';
 import '../../features/tasks/presentation/tasks_screen.dart';
+import '../../features/more/presentation/more_screen.dart';
+import '../../features/automations/presentation/automations_screen.dart';
+import '../../features/integrations/presentation/integrations_screen.dart';
+import '../../features/settings/presentation/settings_screen.dart';
 
 /// A Listenable that pings go_router's `refreshListenable` whenever auth
 /// status changes, so login/logout immediately re-evaluates `redirect`
@@ -47,6 +51,15 @@ final routerProvider = Provider<GoRouter>((ref) {
           GoRoute(path: '/chat', builder: (context, state) => const ChatScreen()),
           GoRoute(path: '/agents', builder: (context, state) => const AgentsScreen()),
           GoRoute(path: '/tasks', builder: (context, state) => const TasksScreen()),
+          GoRoute(
+            path: '/more',
+            builder: (context, state) => const MoreScreen(),
+            routes: [
+              GoRoute(path: 'automations', builder: (context, state) => const AutomationsScreen()),
+              GoRoute(path: 'integrations', builder: (context, state) => const IntegrationsScreen()),
+              GoRoute(path: 'settings', builder: (context, state) => const SettingsScreen()),
+            ],
+          ),
         ],
       ),
     ],

@@ -6,7 +6,7 @@ import multer from "multer";
 import db from "../db.js";
 import { requireAuth, logActivity } from "../middleware.js";
 import { cryptoRandom } from "../middleware.js";
-import { extractTextFromFile } from "../tools/research/documentExtract.js";
+import { extractTextFromFile, isImageFile } from "../tools/research/documentExtract.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "knowledge");
@@ -52,42 +52,48 @@ router.get("/knowledge/:id", (req, res) => {
   });
 });
 
-// Uploads a document (PDF, DOCX, TXT, MD, CSV, or other), extracts what text
-// it can, and stores it as a knowledge_items row with type "document". Once
-// stored, it's automatically visible via list_saved_research and searchable
-// via search_knowledge — no separate agent tool needed, since both already
-// operate over this same table.
+// Uploads a document (PDF, DOCX, TXT, MD, CSV, or other) or an image, and
+// stores it as a knowledge_items row (type "document" or "image"). Documents
+// get text extracted so they're searchable via search_knowledge; images are
+// stored as-is with no extraction attempted — there's nothing to extract —
+// and instead get handed to the AI provider as a vision input when attached
+// in chat (see conversationService.js).
 router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded." });
 
   const { originalname, mimetype, size, path: storagePath } = req.file;
   try {
-    const { text, note } = await extractTextFromFile(storagePath, originalname, mimetype);
+    const isImage = isImageFile(originalname, mimetype);
+    const { text, note } = isImage
+      ? { text: "", note: null }
+      : await extractTextFromFile(storagePath, originalname, mimetype);
+    const type = isImage ? "image" : "document";
     const id = cryptoRandom();
     const now = new Date().toISOString();
     const title = req.body.title?.trim() || originalname;
 
     db.prepare(
       `INSERT INTO knowledge_items (id, userId, type, title, category, tags, content, sourceUrls, ownerAgentId, visibility, editable, createdAt)
-       VALUES (?, ?, 'document', ?, ?, ?, ?, ?, NULL, 'shared', 'editable', ?)`
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'shared', 'editable', ?)`
     ).run(
       id,
       req.session.userId,
+      type,
       title,
-      "Document",
+      isImage ? "Image" : "Document",
       JSON.stringify([]),
       JSON.stringify({ extractedText: text, mimeType: mimetype, originalFilename: originalname, fileSizeBytes: size, storagePath, note: note || null }),
       JSON.stringify([]),
       now
     );
 
-    logActivity(db, req.session.userId, "document_uploaded", `Uploaded document: "${title}"`);
+    logActivity(db, req.session.userId, isImage ? "image_uploaded" : "document_uploaded", `Uploaded ${isImage ? "image" : "document"}: "${title}"`);
 
     res.json({
       id,
-      type: "document",
+      type,
       title,
-      category: "Document",
+      category: isImage ? "Image" : "Document",
       tags: [],
       sourceUrls: [],
       createdAt: now,
@@ -110,7 +116,7 @@ router.post("/knowledge/upload", upload.single("file"), async (req, res) => {
 // Streams the original uploaded file back — used by "download"/"open" in
 // the UI. Ownership is checked the same way every other route here does.
 router.get("/knowledge/:id/file", (req, res) => {
-  const row = db.prepare("SELECT * FROM knowledge_items WHERE id = ? AND userId = ? AND type = 'document'")
+  const row = db.prepare("SELECT * FROM knowledge_items WHERE id = ? AND userId = ? AND type IN ('document', 'image')")
     .get(req.params.id, req.session.userId);
   if (!row) return res.status(404).json({ error: "Not found" });
 
@@ -128,9 +134,9 @@ router.delete("/knowledge/:id", (req, res) => {
   const owned = db.prepare("SELECT id, title, type, content FROM knowledge_items WHERE id = ? AND userId = ?").get(req.params.id, req.session.userId);
   if (!owned) return res.status(404).json({ error: "Not found" });
 
-  // For documents, also remove the file on disk so uploads don't accumulate
-  // forever after the knowledge item referencing them is deleted.
-  if (owned.type === "document") {
+  // For documents and images, also remove the file on disk so uploads don't
+  // accumulate forever after the knowledge item referencing them is deleted.
+  if (owned.type === "document" || owned.type === "image") {
     try {
       const content = JSON.parse(owned.content || "{}");
       if (content.storagePath) fs.unlink(content.storagePath, () => {});

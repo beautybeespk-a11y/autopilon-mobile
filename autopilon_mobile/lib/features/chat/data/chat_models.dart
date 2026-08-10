@@ -72,6 +72,23 @@ class ChatMessage {
       );
 }
 
+/// Result of POST /research/knowledge/upload — mirrors what Chat.jsx keeps
+/// in its `attachment` state after a successful upload.
+class UploadedAttachment {
+  final String id;
+  final String title;
+  final String type; // "document" | "image"
+  UploadedAttachment({required this.id, required this.title, required this.type});
+
+  factory UploadedAttachment.fromJson(Map<String, dynamic> json) => UploadedAttachment(
+        id: json['id']?.toString() ?? '',
+        title: json['title'] ?? '',
+        type: json['type'] ?? 'document',
+      );
+
+  bool get isImage => type == 'image';
+}
+
 /// Tools that mutate something real (campaigns, memory, saved research) —
 /// mirrors META_ACTION_TOOLS / isDeleteAction in Chat.jsx, used only for
 /// button labels ("Delete" vs "Approve", "Cancel" vs "Reject").

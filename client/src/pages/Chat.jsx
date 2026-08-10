@@ -81,7 +81,7 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [providerErr, setProviderErr] = useState(null);
-  const [attachment, setAttachment] = useState(null); // { title, extractedText, note }
+  const [attachment, setAttachment] = useState(null); // { title, extractedText, note } | { title, isImage, id, previewUrl }
   const [attachUploading, setAttachUploading] = useState(false);
   const [attachError, setAttachError] = useState(null);
   const scrollRef = useRef(null);
@@ -109,7 +109,14 @@ export default function Chat() {
     setMessages(d.messages.map((m) => ({ ...m, ...(m.meta || {}) })));
   };
 
-  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); setAttachment(null); };
+  const clearAttachment = () => {
+    setAttachment((prev) => {
+      if (prev?.previewUrl) URL.revokeObjectURL(prev.previewUrl);
+      return null;
+    });
+  };
+
+  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); clearAttachment(); };
 
   const onPickFile = async (e) => {
     const file = e.target.files?.[0];
@@ -121,7 +128,17 @@ export default function Chat() {
       const formData = new FormData();
       formData.append("file", file);
       const result = await api.upload("/research/knowledge/upload", formData);
-      setAttachment({ title: result.title, extractedText: result.extractedText || "", note: result.note });
+      const isImage = result.type === "image";
+      // Local object URL for an instant thumbnail — no need to round-trip
+      // the file back from the server just to preview what was just picked.
+      setAttachment({
+        title: result.title,
+        isImage,
+        id: result.id,
+        previewUrl: isImage ? URL.createObjectURL(file) : null,
+        extractedText: result.extractedText || "",
+        note: result.note,
+      });
     } catch (err) {
       setAttachError(err.message || "Upload failed.");
     } finally {
@@ -138,8 +155,12 @@ export default function Chat() {
     const displayContent = hasAttachment ? `📎 ${attachment.title}${content ? `\n\n${content}` : ""}` : content;
     setMessages((m) => [...m, { id: "tmp-" + Date.now(), role: "user", content: displayContent }]);
     setSending(true);
-    const attachmentPayload = hasAttachment ? { attachmentTitle: attachment.title, attachmentText: attachment.extractedText } : {};
-    setAttachment(null);
+    const attachmentPayload = hasAttachment
+      ? attachment.isImage
+        ? { attachmentTitle: attachment.title, attachmentImageId: attachment.id }
+        : { attachmentTitle: attachment.title, attachmentText: attachment.extractedText }
+      : {};
+    clearAttachment();
     try {
       const d = await api.post("/chat/message", { conversationId: activeId, content, agentId: agentId || undefined, ...attachmentPayload });
       setActiveId(d.conversationId);
@@ -275,7 +296,11 @@ export default function Chat() {
         <div className="border-t border-line p-3">
           {(attachment || attachUploading || attachError) && (
             <div className="mb-2 flex items-center gap-2 rounded-xl border border-line bg-bg px-3 py-2 text-sm">
-              <FileText size={14} className="shrink-0 text-accent" />
+              {attachment?.isImage && attachment.previewUrl ? (
+                <img src={attachment.previewUrl} alt="" className="h-8 w-8 shrink-0 rounded-md object-cover" />
+              ) : (
+                <FileText size={14} className="shrink-0 text-accent" />
+              )}
               {attachUploading ? (
                 <span className="text-muted">Uploading…</span>
               ) : attachError ? (
@@ -287,7 +312,7 @@ export default function Chat() {
                 <>
                   <span className="flex-1 truncate">{attachment.title}</span>
                   {attachment.note && <span className="shrink-0 text-xs text-amber-500">not searchable</span>}
-                  <button onClick={() => setAttachment(null)} className="shrink-0 rounded p-0.5 text-muted hover:text-ink"><X size={14} /></button>
+                  <button onClick={clearAttachment} className="shrink-0 rounded p-0.5 text-muted hover:text-ink"><X size={14} /></button>
                 </>
               )}
             </div>

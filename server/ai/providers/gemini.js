@@ -2,7 +2,11 @@ export async function geminiChat({ messages, systemPrompt, apiKey, model: modelO
   const model = modelOverride || process.env.GEMINI_MODEL || "gemini-1.5-flash";
   const contents = messages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
-    parts: [{ text: m.content }],
+    parts: Array.isArray(m.content)
+      ? m.content.map((part) =>
+          part.type === "image" ? { inlineData: { mimeType: part.mimeType, data: part.data } } : { text: part.text }
+        )
+      : [{ text: m.content }],
   }));
   const body = {
     contents,

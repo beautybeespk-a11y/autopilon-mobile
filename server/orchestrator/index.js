@@ -122,7 +122,7 @@ function salvageMalformedToolCall(raw, decision) {
  * any tool calls through the executor, and produce a final natural-language
  * response plus a trace of what happened for the ToolActivity UI.
  */
-export async function orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt, extraContext }) {
+export async function orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt, extraContext, extraImage }) {
   const trace = [traceStep("planning", null, "active")];
   const skillIds = getAgentSkillIds(agentId);
   const availableTools = listToolsForSkills(skillIds);
@@ -138,7 +138,21 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // `history` as loaded from the DB, so the stored/displayed transcript
   // stays short and re-opening the conversation later doesn't replay a
   // wall of pasted file content.
-  if (extraContext && conversationForModel.length) {
+  if (extraImage && conversationForModel.length) {
+    // An attached image can't be folded into the text string the way
+    // extraContext is — it becomes a multimodal content array instead
+    // (canonical { type: "text" | "image", ... } parts; each provider
+    // adapter converts these to its own vendor shape). Also turn-only,
+    // never persisted into `history`.
+    const last = conversationForModel[conversationForModel.length - 1];
+    if (last.role === "user") {
+      const text = extraContext ? `${last.content}\n\n${extraContext}` : last.content;
+      conversationForModel = [
+        ...conversationForModel.slice(0, -1),
+        { ...last, content: [{ type: "text", text: text || "" }, { type: "image", mimeType: extraImage.mimeType, data: extraImage.base64 }] },
+      ];
+    }
+  } else if (extraContext && conversationForModel.length) {
     const last = conversationForModel[conversationForModel.length - 1];
     if (last.role === "user") {
       conversationForModel = [
@@ -150,11 +164,15 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const toolResults = [];
 
   while (stepsRun < MAX_STEPS) {
-    const raw = await chatComplete({
+    const completion = await chatComplete({
       messages: conversationForModel, systemPrompt,
       provider: modelChoice?.aiProvider || undefined,
       model: modelChoice?.aiModel || undefined,
     });
+    // Every provider adapter returns { text, usage } — standardized so this
+    // loop (and salvageMalformedToolCall below, which regexes the original
+    // text) never has to special-case a given provider's return shape.
+    const raw = completion.text;
     const decision = safeParseDecision(raw);
 
     if (decision.type === "final") {

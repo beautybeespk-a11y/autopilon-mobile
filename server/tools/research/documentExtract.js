@@ -16,6 +16,14 @@ function extOf(filename) {
   return i === -1 ? "" : filename.slice(i + 1).toLowerCase();
 }
 
+// SVG excluded on purpose — it's XML text, not a raster the vision APIs
+// below (Anthropic/OpenAI/Gemini) accept as an image content block.
+const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp"]);
+
+export function isImageFile(filename, mimeType) {
+  return IMAGE_EXTENSIONS.has(extOf(filename)) || (mimeType || "").startsWith("image/");
+}
+
 /**
  * Extracts readable text from an uploaded file so it can be stored in a
  * knowledge_items row and picked up by the existing search_knowledge tool

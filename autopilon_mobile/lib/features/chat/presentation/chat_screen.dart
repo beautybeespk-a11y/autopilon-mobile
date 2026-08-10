@@ -1,5 +1,7 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
 import '../data/chat_models.dart';
 import '../providers/chat_provider.dart';
 
@@ -296,34 +298,109 @@ class _ComposerState extends State<_Composer> {
 
   void _send() {
     final text = _inputCtrl.text;
-    if (text.trim().isEmpty) return;
+    if (text.trim().isEmpty && widget.state.attachment == null) return;
     widget.controller.send(text);
     _inputCtrl.clear();
   }
 
+  void _showAttachMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Wrap(
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Photo Library'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                widget.controller.pickImage(ImageSource.gallery);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_camera_outlined),
+              title: const Text('Camera'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                widget.controller.pickImage(ImageSource.camera);
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final attachment = widget.state.attachment;
+    final uploading = widget.state.attachUploading;
+    final attachError = widget.state.attachError;
+    final previewPath = widget.state.attachmentPreviewPath;
+
     return SafeArea(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         decoration: BoxDecoration(border: Border(top: BorderSide(color: Theme.of(context).dividerColor))),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.end,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
-            IconButton(icon: const Icon(Icons.attach_file), onPressed: null, tooltip: 'Attach file (coming soon)'),
-            IconButton(icon: const Icon(Icons.mic_none), onPressed: null, tooltip: 'Voice input (coming soon)'),
-            Expanded(
-              child: TextField(
-                controller: _inputCtrl,
-                minLines: 1,
-                maxLines: 5,
-                decoration: const InputDecoration(hintText: 'Message your assistant…', border: InputBorder.none),
-                onSubmitted: (_) => _send(),
+            if (attachment != null || uploading || attachError != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  children: [
+                    if (attachment?.isImage == true && previewPath != null)
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(6),
+                        child: Image.file(File(previewPath), width: 32, height: 32, fit: BoxFit.cover),
+                      )
+                    else
+                      const Icon(Icons.insert_drive_file_outlined, size: 18),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        uploading ? 'Uploading…' : (attachError ?? attachment?.title ?? ''),
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(color: attachError != null ? Colors.red : null, fontSize: 13),
+                      ),
+                    ),
+                    if (!uploading)
+                      IconButton(
+                        icon: const Icon(Icons.close, size: 16),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: widget.controller.clearAttachment,
+                      ),
+                  ],
+                ),
               ),
-            ),
-            IconButton(
-              icon: widget.state.sending ? const Icon(Icons.stop) : const Icon(Icons.send),
-              onPressed: widget.state.sending ? null : _send,
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.attach_file),
+                  tooltip: 'Attach a photo',
+                  onPressed: uploading ? null : () => _showAttachMenu(context),
+                ),
+                const IconButton(icon: Icon(Icons.mic_none), onPressed: null, tooltip: 'Voice input (coming soon)'),
+                Expanded(
+                  child: TextField(
+                    controller: _inputCtrl,
+                    minLines: 1,
+                    maxLines: 5,
+                    decoration: InputDecoration(
+                      hintText: attachment != null ? 'Ask something about this file (optional)…' : 'Message your assistant…',
+                      border: InputBorder.none,
+                    ),
+                    onSubmitted: (_) => _send(),
+                  ),
+                ),
+                IconButton(
+                  icon: widget.state.sending ? const Icon(Icons.stop) : const Icon(Icons.send),
+                  onPressed: widget.state.sending ? null : _send,
+                ),
+              ],
             ),
           ],
         ),

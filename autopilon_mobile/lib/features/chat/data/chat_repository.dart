@@ -1,3 +1,4 @@
+import 'dart:io';
 import '../../../core/api/api_client.dart';
 import 'chat_models.dart';
 
@@ -33,14 +34,26 @@ class ChatRepository {
         parse: (data) => (data as List).map((m) => ChatMessage.fromJson(m)).toList(),
       );
 
-  /// Mirrors Chat.jsx's sendMessage: posts content (+ optional agentId), gets
-  /// back the conversationId (new if this was the first message) and the
-  /// assistant's reply — including trace, tool results, and any confirmation
-  /// the assistant is waiting on before it'll actually run a tool.
+  /// Uploads a picked photo to the Knowledge Library and returns its item id
+  /// — that id (not the image bytes) is what sendMessage() below sends along
+  /// with the next chat message, so the server can read the file off disk
+  /// and hand it to the AI provider as a vision input.
+  Future<ApiResult<UploadedAttachment>> uploadAttachment(File file) => _api.uploadFile<UploadedAttachment>(
+        '/research/knowledge/upload',
+        file,
+        parse: (data) => UploadedAttachment.fromJson(data as Map<String, dynamic>),
+      );
+
+  /// Mirrors Chat.jsx's sendMessage: posts content (+ optional agentId and
+  /// attachment), gets back the conversationId (new if this was the first
+  /// message) and the assistant's reply — including trace, tool results, and
+  /// any confirmation the assistant is waiting on before it'll run a tool.
   Future<ApiResult<SendResult>> sendMessage({
     String? conversationId,
     required String content,
     String? agentId,
+    String? attachmentTitle,
+    String? attachmentImageId,
   }) =>
       _api.post<SendResult>(
         '/chat/message',
@@ -48,6 +61,8 @@ class ChatRepository {
           'conversationId': conversationId,
           'content': content,
           if (agentId != null) 'agentId': agentId,
+          if (attachmentTitle != null) 'attachmentTitle': attachmentTitle,
+          if (attachmentImageId != null) 'attachmentImageId': attachmentImageId,
         },
         parse: (data) {
           final d = data as Map<String, dynamic>;

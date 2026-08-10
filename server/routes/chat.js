@@ -28,8 +28,8 @@ router.get("/conversations/:id/messages", (req, res) => {
 
 // Send a message. Creates a conversation if none supplied.
 router.post("/message", async (req, res) => {
-  const { conversationId, content, agentId, attachmentTitle, attachmentText } = req.body || {};
-  const hasAttachment = Boolean(attachmentTitle && attachmentText);
+  const { conversationId, content, agentId, attachmentTitle, attachmentText, attachmentImageId } = req.body || {};
+  const hasAttachment = Boolean(attachmentTitle && (attachmentText || attachmentImageId));
   if (!content?.trim() && !hasAttachment) return res.status(400).json({ error: "Message content is required." });
   const now = new Date().toISOString();
   const userId = req.session.userId;
@@ -51,6 +51,7 @@ router.post("/message", async (req, res) => {
       userId, agentId: agentId || null, conversationId: convId, content: content || "",
       attachmentTitle: hasAttachment ? attachmentTitle : null,
       attachmentText: hasAttachment ? attachmentText : null,
+      attachmentImageId: hasAttachment ? attachmentImageId : null,
     });
     res.json({ conversationId: convId, reply, trace, toolResults, confirmation, assistantMessageId });
   } catch (err) {

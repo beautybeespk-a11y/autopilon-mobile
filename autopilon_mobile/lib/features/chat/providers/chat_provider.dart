@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image_picker/image_picker.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../data/chat_models.dart';
 import '../data/chat_repository.dart';
@@ -17,6 +19,10 @@ class ChatState {
   final List<ChatMessage> messages;
   final bool sending;
   final String? providerError;
+  final UploadedAttachment? attachment;
+  final String? attachmentPreviewPath; // local picked-file path, for an instant thumbnail
+  final bool attachUploading;
+  final String? attachError;
 
   const ChatState({
     this.conversations = const [],
@@ -26,6 +32,10 @@ class ChatState {
     this.messages = const [],
     this.sending = false,
     this.providerError,
+    this.attachment,
+    this.attachmentPreviewPath,
+    this.attachUploading = false,
+    this.attachError,
   });
 
   ChatState copyWith({
@@ -38,6 +48,12 @@ class ChatState {
     bool? sending,
     String? providerError,
     bool clearProviderError = false,
+    UploadedAttachment? attachment,
+    String? attachmentPreviewPath,
+    bool clearAttachment = false,
+    bool? attachUploading,
+    String? attachError,
+    bool clearAttachError = false,
   }) =>
       ChatState(
         conversations: conversations ?? this.conversations,
@@ -47,6 +63,10 @@ class ChatState {
         messages: messages ?? this.messages,
         sending: sending ?? this.sending,
         providerError: clearProviderError ? null : (providerError ?? this.providerError),
+        attachment: clearAttachment ? null : (attachment ?? this.attachment),
+        attachmentPreviewPath: clearAttachment ? null : (attachmentPreviewPath ?? this.attachmentPreviewPath),
+        attachUploading: attachUploading ?? this.attachUploading,
+        attachError: clearAttachError ? null : (attachError ?? this.attachError),
       );
 }
 
@@ -82,8 +102,28 @@ class ChatController extends StateNotifier<ChatState> {
   void setAgentId(String? id) => state = state.copyWith(agentId: id ?? '');
 
   void newConversation() {
-    state = state.copyWith(clearActiveConversation: true, messages: []);
+    state = state.copyWith(clearActiveConversation: true, messages: [], clearAttachment: true, clearAttachError: true);
   }
+
+  final _picker = ImagePicker();
+
+  /// Mirrors onPickFile() in Chat.jsx, scoped to photos (the mobile attach
+  /// button offers gallery + camera, not a generic file picker) — uploads
+  /// immediately so the item id is ready by the time the user hits send.
+  Future<void> pickImage(ImageSource source) async {
+    final picked = await _picker.pickImage(source: source, imageQuality: 85);
+    if (picked == null) return;
+    state = state.copyWith(attachUploading: true, clearAttachError: true);
+    final repo = _ref.read(chatRepositoryProvider);
+    final result = await repo.uploadAttachment(File(picked.path));
+    if (result.isSuccess && result.data != null) {
+      state = state.copyWith(attachment: result.data, attachmentPreviewPath: picked.path, attachUploading: false);
+    } else {
+      state = state.copyWith(attachUploading: false, attachError: result.error ?? 'Upload failed.');
+    }
+  }
+
+  void clearAttachment() => state = state.copyWith(clearAttachment: true, clearAttachError: true);
 
   Future<void> openConversation(String id) async {
     state = state.copyWith(activeConversationId: id, messages: []);
@@ -95,20 +135,33 @@ class ChatController extends StateNotifier<ChatState> {
   }
 
   Future<void> send(String content) async {
-    if (content.trim().isEmpty || state.sending) return;
+    final hasAttachment = state.attachment != null;
+    if ((content.trim().isEmpty && !hasAttachment) || state.sending) return;
     final repo = _ref.read(chatRepositoryProvider);
+    final attachment = state.attachment;
 
+    final displayContent = hasAttachment
+        ? '📎 ${attachment!.title}${content.trim().isNotEmpty ? '\n\n$content' : ''}'
+        : content;
     final userMessage = ChatMessage(
       id: 'tmp-${DateTime.now().millisecondsSinceEpoch}',
       role: 'user',
-      content: content,
+      content: displayContent,
     );
-    state = state.copyWith(messages: [...state.messages, userMessage], sending: true, clearProviderError: true);
+    state = state.copyWith(
+      messages: [...state.messages, userMessage],
+      sending: true,
+      clearProviderError: true,
+      clearAttachment: true,
+      clearAttachError: true,
+    );
 
     final result = await repo.sendMessage(
       conversationId: state.activeConversationId,
       content: content,
       agentId: state.agentId?.isNotEmpty == true ? state.agentId : null,
+      attachmentTitle: attachment?.title,
+      attachmentImageId: attachment?.isImage == true ? attachment!.id : null,
     );
 
     if (result.isSuccess && result.data != null) {

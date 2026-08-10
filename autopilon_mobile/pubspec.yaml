@@ -34,6 +34,13 @@ dependencies:
   # File-based persistence location for the cookie jar (app documents dir).
   path_provider: ^2.1.3
 
+  # Chat composer's attach-a-photo flow (gallery + camera). Requires
+  # NSPhotoLibraryUsageDescription/NSCameraUsageDescription in the iOS
+  # project's Info.plist and the camera permission in the Android manifest —
+  # this repo doesn't carry the ios/ and android/ platform folders (they live
+  # in the Replit project per REPLIT_SETUP.md), so add those entries there.
+  image_picker: ^1.1.2
+
   # Exact font match with the web client (Space Grotesk / Inter / JetBrains
   # Mono) without bundling font files by hand — same families, fetched once
   # and cached.

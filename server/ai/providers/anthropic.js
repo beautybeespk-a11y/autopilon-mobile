@@ -11,7 +11,16 @@ export async function anthropicChat({ messages, systemPrompt, apiKey, model: mod
       model,
       max_tokens: 4096,
       system: systemPrompt || undefined,
-      messages: messages.map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content })),
+      messages: messages.map((m) => ({
+        role: m.role === "assistant" ? "assistant" : "user",
+        content: Array.isArray(m.content)
+          ? m.content.map((part) =>
+              part.type === "image"
+                ? { type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } }
+                : { type: "text", text: part.text }
+            )
+          : m.content,
+      })),
     }),
   });
   if (!res.ok) throw new Error(`Anthropic error ${res.status}: ${await res.text()}`);

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
@@ -44,6 +45,27 @@ class ApiClient {
 
   Future<ApiResult<T>> delete<T>(String path, {T Function(dynamic)? parse}) =>
       _request('DELETE', path, parse: parse);
+
+  /// Multipart upload — used by the chat composer's attach-a-photo flow.
+  /// Passing a Dio `FormData` body makes Dio compute and send the correct
+  /// `multipart/form-data; boundary=...` content type for this request only,
+  /// overriding the client's default `application/json` header.
+  Future<ApiResult<T>> uploadFile<T>(String path, File file, {T Function(dynamic)? parse}) async {
+    try {
+      final formData = FormData.fromMap({
+        'file': await MultipartFile.fromFile(file.path, filename: file.path.split('/').last),
+      });
+      final res = await _dio.post(path, data: formData);
+      if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300) {
+        final data = parse != null ? parse(res.data) : res.data as T;
+        return ApiResult.success(data);
+      }
+      final errorMessage = (res.data is Map && res.data['error'] != null) ? res.data['error'] as String : 'Upload failed (${res.statusCode}).';
+      return ApiResult.failure(errorMessage, statusCode: res.statusCode);
+    } on DioException catch (e) {
+      return ApiResult.failure(e.message ?? 'Upload failed.');
+    }
+  }
 
   Future<ApiResult<T>> _request<T>(
     String method,

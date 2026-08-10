@@ -1,3 +1,4 @@
+import fs from "fs";
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { orchestrate } from "./index.js";
@@ -14,7 +15,7 @@ import { orchestrate } from "./index.js";
 const MAX_ATTACHMENT_CHARS = 8000;
 
 export async function handleIncomingMessage({
-  userId, agentId, conversationId, content, attachmentTitle = null, attachmentText = null, skipUserInsert = false,
+  userId, agentId, conversationId, content, attachmentTitle = null, attachmentText = null, attachmentImageId = null, skipUserInsert = false,
 }) {
   const now = new Date().toISOString();
 
@@ -40,6 +41,24 @@ export async function handleIncomingMessage({
     extraContext =
       `[Attached file: "${attachmentTitle}". Contents:\n"""\n${clipped}` +
       `${truncated ? "\n[...truncated...]" : ""}\n"""]`;
+  }
+
+  // An attached image never comes through as a base64 body field (that would
+  // blow past the API's JSON body-size limit) — the client already uploaded
+  // it to /research/knowledge/upload and just passes the resulting item id.
+  // Re-read the bytes off disk here, scoped to this user, and hand them to
+  // orchestrate() as a vision input for this turn only (same "not persisted
+  // into future turns" rule as extraContext above).
+  let extraImage = null;
+  if (attachmentImageId) {
+    const row = db.prepare("SELECT content FROM knowledge_items WHERE id = ? AND userId = ? AND type = 'image'")
+      .get(attachmentImageId, userId);
+    if (row) {
+      const meta = JSON.parse(row.content || "{}");
+      if (meta.storagePath && fs.existsSync(meta.storagePath)) {
+        extraImage = { mimeType: meta.mimeType, base64: fs.readFileSync(meta.storagePath).toString("base64") };
+      }
+    }
   }
 
   let systemPrompt = "You are a helpful AI assistant inside the AI Agent Platform.";
@@ -69,6 +88,7 @@ export async function handleIncomingMessage({
     history,
     agentSystemPrompt: systemPrompt,
     extraContext,
+    extraImage,
   });
 
   const replyAt = new Date().toISOString();
