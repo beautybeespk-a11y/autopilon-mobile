@@ -13,6 +13,7 @@ import '../../features/agents/presentation/agent_builder_screen.dart';
 import '../../features/tasks/presentation/tasks_screen.dart';
 import '../../features/more/presentation/more_screen.dart';
 import '../../features/automations/presentation/automations_screen.dart';
+import '../../features/automations/presentation/automation_builder_screen.dart';
 import '../../features/integrations/presentation/integrations_screen.dart';
 import '../../features/settings/presentation/settings_screen.dart';
 import '../../features/marketplace/presentation/marketplace_screen.dart';
@@ -72,7 +73,19 @@ final routerProvider = Provider<GoRouter>((ref) {
             path: '/more',
             builder: (context, state) => const MoreScreen(),
             routes: [
-              GoRoute(path: 'automations', builder: (context, state) => const AutomationsScreen()),
+              GoRoute(
+                path: 'automations',
+                builder: (context, state) => const AutomationsScreen(),
+                routes: [
+                  // 'new' must be declared before ':id' so it's matched as
+                  // the literal segment, not swallowed as an automation id.
+                  GoRoute(path: 'new', builder: (context, state) => const AutomationBuilderScreen()),
+                  GoRoute(
+                    path: ':id/edit',
+                    builder: (context, state) => AutomationBuilderScreen(automationId: state.pathParameters['id']!),
+                  ),
+                ],
+              ),
               GoRoute(path: 'integrations', builder: (context, state) => const IntegrationsScreen()),
               GoRoute(path: 'settings', builder: (context, state) => const SettingsScreen()),
               GoRoute(
