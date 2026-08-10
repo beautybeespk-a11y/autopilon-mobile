@@ -46,6 +46,22 @@ dependencies:
   # the web client's window.location redirect to Stripe.
   url_launcher: ^6.3.0
 
+  # Phase 12D — biometric app lock (Settings > Security toggle). Android
+  # needs the USE_BIOMETRIC permission in the manifest AND MainActivity to
+  # extend FlutterFragmentActivity instead of the default FlutterActivity —
+  # add both wherever the android/ platform folder actually lives (see the
+  # image_picker note above for why it isn't in this repo).
+  local_auth: ^2.3.0
+
+  # Phase 12D — offline mode: detects connectivity for the app-wide offline
+  # banner (see AppShell) and to decide when to fall back to cached data.
+  connectivity_plus: ^6.0.5
+
+  # Phase 12D — offline mode: simple local cache for "last loaded" screen
+  # data (starting with the dashboard) so there's something to show when
+  # connectivity_plus reports no connection.
+  shared_preferences: ^2.3.2
+
   # Exact font match with the web client (Space Grotesk / Inter / JetBrains
   # Mono) without bundling font files by hand — same families, fetched once
   # and cached.

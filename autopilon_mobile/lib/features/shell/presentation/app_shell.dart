@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
+import '../../../core/connectivity/connectivity_provider.dart';
 import '../../organizations/presentation/organization_switcher_sheet.dart';
 import '../../organizations/providers/organization_provider.dart';
 import '../../auth/providers/auth_provider.dart';
@@ -29,6 +30,9 @@ class AppShell extends ConsumerWidget {
 
     final location = GoRouterState.of(context).matchedLocation;
     final currentIndex = _indexForLocation(location);
+    // Defaults to "online" (true) while the stream's first event hasn't
+    // arrived yet, rather than flashing the offline banner on every launch.
+    final isOnline = ref.watch(isOnlineProvider).valueOrNull ?? true;
 
     return Scaffold(
       appBar: AppBar(
@@ -47,7 +51,25 @@ class AppShell extends ConsumerWidget {
           ),
         ],
       ),
-      body: child,
+      body: Column(
+        children: [
+          if (!isOnline)
+            Container(
+              width: double.infinity,
+              color: Colors.amber.withOpacity(0.15),
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.cloud_off_outlined, size: 14, color: Colors.amber),
+                  SizedBox(width: 6),
+                  Text("You're offline — showing saved data where available.", style: TextStyle(fontSize: 12, color: Colors.amber)),
+                ],
+              ),
+            ),
+          Expanded(child: child),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: currentIndex,
         onDestinationSelected: (i) => context.go(_tabs[i]),

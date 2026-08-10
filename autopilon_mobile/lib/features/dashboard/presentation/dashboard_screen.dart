@@ -46,6 +46,17 @@ class DashboardScreen extends ConsumerWidget {
           const SizedBox(height: 4),
           Text('Organization-wide usage, activity, and performance.',
               style: TextStyle(color: Theme.of(context).textTheme.bodySmall?.color)),
+          if (state.cachedAt != null) ...[
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(color: Colors.amber.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+              child: Text(
+                'Showing saved data from ${state.cachedAt!.toLocal().toString().split(".").first} — you appear to be offline.',
+                style: const TextStyle(fontSize: 11, color: Colors.amber),
+              ),
+            ),
+          ],
           const SizedBox(height: 20),
 
           GridView.count(

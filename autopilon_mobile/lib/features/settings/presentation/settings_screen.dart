@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/auth/biometric_gate.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../providers/settings_provider.dart';
 
@@ -11,6 +12,8 @@ class SettingsScreen extends ConsumerWidget {
     final user = ref.watch(authControllerProvider).user;
     final themeMode = ref.watch(themeModeControllerProvider);
     final providerAsync = ref.watch(providerStatusProvider);
+    final biometricSupportAsync = ref.watch(biometricSupportProvider);
+    final biometricEnabled = ref.watch(biometricLockEnabledProvider);
 
     return Scaffold(
       appBar: AppBar(title: const Text('Settings')),
@@ -108,10 +111,30 @@ class SettingsScreen extends ConsumerWidget {
             icon: Icons.shield_outlined,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
-                _BulletLine('Authenticated routes are protected server-side.'),
-                _BulletLine('Sessions use secure cookie storage; passwords are hashed.'),
-                _BulletLine('You can only access your own data.'),
+              children: [
+                const _BulletLine('Authenticated routes are protected server-side.'),
+                const _BulletLine('Sessions use secure cookie storage; passwords are hashed.'),
+                const _BulletLine('You can only access your own data.'),
+                const SizedBox(height: 10),
+                biometricSupportAsync.when(
+                  loading: () => const SizedBox.shrink(),
+                  error: (_, __) => const SizedBox.shrink(),
+                  data: (supported) => supported
+                      ? Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            const Expanded(child: Text('Require biometric unlock', style: TextStyle(fontSize: 13))),
+                            Switch(
+                              value: biometricEnabled,
+                              onChanged: (v) {
+                                ref.read(biometricLockEnabledProvider.notifier).setEnabled(v);
+                                ref.read(biometricGateControllerProvider.notifier).setEnabled(v);
+                              },
+                            ),
+                          ],
+                        )
+                      : const Text('Biometric unlock isn\'t available on this device.', style: TextStyle(fontSize: 12, color: Colors.grey)),
+                ),
               ],
             ),
           ),

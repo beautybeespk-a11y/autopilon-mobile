@@ -30,6 +30,18 @@ class DashboardData {
             .map((e) => RecentActivity.fromJson(e as Map<String, dynamic>))
             .toList(),
       );
+
+  /// Round-trips through LocalCache (offline mode) — the shape here must
+  /// stay parseable by fromJson above.
+  Map<String, dynamic> toJson() => {
+        'members': members.toJson(),
+        'agents': agents.toJson(),
+        'automations': automations.toJson(),
+        'connectedIntegrations': connectedIntegrations,
+        'workspaceCount': workspaceCount,
+        'securityAlerts': securityAlerts.map((s) => s.toJson()).toList(),
+        'recentActivity': recentActivity.map((a) => a.toJson()).toList(),
+      };
 }
 
 class MemberStats {
@@ -42,6 +54,7 @@ class MemberStats {
         active: json['active'] ?? 0,
         invited: json['invited'] ?? 0,
       );
+  Map<String, dynamic> toJson() => {'total': total, 'active': active, 'invited': invited};
 }
 
 class AgentStats {
@@ -52,6 +65,7 @@ class AgentStats {
         total: json['total'] ?? 0,
         active: json['active'] ?? 0,
       );
+  Map<String, dynamic> toJson() => {'total': total, 'active': active};
 }
 
 class AutomationStats {
@@ -62,6 +76,7 @@ class AutomationStats {
         total: json['total'] ?? 0,
         runningNow: json['runningNow'] ?? 0,
       );
+  Map<String, dynamic> toJson() => {'total': total, 'runningNow': runningNow};
 }
 
 class SecurityAlert {
@@ -74,6 +89,7 @@ class SecurityAlert {
         title: json['title'] ?? json['message'] ?? 'Security alert',
         description: json['description'],
       );
+  Map<String, dynamic> toJson() => {'id': id, 'title': title, 'description': description};
 }
 
 class RecentActivity {
@@ -96,6 +112,13 @@ class RecentActivity {
         action: json['action'] ?? '',
         result: json['result'] ?? 'success',
       );
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'createdAt': createdAt.toIso8601String(),
+        'userName': userName,
+        'action': action,
+        'result': result,
+      };
 }
 
 class CostData {

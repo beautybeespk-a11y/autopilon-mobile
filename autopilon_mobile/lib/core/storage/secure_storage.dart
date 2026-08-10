@@ -15,6 +15,7 @@ class SecureStorage {
   static const _keyBaseUrl = 'base_url';
   static const _keyActiveOrgId = 'active_org_id';
   static const _keyThemeMode = 'theme_mode';
+  static const _keyBiometricLock = 'biometric_lock_enabled';
 
   static Future<void> setRememberMe(bool value) => _storage.write(key: _keyRememberMe, value: value.toString());
   static Future<bool> getRememberMe() async => (await _storage.read(key: _keyRememberMe)) == 'true';
@@ -29,6 +30,10 @@ class SecureStorage {
   /// "light" | "dark" | null (null = follow system, the default).
   static Future<void> setThemeMode(String mode) => _storage.write(key: _keyThemeMode, value: mode);
   static Future<String?> getThemeMode() => _storage.read(key: _keyThemeMode);
+
+  static Future<void> setBiometricLockEnabled(bool value) =>
+      _storage.write(key: _keyBiometricLock, value: value.toString());
+  static Future<bool> getBiometricLockEnabled() async => (await _storage.read(key: _keyBiometricLock)) == 'true';
 
   static Future<void> clearAll() => _storage.deleteAll();
 }

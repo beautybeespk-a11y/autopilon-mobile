@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/cache/local_cache.dart';
 import '../../auth/providers/auth_provider.dart';
 import '../../organizations/providers/organization_provider.dart';
 import '../data/dashboard_models.dart';
@@ -15,6 +16,10 @@ class DashboardState {
   final CostData? cost;
   final bool loading;
   final String? error;
+  // Set only when `dashboard` came from LocalCache (offline fallback)
+  // rather than a live server response — the screen uses this to show a
+  // "showing saved data from X" note instead of pretending it's live.
+  final DateTime? cachedAt;
 
   const DashboardState({
     this.dashboard,
@@ -22,6 +27,7 @@ class DashboardState {
     this.cost,
     this.loading = true,
     this.error,
+    this.cachedAt,
   });
 
   DashboardState copyWith({
@@ -30,6 +36,8 @@ class DashboardState {
     CostData? cost,
     bool? loading,
     String? error,
+    DateTime? cachedAt,
+    bool clearCachedAt = false,
   }) =>
       DashboardState(
         dashboard: dashboard ?? this.dashboard,
@@ -37,6 +45,7 @@ class DashboardState {
         cost: cost ?? this.cost,
         loading: loading ?? this.loading,
         error: error,
+        cachedAt: clearCachedAt ? null : (cachedAt ?? this.cachedAt),
       );
 }
 
@@ -51,6 +60,8 @@ class DashboardController extends StateNotifier<DashboardState> {
 
   String? get _activeOrgId => _ref.read(organizationControllerProvider).activeOrgId;
 
+  String _cacheKey(String orgId) => 'dashboard_$orgId';
+
   Future<void> _load() async {
     final orgId = _activeOrgId;
     if (orgId == null) {
@@ -61,10 +72,23 @@ class DashboardController extends StateNotifier<DashboardState> {
 
     final dashboardResult = await repo.dashboard(orgId);
     if (!dashboardResult.isSuccess) {
+      // Likely offline — fall back to whatever was last successfully
+      // loaded for this org, if anything, rather than a bare error screen.
+      final cached = await LocalCache.load(_cacheKey(orgId));
+      if (cached != null) {
+        state = state.copyWith(
+          dashboard: DashboardData.fromJson(cached.$1),
+          loading: false,
+          cachedAt: cached.$2,
+          error: null,
+        );
+        return;
+      }
       state = state.copyWith(loading: false, error: dashboardResult.error);
       return;
     }
-    state = state.copyWith(dashboard: dashboardResult.data, loading: false);
+    state = state.copyWith(dashboard: dashboardResult.data, loading: false, clearCachedAt: true);
+    await LocalCache.save(_cacheKey(orgId), dashboardResult.data!.toJson());
 
     final analyticsResult = await repo.analytics(orgId);
     if (analyticsResult.isSuccess) {
