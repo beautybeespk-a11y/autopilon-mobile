@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "497239736306",
+    "project_id": "autopilon-3bc66",
+    "storage_bucket": "autopilon-3bc66.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:497239736306:android:2a988889ea7265455cf56b",
+        "android_client_info": {
+          "package_name": "com.example.autopilon_mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyB9OxXezPW-Q4w9IJhpwmw_18sLDb64GhU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
