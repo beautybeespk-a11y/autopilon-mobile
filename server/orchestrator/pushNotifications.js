@@ -42,7 +42,6 @@ async function getMessaging() {
 export function registerDeviceToken(userId, token, platform) {
   // UPSERT on the token's uniqueness — same device re-registering (app
   // reinstall, token refresh) updates in place rather than piling up rows.
-  console.log("[push] registerDeviceToken called:", { userId, platform, tokenPreview: token.slice(0, 20) + "…" });
   const existing = db.prepare("SELECT id FROM device_tokens WHERE token = ?").get(token);
   if (existing) {
     db.prepare("UPDATE device_tokens SET userId = ?, platform = ? WHERE token = ?").run(userId, platform, token);
@@ -63,11 +62,9 @@ export function unregisterDeviceToken(token) {
 // never block or fail the in-app notification it's tied to.
 export async function sendPushToUser(userId, { title, body, link }) {
   const messaging = await getMessaging();
-  console.log("[push] sendPushToUser:", { userId, title, messagingReady: Boolean(messaging) });
   if (!messaging) return; // not configured — silently no-op, matches AI-provider-not-configured pattern elsewhere
 
   const tokens = db.prepare("SELECT token FROM device_tokens WHERE userId = ?").all(userId).map((r) => r.token);
-  console.log("[push] tokens found for user:", tokens.length);
   if (!tokens.length) return;
 
   try {
@@ -75,11 +72,6 @@ export async function sendPushToUser(userId, { title, body, link }) {
       tokens,
       notification: { title, body: body || undefined },
       data: link ? { link } : undefined,
-    });
-    console.log("[push] send result:", {
-      successCount: response.successCount,
-      failureCount: response.failureCount,
-      errors: response.responses.filter((r) => !r.success).map((r) => r.error?.message),
     });
     // Firebase reports per-token failures (expired/uninstalled) instead of
     // throwing — prune those so this user's device list doesn't accumulate

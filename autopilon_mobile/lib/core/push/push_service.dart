@@ -24,6 +24,16 @@ class PushService {
       if (token != null) await _register(token);
       FirebaseMessaging.instance.onTokenRefresh.listen(_register);
 
+      // Android suppresses the system notification banner while the app is
+      // in the foreground — without this, a push arriving while the app is
+      // open produces literally no visible feedback at all. Refreshing the
+      // bell (which also updates its unread badge) is the minimal fix; a
+      // proper in-app banner would need flutter_local_notifications, which
+      // isn't in scope here.
+      FirebaseMessaging.onMessage.listen((_) {
+        _ref.read(notificationsControllerProvider.notifier).refresh();
+      });
+
       FirebaseMessaging.onMessageOpenedApp.listen(_handleTap);
       final initialMessage = await FirebaseMessaging.instance.getInitialMessage();
       if (initialMessage != null) _handleTap(initialMessage);
