@@ -28,10 +28,12 @@ class _AutopilonAppState extends ConsumerState<AutopilonApp> with WidgetsBinding
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Re-lock every time the app comes back from the background — the
-    // controller itself no-ops unless the user has biometric lock enabled.
-    if (state == AppLifecycleState.resumed) {
-      ref.read(biometricGateControllerProvider.notifier).onAppResumed();
+    // Locks on the way OUT (.paused), not the way back in — see the long
+    // comment on BiometricGateController for why .resumed would race with
+    // a successful unlock() via the same dialog-closing lifecycle blip.
+    // The controller itself no-ops unless biometric lock is enabled.
+    if (state == AppLifecycleState.paused) {
+      ref.read(biometricGateControllerProvider.notifier).onAppBackgrounded();
     }
   }
 

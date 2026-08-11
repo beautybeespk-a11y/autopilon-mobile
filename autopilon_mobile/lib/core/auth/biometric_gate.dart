@@ -35,9 +35,18 @@ final biometricLockEnabledProvider =
     StateNotifierProvider<BiometricLockEnabledController, bool>((ref) => BiometricLockEnabledController());
 
 /// Whether the lock screen should be showing right now. True on cold start
-/// (once the persisted preference loads, if enabled) and whenever the app
-/// returns from the background — AutopilonApp's WidgetsBindingObserver
-/// drives the latter by calling onAppResumed().
+/// (once the persisted preference loads, if enabled) and set again every
+/// time the app leaves the foreground — AutopilonApp's WidgetsBindingObserver
+/// drives the latter by calling onAppBackgrounded().
+///
+/// Deliberately locks on the way OUT (AppLifecycleState.paused) rather than
+/// the way back IN (.resumed): showing the OS fingerprint/face dialog from
+/// unlock() below itself briefly pauses-then-resumes the Flutter app, so
+/// locking on .resumed would immediately re-lock right after a *successful*
+/// unlock — the same lifecycle blip closing the dialog looks identical to
+/// the user actually leaving and coming back. Locking on .paused instead
+/// means that blip just re-confirms the (already-true) locked state, and a
+/// successful unlock() staying unlocked is never raced.
 class BiometricGateController extends StateNotifier<bool> {
   BiometricGateController() : super(false) {
     _init();
@@ -55,7 +64,7 @@ class BiometricGateController extends StateNotifier<bool> {
   /// without waiting for the next cold start.
   void setEnabled(bool value) => _enabled = value;
 
-  void onAppResumed() {
+  void onAppBackgrounded() {
     if (_enabled) state = true;
   }
 
