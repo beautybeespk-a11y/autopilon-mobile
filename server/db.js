@@ -510,6 +510,19 @@ CREATE TABLE IF NOT EXISTS notifications (
   FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(userId, read);
+
+-- Phase 12D: mobile push. One row per device the user has ever logged in
+-- on — token is unique so re-registering the same device (app reinstall,
+-- token refresh) just updates the row instead of accumulating duplicates.
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id        TEXT PRIMARY KEY,
+  userId    TEXT NOT NULL,
+  token     TEXT NOT NULL UNIQUE,
+  platform  TEXT NOT NULL DEFAULT 'android', -- android | ios
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens(userId);
 `);
 
 // --- Phase 10: Billing, Subscriptions & Usage ---

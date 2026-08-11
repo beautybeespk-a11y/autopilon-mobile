@@ -1,5 +1,6 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
+import { sendPushToUser } from "./pushNotifications.js";
 
 const now = () => new Date().toISOString();
 
@@ -7,6 +8,10 @@ export function createNotification(userId, { type, title, body, link }) {
   const id = cryptoRandom();
   db.prepare("INSERT INTO notifications (id, userId, type, title, body, link, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)")
     .run(id, userId, type, title, body || null, link || null, now());
+  // Fire-and-forget — a push failure (or Firebase simply not being
+  // configured yet) must never affect the in-app notification this is
+  // tied to, which is already persisted above regardless.
+  sendPushToUser(userId, { title, body, link }).catch(() => {});
   return id;
 }
 
