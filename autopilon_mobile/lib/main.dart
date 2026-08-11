@@ -1,6 +1,8 @@
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'core/api/api_client.dart';
+import 'firebase_options.dart';
 import 'app.dart';
 
 /// The one thing you MUST edit before running this: point ApiClient.baseUrl
@@ -16,8 +18,17 @@ import 'app.dart';
 ///   Ports tab, or your phone won't be able to reach it).
 /// - iOS simulator on the same Mac as the server: http://localhost:4000/api
 ///   works as-is.
-void main() {
+void main() async {
   ApiClient.baseUrl = 'https://isotope-dipping-cobweb.ngrok-free.dev/api';
+
+  WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  } catch (err) {
+    // Push notifications just won't work on this run — everything else
+    // about the app is independent of Firebase, so don't block startup.
+    debugPrint('[push] Firebase init failed: $err');
+  }
 
   runApp(const ProviderScope(child: AutopilonApp()));
 }

@@ -1,5 +1,6 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/api/api_client.dart';
+import '../../../core/push/push_service.dart';
 import '../../../core/storage/secure_storage.dart';
 import '../../../core/models/models.dart';
 import '../data/auth_repository.dart';
@@ -42,6 +43,7 @@ class AuthController extends StateNotifier<AuthState> {
     final result = await repo.me();
     if (result.isSuccess) {
       state = AuthState(status: AuthStatus.authenticated, user: result.data);
+      _ref.read(pushServiceProvider).init(); // fire-and-forget — never blocks showing the app
     } else {
       state = const AuthState(status: AuthStatus.unauthenticated);
     }
@@ -53,6 +55,7 @@ class AuthController extends StateNotifier<AuthState> {
     if (result.isSuccess) {
       await SecureStorage.setRememberMe(rememberMe);
       state = AuthState(status: AuthStatus.authenticated, user: result.data);
+      _ref.read(pushServiceProvider).init();
       return true;
     }
     state = AuthState(status: AuthStatus.unauthenticated, error: result.error);
@@ -64,6 +67,7 @@ class AuthController extends StateNotifier<AuthState> {
     final result = await repo.signup(name, email, password);
     if (result.isSuccess) {
       state = AuthState(status: AuthStatus.authenticated, user: result.data);
+      _ref.read(pushServiceProvider).init();
       return true;
     }
     state = AuthState(status: AuthStatus.unauthenticated, error: result.error);
@@ -71,6 +75,7 @@ class AuthController extends StateNotifier<AuthState> {
   }
 
   Future<void> logout() async {
+    await _ref.read(pushServiceProvider).unregister();
     final repo = _ref.read(authRepositoryProvider);
     await repo.logout();
     await SecureStorage.clearAll();

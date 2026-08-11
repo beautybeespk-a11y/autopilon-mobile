@@ -22,6 +22,17 @@ class NotificationRepository {
         body: const {},
         parse: (_) {},
       );
+
+  Future<ApiResult<void>> registerDeviceToken(String token, {String platform = 'android'}) => _api.post<void>(
+        '/notifications/device-token',
+        body: {'token': token, 'platform': platform},
+        parse: (_) {},
+      );
+
+  Future<ApiResult<void>> unregisterDeviceToken(String token) => _api.delete<void>(
+        '/notifications/device-token/${Uri.encodeComponent(token)}',
+        parse: (_) {},
+      );
 }
 
 class NotificationsPayload {
