@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../auth/providers/auth_provider.dart';
+import '../../voice/providers/voice_settings_provider.dart';
 import '../data/chat_models.dart';
 import '../data/chat_repository.dart';
 
@@ -23,6 +24,7 @@ class ChatState {
   final String? attachmentPreviewPath; // local picked-file path, for an instant thumbnail
   final bool attachUploading;
   final String? attachError;
+  final String? justRepliedMessageId; // triggers exactly one autoplay, for the reply that just arrived
 
   const ChatState({
     this.conversations = const [],
@@ -36,6 +38,7 @@ class ChatState {
     this.attachmentPreviewPath,
     this.attachUploading = false,
     this.attachError,
+    this.justRepliedMessageId,
   });
 
   ChatState copyWith({
@@ -54,6 +57,8 @@ class ChatState {
     bool? attachUploading,
     String? attachError,
     bool clearAttachError = false,
+    String? justRepliedMessageId,
+    bool clearJustReplied = false,
   }) =>
       ChatState(
         conversations: conversations ?? this.conversations,
@@ -67,6 +72,7 @@ class ChatState {
         attachmentPreviewPath: clearAttachment ? null : (attachmentPreviewPath ?? this.attachmentPreviewPath),
         attachUploading: attachUploading ?? this.attachUploading,
         attachError: clearAttachError ? null : (attachError ?? this.attachError),
+        justRepliedMessageId: clearJustReplied ? null : (justRepliedMessageId ?? this.justRepliedMessageId),
       );
 }
 
@@ -125,6 +131,8 @@ class ChatController extends StateNotifier<ChatState> {
 
   void clearAttachment() => state = state.copyWith(clearAttachment: true, clearAttachError: true);
 
+  void clearJustReplied() => state = state.copyWith(clearJustReplied: true);
+
   Future<void> openConversation(String id) async {
     state = state.copyWith(activeConversationId: id, messages: []);
     final repo = _ref.read(chatRepositoryProvider);
@@ -165,10 +173,13 @@ class ChatController extends StateNotifier<ChatState> {
     );
 
     if (result.isSuccess && result.data != null) {
+      final autoPlay = _ref.read(voiceSettingsControllerProvider).autoPlay;
       state = state.copyWith(
         activeConversationId: result.data!.conversationId,
         messages: [...state.messages, result.data!.assistantMessage],
         sending: false,
+        justRepliedMessageId: autoPlay ? result.data!.assistantMessage.id : null,
+        clearJustReplied: !autoPlay,
       );
       await loadConversations();
     } else {

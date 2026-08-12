@@ -75,6 +75,16 @@ dependencies:
   # and cached.
   google_fonts: ^6.2.1
 
+  # Phase 13 — voice messages. `record` captures the mic to a local file for
+  # upload to POST /voice/transcribe; `audioplayers` plays back the TTS
+  # bytes returned by POST /voice/speak via BytesSource (no local file
+  # management needed for playback). Android needs RECORD_AUDIO in the
+  # manifest; iOS needs NSMicrophoneUsageDescription in Info.plist — add
+  # both wherever the android/ and ios/ platform folders actually live (see
+  # the image_picker note above for why they aren't in this repo).
+  record: ^5.1.2
+  audioplayers: ^6.1.0
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

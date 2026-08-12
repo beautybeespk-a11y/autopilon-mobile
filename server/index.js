@@ -50,6 +50,7 @@ import shopifyAuthRoutes from "./routes/shopifyAuth.js";
 import shopifyWebhookRoutes from "./routes/shopifyWebhook.js";
 import confirmationRoutes, { sweepExpiredConfirmations } from "./routes/confirmations.js";
 import researchRoutes from "./routes/research.js";
+import voiceRoutes from "./routes/voice.js";
 import metaAuthRoutes from "./routes/metaAuth.js";
 import whatsappAuthRoutes from "./routes/whatsappAuth.js";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook.js";
@@ -122,6 +123,7 @@ app.use("/api/activity", activityRoutes);
 app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/confirmations", confirmationRoutes);
 app.use("/api/research", researchRoutes);
+app.use("/api/voice", voiceRoutes);
 // These must be mounted BEFORE the general "/api/integrations" catalog route
 // below — Express matches by path PREFIX, so that catalog router (which
 // requires login for every request reaching it) would otherwise intercept

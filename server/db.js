@@ -1159,4 +1159,46 @@ for (const { id } of agentsWithNoSkills) {
   grantSkill.run(id, "memory");
 }
 
+// --- Phase 13: Voice & Multimodal AI ---
+// Voice is just another way a message enters the existing chat pipeline (see
+// server/routes/voice.js) — these tables only track usage/preferences around
+// that entry point, they don't duplicate any conversation/message storage.
+// Same unmetered-for-individuals design boundary as billing above: orgId is
+// recorded when known but never required, since direct chat has never been
+// org-scoped either.
+db.exec(`
+CREATE TABLE IF NOT EXISTS voice_usage (
+  id                  TEXT PRIMARY KEY,
+  userId              TEXT NOT NULL,
+  orgId               TEXT,
+  agentId             TEXT,
+  conversationId      TEXT,
+  kind                TEXT NOT NULL, -- 'stt' | 'tts'
+  provider            TEXT NOT NULL,
+  durationSeconds     REAL,          -- stt: input audio duration
+  characters          INTEGER,       -- tts: output text length
+  estimatedCostCents  REAL NOT NULL DEFAULT 0,
+  createdAt           TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_voice_usage_user ON voice_usage(userId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_voice_usage_org ON voice_usage(orgId, createdAt);
+
+-- One row per user, created lazily on first read/write (same pattern as
+-- ensureSubscription() for billing) rather than at signup, so this table
+-- stays empty for users who never touch voice.
+CREATE TABLE IF NOT EXISTS voice_settings (
+  userId     TEXT PRIMARY KEY,
+  voice      TEXT NOT NULL DEFAULT 'alloy',
+  language   TEXT,                       -- NULL = auto-detect
+  speed      REAL NOT NULL DEFAULT 1.0,
+  volume     REAL NOT NULL DEFAULT 1.0,
+  autoPlay   INTEGER NOT NULL DEFAULT 1,
+  voiceMode  TEXT NOT NULL DEFAULT 'tap', -- 'tap' (record/stop/send) — 'continuous' reserved for a future natural-voice-mode pass
+  captions   INTEGER NOT NULL DEFAULT 1,
+  updatedAt  TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+`);
+
 export default db;

@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
-import { Plus, Send, Paperclip, Mic, Square, Sparkles, AlertTriangle, Bot, X, FileText } from "lucide-react";
+import { Plus, Send, Paperclip, Mic, Square, Sparkles, AlertTriangle, Bot, X, FileText, Volume2, Loader2 } from "lucide-react";
 import { api } from "../lib/api.js";
 import ToolActivity from "../components/ToolActivity.jsx";
+
+const MAX_SPEAKABLE_CHARS = 4000; // mirrors server/routes/voice.js's /speak cap
 
 const SUGGESTED = ["Draft a launch plan for a new product", "Summarize the key risks in a project", "Brainstorm names for an AI agent"];
 
@@ -71,6 +73,60 @@ function ConfirmationCard({ confirmation, onResolve }) {
   );
 }
 
+// Fetches TTS audio for one message's text on demand rather than eagerly
+// for every message in the thread — playing is a deliberate user action
+// (or, when autoPlay is on, limited to the single reply that just arrived),
+// so there's no reason to burn API calls speaking messages nobody asked to
+// hear.
+function SpeakButton({ text, voiceSettings, autoPlay, onAutoPlayed }) {
+  const [state, setState] = useState("idle"); // idle | loading | playing | error
+  const audioRef = useRef(null);
+
+  const stop = () => {
+    audioRef.current?.pause();
+    audioRef.current = null;
+    setState("idle");
+  };
+
+  const play = async () => {
+    if (state === "loading") return;
+    if (state === "playing") return stop();
+    setState("loading");
+    try {
+      const blob = await api.postBlob("/voice/speak", {
+        text, voice: voiceSettings?.voice, speed: voiceSettings?.speed,
+      });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.volume = voiceSettings?.volume ?? 1;
+      audio.onended = () => { setState("idle"); URL.revokeObjectURL(url); };
+      audioRef.current = audio;
+      await audio.play();
+      setState("playing");
+    } catch {
+      setState("error");
+    }
+  };
+
+  useEffect(() => {
+    if (autoPlay) { play(); onAutoPlayed?.(); }
+    return () => audioRef.current?.pause();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoPlay]);
+
+  if (text.length > MAX_SPEAKABLE_CHARS) return null;
+  return (
+    <button
+      onClick={play}
+      title={state === "playing" ? "Stop" : "Play reply aloud"}
+      className={`mt-1.5 flex items-center gap-1 rounded-lg px-1.5 py-1 text-xs ${state === "playing" ? "text-accent" : "text-muted hover:text-ink"}`}
+    >
+      {state === "loading" ? <Loader2 size={13} className="animate-spin" /> : <Volume2 size={13} />}
+      {state === "error" ? "Couldn't play" : null}
+    </button>
+  );
+}
+
 export default function Chat() {
   const location = useLocation();
   const [conversations, setConversations] = useState([]);
@@ -84,8 +140,21 @@ export default function Chat() {
   const [attachment, setAttachment] = useState(null); // { title, extractedText, note } | { title, isImage, id, previewUrl }
   const [attachUploading, setAttachUploading] = useState(false);
   const [attachError, setAttachError] = useState(null);
+  const [voiceSettings, setVoiceSettings] = useState(null);
+  const [recording, setRecording] = useState(false);
+  const [recordingSeconds, setRecordingSeconds] = useState(0);
+  const [transcribing, setTranscribing] = useState(false);
+  const [voiceError, setVoiceError] = useState(null);
+  const [justRepliedId, setJustRepliedId] = useState(null); // triggers exactly one autoplay, for the reply that just arrived
   const scrollRef = useRef(null);
   const fileInputRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordingTimerRef = useRef(null);
+
+  useEffect(() => {
+    api.get("/voice/settings").then(setVoiceSettings).catch(() => {});
+  }, []);
 
   const loadConversations = () => api.get("/chat/conversations").then(setConversations).catch(() => {});
 
@@ -102,6 +171,8 @@ export default function Chat() {
   }, []);
 
   useEffect(() => { scrollRef.current?.scrollTo(0, scrollRef.current.scrollHeight); }, [messages, sending]);
+
+  useEffect(() => () => stopRecordingTimer(), []);
 
   const openConversation = async (id) => {
     setActiveId(id);
@@ -146,6 +217,62 @@ export default function Chat() {
     }
   };
 
+  const stopRecordingTimer = () => {
+    clearInterval(recordingTimerRef.current);
+    recordingTimerRef.current = null;
+  };
+
+  // discard=true is the Cancel path — stops the recorder and throws the
+  // audio away instead of sending it for transcription.
+  const stopRecording = (discard = false) => {
+    const recorder = mediaRecorderRef.current;
+    if (!recorder) return;
+    if (discard) recorder.__discard = true;
+    if (recorder.state !== "inactive") recorder.stop();
+    recorder.stream.getTracks().forEach((t) => t.stop());
+  };
+
+  const startRecording = async () => {
+    setVoiceError(null);
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setVoiceError("Microphone permission was denied. Allow microphone access in your browser to use voice input.");
+      return;
+    }
+    const recorder = new MediaRecorder(stream);
+    audioChunksRef.current = [];
+    recorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunksRef.current.push(e.data); };
+    recorder.onstop = async () => {
+      stopRecordingTimer();
+      setRecording(false);
+      setRecordingSeconds(0);
+      if (recorder.__discard || !audioChunksRef.current.length) return;
+      const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || "audio/webm" });
+      setTranscribing(true);
+      try {
+        const formData = new FormData();
+        formData.append("audio", blob, "voice-message.webm");
+        if (agentId) formData.append("agentId", agentId);
+        if (activeId) formData.append("conversationId", activeId);
+        const result = await api.upload("/voice/transcribe", formData);
+        // Transcript lands in the composer for review/edit, never auto-sent —
+        // the user still has to hit Send, same as typed text.
+        setInput((prev) => (prev ? `${prev} ${result.text}` : result.text));
+      } catch (err) {
+        setVoiceError(err.status === 503 ? (err.detail || "Voice input is not configured.") : (err.message || "Couldn't transcribe that recording."));
+      } finally {
+        setTranscribing(false);
+      }
+    };
+    mediaRecorderRef.current = recorder;
+    recorder.start();
+    setRecording(true);
+    setRecordingSeconds(0);
+    recordingTimerRef.current = setInterval(() => setRecordingSeconds((s) => s + 1), 1000);
+  };
+
   const send = async (text) => {
     const content = (text ?? input).trim();
     const hasAttachment = Boolean(attachment);
@@ -164,10 +291,12 @@ export default function Chat() {
     try {
       const d = await api.post("/chat/message", { conversationId: activeId, content, agentId: agentId || undefined, ...attachmentPayload });
       setActiveId(d.conversationId);
+      const assistantId = d.assistantMessageId || ("a-" + Date.now());
       setMessages((m) => [
         ...m,
-        { id: d.assistantMessageId || ("a-" + Date.now()), role: "assistant", content: d.reply, trace: d.trace, toolResults: d.toolResults, confirmation: d.confirmation },
+        { id: assistantId, role: "assistant", content: d.reply, trace: d.trace, toolResults: d.toolResults, confirmation: d.confirmation },
       ]);
+      if (voiceSettings?.autoPlay) setJustRepliedId(assistantId);
       loadConversations();
     } catch (err) {
       if (err.status === 503) setProviderErr(err.detail || "AI provider not configured");
@@ -265,6 +394,14 @@ export default function Chat() {
                       {m.content}
                     </div>
                     {m.role === "assistant" && <TraceRail trace={m.trace} />}
+                    {m.role === "assistant" && m.content && (
+                      <SpeakButton
+                        text={m.content}
+                        voiceSettings={voiceSettings}
+                        autoPlay={justRepliedId === m.id}
+                        onAutoPlayed={() => setJustRepliedId(null)}
+                      />
+                    )}
                     {m.role === "assistant" && m.confirmation && (
                       <ConfirmationCard confirmation={m.confirmation} onResolve={resolveConfirmation(m.id)} />
                     )}
@@ -289,6 +426,12 @@ export default function Chat() {
         {providerErr && (
           <div className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-500">
             <AlertTriangle size={16} /> AI provider not configured — {providerErr}
+          </div>
+        )}
+        {voiceError && (
+          <div className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-500">
+            <AlertTriangle size={16} /> {voiceError}
+            <button onClick={() => setVoiceError(null)} className="ml-auto shrink-0 rounded p-0.5 text-muted hover:text-ink"><X size={14} /></button>
           </div>
         )}
 
@@ -327,7 +470,20 @@ export default function Chat() {
             >
               <Paperclip size={18} />
             </button>
-            <button className="rounded-lg p-2 text-muted hover:bg-elevated" title="Voice input (coming soon)" disabled><Mic size={18} /></button>
+            {recording ? (
+              <div className="flex items-center gap-1">
+                <span className="flex items-center gap-1.5 rounded-lg bg-red-500/10 px-2 py-1.5 text-xs font-medium text-red-500">
+                  <span className="h-2 w-2 animate-pulse rounded-full bg-red-500" />
+                  {String(Math.floor(recordingSeconds / 60)).padStart(2, "0")}:{String(recordingSeconds % 60).padStart(2, "0")}
+                </span>
+                <button onClick={() => stopRecording(true)} className="rounded-lg p-2 text-muted hover:bg-elevated" title="Cancel recording"><X size={16} /></button>
+                <button onClick={() => stopRecording(false)} className="rounded-lg bg-red-500 p-2 text-white" title="Stop and transcribe"><Square size={16} /></button>
+              </div>
+            ) : transcribing ? (
+              <button disabled className="rounded-lg p-2 text-muted" title="Transcribing…"><Loader2 size={18} className="animate-spin" /></button>
+            ) : (
+              <button onClick={startRecording} disabled={sending} className="rounded-lg p-2 text-muted hover:bg-elevated disabled:opacity-40" title="Voice input"><Mic size={18} /></button>
+            )}
             <textarea
               rows={1}
               value={input}

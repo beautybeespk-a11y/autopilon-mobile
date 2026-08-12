@@ -2,6 +2,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:image_picker/image_picker.dart';
+import '../../voice/presentation/voice_speak_button.dart';
+import '../../voice/providers/voice_recorder_provider.dart';
 import '../data/chat_models.dart';
 import '../providers/chat_provider.dart';
 
@@ -63,7 +65,11 @@ class ChatScreen extends ConsumerWidget {
                 : ListView(
                     padding: const EdgeInsets.all(16),
                     children: [
-                      ...state.messages.map((m) => _MessageBubble(message: m, controller: controller)),
+                      ...state.messages.map((m) => _MessageBubble(
+                            message: m,
+                            controller: controller,
+                            autoPlay: state.justRepliedMessageId == m.id,
+                          )),
                       if (state.sending) const _TypingIndicator(),
                     ],
                   ),
@@ -127,9 +133,10 @@ class _EmptyChat extends StatelessWidget {
 }
 
 class _MessageBubble extends StatelessWidget {
-  const _MessageBubble({required this.message, required this.controller});
+  const _MessageBubble({required this.message, required this.controller, this.autoPlay = false});
   final ChatMessage message;
   final ChatController controller;
+  final bool autoPlay;
 
   @override
   Widget build(BuildContext context) {
@@ -155,6 +162,15 @@ class _MessageBubble extends StatelessWidget {
             ),
           ),
           if (!isUser && message.trace != null && message.trace!.isNotEmpty) _ToolTrace(steps: message.trace!),
+          if (!isUser && message.content.isNotEmpty)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: VoiceSpeakButton(
+                text: message.content,
+                autoPlay: autoPlay,
+                onAutoPlayed: controller.clearJustReplied,
+              ),
+            ),
           if (!isUser && message.confirmation != null && message.confirmation!.resolution == null)
             _ConfirmationCard(
               confirmation: message.confirmation!,
@@ -279,15 +295,15 @@ class _TypingIndicator extends StatelessWidget {
   }
 }
 
-class _Composer extends StatefulWidget {
+class _Composer extends ConsumerStatefulWidget {
   const _Composer({required this.state, required this.controller});
   final ChatState state;
   final ChatController controller;
   @override
-  State<_Composer> createState() => _ComposerState();
+  ConsumerState<_Composer> createState() => _ComposerState();
 }
 
-class _ComposerState extends State<_Composer> {
+class _ComposerState extends ConsumerState<_Composer> {
   final _inputCtrl = TextEditingController();
 
   @override
@@ -338,6 +354,17 @@ class _ComposerState extends State<_Composer> {
     final attachError = widget.state.attachError;
     final previewPath = widget.state.attachmentPreviewPath;
 
+    final voiceState = ref.watch(voiceRecorderControllerProvider);
+    final voiceController = ref.read(voiceRecorderControllerProvider.notifier);
+    ref.listen<VoiceRecorderState>(voiceRecorderControllerProvider, (previous, next) {
+      if (next.transcript == null) return;
+      setState(() {
+        _inputCtrl.text = _inputCtrl.text.trim().isEmpty ? next.transcript! : '${_inputCtrl.text} ${next.transcript}';
+        _inputCtrl.selection = TextSelection.collapsed(offset: _inputCtrl.text.length);
+      });
+      voiceController.clearTranscript();
+    });
+
     return SafeArea(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -375,6 +402,23 @@ class _ComposerState extends State<_Composer> {
                   ],
                 ),
               ),
+            if (voiceState.status == VoiceRecorderStatus.error && voiceState.error != null)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: Row(
+                  children: [
+                    const Icon(Icons.warning_amber_rounded, size: 16, color: Colors.amber),
+                    const SizedBox(width: 6),
+                    Expanded(child: Text(voiceState.error!, style: const TextStyle(fontSize: 12, color: Colors.amber))),
+                    IconButton(
+                      icon: const Icon(Icons.close, size: 14),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: voiceController.dismissError,
+                    ),
+                  ],
+                ),
+              ),
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: [
@@ -383,7 +427,43 @@ class _ComposerState extends State<_Composer> {
                   tooltip: 'Attach a photo',
                   onPressed: uploading ? null : () => _showAttachMenu(context),
                 ),
-                const IconButton(icon: Icon(Icons.mic_none), onPressed: null, tooltip: 'Voice input (coming soon)'),
+                if (voiceState.status == VoiceRecorderStatus.recording) ...[
+                  Container(
+                    margin: const EdgeInsets.only(right: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    decoration: BoxDecoration(color: Colors.red.withOpacity(0.1), borderRadius: BorderRadius.circular(8)),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(width: 8, height: 8, decoration: const BoxDecoration(color: Colors.red, shape: BoxShape.circle)),
+                        const SizedBox(width: 6),
+                        Text(
+                          '${(voiceState.elapsedSeconds ~/ 60).toString().padLeft(2, '0')}:${(voiceState.elapsedSeconds % 60).toString().padLeft(2, '0')}',
+                          style: const TextStyle(color: Colors.red, fontSize: 12, fontWeight: FontWeight.w600),
+                        ),
+                      ],
+                    ),
+                  ),
+                  IconButton(icon: const Icon(Icons.close, size: 18), tooltip: 'Cancel', onPressed: voiceController.cancel),
+                  IconButton(
+                    icon: const Icon(Icons.stop_circle, color: Colors.red),
+                    tooltip: 'Stop and transcribe',
+                    onPressed: () => voiceController.stopAndTranscribe(
+                      agentId: widget.state.agentId?.isNotEmpty == true ? widget.state.agentId : null,
+                      conversationId: widget.state.activeConversationId,
+                    ),
+                  ),
+                ] else if (voiceState.status == VoiceRecorderStatus.transcribing)
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 12),
+                    child: SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)),
+                  )
+                else
+                  IconButton(
+                    icon: const Icon(Icons.mic_none),
+                    tooltip: 'Voice input',
+                    onPressed: voiceController.start,
+                  ),
                 Expanded(
                   child: TextField(
                     controller: _inputCtrl,

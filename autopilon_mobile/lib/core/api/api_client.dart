@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
 import 'package:cookie_jar/cookie_jar.dart';
@@ -64,6 +66,56 @@ class ApiClient {
       return ApiResult.failure(errorMessage, statusCode: res.statusCode);
     } on DioException catch (e) {
       return ApiResult.failure(e.message ?? 'Upload failed.');
+    }
+  }
+
+  /// Multipart upload with a fixed 'audio' field name (plus optional plain
+  /// text fields, e.g. agentId/conversationId) — used by the voice composer's
+  /// record-a-message flow. Kept separate from uploadFile() above rather than
+  /// generalizing it, since that method is already in use for the photo
+  /// attach flow and changing its signature would touch an unrelated feature.
+  Future<ApiResult<T>> uploadAudio<T>(String path, File file, {Map<String, String>? fields, T Function(dynamic)? parse}) async {
+    try {
+      final formData = FormData.fromMap({
+        ...?fields,
+        'audio': await MultipartFile.fromFile(file.path, filename: file.path.split('/').last),
+      });
+      final res = await _dio.post(path, data: formData);
+      if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300) {
+        final data = parse != null ? parse(res.data) : res.data as T;
+        return ApiResult.success(data);
+      }
+      final errorMessage = (res.data is Map && res.data['error'] != null) ? res.data['error'] as String : 'Upload failed (${res.statusCode}).';
+      return ApiResult.failure(errorMessage, statusCode: res.statusCode);
+    } on DioException catch (e) {
+      return ApiResult.failure(e.message ?? 'Upload failed.');
+    }
+  }
+
+  /// POSTs a JSON body and reads back a raw binary response — used for
+  /// text-to-speech audio, which unlike every other endpoint isn't JSON.
+  Future<ApiResult<Uint8List>> postBytes(String path, {Object? body}) async {
+    try {
+      final res = await _dio.post(
+        path,
+        data: body,
+        options: Options(method: 'POST', responseType: ResponseType.bytes),
+      );
+      if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300) {
+        return ApiResult.success(Uint8List.fromList(res.data as List<int>));
+      }
+      // Dio still hands back raw bytes for a JSON error response when
+      // responseType is bytes — decode it to surface the real message.
+      String errorMessage = 'Request failed (${res.statusCode}).';
+      try {
+        final decoded = jsonDecode(utf8.decode(res.data as List<int>));
+        if (decoded is Map && decoded['error'] != null) errorMessage = decoded['error'] as String;
+      } catch (_) {
+        // Not decodable JSON — fall back to the generic message above.
+      }
+      return ApiResult.failure(errorMessage, statusCode: res.statusCode);
+    } on DioException catch (e) {
+      return ApiResult.failure(e.message ?? 'Network error.');
     }
   }
 
