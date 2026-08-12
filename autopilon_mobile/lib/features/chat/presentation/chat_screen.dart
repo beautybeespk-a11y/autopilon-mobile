@@ -89,7 +89,11 @@ class _EmptyChat extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Center(
-      child: Padding(
+      // Scrollable rather than a plain Padding — when the keyboard is open
+      // there isn't always enough vertical room for this whole block (icon +
+      // title + subtitle + suggestion buttons), which otherwise overflows
+      // the available space instead of just scrolling.
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(24),
         child: Column(
           mainAxisSize: MainAxisSize.min,
