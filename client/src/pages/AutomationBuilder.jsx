@@ -22,6 +22,8 @@ const TRIGGER_TYPES = [
   { id: "file_shared", label: "File shared" },
   { id: "file_processing_completed", label: "File processing completed" },
   { id: "file_processing_failed", label: "File processing failed" },
+  { id: "content_generated", label: "Content generated (image, copy, voiceover...)" },
+  { id: "content_generation_failed", label: "Content generation failed" },
 ];
 
 const FREQUENCIES = ["every_minute", "hourly", "daily", "weekly", "monthly", "cron"];

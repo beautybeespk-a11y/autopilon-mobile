@@ -5,8 +5,8 @@ import { imageProviderStatus, listImageProviderOptions } from "../ai/imageProvid
 import { videoProviderStatus, listVideoProviderOptions } from "../ai/videoProvider.js";
 import { audioProviderStatus, listAudioProviderOptions } from "../ai/audioProvider.js";
 import {
-  generateImageAsset, regenerateImageAsset, listAssets, requireAssetAccess,
-  updateAsset, duplicateAsset, trashAsset, restoreAsset, permanentlyDeleteAsset, listVersions,
+  generateImageAsset, regenerateImageAsset, generateVoiceoverAsset, listAssets, requireAssetAccess,
+  updateAsset, duplicateAsset, trashAsset, restoreAsset, permanentlyDeleteAsset, listVersions, linkAssetToCampaign,
 } from "../orchestrator/contentService.js";
 import { generateCopy, listCopyTypes } from "../orchestrator/copywriterService.js";
 import { listBrands, getBrand, createBrand, updateBrand, deleteBrand } from "../orchestrator/brandService.js";
@@ -99,6 +99,18 @@ router.post("/generate/image", async (req, res) => {
   } catch (err) { handleError(res, err, "Image generation failed."); }
 });
 
+router.post("/generate/voiceover", async (req, res) => {
+  try {
+    const { text, voice, speed, provider, orgId, workspaceId, projectId, folderId, agentId, title } = req.body || {};
+    if (!text?.trim()) return res.status(400).json({ error: "text is required." });
+    const asset = await generateVoiceoverAsset({
+      userId: req.session.userId, orgId, workspaceId, projectId, folderId, agentId, text, provider, voice, speed, title,
+    });
+    logActivity(db, req.session.userId, "content_generated", `Generated voiceover: "${asset.title}"`, { orgId, workspaceId, req });
+    res.json(asset);
+  } catch (err) { handleError(res, err, "Voiceover generation failed."); }
+});
+
 router.post("/generate/copy", async (req, res) => {
   try {
     const { contentType, brief, brandId, tone, targetAudience, keywords, orgId, workspaceId, projectId, agentId, title, templateId, templateVariables } = req.body || {};
@@ -140,6 +152,14 @@ router.post("/:id/regenerate", async (req, res) => {
     const asset = await regenerateImageAsset(req.session.userId, req.params.id, { prompt, negativePrompt, provider, model, size, quality, background, useReferenceImage });
     res.json(asset);
   } catch (err) { handleError(res, err, "Regeneration failed."); }
+});
+
+router.post("/:id/link-campaign", (req, res) => {
+  try {
+    const { campaignId } = req.body || {};
+    if (!campaignId) return res.status(400).json({ error: "campaignId is required." });
+    res.json(linkAssetToCampaign(req.session.userId, req.params.id, campaignId));
+  } catch (err) { handleError(res, err, "Couldn't link content to campaign."); }
 });
 
 router.post("/:id/duplicate", (req, res) => {

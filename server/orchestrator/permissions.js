@@ -33,6 +33,12 @@ const BASE_USER_PERMISSIONS = new Set([
   "sheets.read", "sheets.write",
   "shopify.read", "shopify.manage",
   "agent.delegate",
+  // Phase 14's files.js tools declared requiredPermissions: ["files"], but
+  // "files" was never actually added here — checkPermission() rejected it
+  // as unknown, so every file automation/agent tool was silently
+  // unusable. Fixed alongside adding "content_studio" for Phase 15's tools.
+  "files",
+  "content_studio",
 ]);
 
 export function checkPermission({ agentId, permission }) {

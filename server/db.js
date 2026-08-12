@@ -1514,6 +1514,19 @@ if (!orgUsageColsPhase15.includes("videoGenerations")) db.exec("ALTER TABLE orga
 if (!orgUsageColsPhase15.includes("audioGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN audioGenerations INTEGER NOT NULL DEFAULT 0");
 if (!orgUsageColsPhase15.includes("contentTextGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN contentTextGenerations INTEGER NOT NULL DEFAULT 0");
 
+// Additive: a purely local reference — "this content asset was designated
+// for this Meta campaign" — NOT an upload to Meta. This codebase's Meta Ads
+// integration (integrations/meta/api.js) only reaches Campaign-level CRUD;
+// there is no Ad Set/Ad/Creative API here, so Meta has nowhere to actually
+// attach an image at the campaign level. Building real creative upload is a
+// separate, larger integration; this column lets create_campaign optionally
+// record which generated asset a campaign was built from, so a human can
+// pick it up from there (download it and attach it manually in Ads
+// Manager, or a future phase can wire the real Creative API). No money
+// moves and no approval step is bypassed by this — it's metadata only.
+const contentAssetCols = db.prepare("PRAGMA table_info(content_assets)").all().map((c) => c.name);
+if (!contentAssetCols.includes("linkedCampaignId")) db.exec("ALTER TABLE content_assets ADD COLUMN linkedCampaignId TEXT");
+
 db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
   .run("content_studio", "AI Content Studio", "Generate and manage AI images, copywriting, and other content assets.", "core");
 db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")

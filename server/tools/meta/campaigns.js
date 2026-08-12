@@ -2,6 +2,7 @@ import { registerTool } from "../registry.js";
 import { requireValidToken } from "../../integrations/manager.js";
 import * as meta from "../../integrations/meta/api.js";
 import { publishEvent } from "../../automation/triggers.js";
+import { linkAssetToCampaign } from "../../orchestrator/contentService.js";
 
 function token(context) {
   // Every Meta tool needs a live connection; this throws a clear, tool-level
@@ -41,7 +42,7 @@ registerTool({
 
 registerTool({
   name: "create_campaign",
-  description: "Creates a new Meta ad campaign (created PAUSED so nothing spends until manually resumed).",
+  description: "Creates a new Meta ad campaign (created PAUSED so nothing spends until manually resumed). Optionally pass contentAssetId to link a Content Studio image/copy asset to this campaign for reference — this does NOT upload it to Meta as a creative (this integration doesn't reach the Ad/Creative level yet), it just records which generated content the campaign was built from.",
   category: "meta_ads",
   parameters: {
     type: "object",
@@ -50,6 +51,7 @@ registerTool({
       name: { type: "string" },
       objective: { type: "string" }, // e.g. OUTCOME_TRAFFIC, OUTCOME_ENGAGEMENT
       dailyBudget: { type: "number" }, // in the account's smallest currency unit (e.g. cents)
+      contentAssetId: { type: "string", description: "Optional Content Studio asset id (image/copy) this campaign is built from" },
     },
     required: ["adAccountId", "name", "objective"],
   },
@@ -62,11 +64,14 @@ registerTool({
       dailyBudget: parameters.dailyBudget,
       status: "PAUSED",
     });
+    if (parameters.contentAssetId) {
+      linkAssetToCampaign(context.userId, parameters.contentAssetId, result.id);
+    }
     // Meta doesn't push ad-account change webhooks to this app — this event
     // is published because OUR OWN tool call just succeeded, not because of
     // an incoming Meta callback. Documented as such in PHASE6.5_NOTES.md.
-    publishEvent(context.userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: result.id, name: parameters.name });
-    return { campaignId: result.id, name: parameters.name, status: "PAUSED" };
+    publishEvent(context.userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: result.id, name: parameters.name, contentAssetId: parameters.contentAssetId || null });
+    return { campaignId: result.id, name: parameters.name, status: "PAUSED", linkedContentAssetId: parameters.contentAssetId || null };
   },
 });
 

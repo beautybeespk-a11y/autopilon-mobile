@@ -1,9 +1,11 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { generateImage, editImage } from "../ai/imageProvider.js";
+import { synthesizeSpeech } from "../ai/speech.js";
 import { uploadFile, downloadFile } from "./fileService.js";
 import { canAccessContent, readableContentClause } from "./contentPermissions.js";
 import { enforceQuota, recordUsage } from "./billing.js";
+import { recordVoiceUsage, TTS_CENTS_PER_CHAR } from "./voiceUsage.js";
 import { publishEvent } from "../automation/triggers.js";
 
 const now = () => new Date().toISOString();
@@ -176,6 +178,65 @@ export async function regenerateImageAsset(userId, assetId, { prompt, negativePr
   db.prepare("UPDATE content_assets SET fileId = ?, currentVersion = ?, status = 'ready', updatedAt = ? WHERE id = ?").run(file.id, nextVersion, now(), assetId);
   if (asset.orgId) recordGenerationUsage({ orgId: asset.orgId, kind: "image", costCents: 4 });
   publishEvent(userId, "content", "content_generated", { assetId, contentType: "image", fileId: file.id, version: nextVersion });
+  return withTags(getAsset(assetId));
+}
+
+// Voiceover generation — reuses the EXISTING Voice system (Phase 13's
+// synthesizeSpeech/ai/speech.js) rather than a new audio provider, and
+// records into the same voice_usage accounting a spoken chat reply uses
+// (voiceUsage.js), per spec: "must integrate with the existing Voice
+// system... all voice usage must pass through existing usage/billing."
+// Storage still goes through the File System, same as image assets.
+export async function generateVoiceoverAsset({ userId, orgId, workspaceId, projectId, folderId, agentId, text, provider, voice, speed, title }) {
+  if (!text?.trim()) {
+    const err = new Error("Voiceover text is required.");
+    err.code = "INVALID";
+    throw err;
+  }
+  if (orgId) checkGenerationQuota(orgId);
+  const start = Date.now();
+  let result;
+  try {
+    result = await synthesizeSpeech({ text, provider, voice, speed });
+  } catch (err) {
+    const assetId = insertAsset({
+      orgId, workspaceId, projectId, ownerId: userId, creatorUserId: userId, agentId,
+      contentType: "voiceover", title: title || text.slice(0, 60) || "Untitled voiceover",
+      status: "failed", errorMessage: err.code === "PROVIDER_NOT_CONFIGURED" ? (err.detail || err.message) : "Voiceover generation failed.",
+    });
+    insertGeneration({ assetId, version: 1, contentType: "voiceover", provider, prompt: text, parameters: { voice, speed }, status: "failed", errorMessage: err.message, creatorUserId: userId, agentId, durationMs: Date.now() - start });
+    publishEvent(userId, "content", "content_generation_failed", { assetId, contentType: "voiceover", error: err.message });
+    throw Object.assign(err, { assetId });
+  }
+
+  const durationMs = Date.now() - start;
+  const costCents = text.length * TTS_CENTS_PER_CHAR;
+  const file = await uploadFile({
+    userId, orgId, workspaceId, projectId, folderId,
+    buffer: result.audio, originalFilename: `${(title || "voiceover").replace(/[^a-zA-Z0-9._-]/g, "_")}.mp3`, mimeType: result.mimeType || "audio/mpeg",
+    visibility: "private", agentId,
+  });
+  const assetId = insertAsset({
+    orgId, workspaceId, projectId, ownerId: userId, creatorUserId: userId, agentId,
+    contentType: "voiceover", title: title || text.slice(0, 60) || "Untitled voiceover", fileId: file.id, status: "ready",
+  });
+  insertGeneration({
+    assetId, version: 1, contentType: "voiceover", provider: result.provider, prompt: text,
+    parameters: { voice, speed }, status: "ready", fileId: file.id, estimatedCostCents: costCents, durationMs, creatorUserId: userId, agentId,
+  });
+  recordVoiceUsage({ userId, kind: "tts", provider: result.provider, characters: text.length, estimatedCostCents: costCents, agentId });
+  if (orgId) recordGenerationUsage({ orgId, kind: "audio", costCents });
+  publishEvent(userId, "content", "content_generated", { assetId, contentType: "voiceover", fileId: file.id });
+  return withTags(getAsset(assetId));
+}
+
+// Records that a content asset was designated for a Meta campaign — a local
+// reference only (see the linkedCampaignId column note in db.js). Called by
+// meta/campaigns.js's create_campaign tool when a contentAssetId is passed;
+// never called from anywhere that spends money or bypasses approval.
+export function linkAssetToCampaign(userId, assetId, campaignId) {
+  requireAssetAccess(userId, assetId, "manage");
+  db.prepare("UPDATE content_assets SET linkedCampaignId = ?, updatedAt = ? WHERE id = ?").run(campaignId, now(), assetId);
   return withTags(getAsset(assetId));
 }
 

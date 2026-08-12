@@ -4,8 +4,9 @@ import path from "path";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import db from "../db.js";
-import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
+import { requireAuth, logActivity } from "../middleware.js";
 import { sttStatus, ttsStatus, listVoices, transcribeAudio, synthesizeSpeech } from "../ai/speech.js";
+import { recordVoiceUsage, TTS_CENTS_PER_CHAR } from "../orchestrator/voiceUsage.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "voice");
@@ -22,7 +23,6 @@ const upload = multer({ dest: UPLOAD_DIR, limits: { fileSize: MAX_UPLOAD_BYTES }
 // spec's "Estimated Cost" usage field. Whisper: $0.006/min. TTS (tts-1): $15
 // per 1M characters.
 const STT_CENTS_PER_SECOND = 0.6 / 60;
-const TTS_CENTS_PER_CHAR = 1500 / 1_000_000;
 
 const router = Router();
 router.use(requireAuth);
@@ -80,24 +80,6 @@ router.patch("/settings", (req, res) => {
   }
   res.json(next);
 });
-
-function resolveOrgId(userId) {
-  // Best-effort only, same "unmetered unless an org context exists" rule as
-  // the rest of chat — a personal account with no org membership simply
-  // records usage with orgId = null.
-  const row = db.prepare("SELECT orgId FROM organization_members WHERE userId = ? AND status != 'suspended' ORDER BY joinedAt ASC LIMIT 1").get(userId);
-  return row?.orgId || null;
-}
-
-function recordVoiceUsage({ userId, kind, provider, durationSeconds, characters, estimatedCostCents, agentId, conversationId }) {
-  db.prepare(
-    `INSERT INTO voice_usage (id, userId, orgId, agentId, conversationId, kind, provider, durationSeconds, characters, estimatedCostCents, createdAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-  ).run(
-    cryptoRandom(), userId, resolveOrgId(userId), agentId || null, conversationId || null,
-    kind, provider, durationSeconds ?? null, characters ?? null, estimatedCostCents, new Date().toISOString()
-  );
-}
 
 // Speech in, text out. The client is expected to show the transcript as an
 // editable preview and only THEN send it through the ordinary POST
