@@ -27,6 +27,8 @@ import Skills from "./pages/Skills.jsx";
 import Automations from "./pages/Automations.jsx";
 import AutomationBuilder from "./pages/AutomationBuilder.jsx";
 import Integrations from "./pages/Integrations.jsx";
+import Files from "./pages/Files.jsx";
+import SharedFile from "./pages/SharedFile.jsx";
 import Knowledge from "./pages/Knowledge.jsx";
 import Tasks from "./pages/Tasks.jsx";
 import Activity from "./pages/Activity.jsx";
@@ -39,6 +41,7 @@ export default function App() {
       <Route path="/login" element={<Login />} />
       <Route path="/signup" element={<Signup />} />
       <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/share/:token" element={<SharedFile />} />
 
       <Route
         path="/app"
@@ -70,6 +73,7 @@ export default function App() {
         <Route path="automations/new" element={<AutomationBuilder />} />
         <Route path="automations/:id/edit" element={<AutomationBuilder />} />
         <Route path="integrations" element={<Integrations />} />
+        <Route path="files" element={<Files />} />
         <Route path="knowledge" element={<Knowledge />} />
         <Route path="tasks" element={<Tasks />} />
         <Route path="activity" element={<Activity />} />
