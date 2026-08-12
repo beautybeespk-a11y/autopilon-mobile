@@ -19,6 +19,16 @@ function extOf(filename) {
   return i === -1 ? "" : filename.slice(i + 1).toLowerCase();
 }
 
+// Blindly rounding to GB reads as "0GB" for any limit under ~1GB — was only
+// ever going to bite plans with a small test/demo limit, but a wrong
+// user-facing number is a wrong user-facing number.
+function formatBytes(bytes) {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${bytes}B`;
+}
+
 async function withTempFile(buffer, extension, fn) {
   const tmpPath = path.join(os.tmpdir(), `filesvc-${cryptoRandom()}${extension ? "." + extension : ""}`);
   fs.writeFileSync(tmpPath, buffer);
@@ -71,7 +81,7 @@ export async function uploadFile({
 
   const quota = checkStorageQuota(orgId, buffer.length);
   if (!quota.allowed) {
-    const err = new Error(`This upload would exceed your organization's storage limit (${Math.round(quota.limit / (1024 * 1024 * 1024))}GB).`);
+    const err = new Error(`This upload would exceed your organization's storage limit (${formatBytes(quota.limit)}).`);
     err.code = "QUOTA_EXCEEDED";
     throw err;
   }
