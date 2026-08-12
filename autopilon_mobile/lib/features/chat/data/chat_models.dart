@@ -92,6 +92,6 @@ class UploadedAttachment {
 /// Tools that mutate something real (campaigns, memory, saved research) —
 /// mirrors META_ACTION_TOOLS / isDeleteAction in Chat.jsx, used only for
 /// button labels ("Delete" vs "Approve", "Cancel" vs "Reject").
-bool isDeleteAction(String toolName) => toolName == 'delete_memory' || toolName == 'delete_saved_research';
+bool isDeleteAction(String toolName) => toolName == 'delete_memory' || toolName == 'delete_saved_research' || toolName == 'delete_file';
 
 const metaActionTools = {'create_campaign', 'update_campaign', 'pause_campaign', 'resume_campaign'};

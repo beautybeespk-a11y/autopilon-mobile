@@ -2,6 +2,9 @@ import fs from "fs";
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { orchestrate } from "./index.js";
+import { requireFileAccess } from "./fileService.js";
+import { getStorageProvider } from "../storage/provider.js";
+import { logFileActivity } from "./fileActivity.js";
 
 // Everything a new inbound message needs to go through, regardless of which
 // channel it arrived on (web chat or WhatsApp): build the agent's system
@@ -15,7 +18,7 @@ import { orchestrate } from "./index.js";
 const MAX_ATTACHMENT_CHARS = 8000;
 
 export async function handleIncomingMessage({
-  userId, agentId, conversationId, content, attachmentTitle = null, attachmentText = null, attachmentImageId = null, skipUserInsert = false,
+  userId, agentId, conversationId, content, attachmentTitle = null, attachmentText = null, attachmentImageId = null, attachmentFileId = null, skipUserInsert = false,
 }) {
   const now = new Date().toISOString();
 
@@ -66,6 +69,30 @@ export async function handleIncomingMessage({
       foundKnowledgeRow: Boolean(row),
       resolvedImage: extraImage ? { mimeType: extraImage.mimeType, base64Length: extraImage.base64.length } : null,
     });
+  }
+
+  // A file attached from the centralized File Manager (Phase 14) — resolved
+  // through requireFileAccess(), the EXACT same permission check any other
+  // access to that file goes through. An agent/automation can never see a
+  // file this way that the user themselves couldn't open in the File
+  // Manager, and a permission failure here fails closed: no file content
+  // reaches the model, the turn just proceeds without it.
+  if (attachmentFileId) {
+    try {
+      const file = requireFileAccess(userId, attachmentFileId, "view");
+      if (file.aiAnalysisSupport && !file.textExtractionSupport) {
+        const buffer = await getStorageProvider(file.storageProvider).download({ key: file.storageKey });
+        extraImage = extraImage || { mimeType: file.mimeType, base64: buffer.toString("base64") };
+      } else if (file.extractedText) {
+        const truncated = file.extractedText.length > MAX_ATTACHMENT_CHARS;
+        const clipped = file.extractedText.slice(0, MAX_ATTACHMENT_CHARS);
+        const fileContext = `[Attached file: "${file.filename}". Contents:\n"""\n${clipped}${truncated ? "\n[...truncated...]" : ""}\n"""]`;
+        extraContext = extraContext ? `${extraContext}\n\n${fileContext}` : fileContext;
+      }
+      logFileActivity(attachmentFileId, "ai_access", { userId, agentId, conversationId, orgId: file.orgId, workspaceId: file.workspaceId });
+    } catch (err) {
+      console.error("[conversationService] attachmentFileId resolution failed:", err.message);
+    }
   }
 
   let systemPrompt = "You are a helpful AI assistant inside the AI Agent Platform.";

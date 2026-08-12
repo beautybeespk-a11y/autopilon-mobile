@@ -28,8 +28,8 @@ router.get("/conversations/:id/messages", (req, res) => {
 
 // Send a message. Creates a conversation if none supplied.
 router.post("/message", async (req, res) => {
-  const { conversationId, content, agentId, attachmentTitle, attachmentText, attachmentImageId } = req.body || {};
-  const hasAttachment = Boolean(attachmentTitle && (attachmentText || attachmentImageId));
+  const { conversationId, content, agentId, attachmentTitle, attachmentText, attachmentImageId, attachmentFileId } = req.body || {};
+  const hasAttachment = Boolean(attachmentTitle && (attachmentText || attachmentImageId || attachmentFileId));
   // Temporary diagnostic — remove once image attachments are confirmed
   // working end-to-end. Shows exactly what the client sent for this field,
   // without dumping the (large) attachmentText/body itself.
@@ -61,6 +61,7 @@ router.post("/message", async (req, res) => {
       attachmentTitle: hasAttachment ? attachmentTitle : null,
       attachmentText: hasAttachment ? attachmentText : null,
       attachmentImageId: hasAttachment ? attachmentImageId : null,
+      attachmentFileId: hasAttachment ? attachmentFileId : null,
     });
     res.json({ conversationId: convId, reply, trace, toolResults, confirmation, assistantMessageId });
   } catch (err) {

@@ -1201,4 +1201,190 @@ CREATE TABLE IF NOT EXISTS voice_settings (
 );
 `);
 
+// --- Phase 14: File & Document Management ---
+// Metadata lives here; actual bytes live in whatever the storage provider
+// is configured to (see server/storage/provider.js) — a file row's
+// storageProvider + storageKey is a pointer, never the content itself.
+// Visibility follows the exact same private|workspace|organization
+// convention knowledge_items already uses (see crossUserVisibility above)
+// for consistency; "shared" additionally consults file_permissions for
+// explicit per-user grants, and a public link is its own separate,
+// disabled-by-default mechanism (file_shares), not a visibility level.
+db.exec(`
+CREATE TABLE IF NOT EXISTS folders (
+  id             TEXT PRIMARY KEY,
+  orgId          TEXT,
+  workspaceId    TEXT,
+  projectId      TEXT,
+  ownerId        TEXT NOT NULL,
+  name           TEXT NOT NULL,
+  parentFolderId TEXT,
+  visibility     TEXT NOT NULL DEFAULT 'private', -- private|workspace|organization
+  trashedAt      TEXT,
+  createdAt      TEXT NOT NULL,
+  updatedAt      TEXT NOT NULL,
+  FOREIGN KEY (ownerId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_folders_owner ON folders(ownerId);
+CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parentFolderId);
+CREATE INDEX IF NOT EXISTS idx_folders_org ON folders(orgId);
+CREATE INDEX IF NOT EXISTS idx_folders_workspace ON folders(workspaceId);
+
+CREATE TABLE IF NOT EXISTS files (
+  id                     TEXT PRIMARY KEY,
+  orgId                  TEXT,
+  workspaceId            TEXT,
+  projectId              TEXT,
+  folderId               TEXT,
+  ownerId                TEXT NOT NULL,
+  uploaderId             TEXT NOT NULL,
+  filename               TEXT NOT NULL,
+  originalFilename       TEXT NOT NULL,
+  extension              TEXT,
+  mimeType               TEXT,
+  sizeBytes              INTEGER NOT NULL,
+  storageProvider        TEXT NOT NULL DEFAULT 'local',
+  storageKey             TEXT NOT NULL,
+  checksum               TEXT,
+  version                INTEGER NOT NULL DEFAULT 1,
+  status                 TEXT NOT NULL DEFAULT 'active',       -- active | trashed
+  processingStatus       TEXT NOT NULL DEFAULT 'uploading',    -- uploading|processing|ready|failed|unsupported|quarantined
+  processingError        TEXT,
+  aiProcessingStatus     TEXT NOT NULL DEFAULT 'not_started',  -- not_started|ready|unsupported
+  securityScanStatus     TEXT NOT NULL DEFAULT 'not_scanned',  -- not_scanned|clean|infected|scan_failed — see storage/fileSecurity.js; never set to 'clean' unless a real scanner actually ran
+  securityScanProvider   TEXT,
+  previewSupport         INTEGER NOT NULL DEFAULT 0,
+  textExtractionSupport  INTEGER NOT NULL DEFAULT 0,
+  aiAnalysisSupport      INTEGER NOT NULL DEFAULT 0,
+  extractedText          TEXT, -- populated by the processing pipeline; LIKE-searched, same approach as knowledge_items
+  visibility             TEXT NOT NULL DEFAULT 'private', -- private|workspace|organization|shared
+  favorite               INTEGER NOT NULL DEFAULT 0,
+  trashedAt              TEXT,
+  lastAccessedAt         TEXT,
+  createdAt              TEXT NOT NULL,
+  updatedAt              TEXT NOT NULL,
+  FOREIGN KEY (ownerId) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (folderId) REFERENCES folders(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_files_owner ON files(ownerId, status);
+CREATE INDEX IF NOT EXISTS idx_files_org ON files(orgId, status);
+CREATE INDEX IF NOT EXISTS idx_files_workspace ON files(workspaceId, status);
+CREATE INDEX IF NOT EXISTS idx_files_project ON files(projectId, status);
+CREATE INDEX IF NOT EXISTS idx_files_folder ON files(folderId, status);
+
+-- Every upload creates version 1 here too — files.version/storageKey always
+-- mirror the current row in this table, so "download this file" never needs
+-- to know versioning exists, while "view history" has a complete record.
+CREATE TABLE IF NOT EXISTS file_versions (
+  id              TEXT PRIMARY KEY,
+  fileId          TEXT NOT NULL,
+  version         INTEGER NOT NULL,
+  storageProvider TEXT NOT NULL,
+  storageKey      TEXT NOT NULL,
+  sizeBytes       INTEGER NOT NULL,
+  checksum        TEXT,
+  uploaderId      TEXT NOT NULL,
+  note            TEXT,
+  createdAt       TEXT NOT NULL,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_versions_unique ON file_versions(fileId, version);
+
+-- subjectType is 'user' only for this pass; 'team'/'agent' are valid values
+-- the schema already accepts so a later phase can grant to those without a
+-- migration — nothing in this phase writes them yet.
+CREATE TABLE IF NOT EXISTS file_permissions (
+  id          TEXT PRIMARY KEY,
+  fileId      TEXT NOT NULL,
+  subjectType TEXT NOT NULL, -- 'user' | 'team' | 'agent'
+  subjectId   TEXT NOT NULL,
+  permission  TEXT NOT NULL, -- view|download|edit|share|delete|manage
+  grantedBy   TEXT NOT NULL,
+  createdAt   TEXT NOT NULL,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_permissions_unique ON file_permissions(fileId, subjectType, subjectId, permission);
+CREATE INDEX IF NOT EXISTS idx_file_permissions_subject ON file_permissions(subjectType, subjectId);
+
+CREATE TABLE IF NOT EXISTS file_tags (
+  fileId TEXT NOT NULL,
+  tag    TEXT NOT NULL,
+  PRIMARY KEY (fileId, tag),
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_file_tags_tag ON file_tags(tag);
+
+CREATE TABLE IF NOT EXISTS file_shares (
+  id             TEXT PRIMARY KEY,
+  fileId         TEXT NOT NULL,
+  token          TEXT NOT NULL UNIQUE,
+  createdBy      TEXT NOT NULL,
+  expiresAt      TEXT,
+  passwordHash   TEXT,
+  downloadOnly   INTEGER NOT NULL DEFAULT 0,
+  revoked        INTEGER NOT NULL DEFAULT 0,
+  accessCount    INTEGER NOT NULL DEFAULT 0,
+  lastAccessedAt TEXT,
+  createdAt      TEXT NOT NULL,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_file_shares_file ON file_shares(fileId);
+
+CREATE TABLE IF NOT EXISTS file_activity (
+  id          TEXT PRIMARY KEY,
+  fileId      TEXT NOT NULL,
+  userId      TEXT,
+  orgId       TEXT,
+  workspaceId TEXT,
+  projectId   TEXT,
+  agentId     TEXT,
+  action      TEXT NOT NULL, -- upload|download|view|share|rename|move|delete|restore|version_created|permission_changed|ai_access|ai_analysis|automation_access
+  result      TEXT NOT NULL DEFAULT 'success',
+  detail      TEXT,
+  createdAt   TEXT NOT NULL,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_file_activity_file ON file_activity(fileId, createdAt);
+
+-- Generic association so a file can connect to a Project, an Agent, or a
+-- Knowledge Library item without files needing a column per relationship —
+-- section 17/16/15 integrations all read/write this same table.
+CREATE TABLE IF NOT EXISTS file_links (
+  id         TEXT PRIMARY KEY,
+  fileId     TEXT NOT NULL,
+  linkedType TEXT NOT NULL, -- 'project' | 'agent' | 'knowledge'
+  linkedId   TEXT NOT NULL,
+  createdAt  TEXT NOT NULL,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_file_links_unique ON file_links(fileId, linkedType, linkedId);
+CREATE INDEX IF NOT EXISTS idx_file_links_linked ON file_links(linkedType, linkedId);
+`);
+
+// Storage usage is deliberately NOT a separate rollup table — with this
+// app's data volumes, SUM(sizeBytes) over files is cheap and always
+// accurate, and a cached rollup would just be one more place for drift to
+// creep in. See getStorageUsage() in orchestrator/storageUsage.js.
+
+// Additive: lets each plan cap total file storage, enforced the same way
+// every other quota is (see billing.js). NULL = unlimited, matching every
+// other plan limit column's convention.
+const planColsPhase14 = db.prepare("PRAGMA table_info(plans)").all().map((c) => c.name);
+if (!planColsPhase14.includes("maxStorageBytes")) db.exec("ALTER TABLE plans ADD COLUMN maxStorageBytes INTEGER");
+if (!planColsPhase14.includes("maxFileUploadMB")) db.exec("ALTER TABLE plans ADD COLUMN maxFileUploadMB INTEGER");
+db.prepare("UPDATE plans SET maxStorageBytes = ? WHERE id = ? AND maxStorageBytes IS NULL").run(1 * 1024 * 1024 * 1024, "free");
+db.prepare("UPDATE plans SET maxStorageBytes = ? WHERE id = ? AND maxStorageBytes IS NULL").run(10 * 1024 * 1024 * 1024, "starter");
+db.prepare("UPDATE plans SET maxStorageBytes = ? WHERE id = ? AND maxStorageBytes IS NULL").run(50 * 1024 * 1024 * 1024, "professional");
+db.prepare("UPDATE plans SET maxStorageBytes = ? WHERE id = ? AND maxStorageBytes IS NULL").run(250 * 1024 * 1024 * 1024, "business");
+// enterprise stays NULL = unlimited, consistent with its other limits.
+db.prepare("UPDATE plans SET maxFileUploadMB = ? WHERE id = ? AND maxFileUploadMB IS NULL").run(10, "free");
+db.prepare("UPDATE plans SET maxFileUploadMB = ? WHERE id = ? AND maxFileUploadMB IS NULL").run(50, "starter");
+db.prepare("UPDATE plans SET maxFileUploadMB = ? WHERE id = ? AND maxFileUploadMB IS NULL").run(200, "professional");
+db.prepare("UPDATE plans SET maxFileUploadMB = ? WHERE id = ? AND maxFileUploadMB IS NULL").run(500, "business");
+
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("files", "Files & Documents", "Find, organize, and analyze files and documents in the centralized File Manager.", "core");
+db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
+  .run("Find, organize, and analyze files and documents in the centralized File Manager.", "core", "files");
+
 export default db;

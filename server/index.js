@@ -51,6 +51,8 @@ import shopifyWebhookRoutes from "./routes/shopifyWebhook.js";
 import confirmationRoutes, { sweepExpiredConfirmations } from "./routes/confirmations.js";
 import researchRoutes from "./routes/research.js";
 import voiceRoutes from "./routes/voice.js";
+import filesRoutes from "./routes/files.js";
+import fileSharesRoutes from "./routes/fileShares.js";
 import metaAuthRoutes from "./routes/metaAuth.js";
 import whatsappAuthRoutes from "./routes/whatsappAuth.js";
 import whatsappWebhookRoutes from "./routes/whatsappWebhook.js";
@@ -96,6 +98,26 @@ app.use(
 );
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// Every genuinely-public route (no session cookie involved at all — an
+// external service or an anonymous share-link visitor) is mounted here,
+// FIRST, before any router that applies a blanket requireAuth. This
+// matters because billingRoutes/couponRoutes/workspaceRoutes/projectRoutes
+// below are all mounted at the bare "/api" prefix with an unconditional
+// `router.use(requireAuth)` inside them — Express walks middleware in
+// registration order, so a request to (for example) /api/stripe/webhook
+// would otherwise reach that requireAuth check FIRST and get a 401 before
+// ever reaching stripeWebhookRoutes' own, deliberately public, handler.
+// (Discovered while adding /api/share for Phase 14 — the same misordering
+// was already silently blocking the Stripe/WhatsApp/Shopify webhooks below,
+// which are each explicitly commented "NOT behind requireAuth" in their own
+// files; fixed here rather than worked around, since real inbound webhooks
+// depend on it.)
+app.use("/api/stripe", stripeWebhookRoutes);
+app.use("/api/integrations/whatsapp", whatsappWebhookRoutes);
+app.use("/api/integrations/shopify", shopifyWebhookRoutes);
+app.use("/api/share", fileSharesRoutes);
+
 app.use("/api/auth", authRoutes);
 app.use("/api/chat", chatRoutes);
 app.use("/api/agents", agentRoutes);
@@ -109,7 +131,6 @@ app.use("/api/organizations", orgAnalyticsRoutes);
 app.use("/api", billingRoutes);
 app.use("/api", couponRoutes);
 app.use("/api/admin", platformAdminRoutes);
-app.use("/api/stripe", stripeWebhookRoutes);
 app.use("/api/marketplace", marketplaceRoutes);
 app.use("/api/marketplace", marketplaceInstallRoutes);
 app.use("/api/marketplace", marketplaceReviewRoutes);
@@ -124,13 +145,13 @@ app.use("/api/dashboard", dashboardRoutes);
 app.use("/api/confirmations", confirmationRoutes);
 app.use("/api/research", researchRoutes);
 app.use("/api/voice", voiceRoutes);
+app.use("/api/files", filesRoutes);
 // These must be mounted BEFORE the general "/api/integrations" catalog route
 // below — Express matches by path PREFIX, so that catalog router (which
 // requires login for every request reaching it) would otherwise intercept
 // anything starting with "/api/integrations", including the public webhook,
 // before this more specific router ever got a chance to run.
 app.use("/api/integrations/meta", metaAuthRoutes);
-app.use("/api/integrations/whatsapp", whatsappWebhookRoutes);
 app.use("/api/integrations/whatsapp", whatsappAuthRoutes);
 app.use("/api/integrations/wordpress", wordpressAuthRoutes);
 app.use("/api/integrations/woocommerce", woocommerceAuthRoutes);
@@ -139,7 +160,6 @@ app.use("/api/integrations/google_calendar", createGoogleServiceRouter("google_c
 app.use("/api/integrations/google_drive", createGoogleServiceRouter("google_drive", "Google Drive"));
 app.use("/api/integrations/google_docs", createGoogleServiceRouter("google_docs", "Google Docs"));
 app.use("/api/integrations/google_sheets", createGoogleServiceRouter("google_sheets", "Google Sheets"));
-app.use("/api/integrations/shopify", shopifyWebhookRoutes);
 app.use("/api/integrations/shopify", shopifyAuthRoutes);
 app.use("/api/integrations", integrationRoutes);
 app.use("/api/automations", automationRoutes);

@@ -14,7 +14,7 @@ function TraceRail({ trace }) {
 }
 
 function isDeleteAction(toolName) {
-  return toolName === "delete_memory" || toolName === "delete_saved_research";
+  return toolName === "delete_memory" || toolName === "delete_saved_research" || toolName === "delete_file";
 }
 
 const META_ACTION_TOOLS = new Set(["create_campaign", "update_campaign", "pause_campaign", "resume_campaign"]);

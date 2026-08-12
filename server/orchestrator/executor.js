@@ -145,5 +145,11 @@ function confirmationReason(toolName, parameters) {
   if (toolName === "resume_campaign") {
     return `This resumes campaign ${parameters.campaignId}, allowing it to spend budget again.`;
   }
+  if (toolName === "delete_file") {
+    return "This moves a file to Trash. It can be restored from there until it's permanently deleted.";
+  }
+  if (toolName === "share_file") {
+    return "This creates a link that lets anyone who has it access this file, outside the platform's normal permissions.";
+  }
   return "This action requires your approval before it runs.";
 }

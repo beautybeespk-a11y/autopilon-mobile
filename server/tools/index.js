@@ -25,5 +25,6 @@ import "./shopify/collections.js";
 import "./shopify/analytics.js";
 import "./shopify/webhooks.js";
 import "./agentCollaboration.js";
+import "./files.js";
 
 export { listTools, listToolsForSkills, getTool } from "./registry.js";

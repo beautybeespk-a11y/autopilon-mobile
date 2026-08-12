@@ -9,6 +9,8 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.686.0",
+    "@aws-sdk/s3-request-presigner": "^3.686.0",
     "bcryptjs": "^2.4.3",
     "better-sqlite3": "^11.3.0",
     "cors": "^2.8.5",
@@ -21,6 +23,7 @@
     "nanoid": "^5.0.7",
     "node-cron": "^3.0.3",
     "pdf-parse": "^2.4.5",
-    "stripe": "^17.3.1"
+    "stripe": "^17.3.1",
+    "xlsx": "^0.18.5"
   }
 }

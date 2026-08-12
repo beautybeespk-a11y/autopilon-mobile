@@ -6,7 +6,7 @@ import db from "../db.js";
 export const PERMISSIONS = [
   "agent_management", "automation", "integrations", "billing", "knowledge",
   "tasks", "workflows", "marketplace", "api_keys", "reports", "settings",
-  "member_management",
+  "member_management", "files",
 ];
 
 // Built-in roles map to fixed permission sets — not stored in the DB, since
@@ -15,9 +15,9 @@ export const PERMISSIONS = [
 const BUILTIN_ROLE_PERMISSIONS = {
   owner: [...PERMISSIONS], // everything, including billing/settings/member_management
   admin: PERMISSIONS.filter((p) => p !== "billing"),
-  manager: ["agent_management", "automation", "integrations", "knowledge", "tasks", "workflows", "reports"],
-  member: ["agent_management", "knowledge", "tasks", "workflows"],
-  viewer: ["reports", "knowledge"],
+  manager: ["agent_management", "automation", "integrations", "knowledge", "tasks", "workflows", "reports", "files"],
+  member: ["agent_management", "knowledge", "tasks", "workflows", "files"],
+  viewer: ["reports", "knowledge", "files"],
 };
 const BUILTIN_ROLES = Object.keys(BUILTIN_ROLE_PERMISSIONS);
 

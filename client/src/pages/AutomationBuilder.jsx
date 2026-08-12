@@ -17,6 +17,11 @@ const TRIGGER_TYPES = [
   { id: "ai_chat_request", label: "AI chat request (not yet auto-firing)" },
   { id: "knowledge_update", label: "Knowledge update (not yet auto-firing)" },
   { id: "task_due", label: "Task due (not yet auto-firing)" },
+  { id: "file_uploaded", label: "File uploaded" },
+  { id: "file_updated", label: "File updated (new version, moved, or renamed)" },
+  { id: "file_shared", label: "File shared" },
+  { id: "file_processing_completed", label: "File processing completed" },
+  { id: "file_processing_failed", label: "File processing failed" },
 ];
 
 const FREQUENCIES = ["every_minute", "hourly", "daily", "weekly", "monthly", "cron"];
