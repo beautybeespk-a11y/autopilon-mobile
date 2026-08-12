@@ -10,6 +10,7 @@ class MoreScreen extends StatelessWidget {
       (Icons.bolt_outlined, 'Automations', 'Workflows on a schedule or trigger', '/more/automations'),
       (Icons.power_outlined, 'Integrations', 'Connect the tools your agents use', '/more/integrations'),
       (Icons.folder_outlined, 'Files', 'Browse, upload, and share your documents', '/more/files'),
+      (Icons.auto_awesome_outlined, 'Content Studio', 'Generate images, captions, and voiceovers with AI', '/more/content'),
       (Icons.storefront_outlined, 'Marketplace', 'Browse and install agents & automations', '/more/marketplace'),
       (Icons.receipt_long_outlined, 'Billing', 'Plan, usage, and payment details', '/more/billing'),
       // Analytics already lives on the Home tab (dashboard_screen.dart) —
