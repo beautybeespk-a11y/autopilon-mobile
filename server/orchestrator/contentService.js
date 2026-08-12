@@ -71,6 +71,21 @@ function insertGeneration({ assetId, version, contentType, provider, model, prom
   );
 }
 
+// Records a visible failed text asset (e.g. copywriterService.generateCopy
+// hitting PROVIDER_NOT_CONFIGURED) — same "failures are visible in history,
+// never silently dropped" principle generateImageAsset already follows.
+// Kept separate from createTextAsset() since a failed attempt never has
+// completion text to store.
+export function recordFailedTextGeneration({ userId, orgId, workspaceId, projectId, agentId, contentType, title, prompt, errorMessage }) {
+  const assetId = insertAsset({
+    orgId, workspaceId, projectId, ownerId: userId, creatorUserId: userId, agentId, contentType,
+    title, status: "failed", errorMessage,
+  });
+  insertGeneration({ assetId, version: 1, contentType, prompt, parameters: {}, status: "failed", errorMessage, creatorUserId: userId, agentId });
+  publishEvent(userId, "content", "content_generation_failed", { assetId, contentType, error: errorMessage });
+  return assetId;
+}
+
 // Text content (captions, ad copy, blog posts, scripts...) — no File System
 // involvement at all, since it's just text living on the asset row (see the
 // design note in db.js). Used by copywriterService.js.

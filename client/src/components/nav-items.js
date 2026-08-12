@@ -1,6 +1,6 @@
 import {
   LayoutDashboard, MessageSquare, Bot, BarChart3, Wrench, Zap, Puzzle,
-  BookOpen, ListChecks, Activity, Settings, Building2, Store, Code2, FolderOpen,
+  BookOpen, ListChecks, Activity, Settings, Building2, Store, Code2, FolderOpen, Sparkles,
 } from "lucide-react";
 
 export const NAV = [
@@ -15,6 +15,7 @@ export const NAV = [
   { to: "/app/automations", label: "Automations", icon: Zap },
   { to: "/app/integrations", label: "Integrations", icon: Puzzle },
   { to: "/app/files", label: "Files", icon: FolderOpen },
+  { to: "/app/content-studio", label: "Content Studio", icon: Sparkles },
   { to: "/app/knowledge", label: "Knowledge", icon: BookOpen },
   { to: "/app/tasks", label: "Tasks", icon: ListChecks },
   { to: "/app/activity", label: "Activity", icon: Activity },

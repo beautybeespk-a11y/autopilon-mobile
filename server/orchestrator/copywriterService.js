@@ -1,5 +1,5 @@
 import { chatComplete } from "../ai/provider.js";
-import { createTextAsset } from "./contentService.js";
+import { createTextAsset, recordFailedTextGeneration } from "./contentService.js";
 import { getBrand } from "./brandService.js";
 import { enforceQuota } from "./billing.js";
 
@@ -71,7 +71,21 @@ export async function generateCopy({ userId, orgId, workspaceId, projectId, agen
   const systemPrompt = buildSystemPrompt({ type: contentType, brand, tone, targetAudience });
   const userMessage = keywords?.length ? `${brief}\n\nKeywords to incorporate: ${keywords.join(", ")}` : brief;
 
-  const completion = await chatComplete({ systemPrompt, messages: [{ role: "user", content: userMessage }] });
+  let completion;
+  try {
+    completion = await chatComplete({ systemPrompt, messages: [{ role: "user", content: userMessage }] });
+  } catch (err) {
+    // Same "failures are visible in the library, never silently dropped"
+    // principle generateImageAsset already follows — this was previously
+    // missing here, so a copy-generation failure just threw with nothing
+    // to show for it.
+    const assetId = recordFailedTextGeneration({
+      userId, orgId, workspaceId, projectId, agentId, contentType,
+      title: title || brief.slice(0, 60), prompt: brief,
+      errorMessage: err.code === "PROVIDER_NOT_CONFIGURED" ? (err.detail || err.message) : "Copy generation failed.",
+    });
+    throw Object.assign(err, { assetId });
+  }
 
   return createTextAsset({
     userId, orgId, workspaceId, projectId, agentId, contentType,
