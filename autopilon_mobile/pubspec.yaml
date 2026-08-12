@@ -82,7 +82,13 @@ dependencies:
   # manifest; iOS needs NSMicrophoneUsageDescription in Info.plist — add
   # both wherever the android/ and ios/ platform folders actually live (see
   # the image_picker note above for why they aren't in this repo).
-  record: ^5.1.2
+  # Pinned to 7.x specifically — 5.1.2 pulled in a record_linux release
+  # whose version had drifted out of sync with record_platform_interface
+  # (a packaging issue in that old release, not our code), breaking
+  # compilation. record's public API used here (AudioRecorder, RecordConfig,
+  # start/stop/cancel/hasPermission) has been stable since 5.0.0, so this
+  # jump doesn't need any code changes.
+  record: ^7.1.1
   audioplayers: ^6.1.0
 
   cupertino_icons: ^1.0.8
