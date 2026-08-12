@@ -98,7 +98,11 @@ dependencies:
   # reliable across Android versions than trying to open an arbitrary file
   # type directly ourselves.
   file_picker: ^11.0.3
-  share_plus: ^13.3.0
+  # Pinned below latest (13.x) specifically — 13.x's win32 requirement
+  # (^6.0.1) conflicts with file_picker's (^5.9.0); 12.0.2's win32 ^5.5.3
+  # overlaps both. Still has the SharePlus.instance.share(ShareParams(...))
+  # API this code uses (introduced in 11.0.0, unchanged through 12.x).
+  share_plus: ^12.0.2
 
   cupertino_icons: ^1.0.8
 
