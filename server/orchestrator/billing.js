@@ -74,7 +74,12 @@ export function setBillingMode(orgId, mode) {
 
 function usageColumnFor(type) {
   return { ai_request: "aiRequests", prompt_tokens: "promptTokens", completion_tokens: "completionTokens",
-    automation_execution: "automationExecutions", tool_call: "toolCalls", api_call: "apiCalls" }[type];
+    automation_execution: "automationExecutions", tool_call: "toolCalls", api_call: "apiCalls",
+    // Phase 15 — Content Studio. Analytics-only counters; the actual quota
+    // gate is still the existing maxAiRequests check (every content
+    // generation also records an 'ai_request' alongside its specific type).
+    image_generation: "imageGenerations", video_generation: "videoGenerations",
+    audio_generation: "audioGenerations", content_text_generation: "contentTextGenerations" }[type];
 }
 
 export function recordUsage(orgId, type, quantity = 1, metadata = null) {
@@ -93,7 +98,8 @@ export function recordUsage(orgId, type, quantity = 1, metadata = null) {
 export function getUsage(orgId, period = currentPeriod()) {
   return (
     db.prepare("SELECT * FROM organization_usage WHERE orgId = ? AND period = ?").get(orgId, period) ||
-    { orgId, period, aiRequests: 0, promptTokens: 0, completionTokens: 0, automationExecutions: 0, toolCalls: 0, apiCalls: 0 }
+    { orgId, period, aiRequests: 0, promptTokens: 0, completionTokens: 0, automationExecutions: 0, toolCalls: 0, apiCalls: 0,
+      imageGenerations: 0, videoGenerations: 0, audioGenerations: 0, contentTextGenerations: 0 }
   );
 }
 

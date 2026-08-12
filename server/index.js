@@ -52,6 +52,7 @@ import confirmationRoutes, { sweepExpiredConfirmations } from "./routes/confirma
 import researchRoutes from "./routes/research.js";
 import voiceRoutes from "./routes/voice.js";
 import filesRoutes from "./routes/files.js";
+import contentRoutes from "./routes/content.js";
 import fileSharesRoutes from "./routes/fileShares.js";
 import metaAuthRoutes from "./routes/metaAuth.js";
 import whatsappAuthRoutes from "./routes/whatsappAuth.js";
@@ -146,6 +147,7 @@ app.use("/api/confirmations", confirmationRoutes);
 app.use("/api/research", researchRoutes);
 app.use("/api/voice", voiceRoutes);
 app.use("/api/files", filesRoutes);
+app.use("/api/content", contentRoutes);
 // These must be mounted BEFORE the general "/api/integrations" catalog route
 // below — Express matches by path PREFIX, so that catalog router (which
 // requires login for every request reaching it) would otherwise intercept

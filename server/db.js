@@ -1387,4 +1387,171 @@ db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, statu
 db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
   .run("Find, organize, and analyze files and documents in the centralized File Manager.", "core", "files");
 
+// --- Phase 15: AI Content Studio ---
+// Media assets (images/video/audio/voiceovers) are never stored here —
+// contentAssets.fileId points at the existing `files` table, which owns
+// the actual bytes, permissions, and versioning-at-the-storage-level. Pure
+// text content (captions, ad copy, blog posts, scripts) is stored inline
+// on the asset/generation row instead of wrapped in a File — that's a
+// database column, not a second storage system, and matches how
+// knowledge_items has always stored note/report text directly rather than
+// as a file. A generation IS a version: content_generations doubles as
+// version history (ordered by `version` per assetId) rather than keeping a
+// separate content_versions table that would just mirror it.
+db.exec(`
+CREATE TABLE IF NOT EXISTS content_brands (
+  id               TEXT PRIMARY KEY,
+  orgId            TEXT,
+  ownerId          TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  description      TEXT,
+  tone             TEXT,
+  writingStyle     TEXT,
+  targetAudience   TEXT,
+  preferredWords   TEXT NOT NULL DEFAULT '[]',
+  avoidWords       TEXT NOT NULL DEFAULT '[]',
+  ctaStyle         TEXT,
+  guidelines       TEXT,
+  createdAt        TEXT NOT NULL,
+  updatedAt        TEXT NOT NULL,
+  FOREIGN KEY (ownerId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_content_brands_org ON content_brands(orgId);
+CREATE INDEX IF NOT EXISTS idx_content_brands_owner ON content_brands(ownerId);
+
+-- NULL ownerId + isPlatform=1 rows are the built-in seed templates (visible
+-- to everyone); a real ownerId row is a user's own custom template, private
+-- unless later published to the Marketplace (marketplaceAssetId links back
+-- once it is — set by the existing marketplace publish flow, not this table).
+CREATE TABLE IF NOT EXISTS content_templates (
+  id                  TEXT PRIMARY KEY,
+  orgId               TEXT,
+  ownerId             TEXT,
+  name                TEXT NOT NULL,
+  description         TEXT,
+  contentType         TEXT NOT NULL,
+  category            TEXT,
+  promptTemplate      TEXT NOT NULL,
+  config              TEXT NOT NULL DEFAULT '{}',
+  isPlatform          INTEGER NOT NULL DEFAULT 0,
+  marketplaceAssetId  TEXT,
+  createdAt           TEXT NOT NULL,
+  updatedAt           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_content_templates_org ON content_templates(orgId);
+CREATE INDEX IF NOT EXISTS idx_content_templates_type ON content_templates(contentType);
+
+CREATE TABLE IF NOT EXISTS content_assets (
+  id              TEXT PRIMARY KEY,
+  orgId           TEXT,
+  workspaceId     TEXT,
+  projectId       TEXT,
+  ownerId         TEXT NOT NULL,
+  creatorUserId   TEXT NOT NULL,
+  agentId         TEXT,
+  contentType     TEXT NOT NULL, -- image|video|audio|voiceover|music|social_post|ad_copy|product_description|blog|email|script|caption|hashtags|ugc_script|campaign_creative
+  title           TEXT NOT NULL,
+  fileId          TEXT,          -- media types: the current version's file in the centralized File System
+  textContent     TEXT,          -- text types: the current version's generated text
+  status          TEXT NOT NULL DEFAULT 'ready', -- queued|processing|ready|failed|cancelled
+  errorMessage    TEXT,
+  currentVersion  INTEGER NOT NULL DEFAULT 1,
+  favorite        INTEGER NOT NULL DEFAULT 0,
+  visibility      TEXT NOT NULL DEFAULT 'private', -- private|workspace|organization
+  publishStatus   TEXT NOT NULL DEFAULT 'draft',   -- draft|published
+  tags            TEXT NOT NULL DEFAULT '[]',
+  trashedAt       TEXT,
+  createdAt       TEXT NOT NULL,
+  updatedAt       TEXT NOT NULL,
+  FOREIGN KEY (ownerId) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_content_assets_owner ON content_assets(ownerId, status);
+CREATE INDEX IF NOT EXISTS idx_content_assets_org ON content_assets(orgId, status);
+CREATE INDEX IF NOT EXISTS idx_content_assets_workspace ON content_assets(workspaceId, status);
+CREATE INDEX IF NOT EXISTS idx_content_assets_project ON content_assets(projectId, status);
+CREATE INDEX IF NOT EXISTS idx_content_assets_type ON content_assets(contentType, status);
+
+-- Every attempt is recorded, including failures — this is both the audit
+-- trail and the version history (a successful generation with a new
+-- 'version' number IS what "regenerate" produces).
+CREATE TABLE IF NOT EXISTS content_generations (
+  id                  TEXT PRIMARY KEY,
+  assetId             TEXT NOT NULL,
+  version             INTEGER NOT NULL,
+  contentType         TEXT NOT NULL,
+  provider            TEXT,
+  model               TEXT,
+  prompt              TEXT,
+  negativePrompt      TEXT,
+  parameters          TEXT NOT NULL DEFAULT '{}', -- aspectRatio, resolution, duration, style, seed, numImages, etc — only what the provider actually supports
+  status              TEXT NOT NULL DEFAULT 'queued', -- queued|processing|ready|failed|cancelled
+  errorMessage        TEXT,
+  fileId              TEXT,   -- this version's resulting file, for media types
+  textContent         TEXT,   -- this version's resulting text, for text types
+  estimatedCostCents  REAL NOT NULL DEFAULT 0,
+  durationMs          INTEGER,
+  creatorUserId       TEXT NOT NULL,
+  agentId             TEXT,
+  createdAt           TEXT NOT NULL,
+  completedAt         TEXT,
+  FOREIGN KEY (assetId) REFERENCES content_assets(id) ON DELETE CASCADE,
+  FOREIGN KEY (fileId) REFERENCES files(id) ON DELETE SET NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_content_generations_unique ON content_generations(assetId, version);
+CREATE INDEX IF NOT EXISTS idx_content_generations_creator ON content_generations(creatorUserId, createdAt);
+`);
+
+// Additive: reuses the EXISTING usage/billing pipeline (organization_usage +
+// recordUsage()/checkQuota() in billing.js) rather than a parallel one —
+// these are analytics-only counters; the actual quota gate content
+// generation goes through is the existing maxAiRequests soft quota (every
+// content generation also records an 'ai_request', same as any other AI
+// call), so no new plan-limit column or enforcement path was needed.
+const orgUsageColsPhase15 = db.prepare("PRAGMA table_info(organization_usage)").all().map((c) => c.name);
+if (!orgUsageColsPhase15.includes("imageGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN imageGenerations INTEGER NOT NULL DEFAULT 0");
+if (!orgUsageColsPhase15.includes("videoGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN videoGenerations INTEGER NOT NULL DEFAULT 0");
+if (!orgUsageColsPhase15.includes("audioGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN audioGenerations INTEGER NOT NULL DEFAULT 0");
+if (!orgUsageColsPhase15.includes("contentTextGenerations")) db.exec("ALTER TABLE organization_usage ADD COLUMN contentTextGenerations INTEGER NOT NULL DEFAULT 0");
+
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("content_studio", "AI Content Studio", "Generate and manage AI images, copywriting, and other content assets.", "core");
+db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
+  .run("Generate and manage AI images, copywriting, and other content assets.", "core", "content_studio");
+
+// Platform seed templates (isPlatform=1, ownerId NULL) — visible to every
+// user, never editable by them (templateService.js enforces that). {{...}}
+// placeholders are filled in by the caller via applyTemplate().
+const seedContentTemplates = [
+  ["tmpl-ig-product-post", "Instagram Product Post", "A caption for a single-product Instagram post.", "caption", "social",
+    "Write an Instagram caption for {{productName}}, a {{productDescription}}. Target audience: {{targetAudience}}. Include a short hook, 2-3 sentences of value, and a call to action.", {}],
+  ["tmpl-ig-reel-script", "Instagram Reel Script", "A short-form vertical video script.", "script", "social",
+    "Write a 20-30 second Instagram Reel script for {{productName}}. Target audience: {{targetAudience}}. Include on-screen text cues and a hook in the first line.", { aspectRatio: "9:16" }],
+  ["tmpl-facebook-ad", "Facebook Ad", "Persuasive ad copy for a Facebook campaign.", "ad_copy", "ads",
+    "Write Facebook ad copy for {{productName}}. Offer: {{offer}}. Target audience: {{targetAudience}}. Include a headline, primary text, and a call to action.", {}],
+  ["tmpl-meta-ad-creative-image", "Meta Ad Creative", "A product ad creative image prompt.", "image", "ads",
+    "A professional advertising photo of {{productName}}, {{productDescription}}, styled for a {{platform}} ad targeting {{targetAudience}}. Clean composition, commercial photography lighting.", { aspectRatio: "1:1" }],
+  ["tmpl-product-launch", "Product Launch", "An announcement caption for a new product.", "caption", "social",
+    "Write an exciting product launch announcement for {{productName}}. What's new: {{whatsNew}}. Target audience: {{targetAudience}}.", {}],
+  ["tmpl-sale-announcement", "Sale Announcement", "A caption announcing a sale or promotion.", "caption", "social",
+    "Write a sale announcement caption. Offer: {{offer}}. Ends: {{endDate}}. Create urgency without sounding pushy.", {}],
+  ["tmpl-ugc-video", "UGC Video", "An authentic, creator-style video script.", "ugc_script", "ugc",
+    "Write a UGC-style video script for {{productName}}. Brand: {{brand}}. Offer: {{offer}}. Tone: {{tone}}. Target platform: {{platform}}.", { aspectRatio: "9:16" }],
+  ["tmpl-product-review", "Product Review Highlights", "Copy summarizing why customers love a product.", "product_description", "social",
+    "Write product description copy for {{productName}} that highlights the kind of things real customers love about it. Target audience: {{targetAudience}}.", {}],
+  ["tmpl-email-campaign", "Email Campaign", "A marketing email with subject line and body.", "email", "email",
+    "Write a marketing email for {{productName}}. Offer: {{offer}}. Target audience: {{targetAudience}}. Include a subject line.", {}],
+  ["tmpl-blog-article", "Blog Article", "A structured, SEO-aware blog post.", "blog", "content",
+    "Write a blog article about {{topic}}. Target audience: {{targetAudience}}. Keywords to include: {{keywords}}.", {}],
+  ["tmpl-youtube-short", "YouTube Short", "A vertical short-form video script.", "script", "social",
+    "Write a YouTube Shorts script (under 60 seconds) for {{productName}}. Target audience: {{targetAudience}}. Strong hook in the first 3 seconds.", { aspectRatio: "9:16" }],
+];
+const insertContentTemplate = db.prepare(
+  `INSERT OR IGNORE INTO content_templates (id, orgId, ownerId, name, description, contentType, category, promptTemplate, config, isPlatform, marketplaceAssetId, createdAt, updatedAt)
+   VALUES (?, NULL, NULL, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)`
+);
+for (const [id, name, description, contentType, category, promptTemplate, config] of seedContentTemplates) {
+  insertContentTemplate.run(id, name, description, contentType, category, promptTemplate, JSON.stringify(config), new Date().toISOString(), new Date().toISOString());
+}
+
 export default db;
