@@ -20,6 +20,7 @@ import '../../features/marketplace/presentation/marketplace_screen.dart';
 import '../../features/marketplace/presentation/marketplace_asset_detail_screen.dart';
 import '../../features/marketplace/presentation/marketplace_installs_screen.dart';
 import '../../features/billing/presentation/billing_screen.dart';
+import '../../features/files/presentation/files_screen.dart';
 
 /// A Listenable that pings go_router's `refreshListenable` whenever auth
 /// status changes, so login/logout immediately re-evaluates `redirect`
@@ -102,6 +103,7 @@ final routerProvider = Provider<GoRouter>((ref) {
                 ],
               ),
               GoRoute(path: 'billing', builder: (context, state) => const BillingScreen()),
+              GoRoute(path: 'files', builder: (context, state) => const FilesScreen()),
             ],
           ),
         ],

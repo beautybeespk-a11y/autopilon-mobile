@@ -91,6 +91,15 @@ dependencies:
   record: ^7.1.1
   audioplayers: ^6.1.0
 
+  # Phase 14 — File Manager. `file_picker` covers the "Document Picker"
+  # requirement (any file type, not just photos — image_picker above stays
+  # for camera/gallery). `share_plus` hands a downloaded file to the OS's
+  # native share/open sheet after fetching its bytes — simpler and more
+  # reliable across Android versions than trying to open an arbitrary file
+  # type directly ourselves.
+  file_picker: ^11.0.3
+  share_plus: ^13.3.0
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

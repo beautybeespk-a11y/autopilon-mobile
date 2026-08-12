@@ -52,9 +52,10 @@ class ApiClient {
   /// Passing a Dio `FormData` body makes Dio compute and send the correct
   /// `multipart/form-data; boundary=...` content type for this request only,
   /// overriding the client's default `application/json` header.
-  Future<ApiResult<T>> uploadFile<T>(String path, File file, {T Function(dynamic)? parse}) async {
+  Future<ApiResult<T>> uploadFile<T>(String path, File file, {Map<String, String>? fields, T Function(dynamic)? parse}) async {
     try {
       final formData = FormData.fromMap({
+        ...?fields,
         'file': await MultipartFile.fromFile(file.path, filename: file.path.split('/').last),
       });
       final res = await _dio.post(path, data: formData);
@@ -106,6 +107,28 @@ class ApiClient {
       }
       // Dio still hands back raw bytes for a JSON error response when
       // responseType is bytes — decode it to surface the real message.
+      String errorMessage = 'Request failed (${res.statusCode}).';
+      try {
+        final decoded = jsonDecode(utf8.decode(res.data as List<int>));
+        if (decoded is Map && decoded['error'] != null) errorMessage = decoded['error'] as String;
+      } catch (_) {
+        // Not decodable JSON — fall back to the generic message above.
+      }
+      return ApiResult.failure(errorMessage, statusCode: res.statusCode);
+    } on DioException catch (e) {
+      return ApiResult.failure(e.message ?? 'Network error.');
+    }
+  }
+
+  /// GETs a raw binary response — used to download a file's actual bytes
+  /// (as opposed to its JSON metadata) so they can be handed to share_plus
+  /// for the OS's native "open with / share / save" sheet.
+  Future<ApiResult<Uint8List>> getBytes(String path) async {
+    try {
+      final res = await _dio.get(path, options: Options(responseType: ResponseType.bytes));
+      if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300) {
+        return ApiResult.success(Uint8List.fromList(res.data as List<int>));
+      }
       String errorMessage = 'Request failed (${res.statusCode}).';
       try {
         final decoded = jsonDecode(utf8.decode(res.data as List<int>));
