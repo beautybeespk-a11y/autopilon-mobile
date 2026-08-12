@@ -73,7 +73,7 @@ class _FilesScreenState extends ConsumerState<FilesScreen> {
               title: const Text('Document'),
               onTap: () async {
                 Navigator.pop(sheetContext);
-                final result = await FilePicker.pickFiles();
+                final result = await FilePicker.platform.pickFiles();
                 final path = result?.files.single.path;
                 if (path != null) await _upload(File(path));
               },
