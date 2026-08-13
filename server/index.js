@@ -65,6 +65,8 @@ import eventWebhookRoutes from "./routes/eventWebhooks.js";
 import { initializeSchedulesOnBoot } from "./automation/scheduler.js";
 import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
+import "./jobs/handlers.js"; // side-effect: registers built-in job handlers
+import { initializeJobProcessor } from "./jobs/jobManager.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -181,6 +183,7 @@ app.listen(PORT, () => {
   console.log(`AI Agent Platform API running on http://localhost:${PORT}`);
   initializeSchedulesOnBoot(runScheduledAutomation);
   initializeQueueProcessor();
+  initializeJobProcessor();
   setInterval(sweepExpiredConfirmations, 60_000); // catch ignored confirmations once a minute
   setInterval(sweepExpiredTrials, 60_000 * 60); // check for ended trials once an hour
 });

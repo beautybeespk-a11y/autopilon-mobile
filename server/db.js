@@ -1567,4 +1567,50 @@ for (const [id, name, description, contentType, category, promptTemplate, config
   insertContentTemplate.run(id, name, description, contentType, category, promptTemplate, JSON.stringify(config), new Date().toISOString(), new Date().toISOString());
 }
 
+// --- Phase 16: generalized Job Manager ---
+// Separate from automation_event_queue (above) on purpose: that queue is
+// specific to workflow execution, already durable, already proven in
+// production use, and stays exactly as-is (no rewrite risk to something
+// working). This `jobs` table is the generic backing store for the new
+// Job Manager (server/jobs/jobManager.js) — future long-running work
+// (batch generation, file processing at scale, video generation once a
+// provider exists) registers here instead of each subsystem inventing its
+// own ad-hoc tracking. Built behind a Queue Provider interface
+// (server/jobs/queueProvider.js) so swapping the in-process adapter for a
+// real Redis/BullMQ one later doesn't touch call sites.
+db.exec(`
+CREATE TABLE IF NOT EXISTS jobs (
+  id            TEXT PRIMARY KEY,
+  type          TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'queued', -- queued|running|paused|completed|failed|cancelled|dead_letter
+  priority      INTEGER NOT NULL DEFAULT 0,      -- higher runs first
+  orgId         TEXT,
+  workspaceId   TEXT,
+  userId        TEXT,
+  agentId       TEXT,
+  automationId  TEXT,
+  payload       TEXT NOT NULL DEFAULT '{}',
+  result        TEXT,
+  progress      INTEGER NOT NULL DEFAULT 0,      -- 0-100, best-effort
+  progressNote  TEXT,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  maxAttempts   INTEGER NOT NULL DEFAULT 3,
+  idempotencyKey TEXT,
+  error         TEXT,
+  errorRetryable INTEGER NOT NULL DEFAULT 1,
+  createdAt     TEXT NOT NULL,
+  startedAt     TEXT,
+  completedAt   TEXT,
+  nextAttemptAt TEXT                              -- backoff: don't retry before this time
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, priority DESC, createdAt);
+CREATE INDEX IF NOT EXISTS idx_jobs_org ON jobs(orgId, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(userId, status);
+CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type, status);
+-- A NULL idempotencyKey means "no dedup requested" — SQLite's UNIQUE index
+-- treats every NULL as distinct, so only requests that actually supply a
+-- key collide with each other.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs(idempotencyKey) WHERE idempotencyKey IS NOT NULL;
+`);
+
 export default db;
