@@ -1,5 +1,8 @@
 import db from "../../../db.js";
 import { cryptoRandom } from "../../../middleware.js";
+import { isDuplicateEvent } from "../../../orchestrator/webhookDedup.js";
+
+export { isDuplicateEvent };
 
 // Gets or creates the linked web conversation for a (userId, contactPhone)
 // pair. This is the mechanism that keeps "one unified conversation history"
@@ -41,15 +44,4 @@ export function logWhatsAppMessage({ messageId, waMessageId, direction, type, st
 
 export function updateMessageStatus(waMessageId, status) {
   db.prepare("UPDATE whatsapp_messages SET status = ? WHERE waMessageId = ?").run(status, waMessageId);
-}
-
-// Webhook dedup — returns true if this event was already processed.
-export function isDuplicateEvent(id, eventType) {
-  try {
-    db.prepare("INSERT INTO webhook_events (id, eventType, receivedAt) VALUES (?, ?, ?)")
-      .run(id, eventType, new Date().toISOString());
-    return false;
-  } catch {
-    return true; // primary key collision — Meta redelivered this event
-  }
 }

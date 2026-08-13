@@ -116,7 +116,7 @@ router.post("/generate/copy", async (req, res) => {
     const { contentType, brief, brandId, tone, targetAudience, keywords, orgId, workspaceId, projectId, agentId, title, templateId, templateVariables } = req.body || {};
     let effectiveBrief = brief;
     if (templateId) {
-      const template = getTemplate(templateId);
+      const template = getTemplate(req.session.userId, templateId);
       if (!template) return res.status(404).json({ error: "Template not found." });
       effectiveBrief = applyTemplate(template, templateVariables || {});
     }

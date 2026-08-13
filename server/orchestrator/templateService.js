@@ -21,8 +21,24 @@ export function listTemplates({ userId, orgId, contentType }) {
   return db.prepare(sql).all(...params).map(withConfig);
 }
 
-export function getTemplate(id) {
-  return withConfig(db.prepare("SELECT * FROM content_templates WHERE id = ?").get(id));
+// Same visibility rule as listTemplates() — platform templates are open to
+// everyone, an org's templates to its members, a personal template only to
+// its creator. Fixed alongside a Phase 16 security audit: this used to have
+// NO access check at all, letting any authenticated user read (and, via
+// generate/copy's templateId lookup, exfiltrate the full text of) any
+// other user's or org's private template by id.
+function canAccessTemplate(userId, template) {
+  if (!template) return false;
+  if (template.isPlatform) return true;
+  if (template.ownerId === userId) return true;
+  if (template.orgId) return Boolean(getMembership(template.orgId, userId));
+  return false;
+}
+
+export function getTemplate(userId, id) {
+  const template = db.prepare("SELECT * FROM content_templates WHERE id = ?").get(id);
+  if (!canAccessTemplate(userId, template)) return null;
+  return withConfig(template);
 }
 
 export function createTemplate(userId, { orgId, name, description, contentType, category, promptTemplate, config }) {
@@ -40,7 +56,7 @@ export function createTemplate(userId, { orgId, name, description, contentType, 
     `INSERT INTO content_templates (id, orgId, ownerId, name, description, contentType, category, promptTemplate, config, isPlatform, marketplaceAssetId, createdAt, updatedAt)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)`
   ).run(id, orgId || null, userId, name, description || null, contentType, category || null, promptTemplate, JSON.stringify(config || {}), ts, ts);
-  return getTemplate(id);
+  return getTemplate(userId, id);
 }
 
 export function updateTemplate(userId, id, patch) {
@@ -63,7 +79,7 @@ export function updateTemplate(userId, id, patch) {
   sets.push("updatedAt = ?"); params.push(now());
   params.push(id);
   db.prepare(`UPDATE content_templates SET ${sets.join(", ")} WHERE id = ?`).run(...params);
-  return getTemplate(id);
+  return getTemplate(userId, id);
 }
 
 export function deleteTemplate(userId, id) {

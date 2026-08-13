@@ -1,8 +1,38 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { createNotification } from "./notifications.js";
+import { canAccessAgent } from "./agentManager.js";
+import { canAccessProject } from "./projectManager.js";
+import { canAccessFile } from "./filePermissions.js";
+import { canAccessContent } from "./contentPermissions.js";
 
 const now = () => new Date().toISOString();
+
+// This comments feature is generic across entity types by design (any
+// resource can grow a comment thread later), but that genericity was the
+// bug: neither createComment() nor listComments() checked whether the
+// caller could actually access the (entityType, entityId) they were
+// commenting on — any authenticated user could read and write comments on
+// ANY entity in the system regardless of ownership or org membership.
+// Fixed alongside a Phase 16 security audit by requiring every entity type
+// to resolve through its OWN existing permission check before a comment
+// read/write is allowed; an entityType with no entry here is denied by
+// default rather than allowed by default.
+const ENTITY_ACCESS = {
+  task: (userId, id) => Boolean(db.prepare("SELECT 1 FROM tasks WHERE id = ? AND userId = ?").get(id, userId)),
+  agent: (userId, id) => canAccessAgent(userId, db.prepare("SELECT * FROM agents WHERE id = ?").get(id)),
+  project: (userId, id) => {
+    const project = db.prepare("SELECT * FROM projects WHERE id = ?").get(id);
+    return Boolean(project) && canAccessProject(userId, project);
+  },
+  file: (userId, id) => canAccessFile(userId, db.prepare("SELECT * FROM files WHERE id = ?").get(id), "view"),
+  content: (userId, id) => canAccessContent(userId, db.prepare("SELECT * FROM content_assets WHERE id = ?").get(id), "view"),
+};
+
+export function canAccessEntity(userId, entityType, entityId) {
+  const check = ENTITY_ACCESS[entityType];
+  return Boolean(check && check(userId, entityId));
+}
 
 // Resolves @name or @email fragments in a comment against people the
 // author actually shares an active organization with — mentioning someone
@@ -28,7 +58,16 @@ function resolveMentions(authorUserId, content) {
   return Array.from(matched);
 }
 
+function requireEntityAccess(userId, entityType, entityId) {
+  if (!canAccessEntity(userId, entityType, entityId)) {
+    const err = new Error("You don't have permission to access this.");
+    err.code = "FORBIDDEN";
+    throw err;
+  }
+}
+
 export function createComment(authorUserId, { entityType, entityId, content }) {
+  requireEntityAccess(authorUserId, entityType, entityId);
   if (!content?.trim()) throw new Error("Comment content is required.");
   const mentionedUserIds = resolveMentions(authorUserId, content);
   const id = cryptoRandom();
@@ -48,7 +87,8 @@ export function createComment(authorUserId, { entityType, entityId, content }) {
   return { id, mentionedUserIds };
 }
 
-export function listComments(entityType, entityId) {
+export function listComments(userId, entityType, entityId) {
+  requireEntityAccess(userId, entityType, entityId);
   return db.prepare(
     `SELECT c.*, u.name AS authorName, u.avatar AS authorAvatar FROM comments c
      JOIN users u ON u.id = c.authorUserId

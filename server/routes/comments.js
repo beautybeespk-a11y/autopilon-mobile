@@ -6,7 +6,11 @@ const router = Router();
 router.use(requireAuth);
 
 router.get("/:entityType/:entityId/comments", (req, res) => {
-  res.json(listComments(req.params.entityType, req.params.entityId));
+  try {
+    res.json(listComments(req.session.userId, req.params.entityType, req.params.entityId));
+  } catch (err) {
+    res.status(err.code === "FORBIDDEN" ? 403 : 400).json({ error: err.message });
+  }
 });
 
 router.post("/:entityType/:entityId/comments", (req, res) => {
@@ -14,7 +18,7 @@ router.post("/:entityType/:entityId/comments", (req, res) => {
     const result = createComment(req.session.userId, { entityType: req.params.entityType, entityId: req.params.entityId, content: req.body?.content });
     res.json(result);
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    res.status(err.code === "FORBIDDEN" ? 403 : 400).json({ error: err.message });
   }
 });
 

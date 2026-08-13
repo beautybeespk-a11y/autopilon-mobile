@@ -247,9 +247,13 @@ CREATE TABLE IF NOT EXISTS whatsapp_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_wa_msg_wamessageid ON whatsapp_messages(waMessageId);
 
--- Dedupes webhook deliveries — Meta can and does redeliver the same event.
+-- Dedupes webhook deliveries — Meta/WhatsApp and Stripe both explicitly
+-- document at-least-once delivery (the same event can arrive more than
+-- once). 'id' is the source's own event/message id, namespaced per source
+-- (e.g. "stripe:evt_...") where a source's own ids aren't already globally
+-- unique across sources — see orchestrator/webhookDedup.js.
 CREATE TABLE IF NOT EXISTS webhook_events (
-  id         TEXT PRIMARY KEY, -- the WhatsApp message/status id, so a redelivery collides here
+  id         TEXT PRIMARY KEY,
   eventType  TEXT NOT NULL,
   receivedAt TEXT NOT NULL
 );
