@@ -2,10 +2,15 @@ import { Router } from "express";
 import bcrypt from "bcryptjs";
 import db from "../db.js";
 import { cryptoRandom, logActivity } from "../middleware.js";
+import { rateLimit } from "../orchestrator/rateLimiter.js";
 
 const router = Router();
 
-router.post("/signup", (req, res) => {
+// Credential-stuffing / brute-force protection — tighter than the general
+// API rate limit, and keyed by IP since there's no session yet at this point.
+const authLimiter = rateLimit({ windowMs: 60_000, max: 10, keyFn: (req) => req.ip, label: "auth" });
+
+router.post("/signup", authLimiter, (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "Name, email and password are required." });
   if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
@@ -21,7 +26,7 @@ router.post("/signup", (req, res) => {
   res.json({ user: { id, name, email: email.toLowerCase() } });
 });
 
-router.post("/login", (req, res) => {
+router.post("/login", authLimiter, (req, res) => {
   const { email, password } = req.body || {};
   const user = db.prepare("SELECT * FROM users WHERE email = ?").get((email || "").toLowerCase());
   if (!user || !bcrypt.compareSync(password || "", user.password)) {
@@ -51,7 +56,7 @@ router.get("/me", (req, res) => {
 
 // Phase 1: no email delivery yet. Endpoint acknowledges without leaking which
 // emails exist, so the flow can be wired to a mailer later.
-router.post("/forgot-password", (req, res) => {
+router.post("/forgot-password", authLimiter, (req, res) => {
   res.json({ ok: true, message: "If an account exists for that email, reset instructions will be sent." });
 });
 

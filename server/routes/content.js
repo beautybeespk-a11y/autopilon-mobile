@@ -11,9 +11,12 @@ import {
 import { generateCopy, listCopyTypes } from "../orchestrator/copywriterService.js";
 import { listBrands, getBrand, createBrand, updateBrand, deleteBrand } from "../orchestrator/brandService.js";
 import { listTemplates, getTemplate, createTemplate, updateTemplate, deleteTemplate, applyTemplate } from "../orchestrator/templateService.js";
+import { aiRateLimit, aiConcurrencyLimit } from "../orchestrator/rateLimiter.js";
 
 const router = Router();
 router.use(requireAuth);
+const aiLimiter = aiRateLimit();
+const aiConcurrency = aiConcurrencyLimit();
 
 const ERROR_STATUS = { NOT_FOUND: 404, FORBIDDEN: 403, INVALID: 400, QUOTA_EXCEEDED: 403, UNSUPPORTED: 501 };
 
@@ -86,7 +89,7 @@ router.delete("/templates/:id", (req, res) => {
 
 // --- Generation — "/generate/*" is also a literal prefix, safe before "/:id". ---
 
-router.post("/generate/image", async (req, res) => {
+router.post("/generate/image", aiLimiter, aiConcurrency, async (req, res) => {
   try {
     const { prompt, negativePrompt, provider, model, size, quality, numImages, background, orgId, workspaceId, projectId, folderId, agentId, title } = req.body || {};
     if (!prompt?.trim()) return res.status(400).json({ error: "A prompt is required." });
@@ -99,7 +102,7 @@ router.post("/generate/image", async (req, res) => {
   } catch (err) { handleError(res, err, "Image generation failed."); }
 });
 
-router.post("/generate/voiceover", async (req, res) => {
+router.post("/generate/voiceover", aiLimiter, aiConcurrency, async (req, res) => {
   try {
     const { text, voice, speed, provider, orgId, workspaceId, projectId, folderId, agentId, title } = req.body || {};
     if (!text?.trim()) return res.status(400).json({ error: "text is required." });
@@ -111,7 +114,7 @@ router.post("/generate/voiceover", async (req, res) => {
   } catch (err) { handleError(res, err, "Voiceover generation failed."); }
 });
 
-router.post("/generate/copy", async (req, res) => {
+router.post("/generate/copy", aiLimiter, aiConcurrency, async (req, res) => {
   try {
     const { contentType, brief, brandId, tone, targetAudience, keywords, orgId, workspaceId, projectId, agentId, title, templateId, templateVariables } = req.body || {};
     let effectiveBrief = brief;

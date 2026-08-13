@@ -3,9 +3,12 @@ import db from "../db.js";
 import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
 import { providerStatus, listProviderOptions } from "../ai/provider.js";
 import { handleIncomingMessage } from "../orchestrator/conversationService.js";
+import { aiRateLimit, aiConcurrencyLimit } from "../orchestrator/rateLimiter.js";
 
 const router = Router();
 router.use(requireAuth);
+const aiLimiter = aiRateLimit();
+const aiConcurrency = aiConcurrencyLimit();
 
 router.get("/provider-status", (req, res) => res.json(providerStatus()));
 router.get("/provider-options", (req, res) => res.json(listProviderOptions()));
@@ -27,7 +30,7 @@ router.get("/conversations/:id/messages", (req, res) => {
 });
 
 // Send a message. Creates a conversation if none supplied.
-router.post("/message", async (req, res) => {
+router.post("/message", aiLimiter, aiConcurrency, async (req, res) => {
   const { conversationId, content, agentId, attachmentTitle, attachmentText, attachmentImageId, attachmentFileId } = req.body || {};
   const hasAttachment = Boolean(attachmentTitle && (attachmentText || attachmentImageId || attachmentFileId));
   // Temporary diagnostic — remove once image attachments are confirmed

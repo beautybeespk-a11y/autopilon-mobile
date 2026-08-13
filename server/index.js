@@ -67,6 +67,7 @@ import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
 import "./jobs/handlers.js"; // side-effect: registers built-in job handlers
 import { initializeJobProcessor } from "./jobs/jobManager.js";
+import { rateLimit } from "./orchestrator/rateLimiter.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -101,6 +102,13 @@ app.use(
 );
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// A generous, IP-keyed ceiling across ALL /api traffic — basic abuse/DoS
+// protection, not meant to be felt by any legitimate usage pattern
+// (including webhook bursts from Stripe/Meta/Shopify, which run nowhere
+// near this volume). Endpoint-specific limits (auth, AI generation) are
+// tighter and layered on top of this one, not instead of it.
+app.use("/api", rateLimit({ windowMs: 60_000, max: 300, keyFn: (req) => req.ip, label: "global" }));
 
 // Every genuinely-public route (no session cookie involved at all — an
 // external service or an anonymous share-link visitor) is mounted here,

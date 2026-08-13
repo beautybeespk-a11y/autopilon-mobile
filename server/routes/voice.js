@@ -7,6 +7,7 @@ import db from "../db.js";
 import { requireAuth, logActivity } from "../middleware.js";
 import { sttStatus, ttsStatus, listVoices, transcribeAudio, synthesizeSpeech } from "../ai/speech.js";
 import { recordVoiceUsage, TTS_CENTS_PER_CHAR } from "../orchestrator/voiceUsage.js";
+import { aiRateLimit, aiConcurrencyLimit } from "../orchestrator/rateLimiter.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UPLOAD_DIR = path.join(__dirname, "..", "uploads", "voice");
@@ -26,6 +27,8 @@ const STT_CENTS_PER_SECOND = 0.6 / 60;
 
 const router = Router();
 router.use(requireAuth);
+const aiLimiter = aiRateLimit();
+const aiConcurrency = aiConcurrencyLimit();
 
 router.get("/status", (req, res) => {
   res.json({ stt: sttStatus(), tts: ttsStatus(), voices: listVoices() });
@@ -86,7 +89,7 @@ router.patch("/settings", (req, res) => {
 // /chat/message — this endpoint never talks to the AI Orchestrator itself,
 // so a voice message goes through exactly the same permission/approval/
 // quota/audit path as anything typed, just with an STT step in front of it.
-router.post("/transcribe", upload.single("audio"), async (req, res) => {
+router.post("/transcribe", aiLimiter, aiConcurrency, upload.single("audio"), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No audio uploaded." });
   const { language, agentId, conversationId } = req.body || {};
   const filePath = req.file.path;
@@ -119,7 +122,7 @@ router.post("/transcribe", upload.single("audio"), async (req, res) => {
 // it wants spoken (typically the AI's own reply that already came back from
 // POST /chat/message), so this never needs to know about conversations,
 // tools, or permissions at all.
-router.post("/speak", async (req, res) => {
+router.post("/speak", aiLimiter, aiConcurrency, async (req, res) => {
   const { text, voice, speed, agentId, conversationId } = req.body || {};
   if (!text?.trim()) return res.status(400).json({ error: "text is required." });
   if (text.length > 4000) return res.status(400).json({ error: "Text is too long to speak in one request (max 4000 characters)." });
