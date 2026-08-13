@@ -1,4 +1,12 @@
 import fs from "fs";
+import { resilientFetch } from "../resilientFetch.js";
+
+// Voiceover text can be long (up to 4000 chars, per routes/voice.js's own
+// cap) and transcription audio can run several minutes — the default 30s
+// is too tight for either. retries: 0 for the same reason as image
+// generation: a false timeout retry risks a second, separately-billed
+// synthesis/transcription rather than a free retry.
+const VOICE_RESILIENCE = (circuitKey) => ({ timeoutMs: 60_000, retries: 0, circuitKey });
 
 // Whisper accepts the language as an ISO-639-1 hint but auto-detects when
 // omitted — verbose_json is requested specifically so the detected language
@@ -12,11 +20,11 @@ export async function openaiTranscribe({ filePath, filename, mimeType, apiKey, l
   form.append("response_format", "verbose_json");
   if (language) form.append("language", language);
 
-  const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+  const res = await resilientFetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
     headers: { authorization: `Bearer ${apiKey}` },
     body: form,
-  });
+  }, VOICE_RESILIENCE("openai_stt"));
   if (!res.ok) throw new Error(`OpenAI transcription error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return {
@@ -31,7 +39,7 @@ export async function openaiTranscribe({ filePath, filename, mimeType, apiKey, l
 // per-request by the caller — this just supplies a sane default.
 export async function openaiSynthesize({ text, apiKey, voice, speed }) {
   const model = process.env.OPENAI_TTS_MODEL || "tts-1";
-  const res = await fetch("https://api.openai.com/v1/audio/speech", {
+  const res = await resilientFetch("https://api.openai.com/v1/audio/speech", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
@@ -41,7 +49,7 @@ export async function openaiSynthesize({ text, apiKey, voice, speed }) {
       speed: speed || 1.0,
       response_format: "mp3",
     }),
-  });
+  }, VOICE_RESILIENCE("openai_tts"));
   if (!res.ok) throw new Error(`OpenAI speech error ${res.status}: ${await res.text()}`);
   const arrayBuffer = await res.arrayBuffer();
   return { audio: Buffer.from(arrayBuffer), mimeType: "audio/mpeg" };

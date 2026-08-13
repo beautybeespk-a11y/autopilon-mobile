@@ -4,6 +4,7 @@
 // more providers/*.js adapter plus a registry entry here; nothing that
 // calls generateImage()/editImage() has to change.
 import { openaiGenerateImage, openaiEditImage, OPENAI_IMAGE_CAPABILITIES } from "./providers/openaiImage.js";
+import { circuitStatus } from "./resilientFetch.js";
 
 const REGISTRY = {
   openai: {
@@ -12,6 +13,7 @@ const REGISTRY = {
     keyEnv: "OPENAI_API_KEY",
     label: "OpenAI (gpt-image-1)",
     capabilities: OPENAI_IMAGE_CAPABILITIES,
+    circuitKey: "openai_image",
   },
 };
 
@@ -25,7 +27,12 @@ export function imageProviderStatus(name) {
   const entry = REGISTRY[providerName];
   if (!entry) return { configured: false, provider: providerName, reason: `Unknown provider "${providerName}"` };
   const hasKey = Boolean(process.env[entry.keyEnv]);
-  return { configured: hasKey, provider: providerName, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set`, capabilities: entry.capabilities };
+  const circuit = circuitStatus(entry.circuitKey);
+  return {
+    configured: hasKey, provider: providerName, label: entry.label,
+    reason: hasKey ? null : `${entry.keyEnv} is not set`, capabilities: entry.capabilities,
+    healthy: circuit.state !== "open", circuitState: circuit.state,
+  };
 }
 
 // Every image provider this platform could ever support, not just the

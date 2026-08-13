@@ -1,3 +1,5 @@
+import { resilientFetch } from "../resilientFetch.js";
+
 export async function geminiChat({ messages, systemPrompt, apiKey, model: modelOverride }) {
   const model = modelOverride || process.env.GEMINI_MODEL || "gemini-1.5-flash";
   const contents = messages.map((m) => ({
@@ -14,11 +16,11 @@ export async function geminiChat({ messages, systemPrompt, apiKey, model: modelO
     ...(systemPrompt ? { systemInstruction: { parts: [{ text: systemPrompt }] } } : {}),
   };
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-  const res = await fetch(url, {
+  const res = await resilientFetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }, { circuitKey: "gemini_text" });
   if (!res.ok) throw new Error(`Gemini error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   const text = data.candidates?.[0]?.content?.parts?.map((p) => p.text).join("\n") || "";

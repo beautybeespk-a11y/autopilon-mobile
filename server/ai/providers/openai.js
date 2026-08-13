@@ -1,3 +1,5 @@
+import { resilientFetch } from "../resilientFetch.js";
+
 export async function openaiChat({ messages, systemPrompt, apiKey, model: modelOverride }) {
   const model = modelOverride || process.env.OPENAI_MODEL || "gpt-4o-mini";
   const normalized = messages.map((m) => ({
@@ -11,11 +13,11 @@ export async function openaiChat({ messages, systemPrompt, apiKey, model: modelO
       : m.content,
   }));
   const full = systemPrompt ? [{ role: "system", content: systemPrompt }, ...normalized] : normalized;
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+  const res = await resilientFetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({ model, messages: full, max_tokens: 4096 }),
-  });
+  }, { circuitKey: "openai_text" });
   if (!res.ok) throw new Error(`OpenAI error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   let content = data.choices?.[0]?.message?.content;

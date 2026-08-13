@@ -1,6 +1,8 @@
+import { resilientFetch } from "../resilientFetch.js";
+
 export async function anthropicChat({ messages, systemPrompt, apiKey, model: modelOverride }) {
   const model = modelOverride || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await resilientFetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -22,7 +24,7 @@ export async function anthropicChat({ messages, systemPrompt, apiKey, model: mod
           : m.content,
       })),
     }),
-  });
+  }, { circuitKey: "anthropic_text" });
   if (!res.ok) throw new Error(`Anthropic error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   const text = data.content?.filter((b) => b.type === "text").map((b) => b.text).join("\n") || "";

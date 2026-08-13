@@ -4,7 +4,18 @@
 // fetch step). Endpoint reference verified against openai-node's SDK
 // source rather than assumed from memory, since this is exactly the kind
 // of API-shape detail that's easy to get subtly wrong.
+import { resilientFetch } from "../resilientFetch.js";
+
 const DEFAULT_MODEL = "gpt-image-1";
+
+// Image generation is slow (60-90s+ observed in real device testing) and
+// expensive per call — the opposite of what a short-timeout+auto-retry
+// policy is safe for. retries: 0 here specifically: retrying a request
+// that timed out on OUR end but is still being billed/rendered on
+// OpenAI's end would risk generating (and paying for) the image twice.
+// A generous timeout instead of a retry is the safe way to give this the
+// room it actually needs.
+const IMAGE_RESILIENCE = { timeoutMs: 120_000, retries: 0, circuitKey: "openai_image" };
 
 function b64ImagesToBuffers(data) {
   return (data || []).map((d) => ({
@@ -24,11 +35,11 @@ export async function openaiGenerateImage({
     delete body.background;
   }
 
-  const res = await fetch("https://api.openai.com/v1/images/generations", {
+  const res = await resilientFetch("https://api.openai.com/v1/images/generations", {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
     body: JSON.stringify(body),
-  });
+  }, IMAGE_RESILIENCE);
   if (!res.ok) throw new Error(`OpenAI image generation error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return { images: b64ImagesToBuffers(data.data), model };
@@ -50,11 +61,11 @@ export async function openaiEditImage({
   form.append("image", new Blob([imageBuffer], { type: imageMimeType }), "image.png");
   if (maskBuffer) form.append("mask", new Blob([maskBuffer], { type: "image/png" }), "mask.png");
 
-  const res = await fetch("https://api.openai.com/v1/images/edits", {
+  const res = await resilientFetch("https://api.openai.com/v1/images/edits", {
     method: "POST",
     headers: { authorization: `Bearer ${apiKey}` },
     body: form,
-  });
+  }, IMAGE_RESILIENCE);
   if (!res.ok) throw new Error(`OpenAI image edit error ${res.status}: ${await res.text()}`);
   const data = await res.json();
   return { images: b64ImagesToBuffers(data.data), model };

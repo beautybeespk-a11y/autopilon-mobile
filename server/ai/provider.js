@@ -3,11 +3,12 @@
 import { anthropicChat } from "./providers/anthropic.js";
 import { openaiChat } from "./providers/openai.js";
 import { geminiChat } from "./providers/gemini.js";
+import { circuitStatus } from "./resilientFetch.js";
 
 const REGISTRY = {
-  anthropic: { fn: anthropicChat, keyEnv: "ANTHROPIC_API_KEY", label: "Anthropic Claude" },
-  openai:    { fn: openaiChat,    keyEnv: "OPENAI_API_KEY",    label: "OpenAI" },
-  gemini:    { fn: geminiChat,    keyEnv: "GEMINI_API_KEY",    label: "Google Gemini" },
+  anthropic: { fn: anthropicChat, keyEnv: "ANTHROPIC_API_KEY", label: "Anthropic Claude", circuitKey: "anthropic_text" },
+  openai:    { fn: openaiChat,    keyEnv: "OPENAI_API_KEY",    label: "OpenAI",           circuitKey: "openai_text" },
+  gemini:    { fn: geminiChat,    keyEnv: "GEMINI_API_KEY",    label: "Google Gemini",    circuitKey: "gemini_text" },
 };
 
 export function providerStatus() {
@@ -15,7 +16,17 @@ export function providerStatus() {
   const entry = REGISTRY[name];
   if (!entry) return { configured: false, provider: name, reason: `Unknown provider "${name}"` };
   const hasKey = Boolean(process.env[entry.keyEnv]);
-  return { configured: hasKey, provider: name, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set` };
+  const circuit = circuitStatus(entry.circuitKey);
+  return {
+    configured: hasKey, provider: name, label: entry.label,
+    reason: hasKey ? null : `${entry.keyEnv} is not set`,
+    // "configured" and "healthy" are different questions — a provider can
+    // have a valid key but still be temporarily down after repeated
+    // failures (circuit open), which the UI should show distinctly from
+    // "you never set this up."
+    healthy: circuit.state !== "open",
+    circuitState: circuit.state,
+  };
 }
 
 // Lets the Agent Builder show which providers can actually be selected —

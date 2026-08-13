@@ -4,12 +4,13 @@
 // these two registries and a providers/*.js adapter; nothing that calls
 // transcribeAudio()/synthesizeSpeech() below has to change.
 import { openaiTranscribe, openaiSynthesize, OPENAI_VOICES } from "./providers/openaiVoice.js";
+import { circuitStatus } from "./resilientFetch.js";
 
 const STT_REGISTRY = {
-  openai: { fn: openaiTranscribe, keyEnv: "OPENAI_API_KEY", label: "OpenAI Whisper" },
+  openai: { fn: openaiTranscribe, keyEnv: "OPENAI_API_KEY", label: "OpenAI Whisper", circuitKey: "openai_stt" },
 };
 const TTS_REGISTRY = {
-  openai: { fn: openaiSynthesize, keyEnv: "OPENAI_API_KEY", label: "OpenAI TTS", voices: OPENAI_VOICES },
+  openai: { fn: openaiSynthesize, keyEnv: "OPENAI_API_KEY", label: "OpenAI TTS", voices: OPENAI_VOICES, circuitKey: "openai_tts" },
 };
 
 function defaultProviderName(registry, envVar) {
@@ -21,14 +22,22 @@ export function sttStatus() {
   const name = defaultProviderName(STT_REGISTRY, "STT_PROVIDER");
   const entry = STT_REGISTRY[name];
   const hasKey = Boolean(process.env[entry.keyEnv]);
-  return { configured: hasKey, provider: name, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set` };
+  const circuit = circuitStatus(entry.circuitKey);
+  return {
+    configured: hasKey, provider: name, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set`,
+    healthy: circuit.state !== "open", circuitState: circuit.state,
+  };
 }
 
 export function ttsStatus() {
   const name = defaultProviderName(TTS_REGISTRY, "TTS_PROVIDER");
   const entry = TTS_REGISTRY[name];
   const hasKey = Boolean(process.env[entry.keyEnv]);
-  return { configured: hasKey, provider: name, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set` };
+  const circuit = circuitStatus(entry.circuitKey);
+  return {
+    configured: hasKey, provider: name, label: entry.label, reason: hasKey ? null : `${entry.keyEnv} is not set`,
+    healthy: circuit.state !== "open", circuitState: circuit.state,
+  };
 }
 
 export function listVoices() {
