@@ -1685,4 +1685,20 @@ CREATE TABLE IF NOT EXISTS organization_spend_limits (
 );
 `);
 
+// Phase 16 database performance pass — indexes for lookups that were doing
+// full table scans (found via the audit: reverse-lookups and org/workspace
+// scoping filters that had no matching index, only the userId-scoped ones
+// added when each table was created).
+db.exec(`
+CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(userId);
+CREATE INDEX IF NOT EXISTS idx_conv_agent ON conversations(agentId);
+CREATE INDEX IF NOT EXISTS idx_exec_conversation ON tool_executions(conversationId);
+CREATE INDEX IF NOT EXISTS idx_agents_org ON agents(orgId);
+CREATE INDEX IF NOT EXISTS idx_agents_workspace ON agents(workspaceId);
+CREATE INDEX IF NOT EXISTS idx_automations_org ON automations(orgId);
+CREATE INDEX IF NOT EXISTS idx_automations_workspace ON automations(workspaceId);
+CREATE INDEX IF NOT EXISTS idx_activity_org_created ON activity_logs(orgId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_queue_user ON automation_event_queue(userId);
+`);
+
 export default db;

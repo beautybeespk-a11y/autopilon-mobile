@@ -5,7 +5,8 @@ import { applyCustomerBalance } from "./stripeService.js";
 
 const now = () => new Date().toISOString();
 
-export function listAllOrganizations() {
+export function listAllOrganizations({ limit = 200, offset = 0 } = {}) {
+  const cappedLimit = Math.min(Number(limit) || 200, 500);
   return db.prepare(
     `SELECT o.id, o.name, o.status, o.createdAt, u.name AS ownerName, u.email AS ownerEmail,
             s.planId, s.status AS subscriptionStatus, s.trialEndsAt,
@@ -13,8 +14,8 @@ export function listAllOrganizations() {
      FROM organizations o
      LEFT JOIN users u ON u.id = o.ownerId
      LEFT JOIN subscriptions s ON s.orgId = o.id
-     ORDER BY o.createdAt DESC`
-  ).all();
+     ORDER BY o.createdAt DESC LIMIT ? OFFSET ?`
+  ).all(cappedLimit, Math.max(Number(offset) || 0, 0));
 }
 
 export function updatePlan(planId, fields) {

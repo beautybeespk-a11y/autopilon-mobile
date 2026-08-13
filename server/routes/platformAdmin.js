@@ -108,7 +108,7 @@ router.post("/maintenance", (req, res) => {
 });
 
 router.get("/organizations", (req, res) => {
-  res.json(listAllOrganizations());
+  res.json(listAllOrganizations({ limit: req.query.limit, offset: req.query.offset }));
 });
 
 router.get("/plans", (req, res) => {

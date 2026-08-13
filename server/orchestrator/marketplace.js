@@ -24,6 +24,25 @@ function attachLatestVersion(asset) {
   return { ...asset, tags: JSON.parse(asset.tags || "[]"), latestVersion: version ? { ...version, manifest: JSON.parse(version.manifest) } : null };
 }
 
+// Batched equivalent of attachLatestVersion for list views (listAssets,
+// listMyAssets) — one query for every row's latest version instead of one
+// query per row, and skips the (sometimes large) manifest JSON blob that
+// only the single-asset detail view (getAsset -> attachLatestVersion)
+// actually renders.
+function attachLatestVersionsBatch(assets) {
+  if (assets.length === 0) return [];
+  const placeholders = assets.map(() => "?").join(",");
+  const versionRows = db.prepare(
+    `SELECT id, assetId, version, releaseNotes, createdAt FROM (
+       SELECT id, assetId, version, releaseNotes, createdAt,
+              ROW_NUMBER() OVER (PARTITION BY assetId ORDER BY createdAt DESC) AS rn
+       FROM asset_versions WHERE assetId IN (${placeholders})
+     ) WHERE rn = 1`
+  ).all(...assets.map((a) => a.id));
+  const byAsset = new Map(versionRows.map((v) => [v.assetId, v]));
+  return assets.map((asset) => ({ ...asset, tags: JSON.parse(asset.tags || "[]"), latestVersion: byAsset.get(asset.id) || null }));
+}
+
 // Public browse/search — published + public only, unless the viewer is the
 // asset's own creator (who should see their unlisted/private/draft work too).
 export function listAssets(viewerUserId, { query, assetType, categoryId, sort = "recent", limit = 30 } = {}) {
@@ -44,7 +63,7 @@ export function listAssets(viewerUserId, { query, assetType, categoryId, sort = 
   const rows = db.prepare(
     `SELECT * FROM marketplace_assets WHERE ${clauses.join(" AND ")} ORDER BY ${orderBy} LIMIT ?`
   ).all(...params, limit);
-  return rows.map(attachLatestVersion);
+  return attachLatestVersionsBatch(rows);
 }
 
 export function getAsset(viewerUserId, assetId) {
@@ -56,7 +75,8 @@ export function getAsset(viewerUserId, assetId) {
 }
 
 export function listMyAssets(userId) {
-  return db.prepare("SELECT * FROM marketplace_assets WHERE creatorUserId = ? ORDER BY updatedAt DESC").all(userId).map(attachLatestVersion);
+  const rows = db.prepare("SELECT * FROM marketplace_assets WHERE creatorUserId = ? ORDER BY updatedAt DESC").all(userId);
+  return attachLatestVersionsBatch(rows);
 }
 
 function createAssetWithVersion(creatorUserId, { assetType, name, description, categoryId, tags, pricingType, priceCents, license, visibility, manifest, releaseNotes }) {

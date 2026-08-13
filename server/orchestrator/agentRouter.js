@@ -68,11 +68,25 @@ export function findBestAgent(userId, taskDescription, { excludeAgentId } = {}) 
   const agents = db.prepare("SELECT * FROM agents WHERE userId = ? AND status = 'active'").all(userId);
   const words = new Set(taskDescription.toLowerCase().match(/[a-z0-9]+/g) || []);
 
+  // One query for every candidate agent's skills instead of one query per
+  // agent — this used to re-query per agent inside the loop below.
+  const skillsByAgent = new Map();
+  if (agents.length) {
+    const placeholders = agents.map(() => "?").join(",");
+    const rows = db.prepare(
+      `SELECT a.agentId, s.name, s.category FROM skills s JOIN agent_skills a ON a.skillId = s.id WHERE a.agentId IN (${placeholders})`
+    ).all(...agents.map((a) => a.id));
+    for (const row of rows) {
+      if (!skillsByAgent.has(row.agentId)) skillsByAgent.set(row.agentId, []);
+      skillsByAgent.get(row.agentId).push(row);
+    }
+  }
+
   let best = null;
   let bestScore = 0;
   for (const agent of agents) {
     if (agent.id === excludeAgentId) continue;
-    const skills = db.prepare("SELECT s.name, s.category FROM skills s JOIN agent_skills a ON a.skillId = s.id WHERE a.agentId = ?").all(agent.id);
+    const skills = skillsByAgent.get(agent.id) || [];
     const haystack = [agent.name, agent.description, agent.category, ...skills.map((s) => `${s.name} ${s.category}`)].join(" ").toLowerCase();
     const haystackWords = new Set(haystack.match(/[a-z0-9]+/g) || []);
     let score = 0;

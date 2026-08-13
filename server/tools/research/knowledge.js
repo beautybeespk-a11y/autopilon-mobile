@@ -118,7 +118,7 @@ registerTool({
     const readable = readableKnowledgeClause(userId);
     const rows = db.prepare(
       `SELECT id, title, category, tags, userId AS ownerUserId, ownerAgentId, visibility, editable, orgId, workspaceId, crossUserVisibility, crossUserEditable, createdAt
-       FROM knowledge_items WHERE ${readable.sql} ORDER BY createdAt DESC`
+       FROM knowledge_items WHERE ${readable.sql} ORDER BY createdAt DESC LIMIT 200`
     ).all(...readable.params);
     const visible = rows.filter((r) => r.ownerUserId !== userId || !r.ownerAgentId || r.ownerAgentId === agentId || r.visibility === "shared");
     return { items: visible.map((r) => ({ ...r, tags: JSON.parse(r.tags || "[]") })), count: visible.length };
