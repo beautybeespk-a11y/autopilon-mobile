@@ -2,6 +2,7 @@ import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { createNotification } from "./notifications.js";
 import { applyCustomerBalance } from "./stripeService.js";
+import { invalidatePlanCache } from "./billing.js";
 
 const now = () => new Date().toISOString();
 
@@ -41,6 +42,7 @@ export function updatePlan(planId, fields) {
     stripePriceId !== undefined ? 1 : 0, stripePriceId === "" ? null : stripePriceId,
     planId
   );
+  invalidatePlanCache(planId);
   return db.prepare("SELECT * FROM plans WHERE id = ?").get(planId);
 }
 

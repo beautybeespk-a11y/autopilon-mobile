@@ -6,6 +6,7 @@
 import db from "../db.js";
 import crypto from "crypto";
 import { cryptoRandom } from "../middleware.js";
+import { cached, invalidate } from "./cacheProvider.js";
 
 const now = () => new Date().toISOString();
 
@@ -33,6 +34,7 @@ export function createFlag({ key, name, description, enabled = false, rolloutPer
   db.prepare(
     "INSERT INTO feature_flags (id, key, name, description, enabled, rolloutPercent, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(id, key.trim(), name, description || null, enabled ? 1 : 0, Math.max(0, Math.min(100, rolloutPercent)), ts, ts);
+  invalidateFlagCache(key); // a prior "unknown key" evaluation may have cached a null result for this key
   return getFlag(key);
 }
 
@@ -48,6 +50,7 @@ export function updateFlag(key, patch) {
   sets.push("updatedAt = ?"); params.push(now());
   params.push(key);
   db.prepare(`UPDATE feature_flags SET ${sets.join(", ")} WHERE key = ?`).run(...params);
+  invalidateFlagCache(key);
   return getFlag(key);
 }
 
@@ -57,6 +60,7 @@ export function disableFlag(key) { return updateFlag(key, { enabled: false }); }
 
 export function deleteFlag(key) {
   db.prepare("DELETE FROM feature_flags WHERE key = ?").run(key); // feature_flag_overrides cascades via FK
+  invalidateFlagCache(key);
 }
 
 export function setOverride(flagKey, scopeType, scopeId, enabled) {
@@ -68,11 +72,13 @@ export function setOverride(flagKey, scopeType, scopeId, enabled) {
   if (existing) db.prepare("UPDATE feature_flag_overrides SET enabled = ? WHERE id = ?").run(enabled ? 1 : 0, existing.id);
   else db.prepare("INSERT INTO feature_flag_overrides (id, flagKey, scopeType, scopeId, enabled, createdAt) VALUES (?, ?, ?, ?, ?, ?)")
     .run(cryptoRandom(), flagKey, scopeType, scopeId, enabled ? 1 : 0, now());
+  invalidateFlagCache(flagKey);
   return getFlag(flagKey);
 }
 
 export function removeOverride(flagKey, scopeType, scopeId) {
   db.prepare("DELETE FROM feature_flag_overrides WHERE flagKey = ? AND scopeType = ? AND scopeId = ?").run(flagKey, scopeType, scopeId);
+  invalidateFlagCache(flagKey);
   return getFlag(flagKey);
 }
 
@@ -86,18 +92,35 @@ function inRollout(flagKey, seedId, percent) {
   return (hash.readUInt32BE(0) % 100) < percent;
 }
 
+// Evaluated on every isFeatureEnabled() call, which can sit on a hot path
+// (gating behavior inside a request) — cache the flag + its full override
+// list as one unit (2 queries instead of up to 3 per evaluation), not a
+// per-user/org cache entry, since that would grow unbounded with distinct
+// caller ids for no benefit (the override lookup against a small cached
+// list is already O(1)-ish and doesn't need its own cache slot).
+function evaluationData(key) {
+  return cached(`flag_eval:${key}`, 30, () => {
+    const flag = db.prepare("SELECT * FROM feature_flags WHERE key = ?").get(key);
+    if (!flag) return { flag: null };
+    const overrides = db.prepare("SELECT scopeType, scopeId, enabled FROM feature_flag_overrides WHERE flagKey = ?").all(key);
+    return {
+      flag,
+      userOverrides: new Map(overrides.filter((o) => o.scopeType === "user").map((o) => [o.scopeId, Boolean(o.enabled)])),
+      orgOverrides: new Map(overrides.filter((o) => o.scopeType === "org").map((o) => [o.scopeId, Boolean(o.enabled)])),
+    };
+  });
+}
+
+function invalidateFlagCache(key) {
+  invalidate(`flag_eval:${key}`);
+}
+
 export function isFeatureEnabled(key, { userId, orgId } = {}) {
-  const flag = db.prepare("SELECT * FROM feature_flags WHERE key = ?").get(key);
+  const { flag, userOverrides, orgOverrides } = evaluationData(key);
   if (!flag) return false; // unknown key — never silently on
 
-  if (userId) {
-    const userOverride = db.prepare("SELECT enabled FROM feature_flag_overrides WHERE flagKey = ? AND scopeType = 'user' AND scopeId = ?").get(key, userId);
-    if (userOverride) return Boolean(userOverride.enabled);
-  }
-  if (orgId) {
-    const orgOverride = db.prepare("SELECT enabled FROM feature_flag_overrides WHERE flagKey = ? AND scopeType = 'org' AND scopeId = ?").get(key, orgId);
-    if (orgOverride) return Boolean(orgOverride.enabled);
-  }
+  if (userId && userOverrides.has(userId)) return userOverrides.get(userId);
+  if (orgId && orgOverrides.has(orgId)) return orgOverrides.get(orgId);
   if (!flag.enabled) return false;
   const seedId = userId || orgId;
   if (!seedId) return flag.rolloutPercent >= 100; // nothing to bucket by — only a fully-on flag applies anonymously

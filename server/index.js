@@ -103,8 +103,6 @@ app.use(
   })
 );
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
-
 // Maintenance mode gate (Phase 16 §35) — checked on every request before
 // any feature router runs. Health checks, auth, and every genuinely-public
 // webhook stay reachable regardless (an external service retrying a

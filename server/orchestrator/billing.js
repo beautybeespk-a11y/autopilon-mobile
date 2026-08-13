@@ -1,6 +1,7 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { createNotification } from "./notifications.js";
+import { cached, invalidate } from "./cacheProvider.js";
 
 const now = () => new Date().toISOString();
 const currentPeriod = () => new Date().toISOString().slice(0, 7); // 'YYYY-MM'
@@ -21,8 +22,19 @@ function periodBounds() {
   return { start, end };
 }
 
+// Plan definitions are near-static reference data read on every single
+// quota check (every AI request, every agent/automation create) — a prime
+// hot-path cache target, unlike usage counts or spend totals which must
+// stay live. 60s TTL: an admin changing a plan's limits doesn't need to
+// take effect mid-second, and updatePlan() (platformAdmin.js) invalidates
+// this explicitly anyway, so the TTL is just a safety net, not the only
+// way this goes fresh.
 export function getPlan(planId) {
-  return db.prepare("SELECT * FROM plans WHERE id = ?").get(planId);
+  return cached(`plan:${planId}`, 60, () => db.prepare("SELECT * FROM plans WHERE id = ?").get(planId));
+}
+
+export function invalidatePlanCache(planId) {
+  invalidate(`plan:${planId}`);
 }
 
 export function listPlans() {

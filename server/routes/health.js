@@ -15,6 +15,7 @@ import { audioProviderStatus } from "../ai/audioProvider.js";
 import { storageStatus } from "../storage/provider.js";
 import { queueProviderStatus } from "../jobs/queueProvider.js";
 import { createJob, getJob, jobStats, processJobsTick } from "../jobs/jobManager.js";
+import { cacheProviderStatus, getCacheProvider } from "../orchestrator/cacheProvider.js";
 
 const router = Router();
 
@@ -117,6 +118,7 @@ router.get("/", async (req, res) => {
     storage: storageStatus(),
     queue: { provider: queueProviderStatus(), jobs: jobStats() },
     ai: { text: providerStatus(), image: imageProviderStatus(), stt: sttStatus(), tts: ttsStatus() },
+    cache: { ...cacheProviderStatus(), entries: getCacheProvider().configured ? getCacheProvider().size() : null },
   });
 });
 
