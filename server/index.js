@@ -62,6 +62,7 @@ import woocommerceAuthRoutes from "./routes/woocommerceAuth.js";
 import gmailAuthRoutes from "./routes/gmailAuth.js";
 import automationRoutes from "./routes/automations.js";
 import eventWebhookRoutes from "./routes/eventWebhooks.js";
+import healthRoutes from "./routes/health.js";
 import { initializeSchedulesOnBoot } from "./automation/scheduler.js";
 import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
@@ -128,6 +129,15 @@ app.use("/api/stripe", stripeWebhookRoutes);
 app.use("/api/integrations/whatsapp", whatsappWebhookRoutes);
 app.use("/api/integrations/shopify", shopifyWebhookRoutes);
 app.use("/api/share", fileSharesRoutes);
+// Same reasoning as the block above — health.js's /live and /ready must be
+// reachable with no session (infra liveness/readiness probes can't
+// authenticate), so this has to be mounted here too, not down with the
+// rest of the routes below billingRoutes/couponRoutes/workspaceRoutes/
+// projectRoutes' blanket requireAuth. health.js still gates its OWN deeper
+// diagnostic sub-routes (/database, /queue, /storage, /ai, /integrations)
+// behind requireAuth + requirePlatformAdmin internally — mounting early
+// only affects /live and /ready's reachability, not what's protected.
+app.use("/api/health", healthRoutes);
 
 app.use("/api/auth", authRoutes);
 app.use("/api/chat", chatRoutes);
