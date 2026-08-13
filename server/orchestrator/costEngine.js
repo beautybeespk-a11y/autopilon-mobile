@@ -1,4 +1,5 @@
 import db from "../db.js";
+import { recordUsage } from "./billing.js";
 
 // Representative published per-provider rates, in dollars per 1,000,000
 // tokens. These are approximate — actual cost depends on the exact model
@@ -13,10 +14,37 @@ const RATES_PER_MILLION_TOKENS = {
   gemini: { prompt: 0.075, completion: 0.3 },      // Gemini Flash-class pricing
 };
 
-function estimateCostCents(provider, promptTokens, completionTokens) {
+// Exported (Phase 16) so any call site recording prompt/completion token
+// usage can compute and store a real costCents figure on the usage_records
+// row at write time — costControls.js's spend-limit checks need a plain
+// SUM(costCents) to be accurate, which only works if it's populated
+// everywhere a cost is known, not just here.
+export function estimateCostCents(provider, promptTokens, completionTokens) {
   const rates = RATES_PER_MILLION_TOKENS[provider] || RATES_PER_MILLION_TOKENS.anthropic;
   const dollars = (promptTokens / 1_000_000) * rates.prompt + (completionTokens / 1_000_000) * rates.completion;
   return Math.round(dollars * 100);
+}
+
+// Shared by every text-generation call site (chat's orchestrate(), automation
+// step execution, Content Studio's copywriter) so the ai_request + prompt/
+// completion token bookkeeping — including splitting the one estimated
+// dollar cost proportionally across the two token rows so a plain
+// SUM(costCents) adds up exactly, without rounding drift — is written once,
+// not reimplemented at each call site with room to drift out of sync.
+// recordRequest: false when the caller already records its own "ai_request"
+// tally elsewhere for this same generation (Content Studio's copywriter
+// does, via createTextAsset()/recordGenerationUsage()) — avoids double-
+// counting the request count while still recording the token-level cost,
+// which nothing else computes for text generation.
+export function recordAiTextUsage(orgId, { provider, promptTokens = 0, completionTokens = 0, agentId = null, userId = null, automationId = null, recordRequest = true }) {
+  if (!orgId) return;
+  const usageMeta = { provider, agentId, userId };
+  const scope = { agentId, userId, automationId };
+  if (recordRequest) recordUsage(orgId, "ai_request", 1, usageMeta, scope);
+  const totalCostCents = estimateCostCents(provider, promptTokens, completionTokens);
+  const promptShare = completionTokens ? Math.round(totalCostCents * (promptTokens / (promptTokens + completionTokens))) : totalCostCents;
+  if (promptTokens) recordUsage(orgId, "prompt_tokens", promptTokens, usageMeta, { ...scope, costCents: promptShare });
+  if (completionTokens) recordUsage(orgId, "completion_tokens", completionTokens, usageMeta, { ...scope, costCents: totalCostCents - (promptTokens ? promptShare : 0) });
 }
 
 function parseMeta(row) {
@@ -66,6 +94,28 @@ export function getCostBreakdown(orgId, { sinceDays = 30 } = {}) {
     if (b.agentId) byAgent[b.agentId] = (byAgent[b.agentId] || 0) + cents;
     if (b.userId) byUser[b.userId] = (byUser[b.userId] || 0) + cents;
     byDay[b.day] = (byDay[b.day] || 0) + cents;
+  }
+
+  // Phase 15 media generation (image/video/audio) isn't token-based — it's
+  // a flat per-generation cost already computed and stored directly as
+  // costCents on the usage_records row (see contentService.js), not
+  // estimated here from a rate table. Folded into the same totals/byAgent/
+  // byUser/byDay shape using the real columns added in Phase 16, not
+  // metadata parsing. content_text_generation is deliberately excluded —
+  // Content Studio copy's actual cost is captured via its own
+  // prompt_tokens/completion_tokens events above, so including it here too
+  // would double-count the same generation.
+  const mediaRows = db.prepare(
+    `SELECT costCents, agentId, userId, createdAt FROM usage_records
+     WHERE orgId = ? AND type IN ('image_generation', 'video_generation', 'audio_generation') AND createdAt > ? AND costCents > 0`
+  ).all(orgId, since);
+  for (const row of mediaRows) {
+    totalCents += row.costCents;
+    byProvider.media = (byProvider.media || 0) + row.costCents;
+    if (row.agentId) byAgent[row.agentId] = (byAgent[row.agentId] || 0) + row.costCents;
+    if (row.userId) byUser[row.userId] = (byUser[row.userId] || 0) + row.costCents;
+    const day = row.createdAt.slice(0, 10);
+    byDay[day] = (byDay[day] || 0) + row.costCents;
   }
 
   const agentNames = Object.keys(byAgent).length

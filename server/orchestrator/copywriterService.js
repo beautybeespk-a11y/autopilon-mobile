@@ -2,6 +2,8 @@ import { chatComplete } from "../ai/provider.js";
 import { createTextAsset, recordFailedTextGeneration } from "./contentService.js";
 import { getBrand } from "./brandService.js";
 import { enforceQuota } from "./billing.js";
+import { enforceSpendLimit } from "./costControls.js";
+import { recordAiTextUsage } from "./costEngine.js";
 
 // Every entry maps a content_assets.contentType to how the Copywriter
 // should brief the model — reuses chatComplete() (ai/provider.js) exactly
@@ -65,7 +67,10 @@ export async function generateCopy({ userId, orgId, workspaceId, projectId, agen
   // Checked BEFORE the provider call, not after — createTextAsset() below
   // also enforces this, but by then the (billable) generation would have
   // already happened. Quota must gate the spend, not just the bookkeeping.
-  if (orgId) enforceQuota(orgId, "maxAiRequests", "AI requests");
+  if (orgId) {
+    enforceQuota(orgId, "maxAiRequests", "AI requests");
+    enforceSpendLimit(orgId, { agentId, userId });
+  }
 
   const brand = brandId ? getBrand(userId, brandId) : null;
   const systemPrompt = buildSystemPrompt({ type: contentType, brand, tone, targetAudience });
@@ -87,11 +92,26 @@ export async function generateCopy({ userId, orgId, workspaceId, projectId, agen
     throw Object.assign(err, { assetId });
   }
 
+  const provider = process.env.AI_PROVIDER || "anthropic";
+  // createTextAsset() below already records the "ai_request" tally for
+  // this generation (via recordGenerationUsage) — recordRequest: false so
+  // this only adds the token-level cost, which nothing else computes for
+  // Content Studio text generation (it was previously hardcoded to
+  // costCents: 0, meaning copy generation cost was invisible everywhere).
+  if (orgId) {
+    recordAiTextUsage(orgId, {
+      provider, agentId: agentId || null, userId,
+      promptTokens: completion.usage?.promptTokens || 0,
+      completionTokens: completion.usage?.completionTokens || 0,
+      recordRequest: false,
+    });
+  }
+
   return createTextAsset({
     userId, orgId, workspaceId, projectId, agentId, contentType,
     title: title || brief.slice(0, 60),
     textContent: completion.text,
-    provider: process.env.AI_PROVIDER || "anthropic",
+    provider,
     prompt: brief,
   });
 }

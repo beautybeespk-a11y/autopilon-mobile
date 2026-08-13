@@ -4,6 +4,10 @@ import { chatComplete } from "../ai/provider.js";
 import { listToolsForSkills, getTool } from "../tools/registry.js";
 import { getAgentSkillIds } from "./permissions.js";
 import { runTool } from "./executor.js";
+import { enforceQuota } from "./billing.js";
+import { enforceSpendLimit } from "./costControls.js";
+import { recordAiTextUsage } from "./costEngine.js";
+import { resolveOrgId } from "./voiceUsage.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -126,7 +130,22 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const trace = [traceStep("planning", null, "active")];
   const skillIds = getAgentSkillIds(agentId);
   const availableTools = listToolsForSkills(skillIds);
-  const modelChoice = agentId ? db.prepare("SELECT aiProvider, aiModel FROM agents WHERE id = ?").get(agentId) : null;
+  const modelChoice = agentId ? db.prepare("SELECT aiProvider, aiModel, orgId FROM agents WHERE id = ?").get(agentId) : null;
+
+  // Chat is the highest-volume AI path in the app and, until this pass, was
+  // the one place that called chatComplete() directly with no quota check
+  // and no usage/cost recording at all — every other generation surface
+  // (Content Studio, automations) went through billing.js, this didn't.
+  // orgId must be the org the AGENT belongs to, not just any org the user
+  // happens to be a member of — a user in multiple orgs chatting through an
+  // org-B agent must never be billed/blocked against org A. Only fall back
+  // to the user's default org (voiceUsage.js's resolveOrgId) for personal
+  // agents that aren't scoped to any org at all.
+  const orgId = modelChoice?.orgId || resolveOrgId(userId);
+  if (orgId) {
+    enforceQuota(orgId, "maxAiRequests", "AI requests");
+    enforceSpendLimit(orgId, { agentId, userId });
+  }
 
   const systemPrompt = buildSystemPrompt({ agentSystemPrompt, availableTools });
   let planId = null;
@@ -171,11 +190,22 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const toolResults = [];
 
   while (stepsRun < MAX_STEPS) {
+    const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
     const completion = await chatComplete({
       messages: conversationForModel, systemPrompt,
       provider: modelChoice?.aiProvider || undefined,
       model: modelChoice?.aiModel || undefined,
     });
+    // Every real chatComplete() call in this loop is billable — recorded
+    // every iteration, not just once per user message, since a multi-step
+    // tool-calling turn can call the model several times.
+    if (orgId) {
+      recordAiTextUsage(orgId, {
+        provider, agentId: agentId || null, userId,
+        promptTokens: completion.usage?.promptTokens || 0,
+        completionTokens: completion.usage?.completionTokens || 0,
+      });
+    }
     // Every provider adapter returns { text, usage } — standardized so this
     // loop (and salvageMalformedToolCall below, which regexes the original
     // text) never has to special-case a given provider's return shape.

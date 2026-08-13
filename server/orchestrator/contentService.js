@@ -5,6 +5,7 @@ import { synthesizeSpeech } from "../ai/speech.js";
 import { uploadFile, downloadFile } from "./fileService.js";
 import { canAccessContent, readableContentClause } from "./contentPermissions.js";
 import { enforceQuota, recordUsage } from "./billing.js";
+import { enforceSpendLimit } from "./costControls.js";
 import { recordVoiceUsage, TTS_CENTS_PER_CHAR } from "./voiceUsage.js";
 import { publishEvent } from "../automation/triggers.js";
 
@@ -39,15 +40,17 @@ function withTags(asset) {
 // is made — reuses the EXISTING billing/quota functions (spec §25: "Do NOT
 // create a separate billing path"). Soft quota, same as every other AI call
 // in this codebase: never blocks, just tracked and warned on at thresholds.
-function checkGenerationQuota(orgId) {
+function checkGenerationQuota(orgId, { agentId, userId } = {}) {
   enforceQuota(orgId, "maxAiRequests", "AI requests");
+  enforceSpendLimit(orgId, { agentId, userId });
 }
 
-function recordGenerationUsage({ orgId, kind, costCents }) {
-  recordUsage(orgId, "ai_request", 1);
+function recordGenerationUsage({ orgId, kind, costCents, agentId, userId }) {
+  const scope = { agentId: agentId || null, userId: userId || null };
+  recordUsage(orgId, "ai_request", 1, null, scope);
   const typeMap = { image: "image_generation", video: "video_generation", audio: "audio_generation", text: "content_text_generation" };
   const usageType = typeMap[kind];
-  if (usageType) recordUsage(orgId, usageType, 1, { costCents });
+  if (usageType) recordUsage(orgId, usageType, 1, { costCents }, { ...scope, costCents });
 }
 
 function insertAsset({ orgId, workspaceId, projectId, ownerId, creatorUserId, agentId, contentType, title, fileId, textContent, status, errorMessage }) {
@@ -90,13 +93,13 @@ export function recordFailedTextGeneration({ userId, orgId, workspaceId, project
 // involvement at all, since it's just text living on the asset row (see the
 // design note in db.js). Used by copywriterService.js.
 export function createTextAsset({ userId, orgId, workspaceId, projectId, agentId, contentType, title, textContent, provider, model, prompt }) {
-  if (orgId) checkGenerationQuota(orgId);
+  if (orgId) checkGenerationQuota(orgId, { agentId, userId });
   const assetId = insertAsset({
     orgId, workspaceId, projectId, ownerId: userId, creatorUserId: userId, agentId, contentType, title,
     fileId: null, textContent, status: "ready",
   });
   insertGeneration({ assetId, version: 1, contentType, provider, model, prompt, parameters: {}, status: "ready", textContent, creatorUserId: userId, agentId });
-  if (orgId) recordGenerationUsage({ orgId, kind: "text", costCents: 0 });
+  if (orgId) recordGenerationUsage({ orgId, kind: "text", costCents: 0, agentId, userId });
   publishEvent(userId, "content", "content_generated", { assetId, contentType });
   return withTags(getAsset(assetId));
 }
@@ -106,7 +109,7 @@ export function createTextAsset({ userId, orgId, workspaceId, projectId, agentId
 // stored through the EXISTING File System (uploadFile()), never a second
 // storage path.
 export async function generateImageAsset({ userId, orgId, workspaceId, projectId, folderId, agentId, prompt, negativePrompt, provider, model, size, quality, numImages = 1, background, title }) {
-  if (orgId) checkGenerationQuota(orgId);
+  if (orgId) checkGenerationQuota(orgId, { agentId, userId });
   const start = Date.now();
   let result;
   try {
@@ -143,7 +146,7 @@ export async function generateImageAsset({ userId, orgId, workspaceId, projectId
       parameters: { size, quality, numImages, background }, status: "ready", fileId: file.id,
       estimatedCostCents: costCentsEach, durationMs, creatorUserId: userId, agentId,
     });
-    if (orgId) recordGenerationUsage({ orgId, kind: "image", costCents: costCentsEach });
+    if (orgId) recordGenerationUsage({ orgId, kind: "image", costCents: costCentsEach, agentId, userId });
     publishEvent(userId, "content", "content_generated", { assetId, contentType: "image", fileId: file.id });
     assets.push(withTags(getAsset(assetId)));
   }
@@ -160,7 +163,7 @@ export async function regenerateImageAsset(userId, assetId, { prompt, negativePr
     err.code = "INVALID";
     throw err;
   }
-  if (asset.orgId) checkGenerationQuota(asset.orgId);
+  if (asset.orgId) checkGenerationQuota(asset.orgId, { agentId: asset.agentId, userId });
 
   const start = Date.now();
   const effectivePrompt = prompt || db.prepare("SELECT prompt FROM content_generations WHERE assetId = ? ORDER BY version DESC LIMIT 1").get(assetId)?.prompt;
@@ -191,7 +194,7 @@ export async function regenerateImageAsset(userId, assetId, { prompt, negativePr
     parameters: { size, quality, background }, status: "ready", fileId: file.id, estimatedCostCents: 4, durationMs, creatorUserId: userId,
   });
   db.prepare("UPDATE content_assets SET fileId = ?, currentVersion = ?, status = 'ready', updatedAt = ? WHERE id = ?").run(file.id, nextVersion, now(), assetId);
-  if (asset.orgId) recordGenerationUsage({ orgId: asset.orgId, kind: "image", costCents: 4 });
+  if (asset.orgId) recordGenerationUsage({ orgId: asset.orgId, kind: "image", costCents: 4, agentId: asset.agentId, userId });
   publishEvent(userId, "content", "content_generated", { assetId, contentType: "image", fileId: file.id, version: nextVersion });
   return withTags(getAsset(assetId));
 }
@@ -208,7 +211,7 @@ export async function generateVoiceoverAsset({ userId, orgId, workspaceId, proje
     err.code = "INVALID";
     throw err;
   }
-  if (orgId) checkGenerationQuota(orgId);
+  if (orgId) checkGenerationQuota(orgId, { agentId, userId });
   const start = Date.now();
   let result;
   try {
@@ -240,7 +243,7 @@ export async function generateVoiceoverAsset({ userId, orgId, workspaceId, proje
     parameters: { voice, speed }, status: "ready", fileId: file.id, estimatedCostCents: costCents, durationMs, creatorUserId: userId, agentId,
   });
   recordVoiceUsage({ userId, kind: "tts", provider: result.provider, characters: text.length, estimatedCostCents: costCents, agentId });
-  if (orgId) recordGenerationUsage({ orgId, kind: "audio", costCents });
+  if (orgId) recordGenerationUsage({ orgId, kind: "audio", costCents, agentId, userId });
   publishEvent(userId, "content", "content_generated", { assetId, contentType: "voiceover", fileId: file.id });
   return withTags(getAsset(assetId));
 }

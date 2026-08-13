@@ -82,12 +82,18 @@ function usageColumnFor(type) {
     audio_generation: "audioGenerations", content_text_generation: "contentTextGenerations" }[type];
 }
 
-export function recordUsage(orgId, type, quantity = 1, metadata = null) {
+// scope: optional { costCents, agentId, userId, automationId } — additive,
+// every existing call site that doesn't pass it keeps recording exactly as
+// it always has (costCents defaults to 0, the rest to NULL). This is what
+// costControls.js's spend-limit checks actually query against.
+export function recordUsage(orgId, type, quantity = 1, metadata = null, scope = {}) {
   if (!orgId) return; // no org context — nothing to meter, by design
   const column = usageColumnFor(type);
   if (!column) throw new Error(`Unknown usage type "${type}".`);
-  db.prepare("INSERT INTO usage_records (id, orgId, type, quantity, metadata, createdAt) VALUES (?, ?, ?, ?, ?, ?)")
-    .run(cryptoRandom(), orgId, type, quantity, metadata ? JSON.stringify(metadata) : null, now());
+  const { costCents = 0, agentId = null, userId = null, automationId = null } = scope;
+  db.prepare(
+    "INSERT INTO usage_records (id, orgId, type, quantity, metadata, costCents, agentId, userId, automationId, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+  ).run(cryptoRandom(), orgId, type, quantity, metadata ? JSON.stringify(metadata) : null, costCents, agentId, userId, automationId, now());
   const period = currentPeriod();
   db.prepare(
     `INSERT INTO organization_usage (orgId, period, ${column}, updatedAt) VALUES (?, ?, ?, ?)

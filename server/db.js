@@ -1652,4 +1652,37 @@ CREATE TABLE IF NOT EXISTS platform_settings (
 );
 `);
 
+// Additive: real cost (not just request count) and who/what actually
+// incurred it, so AI spend can be limited per-org/day/month/agent/user/
+// automation (Phase 16 §40) with a real SQL SUM(costCents) instead of
+// parsing every row's JSON metadata — this table is exactly the kind of
+// thing that grows fast, so that distinction matters at scale.
+const usageRecordCols = db.prepare("PRAGMA table_info(usage_records)").all().map((c) => c.name);
+const addUsageCol = (name, type) => { if (!usageRecordCols.includes(name)) db.exec(`ALTER TABLE usage_records ADD COLUMN ${name} ${type}`); };
+addUsageCol("costCents", "INTEGER NOT NULL DEFAULT 0");
+addUsageCol("agentId", "TEXT");
+addUsageCol("userId", "TEXT");
+addUsageCol("automationId", "TEXT");
+db.exec("CREATE INDEX IF NOT EXISTS idx_usage_org_agent ON usage_records(orgId, agentId, createdAt)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_usage_org_user ON usage_records(orgId, userId, createdAt)");
+db.exec("CREATE INDEX IF NOT EXISTS idx_usage_org_automation ON usage_records(orgId, automationId, createdAt)");
+
+// Org-level AI spend safeguards — unset (NULL) means unlimited for that
+// scope; an org only gets real limits once someone explicitly sets them.
+// Separate table, not new plans.* columns: these are per-organization
+// choices an org admin sets for themselves, not a platform-wide plan tier.
+db.exec(`
+CREATE TABLE IF NOT EXISTS organization_spend_limits (
+  orgId                  TEXT PRIMARY KEY,
+  dailyLimitCents        INTEGER,
+  monthlyLimitCents      INTEGER,
+  perAgentLimitCents     INTEGER,
+  perUserLimitCents      INTEGER,
+  perAutomationLimitCents INTEGER,
+  alertThresholdPercent  INTEGER NOT NULL DEFAULT 80,
+  updatedAt              TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+`);
+
 export default db;

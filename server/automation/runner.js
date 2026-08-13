@@ -82,7 +82,7 @@ export async function runWorkflow(automationId, { userId, triggerSource, initial
 // The actual step loop, shared between a fresh run and a resumed one.
 async function driveRun(runId, automation, fromStepOrder, variables) {
   const steps = loadSteps(automation.id);
-  const ctx = { runId, userId: automation.userId, agentId: automation.agentId, orgId: automation.orgId };
+  const ctx = { runId, userId: automation.userId, agentId: automation.agentId, orgId: automation.orgId, automationId: automation.id };
   let currentVars = variables;
 
   for (const step of steps) {

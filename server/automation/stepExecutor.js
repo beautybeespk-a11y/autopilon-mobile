@@ -3,7 +3,9 @@ import { evaluateConditionGroups } from "./conditions.js";
 import { runTool } from "../orchestrator/executor.js";
 import { createApprovalStep } from "./approvals.js";
 import { chatComplete } from "../ai/provider.js";
-import { enforceQuota, recordUsage } from "../orchestrator/billing.js";
+import { enforceQuota } from "../orchestrator/billing.js";
+import { enforceSpendLimit } from "../orchestrator/costControls.js";
+import { recordAiTextUsage } from "../orchestrator/costEngine.js";
 
 function safeParseJson(text, fallback) {
   try {
@@ -58,14 +60,19 @@ export async function executeStep(step, variables, ctx) {
 Decision needed: ${config.question}
 ${config.options ? `Choose one of these options: ${JSON.stringify(config.options)}` : ""}
 Respond with ONLY JSON: {"choice": "<your choice>", "reasoning": "<why, 1-2 sentences>"}`;
-      if (ctx.orgId) enforceQuota(ctx.orgId, "maxAiRequests", "AI requests this billing period");
+      if (ctx.orgId) {
+        enforceQuota(ctx.orgId, "maxAiRequests", "AI requests this billing period");
+        enforceSpendLimit(ctx.orgId, { agentId: ctx.agentId, userId: ctx.userId, automationId: ctx.automationId });
+      }
       const completion = await chatComplete({ messages: [{ role: "user", content: prompt }], systemPrompt: "You are making a decision inside an automated workflow. Be decisive and explain your reasoning briefly." });
       const raw = completion.text;
       if (ctx.orgId) {
-        const usageMeta = { provider: process.env.AI_PROVIDER, agentId: ctx.agentId || null, userId: ctx.userId };
-        recordUsage(ctx.orgId, "ai_request", 1, usageMeta);
-        if (completion.usage?.promptTokens) recordUsage(ctx.orgId, "prompt_tokens", completion.usage.promptTokens, usageMeta);
-        if (completion.usage?.completionTokens) recordUsage(ctx.orgId, "completion_tokens", completion.usage.completionTokens, usageMeta);
+        recordAiTextUsage(ctx.orgId, {
+          provider: process.env.AI_PROVIDER || "anthropic",
+          agentId: ctx.agentId || null, userId: ctx.userId, automationId: ctx.automationId || null,
+          promptTokens: completion.usage?.promptTokens || 0,
+          completionTokens: completion.usage?.completionTokens || 0,
+        });
       }
       const decision = safeParseJson(raw, { choice: config.options?.[0] || null, reasoning: "Could not parse a structured decision; defaulted to the first option." });
       const key = config.resultVariable || "aiDecision";

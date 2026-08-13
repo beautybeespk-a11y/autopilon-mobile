@@ -5,6 +5,7 @@ import { getMembership } from "../orchestrator/rbac.js";
 import { listPlans, getBillingDashboard, setPlan, setBillingMode } from "../orchestrator/billing.js";
 import { saveApiKey, listApiKeys, deleteApiKey } from "../orchestrator/apiKeys.js";
 import { getCostBreakdown } from "../orchestrator/costEngine.js";
+import { getSpendLimits, setSpendLimits, getSpendStatus } from "../orchestrator/costControls.js";
 import { stripeStatus, createCheckoutSession, createPortalSession, cancelSubscription, resumeSubscription } from "../orchestrator/stripeService.js";
 import { getCreditBalance, listCredits } from "../orchestrator/platformAdmin.js";
 
@@ -29,6 +30,16 @@ router.get("/organizations/:orgId/billing", requireOwnerOrAdmin, (req, res) => {
 
 router.get("/organizations/:orgId/cost", requireOwnerOrAdmin, (req, res) => {
   res.json(getCostBreakdown(req.params.orgId, { sinceDays: Number(req.query.sinceDays) || 30 }));
+});
+
+router.get("/organizations/:orgId/spend-limits", requireOwnerOrAdmin, (req, res) => {
+  res.json(getSpendStatus(req.params.orgId));
+});
+
+router.patch("/organizations/:orgId/spend-limits", requireOwnerOrAdmin, (req, res) => {
+  const limits = setSpendLimits(req.params.orgId, req.body || {});
+  logActivity(db, req.session.userId, "spend_limits_updated", `Updated AI spend limits for org ${req.params.orgId}`, { orgId: req.params.orgId, req });
+  res.json(limits);
 });
 
 router.get("/stripe/status", (req, res) => res.json(stripeStatus()));
