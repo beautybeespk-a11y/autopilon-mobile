@@ -39,8 +39,8 @@ class ApiClient {
   Future<ApiResult<T>> get<T>(String path, {Map<String, dynamic>? query, T Function(dynamic)? parse}) =>
       _request('GET', path, query: query, parse: parse);
 
-  Future<ApiResult<T>> post<T>(String path, {Object? body, T Function(dynamic)? parse}) =>
-      _request('POST', path, body: body, parse: parse);
+  Future<ApiResult<T>> post<T>(String path, {Object? body, T Function(dynamic)? parse, Duration? receiveTimeout}) =>
+      _request('POST', path, body: body, parse: parse, receiveTimeout: receiveTimeout);
 
   Future<ApiResult<T>> patch<T>(String path, {Object? body, T Function(dynamic)? parse}) =>
       _request('PATCH', path, body: body, parse: parse);
@@ -148,13 +148,19 @@ class ApiClient {
     Map<String, dynamic>? query,
     Object? body,
     T Function(dynamic)? parse,
+    Duration? receiveTimeout,
   }) async {
     try {
       final res = await _dio.request(
         path,
         data: body,
         queryParameters: query,
-        options: Options(method: method),
+        // A per-request override — most endpoints respond quickly and should
+        // still time out at the client's normal 20s default, but a handful
+        // (AI generation) can legitimately take much longer than any other
+        // call in the app, and 20s was cutting those off client-side even
+        // though the server request was still running and completed fine.
+        options: Options(method: method, receiveTimeout: receiveTimeout),
       );
       if (res.statusCode != null && res.statusCode! >= 200 && res.statusCode! < 300) {
         final data = parse != null ? parse(res.data) : res.data as T;

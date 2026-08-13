@@ -43,6 +43,12 @@ class ContentRepository {
         '/content/generate/image',
         body: {'prompt': prompt, if (size != null) 'size': size, 'numImages': numImages, if (title != null && title.isNotEmpty) 'title': title},
         parse: (d) => ((d as Map<String, dynamic>)['assets'] as List).map((a) => ContentAsset.fromJson(a as Map<String, dynamic>)).toList(),
+        // Image generation routinely takes longer than the client's normal
+        // 20s timeout (OpenAI rendering time + network) — without this the
+        // app reports "couldn't reach the server" for a request that's
+        // actually still running and completes successfully server-side,
+        // which is exactly what was observed testing this on a real device.
+        receiveTimeout: const Duration(seconds: 90),
       );
 
   Future<ApiResult<ContentAsset>> generateCopy({
@@ -64,6 +70,9 @@ class ContentRepository {
       _api.post<ContentAsset>(
         '/content/generate/voiceover',
         body: {'text': text, if (voice != null) 'voice': voice, if (title != null && title.isNotEmpty) 'title': title},
+        // Same reasoning as generateImage() — a longer script can take a
+        // while to synthesize, so give it more headroom than the default.
+        receiveTimeout: const Duration(seconds: 60),
         parse: (d) => ContentAsset.fromJson(d as Map<String, dynamic>),
       );
 
