@@ -6,7 +6,7 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import fs from "fs";
 
-import "./db.js";
+import db from "./db.js";
 import "./tools/index.js"; // side-effect: registers all tools with the Tool Registry
 import authRoutes from "./routes/auth.js";
 import chatRoutes from "./routes/chat.js";
@@ -69,6 +69,7 @@ import { initializeQueueProcessor } from "./automation/eventQueue.js";
 import "./jobs/handlers.js"; // side-effect: registers built-in job handlers
 import { initializeJobProcessor } from "./jobs/jobManager.js";
 import { rateLimit } from "./orchestrator/rateLimiter.js";
+import { maintenanceStatus } from "./orchestrator/maintenanceMode.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -103,6 +104,25 @@ app.use(
 );
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
+
+// Maintenance mode gate (Phase 16 §35) — checked on every request before
+// any feature router runs. Health checks, auth, and every genuinely-public
+// webhook stay reachable regardless (an external service retrying a
+// webhook, or an admin trying to log in to turn maintenance mode back off,
+// must never be the thing maintenance mode itself blocks). Platform admins
+// bypass entirely so they can keep verifying the app during a maintenance
+// window. Never touches the job/queue processors — an in-flight background
+// job keeps running; this only gates NEW incoming HTTP requests.
+const MAINTENANCE_EXEMPT_PREFIXES = ["/api/health", "/api/auth", "/api/stripe", "/api/integrations/whatsapp", "/api/integrations/shopify", "/api/share"];
+app.use((req, res, next) => {
+  if (MAINTENANCE_EXEMPT_PREFIXES.some((p) => req.path.startsWith(p))) return next();
+  const status = maintenanceStatus();
+  if (!status.enabled) return next();
+  const userId = req.session?.userId;
+  if (userId && db.prepare("SELECT isPlatformAdmin FROM users WHERE id = ?").get(userId)?.isPlatformAdmin) return next();
+  if (status.readOnly && req.method === "GET") return next();
+  res.status(503).json({ error: status.message || "The platform is temporarily down for maintenance. Please try again shortly.", maintenance: true });
+});
 
 // A generous, IP-keyed ceiling across ALL /api traffic — basic abuse/DoS
 // protection, not meant to be felt by any legitimate usage pattern

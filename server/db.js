@@ -1615,6 +1615,41 @@ CREATE INDEX IF NOT EXISTS idx_jobs_type ON jobs(type, status);
 -- treats every NULL as distinct, so only requests that actually supply a
 -- key collide with each other.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_idempotency ON jobs(idempotencyKey) WHERE idempotencyKey IS NOT NULL;
+
+-- Feature flags: enable/disable without a redeploy (Phase 16). Overrides
+-- are a separate table (not JSON columns on feature_flags) so a lookup by
+-- (flagKey, scopeType, scopeId) can use a real unique index rather than
+-- scanning and parsing JSON on every isFeatureEnabled() call, which runs on
+-- a hot path.
+CREATE TABLE IF NOT EXISTS feature_flags (
+  id             TEXT PRIMARY KEY,
+  key            TEXT NOT NULL UNIQUE,
+  name           TEXT NOT NULL,
+  description    TEXT,
+  enabled        INTEGER NOT NULL DEFAULT 0,
+  rolloutPercent INTEGER NOT NULL DEFAULT 100,
+  createdAt      TEXT NOT NULL,
+  updatedAt      TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feature_flag_overrides (
+  id        TEXT PRIMARY KEY,
+  flagKey   TEXT NOT NULL,
+  scopeType TEXT NOT NULL, -- 'org' | 'user'
+  scopeId   TEXT NOT NULL,
+  enabled   INTEGER NOT NULL,
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (flagKey) REFERENCES feature_flags(key) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_flag_override_scope ON feature_flag_overrides(flagKey, scopeType, scopeId);
+
+-- Generic key-value store for small, singular pieces of platform-wide
+-- config — maintenance mode today, and a natural home for anything similar
+-- later, rather than a new one-row table per setting.
+CREATE TABLE IF NOT EXISTS platform_settings (
+  key       TEXT PRIMARY KEY,
+  value     TEXT NOT NULL,
+  updatedAt TEXT NOT NULL
+);
 `);
 
 export default db;
