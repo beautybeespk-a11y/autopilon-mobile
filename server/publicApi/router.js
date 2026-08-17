@@ -21,6 +21,7 @@ import filesRouter from "./files.js";
 import contentRouter from "./content.js";
 import integrationsRouter from "./integrations.js";
 import marketplaceRouter from "./marketplace.js";
+import webhooksRouter from "./webhooks.js";
 
 const router = Router();
 
@@ -36,6 +37,7 @@ router.use("/files", filesRouter);
 router.use("/content", contentRouter);
 router.use("/integrations", integrationsRouter);
 router.use("/marketplace", marketplaceRouter);
+router.use("/webhooks", webhooksRouter);
 
 // Unauthenticated root — lets a developer confirm the API is reachable and
 // which version they're on before ever needing a key, same reasoning as
