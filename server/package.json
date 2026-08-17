@@ -9,6 +9,8 @@
     "start": "node index.js",
     "worker": "node worker.js",
     "worker:dev": "node --watch worker.js",
+    "backup": "node scripts/backup-db.js",
+    "restore": "node scripts/restore-db.js",
     "test:security": "node test/securityRegression.js",
     "test:security:public-api": "node test/publicApiSecurityRegression.js",
     "test:idempotency": "node test/idempotencyRegression.js",

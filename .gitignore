@@ -6,6 +6,7 @@ dist
 .DS_Store
 sessions.sqlite
 server/uploads/
+server/backups/
 *.apk
 __pycache__/
 *.pyc
