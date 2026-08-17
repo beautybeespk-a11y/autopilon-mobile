@@ -1836,4 +1836,30 @@ CREATE INDEX IF NOT EXISTS idx_api_agent_runs_org ON api_agent_runs(orgId, creat
 CREATE INDEX IF NOT EXISTS idx_api_agent_runs_agent ON api_agent_runs(agentId, createdAt);
 `);
 
+// Public API Idempotency-Key support (Phase 17.1 §1) — an HTTP-layer
+// request/response cache, deliberately NOT a second job/queue system: it
+// sits in front of the existing synchronous route handlers (and, for async
+// agent execution, in front of the existing Job Manager enqueue) and simply
+// remembers "this exact request, from this exact key, already happened."
+// Scoped by (apiKeyId, idempotencyKey) — never by orgId alone — so two
+// different keys within the same org can't collide, and one org's key can
+// never see or replay into another org's reservation.
+db.exec(`
+CREATE TABLE IF NOT EXISTS api_idempotency_keys (
+  id             TEXT PRIMARY KEY,
+  apiKeyId       TEXT NOT NULL,
+  orgId          TEXT NOT NULL,
+  idempotencyKey TEXT NOT NULL,
+  requestHash    TEXT NOT NULL,   -- sha256(method + path + body) — detects conflicting reuse of the same key
+  status         TEXT NOT NULL DEFAULT 'in_progress', -- in_progress | completed
+  statusCode     INTEGER,
+  responseBody   TEXT,
+  createdAt      TEXT NOT NULL,
+  expiresAt      TEXT NOT NULL,
+  FOREIGN KEY (apiKeyId) REFERENCES developer_api_keys(id) ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON api_idempotency_keys(apiKeyId, idempotencyKey);
+CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON api_idempotency_keys(expiresAt);
+`);
+
 export default db;

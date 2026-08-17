@@ -66,6 +66,7 @@ import eventWebhookRoutes from "./routes/eventWebhooks.js";
 import healthRoutes from "./routes/health.js";
 import publicApiV1 from "./publicApi/router.js";
 import { ensurePublicApiFlags } from "./publicApi/featureGate.js";
+import { sweepExpiredIdempotencyKeys } from "./publicApi/idempotency.js";
 import { initializeSchedulesOnBoot } from "./automation/scheduler.js";
 import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
@@ -241,4 +242,5 @@ app.listen(PORT, () => {
   initializeJobProcessor();
   setInterval(sweepExpiredConfirmations, 60_000); // catch ignored confirmations once a minute
   setInterval(sweepExpiredTrials, 60_000 * 60); // check for ended trials once an hour
+  setInterval(sweepExpiredIdempotencyKeys, 60_000 * 15); // clear expired Idempotency-Key reservations every 15 minutes
 });

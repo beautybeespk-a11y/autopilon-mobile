@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
 import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
+import { idempotent } from "./idempotency.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
 import {
@@ -25,7 +26,7 @@ router.get("/:id", requireScope("projects:read"), (req, res) => {
   res.json(project);
 });
 
-router.post("/", requireScope("projects:write"), (req, res) => {
+router.post("/", requireScope("projects:write"), idempotent(), (req, res) => {
   const { workspaceId, name, description } = req.body || {};
   if (!workspaceId) return apiError(res, 400, "INVALID_REQUEST", "workspaceId is required.");
   try {

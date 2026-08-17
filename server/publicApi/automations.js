@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
 import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
+import { idempotent } from "./idempotency.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
 import { listOrgAutomations, getOrgAutomation, triggerOrgAutomation, listOrgAutomationRuns, getOrgAutomationRun } from "../orchestrator/automationApiService.js";
@@ -22,7 +23,7 @@ router.get("/:id", requireScope("automations:read"), (req, res) => {
   res.json(automation);
 });
 
-router.post("/:id/run", requireScope("automations:execute"), async (req, res) => {
+router.post("/:id/run", requireScope("automations:execute"), idempotent(), async (req, res) => {
   try {
     const result = await triggerOrgAutomation(req.orgId, req.params.id, { userId: req.apiKey.userId, variables: req.body?.variables });
     res.json(result);

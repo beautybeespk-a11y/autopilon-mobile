@@ -105,7 +105,26 @@ Every error follows the same shape:
 
 ## Idempotency
 
-Async agent execution (`POST /v1/agents/:id/execute` with `"async": true`) and webhook delivery both run through the Job Manager, which enforces idempotency on jobs created with an explicit key and provides retry with exponential backoff. There is currently **no client-supplied `Idempotency-Key` header** on synchronous write endpoints (task/project create, content generation, agent execute) — calling one twice creates two resources. This is a known gap, not a documented guarantee; see API_CHANGELOG.md.
+Send an `Idempotency-Key` header on a write request and a retried call with the exact same key **and** the exact same request body returns the original response again — the operation is not repeated:
+
+```
+POST /v1/tasks
+Idempotency-Key: 3f7a9e21-...   (any string you generate, up to 255 chars — a UUID is a good default)
+```
+
+Supported on: `POST /v1/agents/:id/execute`, `POST /v1/agents/:id/messages`, `POST /v1/automations/:id/run`, `POST /v1/content/text`, `POST /v1/content/image`, `POST /v1/content/voice`, `POST /v1/tasks`, `POST /v1/projects`. Not supported on other endpoints (list/get/update/delete calls don't need it; file upload and webhook creation are deliberately out of scope for now — see API_SECURITY.md).
+
+Behavior:
+- **No header** — the endpoint behaves exactly as if idempotency didn't exist; nothing is deduplicated. This is opt-in.
+- **First use of a key** — the request runs normally; the exact HTTP response is stored against that key.
+- **Same key + identical body, within 24h** — the original stored response is replayed verbatim, with `Idempotency-Replayed: true` added. The operation does **not** run again.
+- **Same key + a different body** — rejected with `409 IDEMPOTENCY_KEY_CONFLICT`. Reusing a key for a different request is treated as a client bug, not silently allowed.
+- **Two requests with the same key arriving concurrently** — only one is allowed to execute; the other gets `409 IDEMPOTENCY_KEY_IN_PROGRESS` (retry shortly) rather than being allowed to run in parallel and risk a duplicate.
+- **A request that fails with a 5xx** is *not* cached — the server doesn't know whether the underlying operation actually happened, so the same key can be retried once the transient issue clears, instead of being locked out for 24h.
+- Keys are scoped to the specific API key that made the request — two different keys (even in the same organization) using the identical `Idempotency-Key` string never collide or interfere with each other.
+- Reservations expire and are swept 24 hours after creation; an expired key is treated as brand new.
+
+Async agent execution (`"async": true`) and webhook delivery separately also run through the Job Manager, which has its own retry-with-backoff for the underlying job — the `Idempotency-Key` header above governs the HTTP request itself (so a retried `POST .../execute?async=true` doesn't enqueue a second job in the first place).
 
 ---
 

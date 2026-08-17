@@ -26,6 +26,8 @@ const CODE_TO_STATUS = {
   UNAUTHENTICATED: 401,
   FILE_TOO_LARGE: 413,
   FEATURE_DISABLED: 503,
+  IDEMPOTENCY_KEY_CONFLICT: 409,
+  IDEMPOTENCY_KEY_IN_PROGRESS: 409,
 };
 
 export function apiErrorFromException(res, err, fallbackMessage = "Something went wrong.") {

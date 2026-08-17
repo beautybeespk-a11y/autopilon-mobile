@@ -59,7 +59,7 @@ Every Public API resource area sits behind its own feature flag, plus one master
 
 ## Known limitations (disclosed, not hidden)
 
-- No `Idempotency-Key` support on synchronous write endpoints yet — a retried request after a client-side timeout can create a duplicate resource. Async agent execution and webhook delivery *do* get idempotency and retry, via the Job Manager.
+- `Idempotency-Key` support (Phase 17.1) covers the main write endpoints (agent execute/messages, automation run, content generation, task/project create) — see PUBLIC_API.md. File upload and webhook creation are not covered.
 - No integration *action* execution via the Public API (read-only integration status only) — the documented workaround is executing an agent that has the relevant tool/skill enabled.
 - No admin UI for feature flags (API-only today).
 - This phase's security testing covered functional/regression checks (the 20-check suite) plus targeted manual verification of the specific SSRF, tenant-isolation, and quota-bypass scenarios described above. It did not include third-party penetration testing or a formal load/DoS test against the Public API specifically. Treat this document as a description of implemented controls, not a certification.

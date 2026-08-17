@@ -76,5 +76,5 @@ A minimal JS/TS client wrapping the endpoints above is available — see [`sdk/j
 
 - **Using a session cookie instead of a Bearer key.** `/api/v1` never accepts a browser session — you'll get `401 UNAUTHENTICATED` even while logged into the web app in the same browser.
 - **Forgetting a scope.** `403 INSUFFICIENT_SCOPE` names the exact scope you're missing — go back to the Developer Console and issue a new key (scopes can't be edited on an existing key; rotate or create a new one).
-- **Assuming write endpoints are idempotent.** They currently aren't (no `Idempotency-Key` support yet) — a retried `POST` after a timeout can create a duplicate resource. Check first, or dedupe on your own request id, until this lands.
+- **Forgetting the `Idempotency-Key` header on retries.** Without it, a retried `POST` after a timeout creates a duplicate resource — the endpoint has no way to know it's a retry. Generate a key (a UUID is fine) once per logical operation and send the same one on every retry attempt of that operation; see [PUBLIC_API.md](PUBLIC_API.md#idempotency) for exactly which endpoints support it.
 - **Treating a `404` as "definitely doesn't exist anywhere."** A resource belonging to a *different* organization also 404s, on purpose — the API never confirms another org's data exists.

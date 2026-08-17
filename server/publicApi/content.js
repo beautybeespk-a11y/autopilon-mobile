@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
 import { requireCapability } from "./featureGate.js";
 import { apiRateLimit, apiAiConcurrencyLimit } from "./rateLimit.js";
+import { idempotent } from "./idempotency.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { generateOrgText, generateOrgImage, generateOrgVoice, getOrgAsset } from "../orchestrator/contentApiService.js";
 
@@ -15,7 +16,7 @@ router.get("/:id", requireScope("content:generate"), (req, res) => {
   res.json(asset);
 });
 
-router.post("/text", requireScope("content:generate"), aiConcurrency, async (req, res) => {
+router.post("/text", requireScope("content:generate"), aiConcurrency, idempotent(), async (req, res) => {
   const { contentType, brief } = req.body || {};
   if (!contentType || !brief?.trim()) return apiError(res, 400, "INVALID_REQUEST", "contentType and brief are required.");
   try {
@@ -25,7 +26,7 @@ router.post("/text", requireScope("content:generate"), aiConcurrency, async (req
   }
 });
 
-router.post("/image", requireScope("content:generate"), aiConcurrency, async (req, res) => {
+router.post("/image", requireScope("content:generate"), aiConcurrency, idempotent(), async (req, res) => {
   const { prompt } = req.body || {};
   if (!prompt?.trim()) return apiError(res, 400, "INVALID_REQUEST", "prompt is required.");
   try {
@@ -35,7 +36,7 @@ router.post("/image", requireScope("content:generate"), aiConcurrency, async (re
   }
 });
 
-router.post("/voice", requireScope("content:generate"), aiConcurrency, async (req, res) => {
+router.post("/voice", requireScope("content:generate"), aiConcurrency, idempotent(), async (req, res) => {
   const { text } = req.body || {};
   if (!text?.trim()) return apiError(res, 400, "INVALID_REQUEST", "text is required.");
   try {

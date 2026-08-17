@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
 import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
+import { idempotent } from "./idempotency.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
 import { listOrgTasks, getOrgTask, createOrgTask, updateOrgTask, completeOrgTask, archiveOrgTask } from "../orchestrator/taskApiService.js";
@@ -22,7 +23,7 @@ router.get("/:id", requireScope("tasks:read"), (req, res) => {
   res.json(task);
 });
 
-router.post("/", requireScope("tasks:write"), (req, res) => {
+router.post("/", requireScope("tasks:write"), idempotent(), (req, res) => {
   try {
     const task = createOrgTask(req.orgId, req.apiKey.userId, req.body || {});
     res.status(201).json(task);

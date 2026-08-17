@@ -6,6 +6,7 @@ import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
 import { requireCapability } from "./featureGate.js";
 import { apiRateLimit, apiAiConcurrencyLimit } from "./rateLimit.js";
+import { idempotent } from "./idempotency.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
 import { listOrgAgents, getOrgAgent, executeAgentSync, executeAgentAsync, listRunsForAgent } from "../orchestrator/agentApiService.js";
@@ -52,7 +53,7 @@ router.get("/:id/runs", requireScope("agents:read"), (req, res) => {
 // API-key-keyed here, see apiAiConcurrencyLimit()'s comment for why the
 // internal one can't just be reused directly).
 const aiConcurrency = apiAiConcurrencyLimit();
-router.post("/:id/execute", requireScope("agents:execute"), aiConcurrency, async (req, res) => {
+router.post("/:id/execute", requireScope("agents:execute"), aiConcurrency, idempotent(), async (req, res) => {
   const agent = getOrgAgent(req.orgId, req.params.id);
   if (!agent) return apiError(res, 404, "RESOURCE_NOT_FOUND", "The requested agent was not found.");
   const { message, conversationId, async: runAsync } = req.body || {};
@@ -73,7 +74,7 @@ router.post("/:id/execute", requireScope("agents:execute"), aiConcurrency, async
 // A lighter conversational alias for /execute — always synchronous, meant
 // for simple "send a message, get a reply" integrations (chatbots) that
 // don't need run-tracking detail beyond the reply itself.
-router.post("/:id/messages", requireScope("agents:execute"), aiConcurrency, async (req, res) => {
+router.post("/:id/messages", requireScope("agents:execute"), aiConcurrency, idempotent(), async (req, res) => {
   const agent = getOrgAgent(req.orgId, req.params.id);
   if (!agent) return apiError(res, 404, "RESOURCE_NOT_FOUND", "The requested agent was not found.");
   const { message, conversationId } = req.body || {};
