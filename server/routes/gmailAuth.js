@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
+import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, googleOAuthStatus } from "../integrations/gmail/oauth.js";
 import { saveConnection, disconnectIntegration, connectionHealth } from "../integrations/manager.js";
@@ -12,7 +12,7 @@ router.get("/status", requireAuth, (req, res) => {
 
 router.get("/connect", requireAuth, (req, res) => {
   try {
-    const state = cryptoRandom();
+    const state = secureRandomToken();
     req.session.googleOAuthState = state;
     res.redirect(buildAuthorizationUrl(state));
   } catch (err) {

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
+import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, metaOAuthStatus } from "../integrations/meta/oauth.js";
 import { saveConnection, disconnectIntegration, connectionHealth } from "../integrations/manager.js";
@@ -14,7 +14,7 @@ router.get("/status", requireAuth, (req, res) => {
 // checked on callback — standard CSRF protection for the redirect flow.
 router.get("/connect", requireAuth, (req, res) => {
   try {
-    const state = cryptoRandom();
+    const state = secureRandomToken();
     req.session.metaOAuthState = state;
     const url = buildAuthorizationUrl(state);
     res.redirect(url);

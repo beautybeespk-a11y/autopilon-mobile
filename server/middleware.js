@@ -1,3 +1,4 @@
+import crypto from "crypto";
 import db from "./db.js";
 
 export function requireAuth(req, res, next) {
@@ -32,4 +33,17 @@ export function cryptoRandom() {
   return (
     Date.now().toString(36) + Math.random().toString(36).slice(2, 10)
   );
+}
+
+// Phase 18 §11/§10 (OAuth review) — Math.random()-backed cryptoRandom()
+// above is fine for non-security-sensitive ids (job ids, activity log
+// ids, etc.) but is not a CSPRNG: routes/gmailAuth.js, routes/metaAuth.js,
+// and routes/googleServiceAuth.js were generating their OAuth CSRF
+// `state` parameter with it, inconsistent with how every other genuinely
+// security-sensitive token in this codebase is generated (API keys,
+// webhook secrets, file-share tokens — see orchestrator/apiKeyService.js,
+// developerWebhookService.js, fileShare.js — all crypto.randomBytes).
+// Fixed by routing state generation through this instead.
+export function secureRandomToken(byteLength = 32) {
+  return crypto.randomBytes(byteLength).toString("hex");
 }

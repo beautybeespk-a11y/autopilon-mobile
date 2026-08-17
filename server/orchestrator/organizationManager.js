@@ -3,6 +3,7 @@ import { cryptoRandom } from "../middleware.js";
 import { getMembership, isBuiltinRole } from "./rbac.js";
 import { createNotification } from "./notifications.js";
 import { ensureSubscription, enforceQuota } from "./billing.js";
+import { getStorageProvider } from "../storage/provider.js";
 
 const now = () => new Date().toISOString();
 
@@ -46,8 +47,70 @@ export function updateOrganization(orgId, fields) {
   return db.prepare("SELECT * FROM organizations WHERE id = ?").get(orgId);
 }
 
-export function deleteOrganization(orgId) {
-  db.prepare("DELETE FROM organizations WHERE id = ?").run(orgId); // cascades to members/workspaces/roles
+// Phase 18 §38 (data retention audit): `DELETE FROM organizations` only
+// cascades to the tables that actually declare `FOREIGN KEY (orgId)
+// REFERENCES organizations(id) ON DELETE CASCADE` in db.js — true for
+// subscriptions/usage_records/organization_members/workspaces/custom_roles/
+// api_keys/developer_api_keys/developer_webhooks/api_agent_runs/
+// organization_credits/organization_spend_limits/coupon_redemptions/
+// invoices. It is NOT true for agents/automations/integrations/tasks/
+// activity_logs/knowledge_items/organization_usage/quota_warnings_sent/
+// voice_usage/folders/files/content_brands/content_templates/
+// content_assets/jobs/api_request_logs/api_idempotency_keys — every one of
+// these got its `orgId` column added later via `ALTER TABLE ADD COLUMN`
+// (see db.js), and SQLite's ALTER TABLE cannot add a foreign key
+// constraint to an existing table. Before this fix, deleting an org left
+// every one of those rows behind — orphaned, still holding real user data
+// (uploaded files, generated content, task/knowledge content, agent
+// configs) with a dangling orgId pointing at a now-nonexistent org.
+// Explicit cleanup here, in a single transaction so a mid-failure can
+// never leave the org "deleted" with its data still around (or vice
+// versa). Files first, since they own real storage bytes (S3/local disk)
+// that a bare DB DELETE would leak — same per-version storage.delete()
+// call fileService.js's permanentlyDeleteFile() makes, done directly here
+// (not via that function) because this needs to delete every org member's
+// files regardless of which of them uploaded it, not just one user's own.
+//
+// activity_logs is deliberately NOT in the cleanup list below: it's the
+// audit trail, not operational data, and an audit record of "this org was
+// deleted, by whom, when" needs to survive the deletion it's recording —
+// wiping it the instant it's written would defeat the point. (The route
+// that calls this logs the "organization_deleted" entry BEFORE calling
+// this function for exactly that reason.) Every other org-scoped table
+// here is real business/content data with no retention reason to survive
+// the org itself.
+export async function deleteOrganization(orgId) {
+  const files = db.prepare("SELECT id FROM files WHERE orgId = ?").all(orgId);
+  for (const { id: fileId } of files) {
+    const versions = db.prepare("SELECT storageProvider, storageKey FROM file_versions WHERE fileId = ?").all(fileId);
+    const seen = new Set();
+    for (const v of versions) {
+      const dedupeKey = `${v.storageProvider}:${v.storageKey}`;
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      await getStorageProvider(v.storageProvider).delete({ key: v.storageKey });
+    }
+  }
+
+  const cleanupTx = db.transaction(() => {
+    // files' own FK cascade (ON DELETE CASCADE to file_versions/
+    // file_permissions/file_tags/file_shares/file_activity/file_links)
+    // handles those child tables once this DELETE runs.
+    db.prepare("DELETE FROM files WHERE orgId = ?").run(orgId);
+    for (const table of [
+      "agents", "automations", "integrations", "tasks", "knowledge_items",
+      "organization_usage", "quota_warnings_sent", "voice_usage", "folders",
+      "content_brands", "content_templates", "content_assets", "jobs",
+      "api_request_logs", "api_idempotency_keys",
+    ]) {
+      db.prepare(`DELETE FROM ${table} WHERE orgId = ?`).run(orgId);
+    }
+    // Last — cascades to every table that DOES declare a real FK (see the
+    // list in this function's comment above).
+    db.prepare("DELETE FROM organizations WHERE id = ?").run(orgId);
+  });
+  cleanupTx();
+
   return { deleted: true };
 }
 

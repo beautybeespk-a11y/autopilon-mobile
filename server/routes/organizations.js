@@ -66,13 +66,17 @@ router.patch("/:id", requireOrgPermission("settings"), (req, res) => {
   res.json(org);
 });
 
-router.delete("/:id", (req, res) => {
+router.delete("/:id", async (req, res) => {
   const membership = getMembership(req.params.id, req.session.userId);
   if (!membership || membership.role !== "owner") {
     return res.status(403).json({ error: "Only the organization owner can delete it." });
   }
-  deleteOrganization(req.params.id);
+  // Logged BEFORE deletion, deliberately: deleteOrganization() cleans up
+  // every other org-scoped table but leaves activity_logs alone precisely
+  // so this audit entry (and the org's prior history) survives the org
+  // itself — see organizationManager.js's deleteOrganization() comment.
   logActivity(db, req.session.userId, "organization_deleted", "Deleted an organization", { orgId: req.params.id, req });
+  await deleteOrganization(req.params.id);
   res.json({ deleted: true });
 });
 
