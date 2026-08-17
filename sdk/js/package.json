@@ -1,0 +1,23 @@
+{
+  "name": "@autopilon/sdk",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal JS/TS client for the Autopilon Public API (v1).",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ]
+}
