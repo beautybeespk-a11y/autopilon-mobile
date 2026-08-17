@@ -16,6 +16,7 @@ import { storageStatus } from "../storage/provider.js";
 import { queueProviderStatus } from "../jobs/queueProvider.js";
 import { createJob, getJob, jobStats, processJobsTick } from "../jobs/jobManager.js";
 import { cacheProviderStatus, getCacheProvider } from "../orchestrator/cacheProvider.js";
+import { rateLimiterStatus } from "../orchestrator/rateLimiter.js";
 
 const router = Router();
 
@@ -112,13 +113,23 @@ router.get("/integrations", (req, res) => {
 // A single rollup of everything above, for a one-request dashboard view.
 router.get("/", async (req, res) => {
   const dbOk = (() => { try { db.prepare("SELECT 1").get(); return true; } catch { return false; } })();
+  const cacheEntry = getCacheProvider();
+  let cacheEntries = null;
+  if (cacheEntry.configured) {
+    try {
+      cacheEntries = await cacheEntry.size();
+    } catch (err) {
+      cacheEntries = null;
+    }
+  }
   res.json({
     ok: dbOk,
     database: dbOk,
     storage: storageStatus(),
     queue: { provider: queueProviderStatus(), jobs: jobStats() },
     ai: { text: providerStatus(), image: imageProviderStatus(), stt: sttStatus(), tts: ttsStatus() },
-    cache: { ...cacheProviderStatus(), entries: getCacheProvider().configured ? getCacheProvider().size() : null },
+    cache: { ...cacheProviderStatus(), entries: cacheEntries },
+    rateLimiter: rateLimiterStatus(),
   });
 });
 

@@ -26,20 +26,24 @@ function planLimitForOrg(orgId) {
 }
 
 export function apiRateLimit({ windowMs = 60_000, label = "public_api" } = {}) {
-  return (req, res, next) => {
+  return async (req, res, next) => {
     if (!req.apiKey) return next(); // requireApiKey (mounted before this) already rejects an unauthenticated request
     const max = planLimitForOrg(req.orgId);
     const key = `${label}:${req.apiKey.id}`;
-    const result = checkRateLimit(key, { windowMs, max });
-    res.set("X-RateLimit-Limit", String(max));
-    res.set("X-RateLimit-Remaining", String(result.remaining));
-    res.set("X-RateLimit-Reset", String(Math.ceil(result.resetAt / 1000))); // unix seconds, matches Retry-After's unit family
-    if (!result.allowed) {
-      const retryAfterSeconds = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
-      res.set("Retry-After", String(retryAfterSeconds));
-      return apiError(res, 429, "RATE_LIMITED", `Too many requests for this API key — retry after ${retryAfterSeconds}s.`);
+    try {
+      const result = await checkRateLimit(key, { windowMs, max });
+      res.set("X-RateLimit-Limit", String(max));
+      res.set("X-RateLimit-Remaining", String(result.remaining));
+      res.set("X-RateLimit-Reset", String(Math.ceil(result.resetAt / 1000))); // unix seconds, matches Retry-After's unit family
+      if (!result.allowed) {
+        const retryAfterSeconds = Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
+        res.set("Retry-After", String(retryAfterSeconds));
+        return apiError(res, 429, "RATE_LIMITED", `Too many requests for this API key — retry after ${retryAfterSeconds}s.`);
+      }
+      next();
+    } catch (err) {
+      next(err);
     }
-    next();
   };
 }
 
