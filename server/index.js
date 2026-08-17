@@ -6,6 +6,7 @@ import session from "express-session";
 import cors from "cors";
 import { securityHeaders, permissionsPolicy, corsOptions } from "./config/security.js";
 import { sessionStore } from "./config/sessionStore.js";
+import { requestId, requestLogger } from "./config/requestLogging.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import fs from "fs";
@@ -117,6 +118,12 @@ app.use(
     },
   })
 );
+
+// Request ID + structured access log (Phase 18 §24) — after session so a
+// logged-in request's userId is available; before every route so every
+// request gets an id, including ones that 404 or error.
+app.use(requestId());
+app.use(requestLogger());
 
 // Maintenance mode gate (Phase 16 §35) — checked on every request before
 // any feature router runs. Health checks, auth, and every genuinely-public

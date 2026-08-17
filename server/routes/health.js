@@ -5,6 +5,7 @@
 // information that shouldn't be handed to an unauthenticated prober even
 // though none of it is a secret in the credentials sense.
 import { Router } from "express";
+import Redis from "ioredis";
 import { requireAuth, requirePlatformAdmin } from "../middleware.js";
 import db from "../db.js";
 import { providerStatus } from "../ai/provider.js";
@@ -17,8 +18,30 @@ import { queueProviderStatus } from "../jobs/queueProvider.js";
 import { createJob, getJob, jobStats, processJobsTick } from "../jobs/jobManager.js";
 import { cacheProviderStatus, getCacheProvider } from "../orchestrator/cacheProvider.js";
 import { rateLimiterStatus } from "../orchestrator/rateLimiter.js";
+import { logger } from "../config/logger.js";
 
 const router = Router();
+
+// A dedicated, lazily-created client for connectivity checks only — every
+// *_PROVIDER=redis setting shares one REDIS_URL, so one PING answers "is
+// Redis actually reachable right now" for the cache/rate-limiter/queue/
+// session-store providers all at once, without reaching into each
+// provider's own private client.
+let redisHealthClient = null;
+async function redisHealth() {
+  if (!process.env.REDIS_URL) return { configured: false, ok: null, reason: "REDIS_URL is not set" };
+  try {
+    if (!redisHealthClient) {
+      redisHealthClient = new Redis(process.env.REDIS_URL, { maxRetriesPerRequest: 1, connectTimeout: 2000, lazyConnect: false });
+      redisHealthClient.on("error", () => {}); // handled per-call below via the ping() try/catch — avoid an unhandled 'error' event crashing the process
+    }
+    const start = Date.now();
+    const pong = await redisHealthClient.ping();
+    return { configured: true, ok: pong === "PONG", latencyMs: Date.now() - start };
+  } catch (err) {
+    return { configured: true, ok: false, reason: "unreachable" };
+  }
+}
 
 // --- Public: liveness/readiness only, no operational detail. ---
 
@@ -50,8 +73,17 @@ router.get("/database", (req, res) => {
     const userCount = db.prepare("SELECT COUNT(*) c FROM users").get().c;
     res.json({ ok: true, latencyMs: Date.now() - start, userCount });
   } catch (err) {
-    res.status(503).json({ ok: false, latencyMs: Date.now() - start, error: err.message });
+    // Never the raw driver error in the response — even to an admin, that
+    // can include the on-disk file path or other internal detail no
+    // consumer of this endpoint needs. The real message still goes to the
+    // server's own structured logs for whoever's actually debugging it.
+    logger.error("health.database_check_failed", { requestId: req.requestId, errorCode: err.code || "DB_ERROR" });
+    res.status(503).json({ ok: false, latencyMs: Date.now() - start, error: "Database check failed." });
   }
+});
+
+router.get("/redis", async (req, res) => {
+  res.json(await redisHealth());
 });
 
 router.get("/queue", async (req, res) => {
@@ -130,6 +162,7 @@ router.get("/", async (req, res) => {
     ai: { text: providerStatus(), image: imageProviderStatus(), stt: sttStatus(), tts: ttsStatus() },
     cache: { ...cacheProviderStatus(), entries: cacheEntries },
     rateLimiter: rateLimiterStatus(),
+    redis: await redisHealth(),
   });
 });
 
