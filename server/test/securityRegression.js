@@ -194,6 +194,30 @@ async function run() {
     assert.equal(status, 403);
   });
 
+  // --- Feature-flag admin authorization (Phase 17.1 §3 regression) ----------------
+  await check("privilege escalation: a regular user cannot list feature flags", async () => {
+    const { status } = await f.sessA.req("GET", "/api/admin/feature-flags");
+    assert.equal(status, 403);
+  });
+
+  await check("privilege escalation: a regular user cannot create a feature flag", async () => {
+    const { status } = await f.sessA.req("POST", "/api/admin/feature-flags", { key: `hijack_${cryptoRandom()}`, name: "Hijack attempt" });
+    assert.equal(status, 403);
+  });
+
+  await check("privilege escalation: a regular user cannot disable an existing feature flag (e.g. the Public API kill switch)", async () => {
+    const before = db.prepare("SELECT enabled FROM feature_flags WHERE key = 'public_api'").get();
+    const { status } = await f.sessA.req("PATCH", "/api/admin/feature-flags/public_api", { enabled: false });
+    assert.equal(status, 403);
+    const after = db.prepare("SELECT enabled FROM feature_flags WHERE key = 'public_api'").get();
+    assert.equal(before?.enabled, after?.enabled, "flag state must be unchanged after a rejected request");
+  });
+
+  await check("privilege escalation: a regular user cannot read the feature-flag audit log", async () => {
+    const { status } = await f.sessA.req("GET", "/api/admin/feature-flags/audit-log");
+    assert.equal(status, 403);
+  });
+
   // --- Billing / quota bypass (regression on Task 38's fix) -----------------------
   await check("billing bypass: chat is blocked once the agent's org hits its configured spend limit", async () => {
     await f.sessA.req("PATCH", `/api/organizations/${f.orgA.id}/spend-limits`, { dailyLimitCents: 50 });

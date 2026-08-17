@@ -7,3 +7,5 @@ dist
 sessions.sqlite
 server/uploads/
 *.apk
+__pycache__/
+*.pyc
