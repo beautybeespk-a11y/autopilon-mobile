@@ -8,10 +8,14 @@ import { decryptSecret } from "../orchestrator/secretsCrypto.js";
 import { deliverWebhookOnce } from "../orchestrator/webhookDelivery.js";
 
 // A trivial, always-succeeds job used by /health/queue to prove the queue
-// is actually enqueuing AND processing, not just that the HTTP server is up.
+// is actually enqueuing AND processing, not just that the HTTP server is
+// up. Includes the executing process's pid so it doubles as a real way to
+// confirm which process (the API server's inline processor, or which
+// worker.js instance) actually ran a given job when more than one process
+// is polling the same queue (Phase 18 §8/§31).
 registerJobHandler("system.selftest", async (payload, { reportProgress }) => {
   reportProgress(50, "self-test running");
-  return { ok: true, echoedAt: new Date().toISOString(), payload };
+  return { ok: true, echoedAt: new Date().toISOString(), pid: process.pid, payload };
 });
 
 // Async Public API agent execution (Phase 17 §7) — executeAgentRunFromJob()

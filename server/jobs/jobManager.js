@@ -1,9 +1,15 @@
-// Centralized Job Manager (Phase 16 §2) — the one place that creates,
-// tracks, and drives background work, sitting on top of the Queue Provider
-// abstraction (queueProvider.js) so nothing here depends on the in-process
-// implementation being the permanent one.
+// Centralized Job Manager (Phase 16 §2, Phase 18 §8) — the one place that
+// creates, tracks, and drives background work, sitting on top of the Queue
+// Provider abstraction (queueProvider.js). Deliberately wired to
+// syncProvider() (always the in-process/SQLite adapter), not the
+// QUEUE_PROVIDER-selected one — see queueProvider.js's file-level comment
+// for why. This module's own processing loop (processJobsTick()/
+// initializeJobProcessor()) is reused as-is by both the main API server
+// (inline) and worker.js (standalone) — real multi-process horizontal
+// scaling comes from running more than one of those, all pointed at the
+// same WAL-mode SQLite file, not from a different queue backend.
 import db from "../db.js";
-import { getQueueProvider } from "./queueProvider.js";
+import { syncProvider } from "./queueProvider.js";
 
 // One handler per job `type`, same registration shape as tools/registry.js
 // — a new background job type means "write the handler, register it,"
@@ -23,7 +29,7 @@ function withJson(job) {
 
 export function createJob({ type, orgId, workspaceId, userId, agentId, automationId, payload, priority, maxAttempts, idempotencyKey }) {
   if (!type) throw new Error("Job type is required");
-  const job = getQueueProvider().enqueue({ type, orgId, workspaceId, userId, agentId, automationId, payload, priority, maxAttempts, idempotencyKey });
+  const job = syncProvider().enqueue({ type, orgId, workspaceId, userId, agentId, automationId, payload, priority, maxAttempts, idempotencyKey });
   return withJson(job);
 }
 
@@ -47,11 +53,11 @@ export function listJobs({ orgId, workspaceId, userId, agentId, automationId, ty
   return db.prepare(sql).all(...params).map(withJson);
 }
 
-export const cancelJob = (id) => getQueueProvider().cancel(id);
-export const retryJob = (id) => getQueueProvider().retry(id);
-export const pauseJob = (id) => getQueueProvider().pause(id);
-export const resumeJob = (id) => getQueueProvider().resume(id);
-export const reportProgress = (id, percent, note) => getQueueProvider().progress(id, percent, note);
+export const cancelJob = (id) => syncProvider().cancel(id);
+export const retryJob = (id) => syncProvider().retry(id);
+export const pauseJob = (id) => syncProvider().pause(id);
+export const resumeJob = (id) => syncProvider().resume(id);
+export const reportProgress = (id, percent, note) => syncProvider().progress(id, percent, note);
 
 export function jobStats(filter = {}) {
   const jobs = listJobs({ ...filter, limit: 1000 });
@@ -66,7 +72,7 @@ export function jobStats(filter = {}) {
 // starve the others (claimNext() picks the oldest, highest-priority due job
 // across all registered types, not round-robin per type).
 export async function processJobsTick(batchSize = 5) {
-  const provider = getQueueProvider();
+  const provider = syncProvider();
   const types = Array.from(HANDLERS.keys());
   if (types.length === 0) return;
   for (let i = 0; i < batchSize; i++) {
@@ -92,4 +98,13 @@ export function initializeJobProcessor(intervalMs = 3000) {
   intervalHandle = setInterval(() => {
     processJobsTick().catch((err) => console.error("Job tick error:", err.message));
   }, intervalMs);
+}
+
+// Graceful shutdown (Phase 18 §8/§31): stops scheduling new ticks. Does NOT
+// wait for an in-flight processJobsTick() batch to finish — callers that
+// need that (worker.js) track the in-flight promise themselves, since a
+// setInterval handle alone can't express "and wait for the current one".
+export function stopJobProcessor() {
+  if (intervalHandle) clearInterval(intervalHandle);
+  intervalHandle = null;
 }

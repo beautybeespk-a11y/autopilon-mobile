@@ -241,7 +241,13 @@ app.listen(PORT, () => {
   console.log(`AI Agent Platform API running on http://localhost:${PORT}`);
   initializeSchedulesOnBoot(runScheduledAutomation);
   initializeQueueProcessor();
-  initializeJobProcessor();
+  // [OPTIONAL, default true] Set RUN_INLINE_JOB_PROCESSOR=false once one or
+  // more standalone `node worker.js` processes are handling jobs (Phase 18
+  // §8/§9) — otherwise both this inline processor and the external
+  // worker(s) claim from the same queue at once, which is safe (SQLite's
+  // atomic claim prevents double-processing) but wastes a poll cycle here
+  // for no benefit once dedicated workers exist.
+  if (process.env.RUN_INLINE_JOB_PROCESSOR !== "false") initializeJobProcessor();
   setInterval(sweepExpiredConfirmations, 60_000); // catch ignored confirmations once a minute
   setInterval(sweepExpiredTrials, 60_000 * 60); // check for ended trials once an hour
   setInterval(sweepExpiredIdempotencyKeys, 60_000 * 15); // clear expired Idempotency-Key reservations every 15 minutes
