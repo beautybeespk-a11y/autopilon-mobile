@@ -356,3 +356,276 @@ addition to `requestLog.js`/route handlers, not a redesign) — but until they
 land, this is a solid, correctly-isolated v1 surface for internal or trusted
 early-access developer use, not a hardened, fully-featured public platform
 ready for unrestricted third-party traffic at scale.
+
+*(§13's assessment above is exactly as it stood at Phase 17's completion.
+§14 below is the follow-up hardening pass that closed most of the gaps
+this assessment names — read on for the current picture.)*
+
+---
+
+# Phase 17.1 — Public API Hardening & Completion
+
+A focused follow-up pass, explicitly scoped to closing four of the six
+disclosed Phase 17 gaps (Idempotency-Key support, integration action
+execution, a feature-flag admin UI, and a Python SDK) without redesigning
+or rewriting anything already shipped. Every existing endpoint, table, and
+service function from Phase 17 is untouched except where a task required
+adding a new, additive middleware step (`idempotent()`, `requireCapability`
+was already there) in front of it.
+
+## 14. What Was Implemented
+
+**1. Idempotency-Key support** (`server/publicApi/idempotency.js`,
+`api_idempotency_keys` table) — an HTTP-layer request/response cache in
+front of the existing route handlers, deliberately not a second job/queue
+system. Applied to `POST /v1/agents/:id/execute`, `/messages`,
+`POST /v1/automations/:id/run`, `POST /v1/content/{text,image,voice}`,
+`POST /v1/tasks`, `POST /v1/projects`, and
+`POST /v1/integrations/:provider/actions/:actionName/execute`. Scoped per
+`(apiKeyId, idempotencyKey)` — never shared across keys or orgs, even for
+the identical key string. A 5xx response is never cached (a failed-unknown
+outcome shouldn't lock a client out of retrying). 24h TTL, swept every 15
+minutes via the same `setInterval` pattern `sweepExpiredConfirmations`/
+`sweepExpiredTrials` already use.
+
+**2. Integration Action API** (`orchestrator/integrationApiService.js`'s
+`PUBLIC_INTEGRATION_ACTIONS`, `GET/POST /v1/integrations/:provider/actions...`)
+— a curated, explicitly-approved allowlist across 5 providers (gmail,
+shopify, wordpress, woocommerce, whatsapp), never an arbitrary passthrough.
+Execution reuses `orchestrator/executor.js`'s `runTool()` as-is — the exact
+lifecycle an agent's own AI-driven tool call goes through, including the
+agent-skill permission gate (`toolAvailableToAgent`), confirmation-gating
+for actions that need it, and a real `tool_executions` audit row. New
+scope: `integrations:execute`.
+
+The one real architectural wrinkle this surfaced: every integration tool
+in this codebase resolves credentials via `getConnection(userId, provider)`,
+which follows the **calling user's `users.activeOrgId`** — a session-level
+field — not `req.orgId`. Safe for a human in the web app; not automatically
+safe for a machine API key, whose creator might have a different org
+active. This endpoint explicitly verifies (never assumes) that what
+`getConnection` would resolve for the API key's creator **is** the
+organization's own connection before calling `runTool()` — otherwise it
+rejects with `409 INTEGRATION_CONTEXT_MISMATCH`. This is a real,
+by-design operational constraint (the API key creator must have the
+target org active, with integrations permission, in the web app at call
+time), documented in `API_SECURITY.md`'s new "Integration Actions"
+section — not a workaround, and not hidden.
+
+**3. Feature-flag admin UI** (`client/src/pages/AdminPanel.jsx`'s "Feature
+flags" section, `GET /api/admin/feature-flags/audit-log`) — view, create,
+enable/disable, emergency-disable, edit rollout %, add/remove per-org/user
+overrides, delete, and a recent-changes audit trail. Zero new backend
+gating logic — the Phase 16 flag engine and its existing
+`/api/admin/feature-flags` routes are entirely unchanged; the audit-log
+endpoint only narrows the pre-existing `activity_logs` table to
+`feature_flag_*` actions (same pattern `listBillingLogs()` already used).
+
+**4. Python SDK** (`sdk/python/`, package `autopilon`) — zero third-party
+dependencies (stdlib `urllib` only, including a hand-rolled multipart
+encoder for file upload, since `urllib` has none built in). Mirrors the JS
+SDK's resource coverage exactly: agents, runs, automations, tasks,
+projects, files, content, integrations (`list_actions`/`execute_action`),
+marketplace, webhooks, plus `paginate()` and Idempotency-Key support.
+`AutopilonApiError` carries the same `{code, message, request_id, status}`
+shape as the JS SDK's error class.
+
+**Also, not separately requested but done for consistency**: the JS SDK
+gained `integrations.listActions`/`executeAction` and `idempotencyKey`
+support on every write method that gained it server-side; `openapi.yaml`
+gained the 2 new paths and an `IdempotencyKey` header parameter applied to
+all 9 supporting operations (validated with `openapi-spec-validator`,
+still 0 schema errors); 4 new feature-flag admin-authorization checks were
+added to the core Phase 16 regression suite (a testing gap the original
+suite had, not a gap in the shipped code).
+
+## 15. What Was Actually Tested (and how)
+
+Same discipline as every prior task this project: `node --check`/
+`py_compile` for syntax, then real HTTP requests (or real SDK calls)
+against a locally-booted server with real DB fixtures, explicit
+cross-tenant checks, explicit artifact cleanup after every run — never
+mocked, never claimed without running it.
+
+- **Idempotency**: live-verified via curl before the automated suite
+  existed — first request succeeds, identical retry replays
+  (`Idempotency-Replayed: true`, same resource id), same key + different
+  body → `409`, cross-org isolation (same key string on a different org's
+  key never collides), and a **real concurrent-request test** (`Promise.all`
+  firing two identical requests simultaneously) confirmed exactly one
+  resource was ever created in the database, regardless of which HTTP
+  response each concurrent caller received. `test/idempotencyRegression.js`:
+  **10/10 passing**.
+- **Integration Actions**: live-verified against a real (fixture-inserted,
+  since no real OAuth provider is reachable in this sandbox) connected
+  Gmail integration — the curated action list correctly excludes an
+  internally-real-but-unapproved tool (`gmail.trash_email`); executing
+  `gmail.list_emails` reached the **actual live Gmail API** and got a real
+  Google-issued authentication error back (proof the full pipeline — auth,
+  scope, org ownership, agent-skill gate, `runTool` dispatch — executed
+  correctly end-to-end; the failure is only because the fixture token
+  isn't a real one, see §16); cross-org isolation confirmed for both "no
+  connection" and "connection exists but wrong agent id" cases,
+  independently; the `activeOrgId`-mismatch safety check confirmed live
+  (cleared a real user's `activeOrgId`, confirmed the request correctly
+  rejects with `409` rather than silently proceeding). One flaky first
+  test run using ambiguous Playwright/curl-adjacent selectors accidentally
+  disabled the real `public_api_webhooks` flag — caught, restored, and the
+  second test run used properly-scoped assertions.
+  `test/integrationActionRegression.js`: **12/12 passing**.
+- **Feature-flag admin UI**: live-verified via Playwright against a real
+  booted server and a real platform-admin session — created a flag,
+  disabled it (confirmed the action was scoped to that flag's own row by
+  checking a sibling flag was unaffected), re-enabled it, added an org
+  override (visible immediately), removed it, confirmed the audit log
+  showed the create and override-set events, confirmed deletion via the
+  backend API. Screenshots captured and visually inspected.
+- **Python SDK**: `smoke_test.py` run against a live booted server with a
+  real org and a real 14-scope API key — pagination shape, full task
+  CRUD round-trip, cursor pagination via `client.paginate()`, a 404 error
+  with the correct code, a full webhook create → secret → test-send →
+  list → delete round-trip, a project-creation validation error, a
+  byte-exact file upload → get → download → delete round-trip, an
+  Idempotency-Key replay, and an integration-actions 404 for an
+  unconnected provider. **10/10 passing.**
+- **JS SDK updates**: a targeted 2-check spot test (idempotency replay,
+  integration-actions 404) confirmed the new methods work through the
+  actual published SDK code, not just by inspection.
+- **Full-suite regression**, run together against **one continuously-running
+  fresh server in a single session** (not five isolated claims run
+  separately and never cross-checked): Phase 16 suite **24/24** (20
+  original + 4 new feature-flag authorization checks), Phase 17 Public API
+  suite **30/30**, Idempotency **10/10**, Integration Actions **12/12**,
+  Python SDK smoke test **10/10** — **86/86 total**. A real, observed
+  characteristic of this run: the existing 10-req/min-per-IP auth rate
+  limiter (a pre-existing, intentional brute-force protection, not a bug)
+  was hit once when chaining suites with zero pacing between them
+  (roughly 10 signups across 4 suites landing right at the limiter's
+  boundary); the fix was pacing, not touching the limiter, and is a note
+  for future test-runner tooling, not a defect in the shipped code.
+
+## 16. External Webhook Delivery Test — Exact Steps
+
+Real end-to-end webhook delivery to an external receiver has **not** been
+verified in this sandbox, and cannot be, honestly — this environment's own
+outbound network proxy only allows a fixed domain allowlist, and a real
+test requires delivering to a receiver of the developer's choosing (that's
+the entire point of the feature). This was true at Phase 17's completion
+and remains true here; nothing new in Phase 17.1 changes it. What *has*
+been verified, repeatedly, across both phases: a real webhook created
+against `https://example.com/...` and test-sent gets a real HTTP response
+back (a proxy-issued `403` in this sandbox, correctly captured, signed,
+and recorded as the delivery result) — proof the signing, HTTP-send,
+response-capture, and error-classification logic all run correctly; only
+the "does a receiver outside this sandbox actually get the bytes" step is
+unverified here.
+
+**To verify real external delivery once this app is deployed to a staging
+or production environment with normal outbound internet access:**
+
+1. Stand up a receiver you control that can log incoming requests — the
+   fastest option is a temporary endpoint from a service like
+   `webhook.site` or `requestbin.com` for a first pass, or a real endpoint
+   in your own app for a production-representative test.
+2. In the Developer Console (`/app/organizations/:id/developer` →
+   Webhooks tab) or via the Public API (`POST /v1/webhooks`), create a
+   webhook with that receiver's URL and at least one event type, e.g.
+   `task.created`.
+3. Copy the returned signing secret (`whsec_...`) — you'll need it for
+   step 6.
+4. Click **Test** in the Developer Console (or `POST
+   /v1/webhooks/:id/test`) and confirm the receiver actually logs an
+   incoming POST with a `200`-range response captured back in the
+   Developer Console/API response — this proves basic reachability and
+   that this deployment's outbound network isn't blocked.
+5. Trigger a **real** event the webhook is subscribed to (e.g. create a
+   task via `POST /v1/tasks` if subscribed to `task.created`) and confirm
+   a delivery appears in `GET /v1/webhooks/:id/deliveries` with
+   `status: "completed"` and a real `httpStatus`/`responseTimeMs`.
+6. Verify signature checking on the receiving end: take the raw request
+   body and the `X-Webhook-Signature` header from your receiver's logs,
+   and confirm they validate against the copied secret using the
+   verification snippet in `WEBHOOKS.md`'s "Verifying signatures" section.
+   A mismatch here (rather than at step 4/5) would point to a body
+   re-serialization issue on the *receiver's* side, not this platform's
+   signing.
+7. To verify the retry/dead-letter path specifically, point a webhook at
+   a URL that returns a non-2xx (or is unreachable) and confirm
+   `GET /v1/webhooks/:id/deliveries` shows increasing `attempts` with
+   growing gaps between `lastAttemptAt` values (the documented
+   `min(2^attempts*2, 300)` second backoff), settling at `status:
+   "dead_letter"` after 3 attempts.
+8. To verify SSRF protection is still correctly blocking in the real
+   deployment's network (not just this sandbox's), attempt to create a
+   webhook pointed at `http://169.254.169.254/latest/meta-data/` (or
+   your cloud provider's actual metadata endpoint) and confirm it's
+   rejected with `400 INVALID` at creation time — this is the single most
+   important check to re-run in any new deployment target, since it's the
+   one thing that must hold regardless of network environment.
+
+None of this requires code changes — the implementation is complete and
+was proven correct up to the network boundary this sandbox itself
+imposes; steps 1–8 above are purely a deployment-environment verification
+checklist, not a to-do list of missing functionality.
+
+## 17. Remaining Known Limitations (Phase 17.1)
+
+- Per-event webhook payload schema versioning — still not implemented
+  (unchanged from Phase 17).
+- Automatic re-drive of dead-lettered webhook deliveries — still not
+  implemented (unchanged from Phase 17).
+- Real external webhook delivery testing — architecture-complete,
+  external-environment-dependent (§16 above).
+- Third-party penetration testing / formal load testing of the Public
+  API — not performed (unchanged from Phase 17).
+- Integration Actions' curated allowlist covers 5 providers and a
+  deliberately small action set per provider (§14) — expanding it is
+  real, straightforward, per-action work (one line in
+  `PUBLIC_INTEGRATION_ACTIONS`), not a redesign, but it is not
+  exhaustive of every tool the Tool Registry already has.
+- Integration Actions' `activeOrgId`-dependent credential resolution
+  (§14) is a real operational characteristic of reusing the existing
+  system as instructed, not a bug — but it does mean a Public API caller
+  can hit `409 INTEGRATION_CONTEXT_MISMATCH` for a reason that isn't
+  visible from the API alone (a human needs to switch their active org in
+  the web app first). This is disclosed in `API_SECURITY.md`, not hidden,
+  but it is a real UX rough edge worth a future pass if integration
+  actions become a primary use case.
+- No `Idempotency-Key` support on file upload or webhook creation
+  (deliberately out of scope this pass — file upload's multipart body
+  doesn't hash cleanly via the same JSON-based approach, and webhook
+  creation's duplicate-risk is low).
+
+## 18. Phase 17 / 17.1 — Final Classification
+
+Every capability from both phases, classified honestly:
+
+| Capability | Status |
+|---|---|
+| Agents API (list/get/execute/messages/runs) | **IMPLEMENTED + TESTED** |
+| Automations API | **IMPLEMENTED + TESTED** |
+| Tasks API | **IMPLEMENTED + TESTED** |
+| Projects API | **IMPLEMENTED + TESTED** |
+| Files API (upload/download/list/delete/signed URLs) | **IMPLEMENTED + TESTED** |
+| Content Generation API | **IMPLEMENTED + TESTED** |
+| Integrations API (read-only status) | **IMPLEMENTED + TESTED** |
+| Marketplace browse API | **IMPLEMENTED + TESTED** |
+| Developer webhooks: CRUD, signing, SSRF protection | **IMPLEMENTED + TESTED** |
+| Developer webhooks: delivery mechanics (sign/send/capture/classify) | **IMPLEMENTED + TESTED** |
+| Developer webhooks: real external delivery to a developer's receiver | **IMPLEMENTED + EXTERNAL TEST REQUIRED** (§16) |
+| API request logging + Developer Console (backend + UI) | **IMPLEMENTED + TESTED** |
+| Feature-flag gating of the Public API | **IMPLEMENTED + TESTED** |
+| Admin analytics for Public API usage | **IMPLEMENTED + TESTED** |
+| JS/TS SDK | **IMPLEMENTED + TESTED** |
+| Public API security regression suite | **IMPLEMENTED + TESTED** |
+| Idempotency-Key support | **IMPLEMENTED + TESTED** |
+| Integration Action API (curated allowlist) | **IMPLEMENTED + TESTED**, with real credentials/network access **EXTERNAL TEST REQUIRED** for the underlying provider call itself (§15) |
+| Feature-flag admin UI | **IMPLEMENTED + TESTED** |
+| Python SDK | **IMPLEMENTED + TESTED** |
+| Per-event webhook payload schema versioning | **NOT IMPLEMENTED** |
+| Automatic re-drive of dead-lettered webhook deliveries | **NOT IMPLEMENTED** |
+| Distributed (Redis-backed) rate limiting/queue/cache | **ARCHITECTURE ONLY** (inherited from Phase 16, unchanged) |
+| Third-party penetration testing | **NOT IMPLEMENTED** |
+| Formal load/DoS testing of the Public API | **NOT IMPLEMENTED** |
+| Idempotency-Key on file upload / webhook creation | **NOT IMPLEMENTED** (deliberate scoping, §17) |
+| Integration Actions beyond the 5-provider curated allowlist | **NOT IMPLEMENTED** (expansion is straightforward future work) |

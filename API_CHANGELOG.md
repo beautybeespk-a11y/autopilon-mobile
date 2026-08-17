@@ -2,6 +2,37 @@
 
 The Public API is versioned by URL prefix (`/api/v1`). This changelog tracks what shipped, not a roadmap wishlist — see "Not yet implemented" at the bottom for known gaps.
 
+## v1.1 — 2026-08-17 (hardening & completion pass, status: beta)
+
+Phase 17.1 — closes four of the six gaps disclosed at v1's launch, without redesigning any existing endpoint.
+
+**Idempotency-Key**
+- Opt-in `Idempotency-Key` header on `POST /v1/agents/:id/execute`, `/messages`, `POST /v1/automations/:id/run`, `POST /v1/content/{text,image,voice}`, `POST /v1/tasks`, `POST /v1/projects`, and `POST /v1/integrations/:provider/actions/:actionName/execute`.
+- A retried request with the same key and identical body replays the original response (`Idempotency-Replayed: true`); a different body with the same key is a `409 IDEMPOTENCY_KEY_CONFLICT`; a genuinely concurrent duplicate is `409 IDEMPOTENCY_KEY_IN_PROGRESS`. Scoped per API key — never shared across keys or orgs. 24h TTL, swept every 15 minutes.
+
+**Integration Actions**
+- `GET /v1/integrations/:provider/actions` and `POST /v1/integrations/:provider/actions/:actionName/execute` — a curated, explicitly-approved subset of the internal Tool Registry (gmail, shopify, wordpress, woocommerce, whatsapp), gated by the calling agent's own enabled skills, with confirmation-gating preserved for actions that need it.
+- New scope: `integrations:execute`.
+
+**Feature-flag admin UI**
+- The Admin Panel now has a full "Feature flags" section: view, create, enable/disable, emergency-disable, edit rollout %, org/user overrides, delete, and a recent-changes audit log. No new backend gating — the Phase 16 flag engine and its existing `/api/admin/feature-flags` routes are unchanged.
+
+**Python SDK**
+- `sdk/python/` (`autopilon-sdk`) — a zero-dependency stdlib-only client mirroring the JS SDK's coverage: agents, runs, automations, tasks, projects, files, content, integrations, marketplace, webhooks, plus `paginate()` and Idempotency-Key support.
+
+**Also**
+- `sdk/js/` extended with `integrations.listActions`/`executeAction` and `idempotencyKey` support on every write method that gained it.
+- `openapi.yaml` bumped to 1.1: 2 new paths, `Idempotency-Key` header parameter applied to all 9 supporting operations.
+- New scope `integrations:execute` (18 scopes total).
+- 4 new feature-flag admin-authorization checks added to the core security regression suite.
+- New test suites: `test/idempotencyRegression.js` (10 checks), `test/integrationActionRegression.js` (12 checks), `sdk/python/smoke_test.py` (10 checks).
+
+**Remaining gaps** (unchanged from v1, still disclosed, not hidden):
+- Per-event webhook payload schema versioning.
+- Automatic re-drive of dead-lettered webhook deliveries.
+- Real (non-sandboxed) external webhook delivery testing — requires a staging/production environment with real outbound network access; see PHASE17_NOTES.md's Phase 17.1 section for the exact steps to run once deployed.
+- Third-party penetration testing / formal load testing of the Public API specifically.
+
 ## v1 — 2026-08-17 (initial release, status: beta)
 
 First release of the Public API & Developer Platform (Phase 17).
