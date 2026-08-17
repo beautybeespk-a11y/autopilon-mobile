@@ -3,7 +3,10 @@ import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const db = new Database(join(__dirname, "app.sqlite"));
+// [OPTIONAL] Overrides where the SQLite file lives — e.g. a mounted volume
+// path in a container, so the database survives the container being
+// recreated. Defaults to exactly the previous hardcoded behavior.
+const db = new Database(process.env.DB_PATH || join(__dirname, "app.sqlite"));
 db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 

@@ -1,0 +1,97 @@
+# Local production-like run: app + redis (Phase 18 §44).
+#
+# NOT BUILD/RUN-TESTED IN THIS ENVIRONMENT — no Docker daemon available
+# here (syntax-reviewed only). See Dockerfile's own header comment and
+# DEPLOYMENT_RUNBOOK.md for what's real-tested vs. this.
+#
+# Usage (once Docker is available):
+#   cp .env.example .env   # then fill in SESSION_SECRET/BYOK_ENCRYPTION_KEY at minimum
+#   docker compose up --build
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "4000:4000"
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      SESSION_SECRET: ${SESSION_SECRET}
+      BYOK_ENCRYPTION_KEY: ${BYOK_ENCRYPTION_KEY}
+      CLIENT_ORIGIN: ${CLIENT_ORIGIN:-}
+      APP_BASE_URL: ${APP_BASE_URL:-}
+      PLATFORM_ADMIN_EMAIL: ${PLATFORM_ADMIN_EMAIL:-}
+      # Real, tested Redis-backed providers (Phase 18.2/18.3/18.4) — this
+      # compose file is exactly the "more than one process, needs Redis"
+      # scenario those were built for.
+      REDIS_URL: redis://redis:6379
+      CACHE_PROVIDER: redis
+      RATE_LIMIT_PROVIDER: redis
+      SESSION_STORE: redis
+      # AI provider keys, storage, OAuth, etc. — pass through from the
+      # host's .env; see .env.example for the full list.
+      AI_PROVIDER: ${AI_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+      # A dedicated `worker` service (below) handles job processing in this
+      # compose setup — see server/worker.js (Phase 18.3, real and tested:
+      # two standalone worker processes sharing one SQLite file via WAL
+      # mode correctly split real job load with zero duplication).
+      RUN_INLINE_JOB_PROCESSOR: "false"
+    volumes:
+      - app_data:/app/data
+      - app_uploads:/app/server/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "worker.js"]
+    environment:
+      NODE_ENV: production
+      SESSION_SECRET: ${SESSION_SECRET}
+      BYOK_ENCRYPTION_KEY: ${BYOK_ENCRYPTION_KEY}
+      REDIS_URL: redis://redis:6379
+      AI_PROVIDER: ${AI_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local}
+    volumes:
+      # Same volumes as `app` — worker.js needs the same app.sqlite (WAL
+      # mode; both processes safely share one file) and the same uploaded
+      # files on disk for any job handler that reads/writes them.
+      - app_data:/app/data
+      - app_uploads:/app/server/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+volumes:
+  app_data:
+  app_uploads:
+  redis_data:

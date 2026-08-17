@@ -1,0 +1,235 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One workflow, ordered roughly by cost — cheap syntax/lint checks fail
+# fast before the more expensive live-server regression/SDK jobs run.
+# Phase 18 §28: nothing here is decorative — every job is something that
+# was actually dry-run locally against this exact repo before being
+# committed (see server/config/env.js's validateEnv, the 4 regression
+# suites, and both SDK smoke tests, all already exercised for real during
+# Phase 18 development).
+jobs:
+  lint-and-build:
+    name: Lint, syntax check, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install server dependencies
+        run: npm ci
+        working-directory: server
+
+      - name: Install client dependencies
+        run: npm ci
+        working-directory: client
+
+      - name: Syntax-check every server .js file
+        run: |
+          find . -name "*.js" -not -path "./node_modules/*" -print0 \
+            | xargs -0 -n1 node --check
+        working-directory: server
+
+      - name: Build the client (also exercises esbuild's own syntax/type checks)
+        run: npm run build
+        working-directory: client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-dist
+          path: client/dist
+          retention-days: 1
+
+  migration-check:
+    name: Fresh-database boot check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: server
+
+      # This app's "migrations" are db.js's own idempotent CREATE TABLE IF
+      # NOT EXISTS / PRAGMA table_info + ALTER TABLE ADD COLUMN statements,
+      # run automatically on every boot — there is no separate migration
+      # framework to invoke. The real check is: does the server boot
+      # cleanly against a completely fresh (nonexistent) database file,
+      # and is it actually ready to serve requests afterward.
+      - name: Boot against a fresh database and check readiness
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            if curl -sf http://localhost:4000/api/health/ready > /dev/null; then
+              echo "Server is ready."
+              kill $SERVER_PID
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server never became ready within 20s."
+          kill $SERVER_PID 2>/dev/null || true
+          exit 1
+        working-directory: server
+
+  regression-suites:
+    name: Security / Public API / Idempotency / Integration Action regression
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: server
+
+      - name: Boot the server (default in-process/in-memory providers)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PORT=4102 node index.js &
+          echo $! > server.pid
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4102/api/health/live > /dev/null && exit 0
+            sleep 1
+          done
+          echo "Server never became live within 20s." && exit 1
+        working-directory: server
+
+      - name: Phase 16 security regression
+        run: node test/securityRegression.js http://localhost:4102
+        working-directory: server
+
+      - name: Public API security regression
+        run: node test/publicApiSecurityRegression.js http://localhost:4102
+        working-directory: server
+
+      - name: Idempotency-Key regression
+        run: node test/idempotencyRegression.js http://localhost:4102
+        working-directory: server
+
+      - name: Integration Action API regression
+        run: node test/integrationActionRegression.js http://localhost:4102
+        working-directory: server
+
+      - name: Stop server
+        if: always()
+        run: kill $(cat server.pid) 2>/dev/null || true
+        working-directory: server
+
+      - name: Real Redis connectivity check (Phase 18.2/18.3 providers)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PLATFORM_ADMIN_EMAIL="ci-redis-admin@example.com" \
+          REDIS_URL="redis://localhost:6379" \
+          RATE_LIMIT_PROVIDER=redis CACHE_PROVIDER=redis \
+          PORT=4103 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4103/api/health/live > /dev/null && break
+            sleep 1
+          done
+          COOKIEJAR=$(mktemp)
+          curl -sS -c "$COOKIEJAR" -X POST http://localhost:4103/api/auth/signup \
+            -H "Content-Type: application/json" \
+            -d '{"email":"ci-redis-admin@example.com","password":"CiTestPass123!","name":"CI Redis Admin"}' > /dev/null
+          RESULT=$(curl -sS -b "$COOKIEJAR" http://localhost:4103/api/health/redis)
+          echo "Redis health: $RESULT"
+          kill $SERVER_PID 2>/dev/null || true
+          echo "$RESULT" | grep -q '"ok":true' || { echo "Redis health check did not report ok:true"; exit 1; }
+        working-directory: server
+
+  openapi-validation:
+    name: Validate OpenAPI spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install openapi-spec-validator
+      - name: Validate openapi.yaml
+        run: |
+          python3 -c "
+          from openapi_spec_validator import validate_spec
+          from openapi_spec_validator.readers import read_from_filename
+          spec, base_uri = read_from_filename('openapi.yaml')
+          validate_spec(spec)
+          print(f'OpenAPI spec valid — {len(spec.get(\"paths\", {}))} paths.')
+          "
+
+  sdk-smoke-tests:
+    name: JS + Python SDK smoke tests (real, against a live server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: npm ci
+        working-directory: server
+
+      - name: Boot the server
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          node index.js &
+          echo $! > server.pid
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4000/api/health/live > /dev/null && exit 0
+            sleep 1
+          done
+          echo "Server never became live within 20s." && exit 1
+        working-directory: server
+
+      - name: Provision a real API key for the SDK smoke tests
+        run: |
+          API_KEY=$(node test/ci-provision-api-key.js http://localhost:4000)
+          echo "AUTOPILON_API_KEY=$API_KEY" >> "$GITHUB_ENV"
+        working-directory: server
+
+      - name: JS SDK smoke test
+        run: node smoke_test.mjs
+        working-directory: sdk/js
+        env:
+          AUTOPILON_BASE_URL: http://localhost:4000/api/v1
+
+      - name: Python SDK smoke test
+        run: python3 smoke_test.py
+        working-directory: sdk/python
+        env:
+          AUTOPILON_BASE_URL: http://localhost:4000/api/v1
+
+      - name: Stop server
+        if: always()
+        run: kill $(cat server.pid) 2>/dev/null || true
+        working-directory: server
