@@ -51,6 +51,18 @@ Every Public API resource area sits behind its own feature flag, plus one master
 - Every response carries `X-Request-ID`, echoed in error bodies as `request_id`, so a specific call can be traced end-to-end.
 - Sensitive administrative actions on API keys and webhooks (create, rotate, revoke, delete) are recorded in the organization's activity log via the same `logActivity()` mechanism the rest of the platform uses.
 
+## Integration Actions
+
+`POST /v1/integrations/:provider/actions/:actionName/execute` (Phase 17.1 §2) reuses the existing Tool Registry and agent-skill permission system — it is **not** an arbitrary passthrough to a provider's API. Every layer of protection applies:
+
+- **Curated allowlist**: only the exact tool names listed in `PUBLIC_INTEGRATION_ACTIONS` (`orchestrator/integrationApiService.js`) are reachable — an action registered internally but not on this list returns `404`, indistinguishable from a nonexistent action. Current list: `gmail` (list/search/read emails, send email), `shopify` (list/get products and orders), `wordpress` (list posts, create post), `woocommerce` (list products, list orders), `whatsapp` (list/get conversations, send message). Expanding this list is a deliberate, one-line code change per action, never automatic.
+- **Organization ownership**: the org must have its own `connected` integration row for the provider (`getOrgConnection`), verified before anything else runs.
+- **Agent-based tool permissions**: every call requires an `agentId` belonging to the calling org, and the action runs through the exact same `toolAvailableToAgent()` gate an agent's own AI-driven tool call goes through — an agent without the matching skill enabled is denied, with the same error message a human would see in the chat UI.
+- **A real architectural constraint, verified explicitly, not assumed**: every integration tool in this codebase (not just the ones exposed here) resolves its credentials via `getConnection(userId, provider)`, which follows the **calling user's `activeOrgId`** — a session-level field, not `req.orgId`. This is safe for the web app (a human switches org, their tools follow) but is not automatically safe for a machine API key. Before calling the underlying tool, this endpoint explicitly verifies that what `getConnection` would resolve for the API key's creator **is the same row** as the organization's own connection (`orgConn.id === resolvedForCaller.id`) — if the creator's active organization doesn't match, the request is rejected with `409 INTEGRATION_CONTEXT_MISMATCH` rather than silently executing against whichever organization the user happened to be "in" at that moment. This is the same "verify explicitly, never trust a broader-scoped resolution" discipline applied to every other cross-tenant risk in this phase (see §Tenant Isolation in PHASE17_NOTES.md).
+- **Confirmation gating preserved**: an action that requires human approval internally (`gmail.send_email`) behaves identically through the Public API — it returns `awaiting_confirmation` and a notification is sent to the org; it does not bypass that safety net just because the caller is a machine.
+- **Audit logging**: every call creates a real `tool_executions` row via the existing `runTool()` lifecycle (the same audit trail an agent's own tool call produces), in addition to the Public API's own `api_request_logs` row.
+- **Quotas, usage tracking, billing, rate limits**: this endpoint sits behind the same `apiRateLimit()` and `requireCapability("public_api_integrations")` gate as every other Public API route. There is currently no separate per-tool-call billing/quota system anywhere in this platform (only AI generation is metered) — this endpoint does not bypass anything that exists, because there is nothing beyond rate limiting that currently exists to bypass.
+
 ## Secrets handling
 
 - API key secrets: hashed (SHA-256), shown once, never recoverable — see Authentication above.
@@ -60,6 +72,6 @@ Every Public API resource area sits behind its own feature flag, plus one master
 ## Known limitations (disclosed, not hidden)
 
 - `Idempotency-Key` support (Phase 17.1) covers the main write endpoints (agent execute/messages, automation run, content generation, task/project create) — see PUBLIC_API.md. File upload and webhook creation are not covered.
-- No integration *action* execution via the Public API (read-only integration status only) — the documented workaround is executing an agent that has the relevant tool/skill enabled.
+- Integration *action* execution (Phase 17.1) covers a curated, small set of actions across 5 providers (see §Integration Actions above) — not every registered internal tool, and expanding the list is deliberate per-action work, not automatic.
 - No admin UI for feature flags (API-only today).
 - This phase's security testing covered functional/regression checks (the 20-check suite) plus targeted manual verification of the specific SSRF, tenant-isolation, and quota-bypass scenarios described above. It did not include third-party penetration testing or a formal load/DoS test against the Public API specifically. Treat this document as a description of implemented controls, not a certification.

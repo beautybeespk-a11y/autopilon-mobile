@@ -19,7 +19,7 @@ export const API_SCOPES = [
   "tasks:read", "tasks:write",
   "files:read", "files:write",
   "content:generate",
-  "integrations:read",
+  "integrations:read", "integrations:execute",
   "usage:read",
   "billing:read",
   "webhooks:manage",

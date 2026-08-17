@@ -36,7 +36,8 @@ A key is created with an explicit, fixed set of scopes — there is no "all acce
 | `files:read` | List/get files, download content, create download links |
 | `files:write` | Upload, delete files |
 | `content:generate` | Generate text/image/voice content, read generated assets |
-| `integrations:read` | List connected integrations |
+| `integrations:read` | List connected integrations and their curated public actions |
+| `integrations:execute` | Execute a curated, approved integration action |
 | `usage:read` | *(reserved for future usage-query endpoints — Developer Console UI covers this today)* |
 | `billing:read` | *(reserved — no endpoint uses this yet)* |
 | `webhooks:manage` | Full CRUD on developer webhooks, view deliveries |
@@ -112,7 +113,7 @@ POST /v1/tasks
 Idempotency-Key: 3f7a9e21-...   (any string you generate, up to 255 chars — a UUID is a good default)
 ```
 
-Supported on: `POST /v1/agents/:id/execute`, `POST /v1/agents/:id/messages`, `POST /v1/automations/:id/run`, `POST /v1/content/text`, `POST /v1/content/image`, `POST /v1/content/voice`, `POST /v1/tasks`, `POST /v1/projects`. Not supported on other endpoints (list/get/update/delete calls don't need it; file upload and webhook creation are deliberately out of scope for now — see API_SECURITY.md).
+Supported on: `POST /v1/agents/:id/execute`, `POST /v1/agents/:id/messages`, `POST /v1/automations/:id/run`, `POST /v1/content/text`, `POST /v1/content/image`, `POST /v1/content/voice`, `POST /v1/tasks`, `POST /v1/projects`, `POST /v1/integrations/:provider/actions/:actionName/execute`. Not supported on other endpoints (list/get/update/delete calls don't need it; file upload and webhook creation are deliberately out of scope for now — see API_SECURITY.md).
 
 Behavior:
 - **No header** — the endpoint behaves exactly as if idempotency didn't exist; nothing is deduplicated. This is opt-in.
@@ -259,7 +260,27 @@ List connected integrations for the org. Scope: `integrations:read`.
 ```
 Read-only. Never returns an OAuth token, refresh token, or any other credential.
 
-**Known limitation**: there is no endpoint to *execute* an integration action (send an email, create a product, post to WhatsApp, etc.) through the Public API directly. The real path today is `POST /v1/agents/:id/execute` against an agent that has the relevant skill/tool enabled — every integration action already exists as a Tool an agent can call. A curated per-provider action API is not implemented.
+### `GET /v1/integrations/:provider/actions`
+List the curated, publicly-approved actions available for a connected provider. Scope: `integrations:read`. `404 RESOURCE_NOT_FOUND` if the org has no connected integration for that provider.
+```json
+{ "data": [ { "name": "gmail.list_emails", "description": "...", "parameters": { ... }, "requiresConfirmation": false } ] }
+```
+Only a deliberately small, explicitly-approved subset of each provider's full tool set is exposed here (see [API_SECURITY.md](API_SECURITY.md#integration-actions) for the exact current list) — this is **not** a passthrough to the provider's own API, and it never grows without a code change.
+
+### `POST /v1/integrations/:provider/actions/:actionName/execute`
+Execute one approved action. Scope: `integrations:execute`. Body:
+```json
+{ "agentId": "...", "parameters": { ... } }
+```
+`agentId` is required — the action runs through that agent's own tool permissions (the agent must have the matching skill enabled), the exact same gate an agent's own AI-driven tool call goes through. `Idempotency-Key` is supported (see below).
+
+Response mirrors the internal tool execution lifecycle:
+```json
+{ "executionId": "...", "status": "completed", "result": { ... } }
+```
+`status` can be `completed`, `failed` (with an `error` message — this is a normal `200` response, not an HTTP error, matching how automation runs report failure), or `awaiting_confirmation` (for an action like `gmail.send_email` that always requires human approval — a notification is sent to the org, and the action only actually runs once approved in the web app; there is currently no Public API endpoint to check on or approve a pending confirmation remotely).
+
+**Important**: integration credentials are resolved by the API key creator's *currently-active organization* in the web app (the same mechanism the internal chat pipeline uses) — not directly by the API key's own organization. If those don't match, the request is rejected with `409 INTEGRATION_CONTEXT_MISMATCH` rather than silently running against the wrong organization's connected account. See [API_SECURITY.md](API_SECURITY.md#integration-actions) for why this constraint exists.
 
 ## Marketplace
 

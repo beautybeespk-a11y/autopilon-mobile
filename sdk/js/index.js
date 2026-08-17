@@ -94,16 +94,24 @@ export class AutopilonClient {
   }
 }
 
+// Turns an optional idempotencyKey into the {headers} shape request() expects.
+// Shared by every resource method below that wraps a write endpoint
+// supporting Idempotency-Key (see PUBLIC_API.md's Idempotency section for
+// exactly which ones).
+function idempotencyHeaders(idempotencyKey) {
+  return idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : {};
+}
+
 class AgentsResource {
   constructor(client) { this._c = client; }
   list(opts = {}) { return this._c.request("GET", "/agents", { query: opts }); }
   get(id) { return this._c.request("GET", `/agents/${encodeURIComponent(id)}`); }
   listRuns(id, opts = {}) { return this._c.request("GET", `/agents/${encodeURIComponent(id)}/runs`, { query: opts }); }
-  execute(id, { message, conversationId, async: runAsync } = {}) {
-    return this._c.request("POST", `/agents/${encodeURIComponent(id)}/execute`, { body: { message, conversationId, async: runAsync } });
+  execute(id, { message, conversationId, async: runAsync, idempotencyKey } = {}) {
+    return this._c.request("POST", `/agents/${encodeURIComponent(id)}/execute`, { body: { message, conversationId, async: runAsync }, ...idempotencyHeaders(idempotencyKey) });
   }
-  sendMessage(id, { message, conversationId } = {}) {
-    return this._c.request("POST", `/agents/${encodeURIComponent(id)}/messages`, { body: { message, conversationId } });
+  sendMessage(id, { message, conversationId, idempotencyKey } = {}) {
+    return this._c.request("POST", `/agents/${encodeURIComponent(id)}/messages`, { body: { message, conversationId }, ...idempotencyHeaders(idempotencyKey) });
   }
 }
 
@@ -116,7 +124,7 @@ class AutomationsResource {
   constructor(client) { this._c = client; }
   list(opts = {}) { return this._c.request("GET", "/automations", { query: opts }); }
   get(id) { return this._c.request("GET", `/automations/${encodeURIComponent(id)}`); }
-  run(id, { variables } = {}) { return this._c.request("POST", `/automations/${encodeURIComponent(id)}/run`, { body: { variables } }); }
+  run(id, { variables, idempotencyKey } = {}) { return this._c.request("POST", `/automations/${encodeURIComponent(id)}/run`, { body: { variables }, ...idempotencyHeaders(idempotencyKey) }); }
   listRuns(id, opts = {}) { return this._c.request("GET", `/automations/${encodeURIComponent(id)}/runs`, { query: opts }); }
   getRun(runId) { return this._c.request("GET", `/automations/runs/${encodeURIComponent(runId)}`); }
 }
@@ -125,7 +133,7 @@ class TasksResource {
   constructor(client) { this._c = client; }
   list(opts = {}) { return this._c.request("GET", "/tasks", { query: opts }); }
   get(id) { return this._c.request("GET", `/tasks/${encodeURIComponent(id)}`); }
-  create(body) { return this._c.request("POST", "/tasks", { body }); }
+  create(body, { idempotencyKey } = {}) { return this._c.request("POST", "/tasks", { body, ...idempotencyHeaders(idempotencyKey) }); }
   update(id, patch) { return this._c.request("PATCH", `/tasks/${encodeURIComponent(id)}`, { body: patch }); }
   complete(id) { return this._c.request("POST", `/tasks/${encodeURIComponent(id)}/complete`); }
   archive(id) { return this._c.request("DELETE", `/tasks/${encodeURIComponent(id)}`); }
@@ -135,7 +143,7 @@ class ProjectsResource {
   constructor(client) { this._c = client; }
   list(opts = {}) { return this._c.request("GET", "/projects", { query: opts }); }
   get(id) { return this._c.request("GET", `/projects/${encodeURIComponent(id)}`); }
-  create(body) { return this._c.request("POST", "/projects", { body }); }
+  create(body, { idempotencyKey } = {}) { return this._c.request("POST", "/projects", { body, ...idempotencyHeaders(idempotencyKey) }); }
   update(id, patch) { return this._c.request("PATCH", `/projects/${encodeURIComponent(id)}`, { body: patch }); }
   archive(id) { return this._c.request("DELETE", `/projects/${encodeURIComponent(id)}`); }
   listItems(id) { return this._c.request("GET", `/projects/${encodeURIComponent(id)}/items`); }
@@ -177,14 +185,20 @@ class FilesResource {
 class ContentResource {
   constructor(client) { this._c = client; }
   getAsset(id) { return this._c.request("GET", `/content/${encodeURIComponent(id)}`); }
-  generateText(body) { return this._c.request("POST", "/content/text", { body }); }
-  generateImage(body) { return this._c.request("POST", "/content/image", { body }); }
-  generateVoice(body) { return this._c.request("POST", "/content/voice", { body }); }
+  generateText(body, { idempotencyKey } = {}) { return this._c.request("POST", "/content/text", { body, ...idempotencyHeaders(idempotencyKey) }); }
+  generateImage(body, { idempotencyKey } = {}) { return this._c.request("POST", "/content/image", { body, ...idempotencyHeaders(idempotencyKey) }); }
+  generateVoice(body, { idempotencyKey } = {}) { return this._c.request("POST", "/content/voice", { body, ...idempotencyHeaders(idempotencyKey) }); }
 }
 
 class IntegrationsResource {
   constructor(client) { this._c = client; }
   list() { return this._c.request("GET", "/integrations"); }
+  listActions(provider) { return this._c.request("GET", `/integrations/${encodeURIComponent(provider)}/actions`); }
+  executeAction(provider, actionName, { agentId, parameters, idempotencyKey } = {}) {
+    return this._c.request("POST", `/integrations/${encodeURIComponent(provider)}/actions/${encodeURIComponent(actionName)}/execute`, {
+      body: { agentId, parameters }, ...idempotencyHeaders(idempotencyKey),
+    });
+  }
 }
 
 class MarketplaceResource {

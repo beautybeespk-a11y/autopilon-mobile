@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Autopilon Public API
-  version: "1.0"
+  version: "1.1"
   description: |
     Machine-readable reference for the Autopilon Public API (/api/v1), status: beta.
     This spec covers exactly the endpoints implemented in server/publicApi/ — see
@@ -122,6 +122,7 @@ paths:
       summary: Execute an agent (sync or async)
       tags: [Agents]
       parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/ResourceId"
       requestBody:
         required: true
@@ -155,6 +156,7 @@ paths:
       summary: Send a message to an agent (always synchronous)
       tags: [Agents]
       parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/ResourceId"
       requestBody:
         required: true
@@ -238,6 +240,7 @@ paths:
       summary: Trigger an automation run
       tags: [Automations]
       parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
         - $ref: "#/components/parameters/ResourceId"
       requestBody:
         required: false
@@ -323,6 +326,8 @@ paths:
       operationId: createTask
       summary: Create a task
       tags: [Tasks]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -437,6 +442,8 @@ paths:
       operationId: createProject
       summary: Create a project
       tags: [Projects]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -712,6 +719,8 @@ paths:
       operationId: generateText
       summary: Generate text content
       tags: [Content]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -741,6 +750,8 @@ paths:
       operationId: generateImage
       summary: Generate image content
       tags: [Content]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -772,6 +783,8 @@ paths:
       operationId: generateVoice
       summary: Generate voice content
       tags: [Content]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -815,6 +828,76 @@ paths:
                         provider: { type: string }
                         status: { type: string }
                         createdAt: { type: string, format: date-time }
+
+  /integrations/{provider}/actions:
+    get:
+      operationId: listIntegrationActions
+      summary: List curated, publicly-approved actions for a connected provider
+      tags: [Integrations]
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+          example: gmail
+      responses:
+        "200":
+          description: Approved actions for this provider.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/IntegrationAction" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /integrations/{provider}/actions/{actionName}/execute:
+    post:
+      operationId: executeIntegrationAction
+      summary: Execute one approved integration action
+      tags: [Integrations]
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string }
+          example: gmail
+        - name: actionName
+          in: path
+          required: true
+          schema: { type: string }
+          example: gmail.list_emails
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [agentId]
+              properties:
+                agentId:
+                  type: string
+                  description: An agent in this org with the matching skill enabled — the action runs through that agent's own tool permissions.
+                parameters:
+                  type: object
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Execution result (completed, failed, or awaiting_confirmation - all normal 200 outcomes, not HTTP errors).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/IntegrationActionResult" }
+        "400": { $ref: "#/components/responses/InvalidRequest" }
+        "403": { $ref: "#/components/responses/InsufficientScope" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The API key creator's active organization does not match this organization's connected integration (INTEGRATION_CONTEXT_MISMATCH).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /marketplace/assets:
     get:
@@ -1079,6 +1162,14 @@ components:
       in: query
       description: Opaque cursor from a previous response's pagination.nextCursor.
       schema: { type: string }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      description: |
+        Optional. A retried request with the same key and identical body replays
+        the original response instead of running again. See PUBLIC_API.md's
+        Idempotency section for full semantics (conflict/in-progress/expiry).
+      schema: { type: string, maxLength: 255 }
 
   responses:
     Unauthenticated:
@@ -1265,3 +1356,21 @@ components:
         error: { type: string, nullable: true }
         status: { type: string }
         createdAt: { type: string, format: date-time }
+
+    IntegrationAction:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        parameters: { type: object, additionalProperties: true }
+        requiresConfirmation: { type: boolean }
+
+    IntegrationActionResult:
+      type: object
+      properties:
+        executionId: { type: string }
+        status: { type: string, enum: [completed, failed, awaiting_confirmation] }
+        result: { type: object, additionalProperties: true, nullable: true }
+        error: { type: string, nullable: true }
+        confirmationId: { type: string, nullable: true }
+        reason: { type: string, nullable: true }

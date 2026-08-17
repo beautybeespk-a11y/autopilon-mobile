@@ -66,11 +66,22 @@ const webhook = await client.webhooks.create({
   events: ["agent.run.completed", "agent.run.failed"],
 });
 console.log(webhook.secret);
+
+// Idempotency-Key — a retried write with the same key and body replays the
+// original result instead of running twice. Supported on the write
+// endpoints listed in PUBLIC_API.md's Idempotency section.
+const task = await client.tasks.create({ title: "Follow up" }, { idempotencyKey: crypto.randomUUID() });
+
+// Integration actions — a curated, explicitly-approved subset of what an
+// agent's own tools can do, gated by that agent's enabled skills (same as
+// the internal chat pipeline). See PUBLIC_API.md's Integrations section.
+const { data: actions } = await client.integrations.listActions("gmail");
+const result = await client.integrations.executeAction("gmail", "gmail.list_emails", { agentId: agents[0].id });
 ```
 
 ## What's covered
 
-Every resource documented in [PUBLIC_API.md](../../PUBLIC_API.md): `agents`, `runs`, `automations`, `tasks`, `projects`, `files`, `content`, `integrations`, `marketplace`, `webhooks`. Nothing beyond that — this SDK does not invent convenience methods for endpoints that don't exist server-side (there is, for example, no `client.integrations.execute(...)` — see the "Known limitation" in PUBLIC_API.md's Integrations section).
+Every resource documented in [PUBLIC_API.md](../../PUBLIC_API.md): `agents`, `runs`, `automations`, `tasks`, `projects`, `files`, `content`, `integrations` (including the curated `listActions`/`executeAction` methods), `marketplace`, `webhooks`. Nothing beyond that — this SDK does not invent convenience methods for endpoints that don't exist server-side.
 
 ## What's not covered
 

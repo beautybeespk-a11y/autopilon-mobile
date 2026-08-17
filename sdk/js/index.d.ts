@@ -94,13 +94,24 @@ export interface TestEventResult {
   eventId: string; eventType: string; payload: Record<string, unknown>;
   httpStatus: number | null; responseTimeMs: number; error: string | null;
 }
+export interface IntegrationAction {
+  name: string; description: string; parameters: Record<string, unknown>; requiresConfirmation: boolean;
+}
+export interface IntegrationActionResult {
+  executionId: string;
+  status: "completed" | "failed" | "awaiting_confirmation";
+  result?: unknown;
+  error?: string;
+  confirmationId?: string;
+  reason?: string;
+}
 
 declare class AgentsResource {
   list(opts?: ListOpts): Promise<PaginatedResponse<Agent>>;
   get(id: string): Promise<Agent>;
   listRuns(id: string, opts?: ListOpts): Promise<PaginatedResponse<Run>>;
-  execute(id: string, opts: { message: string; conversationId?: string; async?: boolean }): Promise<Run>;
-  sendMessage(id: string, opts: { message: string; conversationId?: string }): Promise<{ conversationId: string; response: string; usage: Usage }>;
+  execute(id: string, opts: { message: string; conversationId?: string; async?: boolean; idempotencyKey?: string }): Promise<Run>;
+  sendMessage(id: string, opts: { message: string; conversationId?: string; idempotencyKey?: string }): Promise<{ conversationId: string; response: string; usage: Usage }>;
 }
 declare class RunsResource {
   get(id: string): Promise<Run>;
@@ -108,14 +119,14 @@ declare class RunsResource {
 declare class AutomationsResource {
   list(opts?: ListOpts): Promise<PaginatedResponse<Automation>>;
   get(id: string): Promise<Automation>;
-  run(id: string, opts?: { variables?: Record<string, unknown> }): Promise<AutomationRun>;
+  run(id: string, opts?: { variables?: Record<string, unknown>; idempotencyKey?: string }): Promise<AutomationRun>;
   listRuns(id: string, opts?: ListOpts): Promise<PaginatedResponse<AutomationRun>>;
   getRun(runId: string): Promise<AutomationRun>;
 }
 declare class TasksResource {
   list(opts?: ListOpts): Promise<PaginatedResponse<Task>>;
   get(id: string): Promise<Task>;
-  create(body: { title: string; description?: string; priority?: string; dueDate?: string }): Promise<Task>;
+  create(body: { title: string; description?: string; priority?: string; dueDate?: string }, opts?: { idempotencyKey?: string }): Promise<Task>;
   update(id: string, patch: Partial<Pick<Task, "title" | "description" | "status" | "priority" | "dueDate">>): Promise<Task>;
   complete(id: string): Promise<Task>;
   archive(id: string): Promise<Task>;
@@ -123,7 +134,7 @@ declare class TasksResource {
 declare class ProjectsResource {
   list(opts?: ListOpts): Promise<PaginatedResponse<Project>>;
   get(id: string): Promise<Project>;
-  create(body: { workspaceId: string; name?: string; description?: string }): Promise<Project>;
+  create(body: { workspaceId: string; name?: string; description?: string }, opts?: { idempotencyKey?: string }): Promise<Project>;
   update(id: string, patch: Partial<Pick<Project, "name" | "description" | "status">>): Promise<Project>;
   archive(id: string): Promise<Project>;
   listItems(id: string): Promise<unknown[]>;
@@ -140,12 +151,14 @@ declare class FilesResource {
 }
 declare class ContentResource {
   getAsset(id: string): Promise<ContentAsset>;
-  generateText(body: { contentType: string; brief: string; tone?: string; targetAudience?: string; keywords?: string[]; title?: string; agentId?: string }): Promise<ContentAsset>;
-  generateImage(body: { prompt: string; negativePrompt?: string; size?: string; quality?: string; numImages?: number; title?: string; agentId?: string }): Promise<ContentAsset[]>;
-  generateVoice(body: { text: string; voice?: string; speed?: number; title?: string; agentId?: string }): Promise<ContentAsset>;
+  generateText(body: { contentType: string; brief: string; tone?: string; targetAudience?: string; keywords?: string[]; title?: string; agentId?: string }, opts?: { idempotencyKey?: string }): Promise<ContentAsset>;
+  generateImage(body: { prompt: string; negativePrompt?: string; size?: string; quality?: string; numImages?: number; title?: string; agentId?: string }, opts?: { idempotencyKey?: string }): Promise<ContentAsset[]>;
+  generateVoice(body: { text: string; voice?: string; speed?: number; title?: string; agentId?: string }, opts?: { idempotencyKey?: string }): Promise<ContentAsset>;
 }
 declare class IntegrationsResource {
   list(): Promise<{ data: Integration[] }>;
+  listActions(provider: string): Promise<{ data: IntegrationAction[] }>;
+  executeAction(provider: string, actionName: string, opts: { agentId: string; parameters?: Record<string, unknown>; idempotencyKey?: string }): Promise<IntegrationActionResult>;
 }
 declare class MarketplaceResource {
   listAssets(opts?: { q?: string; assetType?: string; categoryId?: string; sort?: string; limit?: number }): Promise<{ data: unknown[]; pagination: { limit: number } }>;
