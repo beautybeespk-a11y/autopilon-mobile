@@ -70,7 +70,7 @@ The response includes a `secret` — save it, it's how you'll verify incoming de
 
 ## 7. Use the SDK (optional)
 
-A minimal JS/TS client wrapping the endpoints above is available — see [`sdk/js/README.md`](sdk/js/README.md). It covers authentication, pagination, and typed error handling; it does not wrap anything not documented in PUBLIC_API.md. There is currently no Python SDK.
+Minimal, dependency-free clients wrapping the endpoints above are available for [JS/TS](sdk/js/README.md) and [Python](sdk/python/README.md). Both cover authentication, pagination, idempotency, and typed/structured error handling; neither wraps anything not documented in PUBLIC_API.md.
 
 ## Common pitfalls
 

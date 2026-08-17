@@ -2,7 +2,7 @@
 
 A minimal, dependency-free JS/TS client for the [Autopilon Public API](../../PUBLIC_API.md). Not published to npm — install it locally from this repo path. Requires Node 18+ (for global `fetch`/`FormData`), or any modern browser.
 
-There is currently no Python SDK — see [API_CHANGELOG.md](../../API_CHANGELOG.md).
+A Python SDK is also available — see [`sdk/python/README.md`](../python/README.md).
 
 ## Install
 

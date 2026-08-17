@@ -42,7 +42,6 @@ First release of the Public API & Developer Platform (Phase 17).
 - `Idempotency-Key` support on synchronous write endpoints.
 - Integration *action* execution through the Public API (read-only status only today).
 - Admin web UI for feature-flag management (API-only).
-- Python SDK.
 - Per-event webhook payload schema versioning.
 - Automatic re-drive of dead-lettered webhook deliveries.
 - Third-party penetration testing / formal load testing of the Public API specifically.
