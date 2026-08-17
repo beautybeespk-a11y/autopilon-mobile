@@ -5,6 +5,10 @@
 // human-written message string, so there is no path for internal detail to
 // leak through it by accident.
 export function apiError(res, status, code, message) {
+  // Stashed on the request so requestLog.js's finish handler can record
+  // which error code a failed call actually returned, without requestLog.js
+  // having to re-parse the JSON body it already streamed out.
+  if (res.req) res.req._apiErrorCode = code;
   res.status(status).json({ error: { code, message, request_id: res.req?.requestId || null } });
 }
 

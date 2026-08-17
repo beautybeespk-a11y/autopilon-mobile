@@ -63,6 +63,7 @@ import gmailAuthRoutes from "./routes/gmailAuth.js";
 import automationRoutes from "./routes/automations.js";
 import eventWebhookRoutes from "./routes/eventWebhooks.js";
 import healthRoutes from "./routes/health.js";
+import publicApiV1 from "./publicApi/router.js";
 import { initializeSchedulesOnBoot } from "./automation/scheduler.js";
 import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
@@ -156,6 +157,16 @@ app.use("/api/share", fileSharesRoutes);
 // behind requireAuth + requirePlatformAdmin internally — mounting early
 // only affects /live and /ready's reachability, not what's protected.
 app.use("/api/health", healthRoutes);
+
+// Public API v1 (Phase 17) — mounted here, before any bare-"/api"-mounted
+// internal router (billingRoutes etc. below), for the exact same reason
+// health.js is: those routers' blanket `router.use(requireAuth)` runs
+// unconditionally for ANY request delegated to them, even one none of
+// their own routes match, and would otherwise 401 every /api/v1/* request
+// with a SESSION check before it ever reached this API-key-authenticated
+// router. This bug class has bitten health.js's /live and /ready twice
+// already this project — mounting early is the fix, not a workaround.
+app.use("/api/v1", publicApiV1);
 
 app.use("/api/auth", authRoutes);
 app.use("/api/chat", chatRoutes);

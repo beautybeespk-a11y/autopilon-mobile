@@ -56,6 +56,15 @@ function getProvider() {
   return REGISTRY[configured] || InMemoryRateLimiter;
 }
 
+// Exposes the same underlying check() every middleware below already uses —
+// for callers (Phase 17's Public API) that need full control over the
+// response shape (custom headers, a different error body) rather than one
+// of the ready-made middlewares here. Still exactly one rate-limiting
+// engine either way, never a second one.
+export function checkRateLimit(key, opts) {
+  return getProvider().check(key, opts);
+}
+
 export function rateLimiterStatus() {
   const entry = getProvider();
   return { provider: entry.name, configured: entry.configured, reason: entry.configured ? null : "Requires REDIS_URL and ioredis — not present in this environment." };
