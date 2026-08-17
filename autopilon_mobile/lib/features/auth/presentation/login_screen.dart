@@ -18,6 +18,16 @@ class _LoginScreenState extends ConsumerState<LoginScreen> {
   bool _submitting = false;
   String? _error;
 
+  @override
+  void initState() {
+    super.initState();
+    // Surfaces AuthController's own error (e.g. "Your session expired —
+    // please log in again," set when a 401 on an authenticated request
+    // redirects here — see auth_provider.dart's onSessionExpired
+    // listener), not just errors from a login attempt made on this screen.
+    _error = ref.read(authControllerProvider).error;
+  }
+
   Future<void> _submit() async {
     if (!_formKey.currentState!.validate()) return;
     setState(() { _submitting = true; _error = null; });

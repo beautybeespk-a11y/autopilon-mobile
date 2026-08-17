@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../../core/api/api_client.dart';
 import '../../../core/push/push_service.dart';
@@ -29,9 +30,27 @@ class AuthState {
 
 class AuthController extends StateNotifier<AuthState> {
   AuthController(this._ref) : super(const AuthState()) {
-    _restoreSession();
+    _init();
   }
   final Ref _ref;
+  StreamSubscription<void>? _sessionExpiredSub;
+
+  Future<void> _init() async {
+    final apiClient = await _ref.read(apiClientProvider.future);
+    // Mid-session expiry (Phase 18 §33): a cookie that was valid a moment
+    // ago and now isn't (expired, or revoked server-side) previously left
+    // the user stuck on whatever screen they were on with silently-failing
+    // requests and no path back to the login screen. This routes any such
+    // 401 (see ApiClient's onResponse interceptor) into the same auth
+    // state the router already redirects on.
+    _sessionExpiredSub = apiClient.onSessionExpired.listen((_) => _handleSessionExpired());
+    await _restoreSession();
+  }
+
+  void _handleSessionExpired() {
+    if (state.status != AuthStatus.authenticated) return; // already logged out / never was — nothing to do
+    state = const AuthState(status: AuthStatus.unauthenticated, error: 'Your session expired — please log in again.');
+  }
 
   /// On app start, try the existing session cookie (if any) against
   /// GET /auth/me — this is what makes "remember me" actually work: if the
@@ -47,6 +66,12 @@ class AuthController extends StateNotifier<AuthState> {
     } else {
       state = const AuthState(status: AuthStatus.unauthenticated);
     }
+  }
+
+  @override
+  void dispose() {
+    _sessionExpiredSub?.cancel();
+    super.dispose();
   }
 
   Future<bool> login(String email, String password, {required bool rememberMe}) async {

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -17,10 +18,24 @@ class ApiClient {
 
   final Dio _dio;
   final PersistCookieJar _cookieJar;
+  final _sessionExpiredController = StreamController<void>.broadcast();
 
-  /// Set this once at app startup (see main.dart) — the base URL of your
-  /// running Autopilon server, e.g. your Codespace's forwarded port-4000 URL.
-  static String baseUrl = 'https://isotope-dipping-cobweb.ngrok-free.dev/api';
+  /// Fires when an already-authenticated request comes back 401 — i.e. the
+  /// session cookie was valid a moment ago and now isn't (expired, or
+  /// revoked server-side). AuthController (features/auth/providers/
+  /// auth_provider.dart) listens to this and flips auth state to
+  /// unauthenticated, which the router's redirect already sends to /login
+  /// (Phase 18 §33 — previously there was no mid-session expiry detection
+  /// at all: an expired cookie just meant every subsequent screen quietly
+  /// failed its requests with no path back to the login screen).
+  Stream<void> get onSessionExpired => _sessionExpiredController.stream;
+
+  /// Set once at app startup from AppConfig.apiBaseUrl (see main.dart and
+  /// core/config/app_config.dart) — resolved from --dart-define values,
+  /// not hardcoded. The empty-string default here is never actually used
+  /// at runtime (main.dart always assigns a real value before create() is
+  /// called); it exists only so this field has a valid initial value.
+  static String baseUrl = '';
 
   static Future<ApiClient> create() async {
     final dir = await getApplicationDocumentsDirectory();
@@ -33,7 +48,21 @@ class ApiClient {
       validateStatus: (status) => status != null && status < 500, // handle 4xx ourselves, not as Dio exceptions
     ));
     dio.interceptors.add(CookieManager(cookieJar));
-    return ApiClient._(dio, cookieJar);
+    final client = ApiClient._(dio, cookieJar);
+    dio.interceptors.add(InterceptorsWrapper(onResponse: (response, handler) {
+      // /auth/* is excluded deliberately: a wrong password on /auth/login
+      // legitimately 401s and must show as "invalid credentials," not
+      // "session expired" (the user isn't authenticated yet at all), and
+      // /auth/me's own 401 on a cold start with no cookie is the normal,
+      // expected "not logged in" case AuthController already handles
+      // directly via its result.isSuccess check.
+      final isAuthEndpoint = response.requestOptions.path.startsWith('/auth/');
+      if (response.statusCode == 401 && !isAuthEndpoint) {
+        client._sessionExpiredController.add(null);
+      }
+      handler.next(response);
+    }));
+    return client;
   }
 
   Future<ApiResult<T>> get<T>(String path, {Map<String, dynamic>? query, T Function(dynamic)? parse}) =>
