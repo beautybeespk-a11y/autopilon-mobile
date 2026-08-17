@@ -13,6 +13,7 @@ import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { handleIncomingMessage } from "./conversationService.js";
 import { createJob, getJob } from "../jobs/jobManager.js";
+import { publishDeveloperWebhookEvent } from "./webhookEvents.js";
 
 const now = () => new Date().toISOString();
 
@@ -52,9 +53,13 @@ function markRunFailed(runId, errorMessage) {
 
 // The one real execution path — both the synchronous route handler and the
 // async job handler call this, so there is exactly one place that actually
-// talks to the orchestrator.
-async function runAgentTurn({ runId, userId, agentId, conversationId, message }) {
+// talks to the orchestrator. orgId is only needed for the webhook events
+// this fires (agent.run.started/completed/failed, Phase 17 §17) — the
+// execution itself resolves its own billing org from the agent, same as
+// internal chat.
+async function runAgentTurn({ runId, orgId, userId, agentId, conversationId, message }) {
   markRunRunning(runId);
+  publishDeveloperWebhookEvent(orgId, "agent.run.started", { runId, agentId, conversationId: conversationId || null });
   try {
     let convId = conversationId;
     if (!convId) {
@@ -69,9 +74,11 @@ async function runAgentTurn({ runId, userId, agentId, conversationId, message })
     // this run row's token columns are a convenience copy for the
     // Developer Console, not a second source of truth.
     markRunCompleted(runId, { conversationId: convId, resultText: reply, ...(usage || {}) });
+    publishDeveloperWebhookEvent(orgId, "agent.run.completed", { runId, agentId, conversationId: convId });
     return { conversationId: convId, reply };
   } catch (err) {
     markRunFailed(runId, err.message);
+    publishDeveloperWebhookEvent(orgId, "agent.run.failed", { runId, agentId, error: err.message });
     throw err;
   }
 }
@@ -80,7 +87,7 @@ async function runAgentTurn({ runId, userId, agentId, conversationId, message })
 // replied, same latency characteristics as the internal chat endpoint.
 export async function executeAgentSync({ orgId, apiKeyId, userId, agentId, message, conversationId }) {
   const runId = recordRun({ orgId, apiKeyId, agentId, userId, conversationId, mode: "sync", inputMessage: message });
-  const { conversationId: convId, reply } = await runAgentTurn({ runId, userId, agentId, conversationId, message });
+  const { conversationId: convId, reply } = await runAgentTurn({ runId, orgId, userId, agentId, conversationId, message });
   const run = getRun(orgId, runId);
   return { ...run, conversationId: convId, reply };
 }
@@ -90,14 +97,14 @@ export async function executeAgentSync({ orgId, apiKeyId, userId, agentId, messa
 // background) and calls the exact same runAgentTurn() the sync path uses.
 export function executeAgentAsync({ orgId, apiKeyId, userId, agentId, message, conversationId }) {
   const runId = recordRun({ orgId, apiKeyId, agentId, userId, conversationId, mode: "async", inputMessage: message });
-  const job = createJob({ type: "public_api.agent_run", orgId, userId, agentId, payload: { runId, userId, agentId, conversationId, message } });
+  const job = createJob({ type: "public_api.agent_run", orgId, userId, agentId, payload: { runId, orgId, userId, agentId, conversationId, message } });
   db.prepare("UPDATE api_agent_runs SET jobId = ? WHERE id = ?").run(job.id, runId);
   return getRun(orgId, runId);
 }
 
 // Called by jobs/handlers.js's registered handler for "public_api.agent_run".
-export async function executeAgentRunFromJob({ runId, userId, agentId, conversationId, message }) {
-  return runAgentTurn({ runId, userId, agentId, conversationId, message });
+export async function executeAgentRunFromJob({ runId, orgId, userId, agentId, conversationId, message }) {
+  return runAgentTurn({ runId, orgId, userId, agentId, conversationId, message });
 }
 
 function toPublicRunShape(row) {

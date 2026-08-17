@@ -9,6 +9,7 @@
 // Public API service this phase.
 import { generateCopy } from "./copywriterService.js";
 import { generateImageAsset, generateVoiceoverAsset, getAsset } from "./contentService.js";
+import { publishDeveloperWebhookEvent } from "./webhookEvents.js";
 
 function toPublicAssetShape(asset) {
   if (!asset) return null;
@@ -25,16 +26,20 @@ function toPublicAssetShape(asset) {
 
 export async function generateOrgText(orgId, userId, { contentType, brief, tone, targetAudience, keywords, title, agentId }) {
   const asset = await generateCopy({ userId, orgId, contentType, brief, tone, targetAudience, keywords, title, agentId });
+  publishDeveloperWebhookEvent(orgId, "content.generated", { assetId: asset.id, contentType: asset.contentType });
   return toPublicAssetShape(asset);
 }
 
 export async function generateOrgImage(orgId, userId, { prompt, negativePrompt, size, quality, numImages, title, agentId }) {
   const assets = await generateImageAsset({ userId, orgId, prompt, negativePrompt, size, quality, numImages, title, agentId });
-  return (Array.isArray(assets) ? assets : [assets]).map(toPublicAssetShape);
+  const list = Array.isArray(assets) ? assets : [assets];
+  for (const asset of list) publishDeveloperWebhookEvent(orgId, "content.generated", { assetId: asset.id, contentType: asset.contentType });
+  return list.map(toPublicAssetShape);
 }
 
 export async function generateOrgVoice(orgId, userId, { text, voice, speed, title, agentId }) {
   const asset = await generateVoiceoverAsset({ userId, orgId, text, voice, speed, title, agentId });
+  publishDeveloperWebhookEvent(orgId, "content.generated", { assetId: asset.id, contentType: asset.contentType });
   return toPublicAssetShape(asset);
 }
 

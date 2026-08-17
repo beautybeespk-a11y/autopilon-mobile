@@ -8,6 +8,7 @@
 // which is untouched and keeps working exactly as it did.
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
+import { publishDeveloperWebhookEvent } from "./webhookEvents.js";
 
 const now = () => new Date().toISOString();
 const VALID_STATUSES = ["todo", "in_progress", "completed", "archived"];
@@ -40,7 +41,9 @@ export function createOrgTask(orgId, userId, { title, description, priority, due
     `INSERT INTO tasks (id, userId, orgId, title, description, status, priority, dueDate, createdAt, updatedAt)
      VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?)`
   ).run(id, userId, orgId, title.trim(), description || "", priority || "medium", dueDate || null, ts, ts);
-  return getOrgTask(orgId, id);
+  const task = getOrgTask(orgId, id);
+  publishDeveloperWebhookEvent(orgId, "task.created", { taskId: id, title: task.title });
+  return task;
 }
 
 export function updateOrgTask(orgId, taskId, patch) {
@@ -58,7 +61,9 @@ export function updateOrgTask(orgId, taskId, patch) {
   sets.push("updatedAt = ?"); params.push(now());
   params.push(taskId, orgId);
   db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ? AND orgId = ?`).run(...params);
-  return getOrgTask(orgId, taskId);
+  const task = getOrgTask(orgId, taskId);
+  if (patch.status === "completed") publishDeveloperWebhookEvent(orgId, "task.completed", { taskId, title: task.title });
+  return task;
 }
 
 export function completeOrgTask(orgId, taskId) {

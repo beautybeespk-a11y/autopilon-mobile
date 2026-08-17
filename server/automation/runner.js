@@ -3,6 +3,7 @@ import { cryptoRandom } from "../middleware.js";
 import { executeStep } from "./stepExecutor.js";
 import { createNotification } from "../orchestrator/notifications.js";
 import { recordUsage } from "../orchestrator/billing.js";
+import { publishDeveloperWebhookEvent } from "../orchestrator/webhookEvents.js";
 
 const now = () => new Date().toISOString();
 
@@ -50,6 +51,7 @@ export async function runWorkflow(automationId, { userId, triggerSource, initial
   db.prepare("UPDATE automations SET lastRunAt = ? WHERE id = ?").run(now(), automationId);
   if (automation.orgId) recordUsage(automation.orgId, "automation_execution");
   updateRun(runId, { status: "running", startedAt: now() });
+  publishDeveloperWebhookEvent(automation.orgId, "automation.started", { automationId, automationName: automation.name, runId, triggerSource });
 
   const result = await driveRun(runId, automation, 0, JSON.parse(db.prepare("SELECT variables FROM automation_runs WHERE id = ?").get(runId).variables));
 
@@ -74,6 +76,17 @@ export async function runWorkflow(automationId, { userId, triggerSource, initial
     } else if (result.status === "failed") {
       publishEvent(userId, "internal", "automation_failed", { automationId, automationName: automation.name, runId, error: result.error });
     }
+  }
+
+  // Developer webhooks don't carry the same infinite-loop risk the guard
+  // above exists for (a webhook delivery can't recursively trigger a new
+  // automation run inside this app), so this fires for every run
+  // regardless of trigger source — more complete than the internal bus,
+  // deliberately.
+  if (result.status === "completed") {
+    publishDeveloperWebhookEvent(automation.orgId, "automation.completed", { automationId, automationName: automation.name, runId });
+  } else if (result.status === "failed") {
+    publishDeveloperWebhookEvent(automation.orgId, "automation.failed", { automationId, automationName: automation.name, runId, error: result.error });
   }
 
   return result;

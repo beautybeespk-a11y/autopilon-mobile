@@ -11,6 +11,7 @@ import { getFolder, requireFolderAccess } from "./folderService.js";
 import { checkStorageQuota, maxUploadBytesFor } from "./storageUsage.js";
 import { logFileActivity } from "./fileActivity.js";
 import { publishEvent } from "../automation/triggers.js";
+import { publishDeveloperWebhookEvent } from "./webhookEvents.js";
 
 const now = () => new Date().toISOString();
 
@@ -133,6 +134,7 @@ export async function uploadFile({
 
   logFileActivity(id, "upload", { userId, orgId, workspaceId, projectId, agentId, detail: originalFilename });
   publishEvent(userId, "files", "file_uploaded", { fileId: id, filename: originalFilename, sizeBytes: uploadResult.sizeBytes, folderId: folderId || null, conversationId: conversationId || null });
+  publishDeveloperWebhookEvent(orgId, "file.uploaded", { fileId: id, filename: originalFilename, sizeBytes: uploadResult.sizeBytes });
   if (processing.processingStatus === "ready") {
     publishEvent(userId, "files", "file_processing_completed", { fileId: id, filename: originalFilename });
   } else if (processing.processingStatus === "failed") {

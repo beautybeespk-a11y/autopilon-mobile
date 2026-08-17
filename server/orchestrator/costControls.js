@@ -8,6 +8,7 @@
 // to run before every generation, not a report.
 import db from "../db.js";
 import { createNotification } from "./notifications.js";
+import { publishDeveloperWebhookEvent } from "./webhookEvents.js";
 
 const now = () => new Date().toISOString();
 
@@ -79,6 +80,7 @@ function maybeAlert(orgId, scopeKey, current, limit, thresholdPercent) {
     body: `${label} spend: $${(current / 100).toFixed(2)} of $${(limit / 100).toFixed(2)}.`,
     link: `/app/organizations/${orgId}`,
   });
+  publishDeveloperWebhookEvent(orgId, "usage.threshold_reached", { scope: label, percentUsed, currentCents: current, limitCents: limit });
 }
 
 // Throws QUOTA_EXCEEDED if any applicable, already-configured limit is
