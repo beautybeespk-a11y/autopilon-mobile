@@ -12,11 +12,16 @@
 import { Router } from "express";
 import { requestId } from "./requestId.js";
 import { requestLog } from "./requestLog.js";
+import agentsRouter from "./agents.js";
+import runsRouter from "./runs.js";
 
 const router = Router();
 
 router.use(requestId);
 router.use(requestLog);
+
+router.use("/agents", agentsRouter);
+router.use("/runs", runsRouter);
 
 // Unauthenticated root — lets a developer confirm the API is reachable and
 // which version they're on before ever needing a key, same reasoning as

@@ -121,7 +121,7 @@ export async function handleIncomingMessage({
     return { role: m.role, content: `${m.content}\n\n[Underlying tool data from this turn, for your own reference in follow-ups — do not repeat verbatim: ${dataNote}]` };
   });
 
-  const { reply, trace, toolResults, confirmation } = await orchestrate({
+  const { reply, trace, toolResults, confirmation, usage } = await orchestrate({
     userId,
     agentId: agentId || null,
     conversationId,
@@ -139,5 +139,5 @@ export async function handleIncomingMessage({
     .run(assistantMessageId, conversationId, reply, replyAt, meta);
   db.prepare("UPDATE conversations SET updatedAt = ? WHERE id = ?").run(replyAt, conversationId);
 
-  return { conversationId, reply, trace, toolResults, confirmation, assistantMessageId };
+  return { conversationId, reply, trace, toolResults, confirmation, assistantMessageId, usage };
 }

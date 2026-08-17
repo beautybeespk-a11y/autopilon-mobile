@@ -5,7 +5,7 @@
 // spec calls for and the Phase 17 consistent error shape, keyed by API key
 // rather than session/IP.
 import db from "../db.js";
-import { checkRateLimit } from "../orchestrator/rateLimiter.js";
+import { checkRateLimit, concurrencyLimit } from "../orchestrator/rateLimiter.js";
 import { apiError } from "./errors.js";
 
 // Plan-derived, same spirit as rateLimiter.js's aiBurstLimitForOrg (same
@@ -41,6 +41,22 @@ export function apiRateLimit({ windowMs = 60_000, label = "public_api" } = {}) {
     }
     next();
   };
+}
+
+// AI-heavy public API routes (agent execute/messages, content generation)
+// stack this on top of apiRateLimit() — a per-key in-flight cap, same
+// purpose as Phase 16's aiConcurrencyLimit() but keyed by API key id
+// instead of req.session.userId, which is never set for API-key auth (that
+// middleware would silently no-op here — keyFn returning undefined skips
+// the check entirely, exactly the same class of gap apiRateLimit() above
+// was written to avoid for per-minute limiting). Reuses the same
+// concurrencyLimit() factory Phase 16 built; its 429 body isn't in the
+// Phase 17 {error:{code,...}} shape (no customization hook exists for
+// it), a minor, deliberate inconsistency rather than duplicating Phase
+// 16's tested acquire/release logic just to reformat one error string.
+const AI_MAX_CONCURRENT_PER_KEY = 3;
+export function apiAiConcurrencyLimit() {
+  return concurrencyLimit({ max: AI_MAX_CONCURRENT_PER_KEY, keyFn: (req) => req.apiKey?.id, label: "public_api_ai_concurrent" });
 }
 
 export { PLAN_LIMITS, DEFAULT_LIMIT };

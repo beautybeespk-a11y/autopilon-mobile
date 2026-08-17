@@ -188,6 +188,14 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     }
   }
   const toolResults = [];
+  // Accumulated across every model call in this turn (a multi-step
+  // tool-calling turn can call the model several times) — exposed to
+  // callers (the Public API's agent execution, Task 45) that need a
+  // per-turn usage total. Not a second source of truth: these are the
+  // exact same numbers recordAiTextUsage() below already writes into
+  // usage_records for billing; this is just also handing them back to the
+  // caller in the return value, which nothing previously did.
+  const usageTotals = { promptTokens: 0, completionTokens: 0 };
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -199,6 +207,8 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     // Every real chatComplete() call in this loop is billable — recorded
     // every iteration, not just once per user message, since a multi-step
     // tool-calling turn can call the model several times.
+    usageTotals.promptTokens += completion.usage?.promptTokens || 0;
+    usageTotals.completionTokens += completion.usage?.completionTokens || 0;
     if (orgId) {
       recordAiTextUsage(orgId, {
         provider, agentId: agentId || null, userId,
@@ -216,7 +226,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));
       if (planId) setPlanStatus(planId, "completed");
-      return { reply: decision.message || "Done.", trace, toolResults };
+      return { reply: decision.message || "Done.", trace, toolResults, usage: usageTotals };
     }
 
     const calls =
@@ -231,7 +241,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // scaffolding to the user (which is a real bug regardless of how the
       // model got here — the decision envelope is an internal format).
       trace.push(traceStep("completed", "Could not determine an action; answering directly.", "done"));
-      return { reply: "I wasn't able to complete that — could you rephrase what you'd like me to do?", trace, toolResults };
+      return { reply: "I wasn't able to complete that — could you rephrase what you'd like me to do?", trace, toolResults, usage: usageTotals };
     }
 
     if (!planId) planId = createPlan({ userId, conversationId, goal: decision.goal || userMessage });
@@ -265,6 +275,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace,
           toolResults,
           confirmation: { confirmationId: outcome.confirmationId, executionId: outcome.executionId, toolName: call.toolName },
+          usage: usageTotals,
         };
       }
 
@@ -308,5 +319,6 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       : "I wasn't able to complete this — every step I tried failed. Let me know if you'd like me to try a different approach.",
     trace,
     toolResults,
+    usage: usageTotals,
   };
 }

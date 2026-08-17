@@ -1795,4 +1795,37 @@ CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook ON webhook_deliveries(
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_job ON webhook_deliveries(jobId);
 `);
 
+// A public-API-initiated agent execution (Phase 17 §6/§7) — a thin tracking
+// record, NOT a parallel execution path: every run's actual work happens
+// through the exact same handleIncomingMessage()/orchestrate() pipeline
+// internal chat already uses (conversationId below points at the real
+// conversation/messages rows that call creates), so quota/spend
+// enforcement and usage recording are inherited for free, not reimplemented.
+// jobId is set only for async runs, pointing at the driving jobs row — same
+// "let the Job Manager own retry/scheduling" pattern webhook_deliveries uses.
+db.exec(`
+CREATE TABLE IF NOT EXISTS api_agent_runs (
+  id               TEXT PRIMARY KEY,
+  orgId            TEXT NOT NULL,
+  apiKeyId         TEXT NOT NULL,
+  agentId          TEXT NOT NULL,
+  userId           TEXT NOT NULL,
+  conversationId   TEXT,
+  jobId            TEXT,
+  mode             TEXT NOT NULL DEFAULT 'sync', -- sync | async
+  status           TEXT NOT NULL DEFAULT 'queued', -- queued|running|completed|failed
+  inputMessage     TEXT,
+  resultText       TEXT,
+  promptTokens     INTEGER NOT NULL DEFAULT 0,
+  completionTokens INTEGER NOT NULL DEFAULT 0,
+  errorMessage     TEXT,
+  createdAt        TEXT NOT NULL,
+  completedAt      TEXT,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE,
+  FOREIGN KEY (apiKeyId) REFERENCES developer_api_keys(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_api_agent_runs_org ON api_agent_runs(orgId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_api_agent_runs_agent ON api_agent_runs(agentId, createdAt);
+`);
+
 export default db;
