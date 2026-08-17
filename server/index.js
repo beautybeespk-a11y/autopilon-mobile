@@ -4,6 +4,8 @@ validateEnv(); // exits the process in production if a critical secret is missin
 import express from "express";
 import session from "express-session";
 import cors from "cors";
+import { securityHeaders, permissionsPolicy, corsOptions } from "./config/security.js";
+import { sessionStore } from "./config/sessionStore.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import fs from "fs";
@@ -86,17 +88,24 @@ const PORT = process.env.PORT || 4000;
 // raw body, not a re-serialized version of the parsed object.
 app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
 
+// Security headers (Phase 18 §16): CSP/HSTS/frame protection/etc, tuned in
+// config/security.js to the client's actual asset origins rather than
+// helmet's generic defaults, plus a Permissions-Policy helmet doesn't set
+// on its own. Applied before anything else so every response gets these
+// headers, including error responses.
+app.use(securityHeaders());
+app.use(permissionsPolicy());
+
 // In dev the client runs on :5173 and proxies /api, so CORS with credentials
-// is only needed if you point the client at the server cross-origin.
-app.use(
-  cors({
-    origin: process.env.CLIENT_ORIGIN || true,
-    credentials: true,
-  })
-);
+// is only needed if you point the client at the server cross-origin. In
+// production this is an explicit allowlist (CLIENT_ORIGIN) that fails
+// closed if unset — see config/security.js's corsOptions().
+app.use(cors(corsOptions()));
 
 app.use(
   session({
+    name: "autopilon.sid", // not the default "connect.sid" — avoids trivially fingerprinting the framework from the cookie name alone
+    store: sessionStore(), // undefined -> express-session's own MemoryStore (dev default); SESSION_STORE=redis for a real, restart-durable, multi-process-safe store
     secret: process.env.SESSION_SECRET || "dev-insecure-secret",
     resave: false,
     saveUninitialized: false,

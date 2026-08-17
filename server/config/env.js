@@ -34,10 +34,17 @@ const CRITICAL_IN_PRODUCTION = [
 ];
 
 const RECOMMENDED_IN_PRODUCTION = [
-  { key: "CLIENT_ORIGIN", reason: "without it, CORS falls back to reflecting any request Origin (see index.js) — set this to your real frontend origin(s) so production CORS is a real allowlist, not permissive-by-default." },
+  { key: "CLIENT_ORIGIN", reason: "without it, production CORS fails closed — no cross-origin browser request can read a response at all (see config/security.js's corsOptions()). Set this to your real frontend origin(s) so the web app can actually call this API cross-origin." },
   { key: "APP_BASE_URL", reason: "used to build webhook/callback URLs shown to users (e.g. Shopify webhook registration) — without it those flows show a blank or wrong URL." },
   { key: "PLATFORM_ADMIN_EMAIL", reason: "without it, no account can ever become a platform admin — the Admin Panel and platform-admin-only routes become permanently unreachable." },
 ];
+
+function checkSessionStore() {
+  if ((process.env.SESSION_STORE || "memory").toLowerCase() !== "redis") {
+    return "SESSION_STORE is not set to \"redis\" — sessions live in this process's memory, so every user is logged out on every restart/deploy, and this breaks entirely if you ever run more than one server process. Set SESSION_STORE=redis and REDIS_URL for production.";
+  }
+  return null;
+}
 
 function checkAiProviderKey() {
   const provider = process.env.AI_PROVIDER || "anthropic";
@@ -62,6 +69,8 @@ export function validateEnv({ exitOnFailure = true } = {}) {
     }
     const aiWarning = checkAiProviderKey();
     if (aiWarning) warnings.push(aiWarning);
+    const sessionStoreWarning = checkSessionStore();
+    if (sessionStoreWarning) warnings.push(sessionStoreWarning);
     if ((process.env.STRIPE_SECRET_KEY && !process.env.STRIPE_WEBHOOK_SECRET) || (!process.env.STRIPE_SECRET_KEY && process.env.STRIPE_WEBHOOK_SECRET)) {
       warnings.push("STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET must both be set (or both unset) — billing is only partially configured right now.");
     }
