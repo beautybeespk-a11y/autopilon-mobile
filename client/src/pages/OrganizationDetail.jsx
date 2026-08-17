@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { Building2, UserPlus, Trash2, Ban, RotateCcw, Layers, Plus, BarChart3 } from "lucide-react";
+import { Building2, UserPlus, Trash2, Ban, RotateCcw, Layers, Plus, BarChart3, Terminal } from "lucide-react";
 import { Card, Button, Badge, Input } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
@@ -165,7 +165,10 @@ export default function OrganizationDetail() {
           </div>
         </div>
         {["owner", "admin"].includes(org.myRole) && (
-          <Button variant="outline" onClick={() => navigate(`/app/organizations/${id}/dashboard`)}><BarChart3 size={16} /> Dashboard</Button>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => navigate(`/app/organizations/${id}/dashboard`)}><BarChart3 size={16} /> Dashboard</Button>
+            <Button variant="outline" onClick={() => navigate(`/app/organizations/${id}/developer`)}><Terminal size={16} /> Developer</Button>
+          </div>
         )}
       </div>
 

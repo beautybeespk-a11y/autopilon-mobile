@@ -13,6 +13,7 @@ import Agents from "./pages/Agents.jsx";
 import Organizations from "./pages/Organizations.jsx";
 import OrganizationDetail from "./pages/OrganizationDetail.jsx";
 import OrganizationDashboard from "./pages/OrganizationDashboard.jsx";
+import DeveloperConsole from "./pages/DeveloperConsole.jsx";
 import AdminPanel from "./pages/AdminPanel.jsx";
 import Marketplace from "./pages/Marketplace.jsx";
 import MarketplaceAssetDetail from "./pages/MarketplaceAssetDetail.jsx";
@@ -58,6 +59,7 @@ export default function App() {
         <Route path="organizations" element={<Organizations />} />
         <Route path="organizations/:id" element={<OrganizationDetail />} />
         <Route path="organizations/:id/dashboard" element={<OrganizationDashboard />} />
+        <Route path="organizations/:id/developer" element={<DeveloperConsole />} />
         <Route path="admin" element={<AdminPanel />} />
         <Route path="marketplace" element={<Marketplace />} />
         <Route path="marketplace/mine" element={<MyMarketplaceAssets />} />
