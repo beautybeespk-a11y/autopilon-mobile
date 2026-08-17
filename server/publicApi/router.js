@@ -14,6 +14,9 @@ import { requestId } from "./requestId.js";
 import { requestLog } from "./requestLog.js";
 import agentsRouter from "./agents.js";
 import runsRouter from "./runs.js";
+import automationsRouter from "./automations.js";
+import tasksRouter from "./tasks.js";
+import projectsRouter from "./projects.js";
 
 const router = Router();
 
@@ -22,6 +25,9 @@ router.use(requestLog);
 
 router.use("/agents", agentsRouter);
 router.use("/runs", runsRouter);
+router.use("/automations", automationsRouter);
+router.use("/tasks", tasksRouter);
+router.use("/projects", projectsRouter);
 
 // Unauthenticated root — lets a developer confirm the API is reachable and
 // which version they're on before ever needing a key, same reasoning as

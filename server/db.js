@@ -407,6 +407,7 @@ if (!agentCols.includes("workspaceId")) db.exec("ALTER TABLE agents ADD COLUMN w
 const execCols = db.prepare("PRAGMA table_info(tool_executions)").all().map((c) => c.name);
 if (!execCols.includes("agentId")) db.exec("ALTER TABLE tool_executions ADD COLUMN agentId TEXT");
 
+
 // Phase 9: Shared Automations — same additive pattern as Shared Agents.
 // A user who never touches organizations keeps every automation exactly
 // as "Personal" (orgId NULL), unchanged from before this migration.
@@ -488,6 +489,13 @@ if (!activityCols.includes("result")) db.exec("ALTER TABLE activity_logs ADD COL
 // of this sees an empty notification list and untouched task behavior. ---
 const taskCols = db.prepare("PRAGMA table_info(tasks)").all().map((c) => c.name);
 if (!taskCols.includes("assignedToUserId")) db.exec("ALTER TABLE tasks ADD COLUMN assignedToUserId TEXT");
+// orgId/updatedAt: additive, same "NULL = personal, unchanged default
+// behavior" pattern as agents.orgId — needed so the Public API (Phase 17),
+// which is inherently org-scoped via the API key, has a real tenant
+// boundary to filter tasks on; a personal (orgId NULL) task simply isn't
+// reachable via any org's API key, same as a personal agent already isn't.
+if (!taskCols.includes("orgId")) db.exec("ALTER TABLE tasks ADD COLUMN orgId TEXT");
+if (!taskCols.includes("updatedAt")) db.exec("ALTER TABLE tasks ADD COLUMN updatedAt TEXT");
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS comments (
