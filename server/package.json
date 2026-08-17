@@ -11,6 +11,7 @@
     "worker:dev": "node --watch worker.js",
     "backup": "node scripts/backup-db.js",
     "restore": "node scripts/restore-db.js",
+    "load-test": "node scripts/load-test.js",
     "test:security": "node test/securityRegression.js",
     "test:security:public-api": "node test/publicApiSecurityRegression.js",
     "test:idempotency": "node test/idempotencyRegression.js",
@@ -35,5 +36,8 @@
     "pdf-parse": "^2.4.5",
     "stripe": "^17.3.1",
     "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0"
   }
 }
