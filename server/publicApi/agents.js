@@ -4,6 +4,7 @@
 // key can't even confirm another org's agent id is real.
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit, apiAiConcurrencyLimit } from "./rateLimit.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
@@ -11,7 +12,7 @@ import { listOrgAgents, getOrgAgent, executeAgentSync, executeAgentAsync, listRu
 import { agentScope } from "../orchestrator/agentManager.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_agents"), apiRateLimit());
 
 function toPublicAgentShape(agent) {
   // Never exposes agent.instructions (the system prompt) — matches §6's

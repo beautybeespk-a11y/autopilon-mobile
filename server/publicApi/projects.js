@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
@@ -9,7 +10,7 @@ import {
 } from "../orchestrator/projectApiService.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_projects"), apiRateLimit());
 
 router.get("/", requireScope("projects:read"), (req, res) => {
   const { limit, cursor } = parsePagination(req);

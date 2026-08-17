@@ -3,6 +3,7 @@
 // authenticate with a Bearer key, never a browser session; the two are not
 // interchangeable and this file never accepts a session as a substitute.
 import { authenticateRawKey, hasScope } from "../orchestrator/apiKeyService.js";
+import { isFeatureEnabled } from "../orchestrator/featureFlags.js";
 import { apiError } from "./errors.js";
 
 export function requireApiKey(req, res, next) {
@@ -13,6 +14,13 @@ export function requireApiKey(req, res, next) {
   if (!apiKey) return apiError(res, 401, "UNAUTHENTICATED", "Invalid, expired, or revoked API key.");
   req.apiKey = apiKey;
   req.orgId = apiKey.orgId; // every public API route treats this as the tenant boundary — nothing downstream re-derives it another way
+
+  // The master Public API kill switch (Phase 17 §53) — checked here, once,
+  // for every authenticated request, so no resource router can forget it.
+  // Per-resource capability flags are layered on top by each router itself.
+  if (!isFeatureEnabled("public_api", { orgId: req.orgId, userId: apiKey.userId })) {
+    return apiError(res, 503, "FEATURE_DISABLED", "The Public API is currently unavailable for this organization.");
+  }
   next();
 }
 

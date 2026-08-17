@@ -3,12 +3,13 @@
 // an earlier /execute response shouldn't need to also know the agent id).
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
 import { apiError } from "./errors.js";
 import { getRun } from "../orchestrator/agentApiService.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_agents"), apiRateLimit());
 
 router.get("/:id", requireScope("agents:read"), (req, res) => {
   const run = getRun(req.orgId, req.params.id);

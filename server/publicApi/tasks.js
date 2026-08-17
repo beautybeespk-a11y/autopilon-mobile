@@ -1,12 +1,13 @@
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
 import { listOrgTasks, getOrgTask, createOrgTask, updateOrgTask, completeOrgTask, archiveOrgTask } from "../orchestrator/taskApiService.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_tasks"), apiRateLimit());
 
 router.get("/", requireScope("tasks:read"), (req, res) => {
   const { limit, cursor } = parsePagination(req);

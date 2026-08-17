@@ -13,11 +13,12 @@
 // limit is the honest fit for this one endpoint, not a retrofit.
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
 import { listAssets, listCategories } from "../orchestrator/marketplace.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_marketplace"), apiRateLimit());
 
 router.get("/assets", requireScope("marketplace:read"), (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 20, 100);

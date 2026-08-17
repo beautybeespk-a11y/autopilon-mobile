@@ -25,6 +25,7 @@ const CODE_TO_STATUS = {
   PROVIDER_NOT_CONFIGURED: 503,
   UNAUTHENTICATED: 401,
   FILE_TOO_LARGE: 413,
+  FEATURE_DISABLED: 503,
 };
 
 export function apiErrorFromException(res, err, fallbackMessage = "Something went wrong.") {

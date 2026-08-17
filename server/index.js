@@ -65,6 +65,7 @@ import automationRoutes from "./routes/automations.js";
 import eventWebhookRoutes from "./routes/eventWebhooks.js";
 import healthRoutes from "./routes/health.js";
 import publicApiV1 from "./publicApi/router.js";
+import { ensurePublicApiFlags } from "./publicApi/featureGate.js";
 import { initializeSchedulesOnBoot } from "./automation/scheduler.js";
 import { runScheduledAutomation } from "./automation/runner.js";
 import { initializeQueueProcessor } from "./automation/eventQueue.js";
@@ -167,6 +168,11 @@ app.use("/api/health", healthRoutes);
 // with a SESSION check before it ever reached this API-key-authenticated
 // router. This bug class has bitten health.js's /live and /ready twice
 // already this project — mounting early is the fix, not a workaround.
+// Idempotent — creates the Phase 17 §53 Public API feature-flag rows the
+// first time the server ever boots against this database, all defaulted
+// enabled=true (matching today's always-on behavior). Runs synchronously,
+// before the router below can serve a single request.
+ensurePublicApiFlags();
 app.use("/api/v1", publicApiV1);
 
 app.use("/api/auth", authRoutes);

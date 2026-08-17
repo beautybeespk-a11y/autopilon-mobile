@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit } from "./rateLimit.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { parsePagination, paginate, cursorWhereClause } from "./pagination.js";
@@ -12,7 +13,7 @@ import { listOrgFiles, getOrgFile, uploadOrgFile, downloadOrgFile, deleteOrgFile
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_files"), apiRateLimit());
 
 router.get("/", requireScope("files:read"), (req, res) => {
   const { limit, cursor } = parsePagination(req);

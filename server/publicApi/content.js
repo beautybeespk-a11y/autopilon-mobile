@@ -1,11 +1,12 @@
 import { Router } from "express";
 import { requireApiKey, requireScope } from "./auth.js";
+import { requireCapability } from "./featureGate.js";
 import { apiRateLimit, apiAiConcurrencyLimit } from "./rateLimit.js";
 import { apiError, apiErrorFromException } from "./errors.js";
 import { generateOrgText, generateOrgImage, generateOrgVoice, getOrgAsset } from "../orchestrator/contentApiService.js";
 
 const router = Router();
-router.use(requireApiKey, apiRateLimit());
+router.use(requireApiKey, requireCapability("public_api_content"), apiRateLimit());
 const aiConcurrency = apiAiConcurrencyLimit();
 
 router.get("/:id", requireScope("content:generate"), (req, res) => {
