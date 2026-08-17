@@ -4,6 +4,7 @@ import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
 import { providerStatus, listProviderOptions } from "../ai/provider.js";
 import { handleIncomingMessage } from "../orchestrator/conversationService.js";
 import { aiRateLimit, aiConcurrencyLimit } from "../orchestrator/rateLimiter.js";
+import { canAccessAgent } from "../orchestrator/agentManager.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -45,6 +46,20 @@ router.post("/message", aiLimiter, aiConcurrency, async (req, res) => {
   if (!content?.trim() && !hasAttachment) return res.status(400).json({ error: "Message content is required." });
   const now = new Date().toISOString();
   const userId = req.session.userId;
+
+  // A real, previously-exploitable cross-tenant gap: this route accepted
+  // any agentId with no ownership/org-membership check at all, so any
+  // authenticated user could chat "as" another org's agent — and since
+  // orchestrate() enforces that agent's own org's quota/spend limit, the
+  // caller was effectively spending/consuming a stranger's org's AI budget.
+  // Confirmed exploitable (a non-member blocked by another org's spend
+  // limit) before this check existed. 404, not 403, to match every other
+  // agent-access check in the app — never confirm an unauthorized agentId
+  // actually exists.
+  if (agentId) {
+    const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+    if (!agent || !canAccessAgent(userId, agent)) return res.status(404).json({ error: "Agent not found" });
+  }
 
   let convId = conversationId;
   if (!convId) {

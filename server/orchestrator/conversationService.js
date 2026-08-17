@@ -97,7 +97,14 @@ export async function handleIncomingMessage({
 
   let systemPrompt = "You are a helpful AI assistant inside the AI Agent Platform.";
   if (agentId) {
-    const agent = db.prepare("SELECT * FROM agents WHERE id = ? AND userId = ?").get(agentId, userId);
+    // Callers (routes/chat.js, the Public API's agent execution) are
+    // expected to have already run canAccessAgent() before reaching here —
+    // this lookup being ownership-only (userId, not org/workspace-aware)
+    // was previously silently swallowing a real access gap: any org
+    // teammate who wasn't the agent's exact creator got this generic
+    // fallback prompt instead of the agent's actual configured personality,
+    // even though they were allowed to use the agent at all.
+    const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
     if (agent) systemPrompt = `You are "${agent.name}". Personality: ${agent.personality}. ${agent.instructions || ""}`.trim();
   }
 
