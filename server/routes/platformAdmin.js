@@ -10,6 +10,7 @@ import {
 import { listJobs, getJob, jobStats, retryJob, cancelJob } from "../jobs/jobManager.js";
 import { listFlags, getFlag, createFlag, updateFlag, disableFlag, deleteFlag, setOverride, removeOverride } from "../orchestrator/featureFlags.js";
 import { maintenanceStatus, setMaintenanceMode } from "../orchestrator/maintenanceMode.js";
+import { getPlatformApiUsageDashboard } from "../orchestrator/apiUsageService.js";
 
 const router = Router();
 router.use(requireAuth, requirePlatformAdmin);
@@ -105,6 +106,14 @@ router.post("/maintenance", (req, res) => {
   const status = setMaintenanceMode({ enabled, message, readOnly });
   logActivity(db, req.session.userId, "maintenance_mode_changed", `Maintenance mode ${status.enabled ? "ENABLED" : "disabled"}${status.readOnly ? " (read-only)" : ""}`, { req });
   res.json(status);
+});
+
+// --- Public API usage (Phase 17 §57) ---
+// Platform-wide rollup of api_request_logs / webhook_deliveries. Never
+// returns a hashed/encrypted secret — only counts and identifying metadata
+// (org name, endpoint path, error code).
+router.get("/api-usage", (req, res) => {
+  res.json(getPlatformApiUsageDashboard({ sinceDays: Number(req.query.sinceDays) || 7 }));
 });
 
 router.get("/organizations", (req, res) => {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag } from "lucide-react";
+import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity } from "lucide-react";
 import { Card, Button, Badge, Input } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
@@ -19,6 +19,7 @@ export default function AdminPanel() {
   const [pendingAssets, setPendingAssets] = useState([]);
   const [reports, setReports] = useState([]);
   const [rejectReasons, setRejectReasons] = useState({});
+  const [apiUsage, setApiUsage] = useState(null);
 
   const load = () => {
     api.get("/admin/organizations").then(setOrgs).catch(() => {});
@@ -27,6 +28,7 @@ export default function AdminPanel() {
     api.get("/admin/billing-logs").then(setLogs).catch(() => {});
     api.get("/admin/marketplace/pending").then(setPendingAssets).catch(() => {});
     api.get("/admin/marketplace/reports").then(setReports).catch(() => {});
+    api.get("/admin/api-usage?sinceDays=7").then(setApiUsage).catch(() => {});
   };
   useEffect(load, []);
 
@@ -100,6 +102,103 @@ export default function AdminPanel() {
             ))}
           </tbody>
         </table>
+      </Card>
+
+      <Card className="p-5">
+        <div className="flex items-center gap-2"><Activity size={18} className="text-accent" /><h3 className="font-display font-semibold">Public API usage (last {apiUsage?.periodDays ?? 7}d, all organizations)</h3></div>
+        {apiUsage ? (
+          <div className="mt-3 space-y-4">
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+              {[
+                ["Requests", apiUsage.requests],
+                ["Errors", apiUsage.errors, `${apiUsage.errorRate}% error rate`],
+                ["Avg latency", apiUsage.avgLatencyMs != null ? `${apiUsage.avgLatencyMs}ms` : "—"],
+                ["Rate-limit events", apiUsage.rateLimitEvents],
+                ["Active API keys", apiUsage.activeApiKeys],
+                ["Active webhooks", apiUsage.activeWebhooks],
+              ].map(([label, value, sub]) => (
+                <div key={label} className="rounded-xl border border-line p-3">
+                  <p className="text-xs text-muted">{label}</p>
+                  <p className="mt-1 font-display text-xl font-semibold">{value}</p>
+                  {sub && <p className="mt-0.5 text-xs text-muted">{sub}</p>}
+                </div>
+              ))}
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div>
+                <p className="mb-2 text-sm font-medium">Top endpoints</p>
+                {apiUsage.topEndpoints.length === 0 ? <p className="text-sm text-muted">No requests yet.</p> : (
+                  <table className="w-full text-left text-xs">
+                    <thead><tr className="text-muted"><th className="pb-1">Endpoint</th><th className="pb-1">Requests</th><th className="pb-1">Avg latency</th></tr></thead>
+                    <tbody>
+                      {apiUsage.topEndpoints.slice(0, 10).map((e, i) => (
+                        <tr key={i} className="border-t border-line/50">
+                          <td className="py-1"><code>{e.method} {e.path}</code></td>
+                          <td className="py-1">{e.requests}</td>
+                          <td className="py-1">{e.avgLatencyMs != null ? `${e.avgLatencyMs}ms` : "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-medium">Top organizations by requests</p>
+                {apiUsage.topOrganizations.length === 0 ? <p className="text-sm text-muted">No requests yet.</p> : (
+                  <table className="w-full text-left text-xs">
+                    <thead><tr className="text-muted"><th className="pb-1">Organization</th><th className="pb-1">Requests</th><th className="pb-1">Errors</th></tr></thead>
+                    <tbody>
+                      {apiUsage.topOrganizations.slice(0, 10).map((o) => (
+                        <tr key={o.orgId} className="border-t border-line/50">
+                          <td className="py-1">{o.orgName}</td>
+                          <td className="py-1">{o.requests}</td>
+                          <td className="py-1">{o.errors}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-medium">Errors by code</p>
+                {apiUsage.errorsByCode.length === 0 ? <p className="text-sm text-muted">No errors in this period.</p> : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {apiUsage.errorsByCode.map((e) => (
+                      <Badge key={e.errorCode} tone="warn">{e.errorCode} · {e.count}</Badge>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <p className="mb-2 text-sm font-medium">Webhook deliveries by status</p>
+                {apiUsage.webhookDeliveriesByStatus.length === 0 ? <p className="text-sm text-muted">No webhook deliveries in this period.</p> : (
+                  <div className="flex flex-wrap gap-1.5">
+                    {apiUsage.webhookDeliveriesByStatus.map((s) => (
+                      <Badge key={s.status} tone={s.status === "completed" ? "success" : s.status === "failed" || s.status === "dead_letter" ? "warn" : "muted"}>{s.status} · {s.count}</Badge>
+                    ))}
+                  </div>
+                )}
+                {apiUsage.topOrgsByWebhookFailures.length > 0 && (
+                  <table className="mt-2 w-full text-left text-xs">
+                    <thead><tr className="text-muted"><th className="pb-1">Organization</th><th className="pb-1">Failed deliveries</th></tr></thead>
+                    <tbody>
+                      {apiUsage.topOrgsByWebhookFailures.slice(0, 10).map((o) => (
+                        <tr key={o.orgId} className="border-t border-line/50">
+                          <td className="py-1">{o.orgName}</td>
+                          <td className="py-1">{o.failures}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        ) : <p className="mt-3 text-sm text-muted">Loading…</p>}
       </Card>
 
       <Card className="p-5">
