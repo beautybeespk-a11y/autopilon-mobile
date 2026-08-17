@@ -1701,4 +1701,98 @@ CREATE INDEX IF NOT EXISTS idx_activity_org_created ON activity_logs(orgId, crea
 CREATE INDEX IF NOT EXISTS idx_queue_user ON automation_event_queue(userId);
 `);
 
+// Phase 17 — Public API & Developer Platform. Deliberately a NEW table, not
+// a reuse of the existing `api_keys` table (that one is BYOK — one AI
+// provider key per org, AES-256-GCM encrypted because the app must decrypt
+// and use it). A developer API key is a different kind of secret: many keys
+// per org, each independently named/scoped/expirable/revocable, and the app
+// NEVER needs the raw value back after creation — only a fast hash
+// comparison at auth time — so it's hashed, not encrypted, and the raw
+// value is shown to the developer exactly once.
+db.exec(`
+CREATE TABLE IF NOT EXISTS developer_api_keys (
+  id            TEXT PRIMARY KEY,
+  orgId         TEXT NOT NULL,
+  userId        TEXT NOT NULL,          -- creator, for audit
+  name          TEXT NOT NULL,
+  keyPrefix     TEXT NOT NULL,          -- first chars of the raw key, shown in the UI so a key is identifiable without ever re-displaying the secret
+  hashedSecret  TEXT NOT NULL UNIQUE,   -- SHA-256 hex digest of the full raw secret
+  scopes        TEXT NOT NULL,          -- JSON array, drawn from the fixed scope list in apiKeyService.js
+  status        TEXT NOT NULL DEFAULT 'active', -- active | revoked
+  expiresAt     TEXT,                   -- NULL = never expires
+  lastUsedAt    TEXT,
+  createdAt     TEXT NOT NULL,
+  revokedAt     TEXT,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dev_api_keys_org ON developer_api_keys(orgId, status);
+
+-- One row per public API request — the source of truth for the Developer
+-- Console's usage dashboard and the admin analytics extension. Expected to
+-- grow fast; no retention/pruning job exists yet (documented as a known
+-- limitation in the Phase 17 report), same honest disclosure Phase 16 gave
+-- usage_records before any archival strategy existed for it either.
+CREATE TABLE IF NOT EXISTS api_request_logs (
+  id           TEXT PRIMARY KEY,
+  apiKeyId     TEXT,
+  orgId        TEXT,
+  requestId    TEXT NOT NULL,
+  method       TEXT NOT NULL,
+  path         TEXT NOT NULL,
+  statusCode   INTEGER,
+  latencyMs    INTEGER,
+  errorCode    TEXT,
+  createdAt    TEXT NOT NULL,
+  FOREIGN KEY (apiKeyId) REFERENCES developer_api_keys(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_api_logs_org_created ON api_request_logs(orgId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_api_logs_key_created ON api_request_logs(apiKeyId, createdAt);
+
+-- Developer-configured webhook endpoints. The signing secret IS encrypted
+-- (not hashed) — unlike an API key, the app must read it back every single
+-- delivery to compute that delivery's HMAC signature, so it uses
+-- secretsCrypto.js the same way BYOK provider keys do.
+CREATE TABLE IF NOT EXISTS developer_webhooks (
+  id            TEXT PRIMARY KEY,
+  orgId         TEXT NOT NULL,
+  userId        TEXT NOT NULL,
+  url           TEXT NOT NULL,
+  description   TEXT,
+  encryptedSecret TEXT NOT NULL,
+  events        TEXT NOT NULL,          -- JSON array of subscribed event types, or ["*"] for all
+  status        TEXT NOT NULL DEFAULT 'active', -- active | disabled
+  createdAt     TEXT NOT NULL,
+  updatedAt     TEXT NOT NULL,
+  FOREIGN KEY (orgId) REFERENCES organizations(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_dev_webhooks_org ON developer_webhooks(orgId);
+
+-- One row per delivery ATTEMPT SERIES for one webhook+event pair — the
+-- developer-facing history record. The actual retry/backoff/dead-letter
+-- scheduling is delegated entirely to the Phase 16 Job Manager (jobId below
+-- points at the driving job); this row mirrors that job's outcome plus the
+-- HTTP-specific detail (status code, response time) the generic jobs table
+-- has no reason to carry. Reusing the queue here is a direct requirement of
+-- the Phase 17 spec, not a design choice made in isolation.
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+  id             TEXT PRIMARY KEY,
+  webhookId      TEXT NOT NULL,
+  jobId          TEXT NOT NULL,
+  eventType      TEXT NOT NULL,
+  eventId        TEXT NOT NULL,         -- unique per event occurrence — the value the receiving end should dedup on
+  payload        TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'pending', -- mirrors jobs.status: pending|running|completed|failed|dead_letter
+  httpStatus     INTEGER,
+  responseTimeMs INTEGER,
+  attempts       INTEGER NOT NULL DEFAULT 0,
+  lastAttemptAt  TEXT,
+  error          TEXT,
+  createdAt      TEXT NOT NULL,
+  FOREIGN KEY (webhookId) REFERENCES developer_webhooks(id) ON DELETE CASCADE,
+  FOREIGN KEY (jobId) REFERENCES jobs(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_webhook ON webhook_deliveries(webhookId, createdAt);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_job ON webhook_deliveries(jobId);
+`);
+
 export default db;

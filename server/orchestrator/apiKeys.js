@@ -1,43 +1,8 @@
-import crypto from "crypto";
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
+import { encryptSecret as encrypt, decryptSecret as decrypt, maskSecret as mask } from "./secretsCrypto.js";
 
 const now = () => new Date().toISOString();
-const ALGO = "aes-256-gcm";
-
-function encryptionKey() {
-  const secret = process.env.BYOK_ENCRYPTION_KEY;
-  if (!secret) {
-    const err = new Error("BYOK_ENCRYPTION_KEY is not set in server/.env — required to store customer-provided API keys securely.");
-    err.code = "ENCRYPTION_NOT_CONFIGURED";
-    throw err;
-  }
-  // Accept any passphrase length — always derive a proper 32-byte key from
-  // it rather than requiring the operator to generate exact-length hex.
-  return crypto.createHash("sha256").update(secret).digest();
-}
-
-function encrypt(plaintext) {
-  const key = encryptionKey();
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(ALGO, key, iv);
-  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return `${iv.toString("hex")}:${authTag.toString("hex")}:${ciphertext.toString("hex")}`;
-}
-
-function decrypt(stored) {
-  const key = encryptionKey();
-  const [ivHex, authTagHex, ciphertextHex] = stored.split(":");
-  const decipher = crypto.createDecipheriv(ALGO, key, Buffer.from(ivHex, "hex"));
-  decipher.setAuthTag(Buffer.from(authTagHex, "hex"));
-  return Buffer.concat([decipher.update(Buffer.from(ciphertextHex, "hex")), decipher.final()]).toString("utf8");
-}
-
-function mask(rawKey) {
-  if (rawKey.length <= 8) return "••••••••";
-  return `${rawKey.slice(0, 4)}${"•".repeat(8)}${rawKey.slice(-4)}`;
-}
 
 export function saveApiKey(orgId, provider, rawKey) {
   const encryptedKey = encrypt(rawKey);
