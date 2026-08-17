@@ -2,7 +2,7 @@ import { Router } from "express";
 import db from "../db.js";
 import { requireAuth, requirePlatformAdmin, logActivity } from "../middleware.js";
 import { listPlans } from "../orchestrator/billing.js";
-import { listAllOrganizations, updatePlan, listBillingLogs, grantManualTrial, grantCredit } from "../orchestrator/platformAdmin.js";
+import { listAllOrganizations, updatePlan, listBillingLogs, listFeatureFlagAuditLogs, grantManualTrial, grantCredit } from "../orchestrator/platformAdmin.js";
 import {
   listPendingAssets, approveAsset, rejectAsset, suspendAsset,
   listOpenReports, resolveReport, createCategory, updateCategory, deleteCategory,
@@ -95,6 +95,10 @@ router.delete("/feature-flags/:key/overrides/:scopeType/:scopeId", (req, res) =>
   const flag = removeOverride(req.params.key, req.params.scopeType, req.params.scopeId);
   logActivity(db, req.session.userId, "feature_flag_override_removed", `Removed ${req.params.scopeType}:${req.params.scopeId} override on "${req.params.key}"`, { req });
   res.json(flag);
+});
+
+router.get("/feature-flags/audit-log", (req, res) => {
+  res.json(listFeatureFlagAuditLogs(Number(req.query.limit) || 100));
 });
 
 // --- Maintenance mode ---

@@ -66,6 +66,25 @@ export function listBillingLogs(limit = 100) {
   ).all(...BILLING_ACTIONS, limit);
 }
 
+// Feature-flag admin UI audit trail (Phase 17.1 §3) — same "narrow the
+// existing activity_logs table by action type" pattern as listBillingLogs
+// above, not a second audit log. Every route in routes/platformAdmin.js's
+// feature-flags section already calls logActivity() on every change; this
+// is only a read-side view over that.
+const FEATURE_FLAG_ACTIONS = [
+  "feature_flag_created", "feature_flag_updated", "feature_flag_disabled", "feature_flag_deleted",
+  "feature_flag_override_set", "feature_flag_override_removed",
+];
+export function listFeatureFlagAuditLogs(limit = 100) {
+  const placeholders = FEATURE_FLAG_ACTIONS.map(() => "?").join(",");
+  return db.prepare(
+    `SELECT al.*, u.name AS userName FROM activity_logs al
+     LEFT JOIN users u ON u.id = al.userId
+     WHERE al.action IN (${placeholders})
+     ORDER BY al.createdAt DESC LIMIT ?`
+  ).all(...FEATURE_FLAG_ACTIONS, limit);
+}
+
 // Manual trial grants — a direct trial/plan grant, reusing the same
 // subscription-update shape billing.setPlan already does. Distinct from
 // grantCredit() below, which is a real $ balance (synced to Stripe when

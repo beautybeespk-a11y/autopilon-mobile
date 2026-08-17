@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity } from "lucide-react";
+import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity, ToggleLeft, Trash2, History } from "lucide-react";
 import { Card, Button, Badge, Input } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
@@ -20,6 +20,10 @@ export default function AdminPanel() {
   const [reports, setReports] = useState([]);
   const [rejectReasons, setRejectReasons] = useState({});
   const [apiUsage, setApiUsage] = useState(null);
+  const [flags, setFlags] = useState([]);
+  const [flagAuditLog, setFlagAuditLog] = useState([]);
+  const [newFlagForm, setNewFlagForm] = useState({ key: "", name: "", description: "", enabled: true, rolloutPercent: "100" });
+  const [overrideDrafts, setOverrideDrafts] = useState({}); // flagKey -> { scopeType, scopeId }
 
   const load = () => {
     api.get("/admin/organizations").then(setOrgs).catch(() => {});
@@ -29,8 +33,37 @@ export default function AdminPanel() {
     api.get("/admin/marketplace/pending").then(setPendingAssets).catch(() => {});
     api.get("/admin/marketplace/reports").then(setReports).catch(() => {});
     api.get("/admin/api-usage?sinceDays=7").then(setApiUsage).catch(() => {});
+    api.get("/admin/feature-flags").then(setFlags).catch(() => {});
+    api.get("/admin/feature-flags/audit-log?limit=30").then(setFlagAuditLog).catch(() => {});
   };
   useEffect(load, []);
+
+  const createFlag = async () => {
+    if (!newFlagForm.key.trim() || !newFlagForm.name.trim()) return;
+    await api.post("/admin/feature-flags", { ...newFlagForm, rolloutPercent: Number(newFlagForm.rolloutPercent) || 100 });
+    setNewFlagForm({ key: "", name: "", description: "", enabled: true, rolloutPercent: "100" });
+    load();
+  };
+  const toggleFlag = async (flag) => { await api.patch(`/admin/feature-flags/${flag.key}`, { enabled: !flag.enabled }); load(); };
+  const emergencyDisableFlag = async (key) => {
+    if (!confirm(`Emergency-disable "${key}" right now? This overrides its rollout percentage and takes effect immediately.`)) return;
+    await api.post(`/admin/feature-flags/${key}/disable`, {});
+    load();
+  };
+  const updateRollout = async (key, rolloutPercent) => { await api.patch(`/admin/feature-flags/${key}`, { rolloutPercent }); load(); };
+  const deleteFlag = async (key) => {
+    if (!confirm(`Delete flag "${key}"? Any code checking this flag will treat it as unknown (always off). This cannot be undone.`)) return;
+    await api.del(`/admin/feature-flags/${key}`);
+    load();
+  };
+  const addOverride = async (flagKey) => {
+    const draft = overrideDrafts[flagKey];
+    if (!draft?.scopeId?.trim()) return;
+    await api.post(`/admin/feature-flags/${flagKey}/overrides`, { scopeType: draft.scopeType || "org", scopeId: draft.scopeId.trim(), enabled: draft.enabled ?? true });
+    setOverrideDrafts({ ...overrideDrafts, [flagKey]: { scopeType: draft.scopeType || "org", scopeId: "", enabled: true } });
+    load();
+  };
+  const removeOverride = async (flagKey, scopeType, scopeId) => { await api.del(`/admin/feature-flags/${flagKey}/overrides/${scopeType}/${scopeId}`); load(); };
 
   const approveAsset = async (id) => { await api.post(`/admin/marketplace/assets/${id}/approve`, {}); load(); };
   const rejectAsset = async (id) => {
@@ -199,6 +232,94 @@ export default function AdminPanel() {
             </div>
           </div>
         ) : <p className="mt-3 text-sm text-muted">Loading…</p>}
+      </Card>
+
+      <Card className="p-5">
+        <div className="flex items-center gap-2"><ToggleLeft size={18} className="text-accent" /><h3 className="font-display font-semibold">Feature flags</h3></div>
+        <p className="mt-1 text-xs text-muted">Global switches for risky or staged-rollout features (including the Public API's per-resource gates) — reuses the same engine every flag in the platform is evaluated against. Changes take effect immediately, no redeploy.</p>
+
+        <div className="mt-3 flex flex-wrap items-end gap-2 rounded-xl border border-line p-3">
+          <div className="w-40"><Input label="Key" value={newFlagForm.key} onChange={(e) => setNewFlagForm({ ...newFlagForm, key: e.target.value })} placeholder="my_new_flag" /></div>
+          <div className="w-48"><Input label="Name" value={newFlagForm.name} onChange={(e) => setNewFlagForm({ ...newFlagForm, name: e.target.value })} placeholder="My New Flag" /></div>
+          <div className="flex-1 min-w-[160px]"><Input label="Description" value={newFlagForm.description} onChange={(e) => setNewFlagForm({ ...newFlagForm, description: e.target.value })} placeholder="What this controls" /></div>
+          <div className="w-24"><Input label="Rollout %" type="number" min="0" max="100" value={newFlagForm.rolloutPercent} onChange={(e) => setNewFlagForm({ ...newFlagForm, rolloutPercent: e.target.value })} /></div>
+          <label className="flex items-center gap-1.5 pb-2.5 text-sm text-muted">
+            <input type="checkbox" checked={newFlagForm.enabled} onChange={(e) => setNewFlagForm({ ...newFlagForm, enabled: e.target.checked })} /> Enabled
+          </label>
+          <Button onClick={createFlag}><Plus size={16} /> Create flag</Button>
+        </div>
+
+        <div className="mt-4 space-y-3">
+          {flags.map((flag) => (
+            <div key={flag.key} className="rounded-xl border border-line p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium">{flag.name}</span>
+                    <code className="text-xs text-muted">{flag.key}</code>
+                    <Badge tone={flag.enabled ? "success" : "muted"}>{flag.enabled ? "enabled" : "disabled"}</Badge>
+                  </div>
+                  {flag.description && <p className="mt-0.5 text-xs text-muted">{flag.description}</p>}
+                </div>
+                <div className="flex items-center gap-2">
+                  <div className="w-20"><Input type="number" min="0" max="100" defaultValue={flag.rolloutPercent} onBlur={(e) => { const v = Number(e.target.value); if (v !== flag.rolloutPercent) updateRollout(flag.key, v); }} /></div>
+                  <span className="text-xs text-muted">% rollout</span>
+                  <Button variant="outline" onClick={() => toggleFlag(flag)}>{flag.enabled ? "Disable" : "Enable"}</Button>
+                  <Button variant="outline" onClick={() => emergencyDisableFlag(flag.key)}>Emergency disable</Button>
+                  <Button variant="outline" onClick={() => deleteFlag(flag.key)}><Trash2 size={14} /></Button>
+                </div>
+              </div>
+
+              <div className="mt-3 border-t border-line pt-3">
+                <p className="mb-2 text-xs font-medium text-muted">Organization / user overrides</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {flag.overrides.length === 0 && <span className="text-xs text-muted">No overrides.</span>}
+                  {flag.overrides.map((o) => (
+                    <Badge key={`${o.scopeType}:${o.scopeId}`} tone={o.enabled ? "success" : "warn"}>
+                      {o.scopeType}:{o.scopeId} → {o.enabled ? "on" : "off"}
+                      <button className="ml-1.5 opacity-70 hover:opacity-100" onClick={() => removeOverride(flag.key, o.scopeType, o.scopeId)} title="Remove override">×</button>
+                    </Badge>
+                  ))}
+                </div>
+                <div className="mt-2 flex flex-wrap items-end gap-2">
+                  <select
+                    value={overrideDrafts[flag.key]?.scopeType || "org"}
+                    onChange={(e) => setOverrideDrafts({ ...overrideDrafts, [flag.key]: { ...overrideDrafts[flag.key], scopeType: e.target.value } })}
+                    className="rounded-xl border border-line bg-surface px-3 py-2 text-xs"
+                  >
+                    <option value="org">org</option>
+                    <option value="user">user</option>
+                  </select>
+                  <div className="w-40"><Input placeholder="org or user id" value={overrideDrafts[flag.key]?.scopeId || ""} onChange={(e) => setOverrideDrafts({ ...overrideDrafts, [flag.key]: { ...overrideDrafts[flag.key], scopeId: e.target.value } })} /></div>
+                  <label className="flex items-center gap-1.5 pb-2.5 text-xs text-muted">
+                    <input type="checkbox" checked={overrideDrafts[flag.key]?.enabled ?? true} onChange={(e) => setOverrideDrafts({ ...overrideDrafts, [flag.key]: { ...overrideDrafts[flag.key], enabled: e.target.checked } })} /> Enabled
+                  </label>
+                  <Button variant="outline" onClick={() => addOverride(flag.key)}>Add override</Button>
+                </div>
+              </div>
+            </div>
+          ))}
+          {flags.length === 0 && <p className="text-sm text-muted">No feature flags yet.</p>}
+        </div>
+
+        <div className="mt-5 border-t border-line pt-4">
+          <div className="flex items-center gap-2"><History size={14} className="text-muted" /><p className="text-xs font-medium text-muted">Recent changes</p></div>
+          <div className="mt-2 max-h-64 overflow-y-auto">
+            <table className="w-full text-left text-xs">
+              <tbody>
+                {flagAuditLog.map((l) => (
+                  <tr key={l.id} className="border-t border-line/50">
+                    <td className="py-1.5 pr-3 text-muted">{new Date(l.createdAt).toLocaleString()}</td>
+                    <td className="py-1.5 pr-3">{l.userName || "—"}</td>
+                    <td className="py-1.5 pr-3 font-mono">{l.action}</td>
+                    <td className="py-1.5 text-muted">{l.description}</td>
+                  </tr>
+                ))}
+                {flagAuditLog.length === 0 && <tr><td className="py-3 text-center text-muted">No changes yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>
       </Card>
 
       <Card className="p-5">
