@@ -1,4 +1,6 @@
 import "dotenv/config";
+import { validateEnv } from "./config/env.js";
+validateEnv(); // exits the process in production if a critical secret is missing/insecure — must run before anything else touches process.env
 import express from "express";
 import session from "express-session";
 import cors from "cors";
