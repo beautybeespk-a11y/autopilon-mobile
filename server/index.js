@@ -84,6 +84,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT || 4000;
 
+// Phase 18 §14/§18 (found during final regression testing): without this,
+// the production session cookie (cookie.secure: true, set below) NEVER
+// gets sent — express-session checks req.secure before setting a Secure
+// cookie, and req.secure is only ever true for a request Express itself
+// terminated TLS on. Every realistic production deployment sits behind a
+// TLS-terminating reverse proxy/load balancer (nginx, a platform's own
+// LB, Cloudflare, etc.) — the connection this process actually sees is
+// plain HTTP, with the proxy reporting the original scheme via
+// X-Forwarded-Proto. Without `trust proxy`, Express ignores that header,
+// req.secure is always false in production, and login/signup silently
+// never sets a session cookie — confirmed by reproducing it directly
+// against a live server with NODE_ENV=production and no reverse proxy
+// spoofing protection this doesn't need in dev (`1` trusts exactly one
+// hop — the single load balancer/proxy in a normal single-tier setup, not
+// arbitrary client-supplied headers with no proxy in front at all).
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
+
 // The `verify` callback stashes the raw bytes before JSON parsing — needed
 // to verify Meta's webhook HMAC signature, which is computed over the exact
 // raw body, not a re-serialized version of the parsed object.
