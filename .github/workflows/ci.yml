@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch: {}
 
 # One workflow, ordered roughly by cost — cheap syntax/lint checks fail
 # fast before the more expensive live-server regression/SDK jobs run.
