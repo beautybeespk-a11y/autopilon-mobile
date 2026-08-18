@@ -132,6 +132,32 @@ const InProcessQueueProvider = {
     const clamped = Math.max(0, Math.min(100, Math.round(percent)));
     db.prepare("UPDATE jobs SET progress = ?, progressNote = ? WHERE id = ?").run(clamped, note || null, jobId);
   },
+
+  // A job claimed by a worker that then CRASHES (killed, OOM, power loss —
+  // not a graceful SIGTERM, which stops claiming new work but lets an
+  // in-flight handler finish) is left at status='running' forever: nothing
+  // else here ever transitions a 'running' job back out on its own. Found
+  // via Phase 19's required worker-crash failure testing (§36 — "must not
+  // lose important jobs silently"), fixed the same way a normal failure
+  // is handled: retry with the existing backoff schedule if attempts
+  // remain, otherwise dead-letter, both explicitly distinguishable in the
+  // job's error message from an ordinary handler failure.
+  reclaimStale(timeoutMs) {
+    const cutoff = new Date(Date.now() - timeoutMs).toISOString();
+    const stale = db.prepare("SELECT * FROM jobs WHERE status = 'running' AND startedAt <= ?").all(cutoff);
+    for (const job of stale) {
+      if (job.attempts < job.maxAttempts) {
+        const backoffSeconds = Math.min(2 ** job.attempts * 2, 300);
+        const nextAttemptAt = new Date(Date.now() + backoffSeconds * 1000).toISOString();
+        db.prepare("UPDATE jobs SET status = 'queued', error = ?, errorRetryable = 1, nextAttemptAt = ? WHERE id = ? AND status = 'running'")
+          .run(`Reclaimed: the worker holding this job did not complete it within ${timeoutMs}ms (crashed or was killed).`, nextAttemptAt, job.id);
+      } else {
+        db.prepare("UPDATE jobs SET status = 'dead_letter', error = ?, errorRetryable = 1, completedAt = ? WHERE id = ? AND status = 'running'")
+          .run(`Reclaimed: the worker holding this job did not complete it within ${timeoutMs}ms (crashed or was killed), and max attempts was already reached.`, now(), job.id);
+      }
+    }
+    return stale.length;
+  },
 };
 
 // Always the in-process/SQLite provider, never REGISTRY-selected — see the
@@ -360,6 +386,15 @@ const RedisQueueProvider = {
   async getJob(jobId) {
     return readJobHash(getRedisClient(), jobId);
   },
+
+  // NOT IMPLEMENTED — no reclaimStale() here, unlike InProcessQueueProvider.
+  // A correct version needs an index of running jobs by startedAt (Redis
+  // has no "WHERE status = X AND startedAt <= Y" query without one), which
+  // is a real, if bounded, addition, not a one-line port of the SQLite
+  // version above. Left undone since this provider isn't wired into the
+  // live job pipeline today (see this file's own header comment) — build
+  // it before ever actually switching QUEUE_PROVIDER=redis into the real
+  // path, not before.
 };
 
 const REGISTRY = { in_process: InProcessQueueProvider, redis: RedisQueueProvider };

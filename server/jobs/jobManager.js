@@ -71,10 +71,18 @@ export function jobStats(filter = {}) {
 // execution, generalized to any job type so a slow job in one type doesn't
 // starve the others (claimNext() picks the oldest, highest-priority due job
 // across all registered types, not round-robin per type).
+// A worker that crashes (killed, OOM, power loss) mid-job leaves it
+// claimed (status='running') with nobody left to finish or retry it —
+// found via Phase 19's required worker-crash failure testing. Reclaimed
+// once it's been running longer than this, using the provider's own
+// retry/dead-letter branching (see queueProvider.js's reclaimStale()).
+const STALE_RUNNING_TIMEOUT_MS = Number(process.env.JOB_STALE_TIMEOUT_MS) || 10 * 60 * 1000;
+
 export async function processJobsTick(batchSize = 5) {
   const provider = syncProvider();
   const types = Array.from(HANDLERS.keys());
   if (types.length === 0) return;
+  provider.reclaimStale?.(STALE_RUNNING_TIMEOUT_MS);
   for (let i = 0; i < batchSize; i++) {
     const job = provider.claimNext(types);
     if (!job) break;

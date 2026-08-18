@@ -27,7 +27,9 @@
     "test:token-refresh-safety": "node test/tokenRefreshSafetyRegression.js",
     "test:reconnect-isolation": "node test/reconnectAndIsolationRegression.js",
     "test:audit-api-response": "node test/auditLoggingAndApiResponseRegression.js",
-    "test:failure-concurrency": "node test/failureHandlingAndConcurrencyRegression.js"
+    "test:failure-concurrency": "node test/failureHandlingAndConcurrencyRegression.js",
+    "test:worker-crash-reclaim": "node test/workerCrashReclaimRegression.js",
+    "test:multi-worker-real-process": "node test/multiWorkerRealProcessRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",
