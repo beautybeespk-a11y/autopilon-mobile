@@ -87,13 +87,34 @@ export async function refreshAccessToken(refreshToken) {
 // them) — that's not a failure to report, it's the end state disconnect
 // was trying to reach anyway, so it's treated as success rather than an
 // error the caller needs to handle specially.
+// Phase 18.2 §16 — no fetch() anywhere in this app's integrations layer
+// has ever had a timeout (a pre-existing, systemic gap out of this
+// phase's scope to retrofit everywhere), but this revoke call is new
+// code this phase is directly responsible for hardening, and "provider
+// times out" is explicitly in the failure-handling checklist — so this
+// one gets a bounded wait rather than being able to hang a disconnect
+// request indefinitely if Google's revoke endpoint never responds.
+const REVOKE_TIMEOUT_MS = 10_000;
+
 export async function revokeToken(token) {
   if (!token) return { revoked: false, alreadyInvalid: false };
-  const res = await fetch("https://oauth2.googleapis.com/revoke", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ token }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REVOKE_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const wrapped = new Error(err.name === "AbortError" ? "Google token revocation timed out" : `Google token revocation failed: ${err.message}`);
+    wrapped.code = err.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR";
+    throw wrapped;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.ok) return { revoked: true, alreadyInvalid: false };
   let data = {};
   try { data = await res.json(); } catch { /* non-JSON error body, fall through to the generic error below */ }

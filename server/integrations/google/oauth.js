@@ -101,13 +101,32 @@ export async function refreshAccessToken(refreshToken) {
 // endpoint — see that file's comment for the full reasoning, duplicated
 // here rather than factored out to match this file's existing
 // duplication-over-cross-import pattern for the rest of the OAuth flow).
+// Phase 18.2 §16 — bounded wait so a hanging provider can't hang a
+// disconnect request indefinitely; see gmail/oauth.js's revokeToken() for
+// the full reasoning (this app's integrations layer otherwise has no
+// fetch() timeouts anywhere — pre-existing and out of this phase's scope
+// to retrofit broadly, but this revoke call is new code this phase owns).
+const REVOKE_TIMEOUT_MS = 10_000;
+
 export async function revokeToken(token) {
   if (!token) return { revoked: false, alreadyInvalid: false };
-  const res = await fetch("https://oauth2.googleapis.com/revoke", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ token }),
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REVOKE_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const wrapped = new Error(err.name === "AbortError" ? "Google token revocation timed out" : `Google token revocation failed: ${err.message}`);
+    wrapped.code = err.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR";
+    throw wrapped;
+  } finally {
+    clearTimeout(timer);
+  }
   if (res.ok) return { revoked: true, alreadyInvalid: false };
   let data = {};
   try { data = await res.json(); } catch { /* non-JSON error body, fall through to the generic error below */ }

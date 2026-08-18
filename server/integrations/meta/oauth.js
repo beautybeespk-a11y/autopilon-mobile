@@ -77,12 +77,30 @@ async function exchangeForLongLivedToken(shortLivedToken) {
 // access/proxy log this specific call might pass through. Not a
 // retrofit of every existing Meta API call (out of this phase's scope,
 // see PHASE18_2_NOTES.md) — just how this new code is written.
+// Phase 18.2 §16 — bounded wait, same reasoning as gmail/oauth.js's
+// revokeToken(): this new revoke call gets a timeout even though the
+// rest of this app's fetch() calls (pre-existing, out of this phase's
+// scope) don't.
+const REVOKE_TIMEOUT_MS = 10_000;
+
 export async function revokeToken(accessToken) {
   if (!accessToken) return { revoked: false };
-  const res = await fetch(`https://graph.facebook.com/${API_VERSION}/me/permissions`, {
-    method: "DELETE",
-    headers: { authorization: `Bearer ${accessToken}` },
-  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REVOKE_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(`https://graph.facebook.com/${API_VERSION}/me/permissions`, {
+      method: "DELETE",
+      headers: { authorization: `Bearer ${accessToken}` },
+      signal: controller.signal,
+    });
+  } catch (err) {
+    const wrapped = new Error(err.name === "AbortError" ? "Meta token revocation timed out" : `Meta token revocation failed: ${err.message}`);
+    wrapped.code = err.name === "AbortError" ? "TIMEOUT" : "NETWORK_ERROR";
+    throw wrapped;
+  } finally {
+    clearTimeout(timer);
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.error) {
     const err = new Error(data?.error?.message || `Meta token revocation failed (${res.status})`);
