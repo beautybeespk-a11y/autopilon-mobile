@@ -149,10 +149,52 @@ the production launch blocker list, and every fix made during this pass.
 
 Phase 18.2 closed the one application-level gap Phase 18.1's own report
 identified (OAuth revocation on disconnect) and re-ran every regression
-suite that now exists — the 121 from Phase 18.1 plus 6 new suites written
-for this pass (OAuth revocation, queued-job credential safety, token
-refresh safety, reconnect/isolation, audit logging + API response
-security, failure handling + concurrency) — 175/175 checks passing
-across 16 suites. See `PHASE18_2_NOTES.md` for the full breakdown and the
-updated production launch blocker list (unchanged in substance from
-Phase 18.1's, minus the revocation item, which is now resolved).
+suite that now exists — the 10 pre-existing suite files from Phase
+16/17/17.1/18/18.1 (one of which, `integrationActionRegression.js`,
+gained 3 new disconnect/reconnect checks this phase) plus 6 new suites
+written for this pass (OAuth revocation, queued-job credential safety,
+token refresh safety, reconnect/isolation, audit logging + API response
+security, failure handling + concurrency) — a freshly measured 174/174
+checks passing across 16 suite files, run against clean servers booted
+fresh for this phase (not carried over from an earlier count). See
+`PHASE18_2_NOTES.md` for the full breakdown and the updated production
+launch blocker list (unchanged in substance from Phase 18.1's, minus the
+revocation item, which is now resolved).
+
+## Phase 18.2 Final Test Matrix
+
+Every suite below was run to completion against a freshly booted server
+(fresh `DB_PATH`, no state carried over between suites) as the very last
+step of this phase, specifically to produce this table — not copied
+forward from an earlier run.
+
+| Test | Result | Environment | Notes |
+|---|---|---|---|
+| OAuth token encryption at rest | 27/27 | Sandbox (mocked provider boundary) | Phase 18.1 work, re-verified unchanged. |
+| OAuth disconnect + provider revocation (Google, Meta) | 11/11 | Sandbox (mocked provider boundary) | `test:oauth-revocation`. Real revoke-endpoint construction, `invalid_token`-as-success, honest failure reporting, idempotent double-disconnect. Live-provider round trip is EXTERNAL TEST REQUIRED. |
+| Credential deletion on disconnect | included above + 8/8 | Sandbox | Covered by `test:oauth-revocation` and `test:credential-leakage`. |
+| Token refresh safety (valid/expired/revoked/concurrent/disconnect-race) | 7/7 | Sandbox (mocked provider boundary) | `test:token-refresh-safety`. Found and fixed a real disconnect-during-refresh resurrection race. |
+| Reconnect lifecycle (connect→use→disconnect→reconnect→use) | 15/15 | Sandbox | `test:reconnect-isolation`. Clean pass, no bugs found. |
+| Cross-user isolation | included above | Sandbox | Same suite as reconnect. |
+| Cross-org isolation (incl. personal+org coexistence for one provider) | included above | Sandbox | Same suite; specifically exercises the Phase 18.1 schema fix. |
+| Cache invalidation | confirmed by code audit + 4/4 | Sandbox | No caching layer exists for integration connections anywhere (grep-verified); `test:queued-job-credential-safety` includes a direct no-stale-read check. |
+| Queued job / worker credential safety | 4/4 | Sandbox | `test:queued-job-credential-safety`. Found and fixed a retry-forever gap on a permanently-unfixable disconnect error. |
+| WooCommerce credential security (no URL leak) | 8/8 | Sandbox | `test:credential-leakage`, includes a dedicated regression check for the Phase 18.1 URL-leak pattern. |
+| Integration Action API (disconnected/revoked credential rejection) | 15/15 | Sandbox | `test:integration-actions`, +3 new checks this phase. |
+| Audit logging (new event taxonomy surfaced correctly) | 5/5 | Sandbox (in-process HTTP) | `test:audit-api-response`. |
+| API response security (no tokens/secrets in any response) | included above | Sandbox | Same suite. |
+| Failure handling (401/403/timeout/network error) | 9/9 | Sandbox (mocked provider boundary) | `test:failure-concurrency`. |
+| Idempotent + concurrent disconnect / connect races | included above | Sandbox | Same suite. |
+| Core security regression (tenant isolation, billing, webhook replay, BYOK) | 24/24 | Sandbox | `test:security`, unchanged from Phase 18.1. |
+| Public API security (scopes, rate limits, secrets) | 30/30 | Sandbox | `test:security:public-api`, unchanged. |
+| Idempotency-Key handling | 10/10 | Sandbox | `test:idempotency`, unchanged. |
+| CSRF (OAuth state param) | 7/7 | Sandbox | `test:csrf`, unchanged. |
+| Production logging redaction | 3/3 | Sandbox | `test:production-logging`, unchanged. |
+| Data retention / deletion cascades | 10/10 | Sandbox | `test:data-retention`, unchanged. |
+| Admin panel access control + response security | 9/9 | Sandbox | `test:admin-panel`, unchanged. |
+| Reverse-proxy / session security (direct + proxy mode) | 7/7 | Sandbox | `test:reverse-proxy`, unchanged, both `NODE_ENV` configurations. |
+| **Total** | **174/174** | — | Across 16 suite files (10 pre-existing + 6 new for Phase 18.2). |
+| Real Google/Meta OAuth account | NOT AVAILABLE | — | No live OAuth credentials in this sandbox — see `EXTERNAL_INFRASTRUCTURE.md`. |
+| Real Stripe account/webhooks | NOT AVAILABLE | — | Unchanged from Phase 18.1. |
+| Flutter mobile compilation | NOT AVAILABLE | — | No Flutter SDK in this sandbox — unchanged from Phase 18.1. |
+| Transactional email delivery | NOT AVAILABLE | — | No email provider integrated — unchanged, known gap. |
