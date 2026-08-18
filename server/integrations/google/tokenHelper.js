@@ -14,6 +14,16 @@ export async function getValidAccessToken(userId, service, label) {
   if (!expired) return conn.accessToken;
 
   const refreshed = await refreshAccessToken(conn.refreshToken);
+  // Phase 18.2 §7: same disconnect-during-refresh race as gmail/api.js's
+  // getValidAccessToken() — re-check the connection is still connected
+  // before persisting, so a disconnect that happened while this refresh's
+  // network call was in flight can't be resurrected by this write.
+  const stillConnected = getConnection(userId, service);
+  if (!stillConnected || stillConnected.status !== "connected") {
+    const err = new Error(`${label} is not connected. Connect it first in Integrations.`);
+    err.code = "INTEGRATION_NOT_CONNECTED";
+    throw err;
+  }
   const meta = JSON.parse(conn.meta || "{}");
   saveConnection(userId, service, {
     accessToken: refreshed.accessToken,

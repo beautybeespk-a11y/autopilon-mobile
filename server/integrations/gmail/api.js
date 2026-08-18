@@ -18,6 +18,20 @@ async function getValidAccessToken(userId) {
   if (!expired) return conn.accessToken;
 
   const refreshed = await refreshAccessToken(conn.refreshToken);
+  // Phase 18.2 §7: the await above is a real network round-trip — the
+  // user can disconnect Gmail while it's in flight. Re-check the
+  // connection is STILL connected before persisting the refreshed token;
+  // without this, saveConnection()'s upsert would silently resurrect a
+  // connection the user just disconnected, complete with a still-valid
+  // refresh token they believed was gone. If it's gone now, the refreshed
+  // access token is simply discarded (never persisted, never returned) —
+  // it was correctly obtained but is no longer wanted.
+  const stillConnected = getConnection(userId, "gmail");
+  if (!stillConnected || stillConnected.status !== "connected") {
+    const err = new Error("Gmail is not connected. Connect it first in Integrations.");
+    err.code = "INTEGRATION_NOT_CONNECTED";
+    throw err;
+  }
   const meta = JSON.parse(conn.meta || "{}");
   saveConnection(userId, "gmail", {
     accessToken: refreshed.accessToken,
