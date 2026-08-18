@@ -69,6 +69,11 @@ router.post("/:orgId/integrations/:provider/connect", async (req, res) => {
   }
 });
 
+// Phase 18.2 §3: every provider here (wordpress/woocommerce/shopify) is
+// manual-token/API-key — none has a revoke call this app can make; see
+// the equivalent personal-connection routes for why, per provider.
+// `revoked: null` is the honest answer; local credentials are always
+// still fully deleted below.
 router.post("/:orgId/integrations/:provider/disconnect", (req, res) => {
   const { orgId, provider } = req.params;
   if (!hasPermission(orgId, req.session.userId, "integrations")) {
@@ -76,7 +81,7 @@ router.post("/:orgId/integrations/:provider/disconnect", (req, res) => {
   }
   disconnectOrgConnection(orgId, provider);
   logActivity(db, req.session.userId, "org_integration_disconnected", `Disconnected an organization integration`, { orgId, req });
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: null, revocationError: null });
 });
 
 export default router;

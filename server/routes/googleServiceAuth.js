@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, googleOAuthStatus } from "../integrations/google/oauth.js";
-import { saveConnection, disconnectIntegration, connectionHealth } from "../integrations/manager.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, googleOAuthStatus, revokeToken } from "../integrations/google/oauth.js";
+import { saveConnection, disconnectIntegration, connectionHealth, getConnection } from "../integrations/manager.js";
 
 // One factory, four routers (google_calendar / google_drive / google_docs /
 // google_sheets) — same connect/callback/disconnect shape as gmailAuth.js,
@@ -42,10 +42,24 @@ export function createGoogleServiceRouter(service, label) {
     }
   });
 
-  router.post("/disconnect", requireAuth, (req, res) => {
+  // Phase 18.2 §2: same real-revocation-before-local-wipe pattern as
+  // gmailAuth.js (this file's sibling — same Google OAuth client, same
+  // revoke endpoint). See that file's comment for the full reasoning.
+  router.post("/disconnect", requireAuth, async (req, res) => {
+    const conn = getConnection(req.session.userId, service);
+    const tokenToRevoke = conn?.refreshToken || conn?.accessToken || null;
+    let revocationError = null;
+    if (tokenToRevoke) {
+      try {
+        await revokeToken(tokenToRevoke);
+      } catch (err) {
+        revocationError = err.message;
+        logActivity(db, req.session.userId, "integration_revocation_failed", `${label} token revocation with Google failed: ${err.message}`, { req, result: "failure" });
+      }
+    }
     disconnectIntegration(req.session.userId, service);
     logActivity(db, req.session.userId, "integration_disconnected", `Disconnected ${label}`);
-    res.json({ ok: true });
+    res.json({ ok: true, revoked: tokenToRevoke ? !revocationError : null, revocationError });
   });
 
   return router;

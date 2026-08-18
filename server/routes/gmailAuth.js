@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, googleOAuthStatus } from "../integrations/gmail/oauth.js";
-import { saveConnection, disconnectIntegration, connectionHealth } from "../integrations/manager.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, googleOAuthStatus, revokeToken } from "../integrations/gmail/oauth.js";
+import { saveConnection, disconnectIntegration, connectionHealth, getConnection } from "../integrations/manager.js";
 
 const router = Router();
 
@@ -36,10 +36,29 @@ router.get("/callback", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/disconnect", requireAuth, (req, res) => {
+// Phase 18.2 §2: revoke the real Google grant before wiping the local
+// record, not instead of it — decrypted only right here inside the
+// server-side credential layer (getConnection() does the decryption; this
+// route never sees ciphertext or forwards the value anywhere). A failed
+// provider-side revocation is never treated as a reason to leave local
+// credentials usable: disconnectIntegration() always runs regardless of
+// what happened above it, and the response is honest about which part
+// (local vs. provider) actually succeeded.
+router.post("/disconnect", requireAuth, async (req, res) => {
+  const conn = getConnection(req.session.userId, "gmail");
+  const tokenToRevoke = conn?.refreshToken || conn?.accessToken || null;
+  let revocationError = null;
+  if (tokenToRevoke) {
+    try {
+      await revokeToken(tokenToRevoke);
+    } catch (err) {
+      revocationError = err.message;
+      logActivity(db, req.session.userId, "integration_revocation_failed", `Gmail token revocation with Google failed: ${err.message}`, { req, result: "failure" });
+    }
+  }
   disconnectIntegration(req.session.userId, "gmail");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected Gmail");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: tokenToRevoke ? !revocationError : null, revocationError });
 });
 
 export default router;

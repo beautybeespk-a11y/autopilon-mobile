@@ -65,3 +65,29 @@ async function exchangeForLongLivedToken(shortLivedToken) {
   const expiresAt = data.expires_in ? new Date(Date.now() + data.expires_in * 1000).toISOString() : null;
   return { accessToken: data.access_token, expiresAt, scopes: SCOPES };
 }
+
+// Phase 18.2 §2/§3 — Meta SUPPORTS real revocation via DELETE /me/permissions,
+// which de-authorizes this app for the user (revokes the whole grant, not
+// just one token — Meta has no separate access/refresh-token pair to
+// revoke individually the way Google does). Sent as an Authorization:
+// Bearer header rather than the ?access_token= query param the rest of
+// this app's Meta client (integrations/meta/api.js) uses — deliberately,
+// same reasoning as the Phase 18.1 WooCommerce fix: Graph API documents
+// both forms as equivalent, and a header keeps the token out of any
+// access/proxy log this specific call might pass through. Not a
+// retrofit of every existing Meta API call (out of this phase's scope,
+// see PHASE18_2_NOTES.md) — just how this new code is written.
+export async function revokeToken(accessToken) {
+  if (!accessToken) return { revoked: false };
+  const res = await fetch(`https://graph.facebook.com/${API_VERSION}/me/permissions`, {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data?.error) {
+    const err = new Error(data?.error?.message || `Meta token revocation failed (${res.status})`);
+    err.code = data?.error?.code || res.status;
+    throw err;
+  }
+  return { revoked: true };
+}

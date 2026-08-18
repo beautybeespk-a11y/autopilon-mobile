@@ -39,10 +39,15 @@ router.post("/connect", async (req, res) => {
   }
 });
 
+// Phase 18.2 §3: Shopify's manual admin API access token has no
+// programmatic revoke call this app can make — only the store owner can
+// remove the custom app's access, in their Shopify admin. `revoked: null`
+// (rather than omitting the field, or claiming true) is the honest
+// answer: local credentials are always still fully deleted below.
 router.post("/disconnect", (req, res) => {
   disconnectIntegration(req.session.userId, "shopify");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected Shopify");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: null, revocationError: null });
 });
 
 export default router;

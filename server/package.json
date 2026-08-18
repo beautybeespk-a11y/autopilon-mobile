@@ -21,7 +21,8 @@
     "test:csrf": "node test/csrfRegression.js",
     "test:production-logging": "node test/productionLoggingRegression.js",
     "test:data-retention": "node test/dataRetentionRegression.js",
-    "test:admin-panel": "node test/adminPanelSecurityRegression.js"
+    "test:admin-panel": "node test/adminPanelSecurityRegression.js",
+    "test:oauth-revocation": "node test/oauthRevocationRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",

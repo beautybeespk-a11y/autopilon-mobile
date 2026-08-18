@@ -39,10 +39,22 @@ router.post("/connect", async (req, res) => {
   }
 });
 
+// Phase 18.2 §3: WordPress application passwords DO have a real revoke
+// endpoint (DELETE /wp-json/wp/v2/users/me/application-passwords/{uuid}),
+// but only by UUID — and this integration only ever receives the raw
+// password the user pastes in, generated ahead of time in their own WP
+// admin. WordPress never re-exposes a password's UUID from the raw value
+// after creation, so there's no reliable way to identify which of the
+// user's application passwords to revoke without risking revoking the
+// wrong one. Classified NOT SUPPORTED for this connect flow specifically
+// (not a limitation of WordPress's API in general) — the user revokes it
+// themselves in Users -> Profile -> Application Passwords. `revoked: null`
+// is the honest answer; local credentials are always still fully deleted
+// below.
 router.post("/disconnect", (req, res) => {
   disconnectIntegration(req.session.userId, "wordpress");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected WordPress");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: null, revocationError: null });
 });
 
 export default router;

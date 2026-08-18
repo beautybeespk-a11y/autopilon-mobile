@@ -39,10 +39,15 @@ router.post("/connect", async (req, res) => {
   }
 });
 
+// Phase 18.2 §3: WooCommerce's consumer key/secret pair has no
+// programmatic revoke call — only the store owner can delete the REST API
+// key, in their WooCommerce admin (Settings -> Advanced -> REST API).
+// `revoked: null` is the honest answer; local credentials are always
+// still fully deleted below.
 router.post("/disconnect", (req, res) => {
   disconnectIntegration(req.session.userId, "woocommerce");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected WooCommerce");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: null, revocationError: null });
 });
 
 export default router;

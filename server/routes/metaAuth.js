@@ -1,8 +1,8 @@
 import { Router } from "express";
 import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
-import { buildAuthorizationUrl, exchangeCodeForToken, metaOAuthStatus } from "../integrations/meta/oauth.js";
-import { saveConnection, disconnectIntegration, connectionHealth } from "../integrations/manager.js";
+import { buildAuthorizationUrl, exchangeCodeForToken, metaOAuthStatus, revokeToken } from "../integrations/meta/oauth.js";
+import { saveConnection, disconnectIntegration, connectionHealth, getConnection } from "../integrations/manager.js";
 
 const router = Router();
 
@@ -43,10 +43,24 @@ router.get("/callback", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/disconnect", requireAuth, (req, res) => {
+// Phase 18.2 §2: real de-authorization before local wipe, same reasoning
+// as gmailAuth.js. Meta has no separate access/refresh token to revoke
+// individually — DELETE /me/permissions revokes the whole app grant.
+router.post("/disconnect", requireAuth, async (req, res) => {
+  const conn = getConnection(req.session.userId, "meta_ads");
+  const tokenToRevoke = conn?.accessToken || null;
+  let revocationError = null;
+  if (tokenToRevoke) {
+    try {
+      await revokeToken(tokenToRevoke);
+    } catch (err) {
+      revocationError = err.message;
+      logActivity(db, req.session.userId, "integration_revocation_failed", `Meta Ads token revocation with Meta failed: ${err.message}`, { req, result: "failure" });
+    }
+  }
   disconnectIntegration(req.session.userId, "meta_ads");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected Meta Ads");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: tokenToRevoke ? !revocationError : null, revocationError });
 });
 
 export default router;

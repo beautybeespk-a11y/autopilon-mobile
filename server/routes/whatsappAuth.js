@@ -60,10 +60,22 @@ router.post("/connect", async (req, res) => {
   }
 });
 
+// Phase 18.2 §3: classified REQUIRES EXTERNAL CONFIGURATION, not
+// SUPPORTED — this token is a Meta System User access token, generated
+// and managed in Meta Business Manager, not a per-user OAuth grant this
+// app created. Meta's /me/permissions de-authorize endpoint (used for
+// metaAuth.js's per-user Ads token) has undocumented semantics against a
+// System User token and could plausibly affect other apps/integrations
+// sharing that same System User in Business Manager — not a call this
+// app can safely make on the user's behalf without real risk of
+// unintended side effects outside this integration. The user revokes or
+// regenerates the token themselves in Meta Business Manager. `revoked:
+// null` is the honest answer; local credentials are always still fully
+// deleted below.
 router.post("/disconnect", (req, res) => {
   disconnectIntegration(req.session.userId, "whatsapp");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected WhatsApp Business");
-  res.json({ ok: true });
+  res.json({ ok: true, revoked: null, revocationError: null });
 });
 
 router.get("/settings", (req, res) => {

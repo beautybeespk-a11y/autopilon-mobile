@@ -94,3 +94,25 @@ export async function refreshAccessToken(refreshToken) {
   const expiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString();
   return { accessToken: data.access_token, expiresAt };
 }
+
+// Phase 18.2 §2/§3 — same real revoke support as gmail/oauth.js (this file
+// is Google OAuth for the "second wave" Calendar/Drive/Docs/Sheets
+// services, sharing the same GOOGLE_CLIENT_ID/SECRET and the same revoke
+// endpoint — see that file's comment for the full reasoning, duplicated
+// here rather than factored out to match this file's existing
+// duplication-over-cross-import pattern for the rest of the OAuth flow).
+export async function revokeToken(token) {
+  if (!token) return { revoked: false, alreadyInvalid: false };
+  const res = await fetch("https://oauth2.googleapis.com/revoke", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token }),
+  });
+  if (res.ok) return { revoked: true, alreadyInvalid: false };
+  let data = {};
+  try { data = await res.json(); } catch { /* non-JSON error body, fall through to the generic error below */ }
+  if (res.status === 400 && data?.error === "invalid_token") return { revoked: true, alreadyInvalid: true };
+  const err = new Error(`Google token revocation failed (${res.status})`);
+  err.code = res.status;
+  throw err;
+}

@@ -75,3 +75,30 @@ export async function refreshAccessToken(refreshToken) {
   const expiresAt = new Date(Date.now() + data.expires_in * 1000).toISOString();
   return { accessToken: data.access_token, expiresAt };
 }
+
+// Phase 18.2 §2/§3 — Google SUPPORTS real token revocation: POST to this
+// endpoint with either the refresh_token or access_token as the `token`
+// param. Revoking the refresh_token also invalidates every access_token
+// derived from it and revokes the app's whole grant — always prefer it
+// over the (narrower) access token when both are available, since that's
+// the closer match to "disconnect this integration" than "invalidate one
+// short-lived token." A 400 with error=invalid_token means Google already
+// considers the token dead (already revoked, expired, or simply unknown to
+// them) — that's not a failure to report, it's the end state disconnect
+// was trying to reach anyway, so it's treated as success rather than an
+// error the caller needs to handle specially.
+export async function revokeToken(token) {
+  if (!token) return { revoked: false, alreadyInvalid: false };
+  const res = await fetch("https://oauth2.googleapis.com/revoke", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token }),
+  });
+  if (res.ok) return { revoked: true, alreadyInvalid: false };
+  let data = {};
+  try { data = await res.json(); } catch { /* non-JSON error body, fall through to the generic error below */ }
+  if (res.status === 400 && data?.error === "invalid_token") return { revoked: true, alreadyInvalid: true };
+  const err = new Error(`Google token revocation failed (${res.status})`);
+  err.code = res.status;
+  throw err;
+}
