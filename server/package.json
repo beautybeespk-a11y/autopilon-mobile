@@ -20,7 +20,8 @@
     "test:reverse-proxy": "node test/reverseProxyRegression.js",
     "test:csrf": "node test/csrfRegression.js",
     "test:production-logging": "node test/productionLoggingRegression.js",
-    "test:data-retention": "node test/dataRetentionRegression.js"
+    "test:data-retention": "node test/dataRetentionRegression.js",
+    "test:admin-panel": "node test/adminPanelSecurityRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",

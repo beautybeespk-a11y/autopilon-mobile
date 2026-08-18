@@ -51,7 +51,14 @@ export function updatePlan(planId, fields) {
 // can see). Reuses the same activity_logs table, just queried without an
 // orgId filter and narrowed to billing-related action types.
 const BILLING_ACTIONS = [
-  "plan_changed", "billing_mode_changed", "api_key_saved", "api_key_deleted",
+  // "plan_changed" (routes/billing.js) = an org owner switching their own
+  // org onto a different existing plan. "plan_updated" (routes/
+  // platformAdmin.js) = a platform admin editing a plan's own definition
+  // (pricing/limits) — a different, genuinely billing-relevant action that
+  // was missing here (found during the Phase 18.1 §12 admin panel review:
+  // admin plan edits were being logged but never actually surfaced in this
+  // audit view, since the action name here didn't match what the route logs).
+  "plan_changed", "plan_updated", "billing_mode_changed", "api_key_saved", "api_key_deleted",
   "coupon_created", "coupon_redeemed", "manual_credit_granted", "support_adjustment",
   "subscription_canceled", "subscription_resumed",
 ];
