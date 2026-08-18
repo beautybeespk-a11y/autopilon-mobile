@@ -97,6 +97,17 @@ export async function deleteOrganization(orgId) {
     // file_permissions/file_tags/file_shares/file_activity/file_links)
     // handles those child tables once this DELETE runs.
     db.prepare("DELETE FROM files WHERE orgId = ?").run(orgId);
+    // Phase 18.1 §9 (found during the data-retention regression pass):
+    // conversations.agentId has no FK to agents at all (unlike every
+    // other agent-child table — agent_skills/agent_permissions/
+    // agent_versions all cascade). Without this, deleting this org's
+    // agents below would leave their conversations (and, via messages'
+    // own FK cascade to conversations, their message content) orphaned
+    // but NOT deleted — real chat content tied to a deleted org's agent
+    // surviving indefinitely with a dangling agentId reference. Must run
+    // before the "agents" delete in the loop below, while the subquery
+    // can still see which agents belonged to this org.
+    db.prepare("DELETE FROM conversations WHERE agentId IN (SELECT id FROM agents WHERE orgId = ?)").run(orgId);
     for (const table of [
       "agents", "automations", "integrations", "tasks", "knowledge_items",
       "organization_usage", "quota_warnings_sent", "voice_usage", "folders",
