@@ -217,7 +217,13 @@ addIntegrationCol("tokenExpiresAt", "TEXT");
 addIntegrationCol("scopes", "TEXT");  // JSON array
 addIntegrationCol("meta", "TEXT");    // JSON — e.g. selected ad account id
 addIntegrationCol("updatedAt", "TEXT");
-db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_int_user_provider ON integrations(userId, provider)");
+// The (userId, provider) unique index used to be created right here, before
+// orgId existed as a column — superseded below (Phase 18.1 §2) by two
+// partial indexes once orgId is added, so it's not (re)created on every
+// boot: doing so here, unconditionally, would re-fail against any DB that
+// already has a personal + org-shared connection for the same user and
+// provider, which the partial-index migration below is specifically there
+// to allow.
 
 // ---- Phase 5: WhatsApp Business ----
 // Connection state (token, phone_number_id, WABA id, business name, settings)
@@ -446,6 +452,22 @@ if (!userCols.includes("stripeCustomerId")) db.exec("ALTER TABLE users ADD COLUM
 
 const integrationOrgCols = db.prepare("PRAGMA table_info(integrations)").all().map((c) => c.name);
 if (!integrationOrgCols.includes("orgId")) db.exec("ALTER TABLE integrations ADD COLUMN orgId TEXT");
+
+// Phase 18.1 §2 fix: idx_int_user_provider (added above, before orgId
+// existed) is a UNIQUE index on just (userId, provider) — it never learned
+// about org-shared connections. In practice this means a user who already
+// has a personal connection for a provider can't also be the connector for
+// an org-level connection of that same provider (and the same user can't
+// connect that provider for two different orgs either) — saveOrgConnection
+// would hit a raw SQLite UNIQUE constraint violation. Split it into two
+// partial indexes matching how getConnection()/saveConnection() and
+// getOrgConnection()/saveOrgConnection() actually scope rows: personal
+// connections stay unique per (userId, provider), org connections are
+// unique per (orgId, provider) instead — a single connecting user can now
+// own both, and be the connector for multiple orgs.
+db.exec("DROP INDEX IF EXISTS idx_int_user_provider");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_int_user_provider_personal ON integrations(userId, provider) WHERE orgId IS NULL");
+db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_int_org_provider ON integrations(orgId, provider) WHERE orgId IS NOT NULL");
 
 // Phase 9: Projects. Belong to a workspace. Rather than adding a projectId
 // column to five different existing tables (tasks, agents, knowledge_items,

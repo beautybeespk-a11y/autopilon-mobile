@@ -1,14 +1,25 @@
 // WooCommerce REST API client. Auth is a consumer key/secret pair
-// (WooCommerce → Settings → Advanced → REST API → generate one) sent as
-// query params or Basic Auth — no OAuth dance needed.
-
+// (WooCommerce → Settings → Advanced → REST API → generate one).
+//
+// Phase 18.1 §2: over HTTPS (virtually every real store), send it as HTTP
+// Basic Auth instead of `consumer_key`/`consumer_secret` query params —
+// this is WooCommerce's own documented recommendation, specifically
+// because a secret in the URL can end up in the store's server access
+// logs, CDN logs, or a `Referer` header, none of which are under our
+// control. Query params are kept only as a fallback for plain-HTTP stores
+// (WooCommerce doesn't support Basic Auth without SSL).
 async function wcFetch(siteUrl, consumerKey, consumerSecret, path, { method = "GET", body } = {}) {
   const url = new URL(`${siteUrl.replace(/\/$/, "")}/wp-json/wc/v3${path}`);
-  url.searchParams.set("consumer_key", consumerKey);
-  url.searchParams.set("consumer_secret", consumerSecret);
+  const headers = { "content-type": "application/json" };
+  if (url.protocol === "https:") {
+    headers.authorization = `Basic ${Buffer.from(`${consumerKey}:${consumerSecret}`).toString("base64")}`;
+  } else {
+    url.searchParams.set("consumer_key", consumerKey);
+    url.searchParams.set("consumer_secret", consumerSecret);
+  }
   const res = await fetch(url, {
     method,
-    headers: { "content-type": "application/json" },
+    headers,
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
