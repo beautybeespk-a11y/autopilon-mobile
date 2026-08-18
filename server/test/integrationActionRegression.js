@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
+import { saveOrgConnection, disconnectOrgConnection } from "../integrations/manager.js";
 
 const BASE = process.argv[2] || process.env.SECURITY_TEST_BASE_URL || "http://localhost:4102";
 
@@ -65,13 +66,21 @@ async function signup(session, email, name) {
   return json.user;
 }
 
+// Phase 18.2 §15 (found during this pass): this used to be a raw INSERT
+// directly into the integrations table — which, since Phase 18.1's token
+// encryption at rest, meant the accessToken stored here was plaintext,
+// and every real read (getConnection/getOrgConnection) would try to
+// decrypt it, fail (it's not in the iv:authTag:ciphertext format), and
+// silently return null — leaving this fixture in DB status='connected'
+// but with connectionHealth() reporting NOT connected. The "executing a
+// real, approved action reaches the actual underlying integration" check
+// below was passing for the wrong reason (failing at the "not connected"
+// gate, not at a real outbound Gmail 401 the way its own comment claims).
+// Fixed by going through the real saveOrgConnection() — the same
+// function every actual org-level connect route uses — so this fixture
+// is genuinely connected and encrypted, exactly like production data.
 function connectGmail(orgId, userId) {
-  const now = new Date().toISOString();
-  const id = cryptoRandom();
-  db.prepare(
-    `INSERT INTO integrations (id, userId, orgId, provider, status, accessToken, refreshToken, tokenExpiresAt, scopes, meta, createdAt, updatedAt)
-     VALUES (?, ?, ?, 'gmail', 'connected', 'fake-access-token-for-testing', NULL, NULL, '[]', '{}', ?, ?)`
-  ).run(id, userId, orgId, now, now);
+  saveOrgConnection(orgId, userId, "gmail", { accessToken: "fake-access-token-for-testing", expiresAt: null, scopes: [], meta: {} });
 }
 
 function enableAgentSkill(agentId, skillId) {
@@ -206,6 +215,29 @@ async function run() {
     assert.equal(status, 200, "runTool() reports this as a normal failed execution, not an HTTP error");
     assert.equal(json.status, "failed");
     assert.ok(json.error.includes("gmail"), `expected a skill-gate error mentioning gmail, got: ${json.error}`);
+  });
+
+  // --- Phase 18.2 §15: disconnected/revoked credentials must never let
+  // an action execute, through this same Public API layer. ---
+  await check("disconnected integration: executing an action against it is rejected as not found, not silently run", async () => {
+    disconnectOrgConnection(f.orgA.id, "gmail");
+    const { status, json } = await f.apiA.req("POST", "/integrations/gmail/actions/gmail.list_emails/execute", { agentId: f.agentA.id, parameters: {} });
+    assert.equal(status, 404);
+    assert.equal(json?.error?.code, "NOT_FOUND");
+    assert.ok(json.error.message.toLowerCase().includes("no connected"), `expected a "no connected integration" message, got: ${json.error.message}`);
+  });
+
+  await check("disconnected integration: the public action LIST also reflects it as unavailable, not stale", async () => {
+    const { status, json } = await f.apiA.req("GET", "/integrations/gmail/actions");
+    assert.equal(status, 404);
+    assert.equal(json?.error?.code, "RESOURCE_NOT_FOUND");
+  });
+
+  await check("reconnect: after reconnecting, the same org/agent/key can execute actions again — the disconnect was not permanent damage", async () => {
+    connectGmail(f.orgA.id, f.userA.id);
+    const { status, json } = await f.apiA.req("POST", "/integrations/gmail/actions/gmail.list_emails/execute", { agentId: f.agentA.id, parameters: {} });
+    assert.equal(status, 200);
+    assert.ok(json.executionId, "the reconnected integration reaches real tool execution again, exactly as it did before disconnect");
   });
 
   const failed = results.filter((r) => !r.ok);
