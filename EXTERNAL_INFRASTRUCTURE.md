@@ -13,7 +13,16 @@ provider's own pricing page at deployment time).
 | Item | Why needed | Staging? | Production? | Cost category |
 |---|---|---|---|---|
 | A host to run `server/index.js` (and, once scaling matters, `server/worker.js`) | The app is a real Node/Express process — nothing here is serverless-native | Required | Required | Low-to-moderate (a single small VM/container is enough for staging and modest production traffic; this is a monolith, not a fleet, until real load says otherwise) |
-| Container runtime / orchestrator (optional) | `Dockerfile`/`docker-compose.yml` exist (Phase 18.7) but are **syntax-reviewed only, not build-tested** — no Docker daemon in this sandbox | Optional (a plain `node index.js` on a VM works too) | Optional, recommended for the worker/redis/app topology `docker-compose.yml` describes | Free (self-hosted) to moderate (managed container platform) |
+| Container runtime / orchestrator (optional) | `Dockerfile`/`docker-compose.yml` exist (Phase 18.7) but are **syntax-reviewed only, not build-tested** — re-confirmed in Phase 19 that no Docker daemon is reachable in this sandbox (the `docker` CLI itself is present, but `docker info` fails on the socket) | Optional (a plain `node index.js` on a VM works too) | Optional, recommended for the worker/redis/app topology `docker-compose.yml` describes | Free (self-hosted) to moderate (managed container platform) |
+
+**Phase 19 note**: this repo already contains a `REPLIT_SETUP.md` written
+for deploying to Replit, and this session had a `Replit` MCP connector
+visible but **unauthenticated** — this session cannot run the OAuth flow
+to connect it. If the account owner authorizes that connector (via
+claude.ai's connector settings), a future session could attempt a real
+deployment there directly instead of just documenting the requirement.
+The application itself has no hard dependency on Replit specifically —
+any Node-capable host works, per the table above.
 
 ## Database
 
@@ -104,6 +113,14 @@ Shopify/WooCommerce/WordPress do **not** need OAuth apps — they're
 manual-token/application-password integrations configured per-connection
 by the end user, nothing platform-level to provision.
 
+**Phase 19 note**: this session had a `novamira-beautybees-store` MCP
+connector visible but **unauthenticated** — this session cannot run its
+OAuth flow. If it's a real WooCommerce or Shopify store and the account
+owner authorizes it, a future session could use it for a genuine
+end-to-end integration test (connect → real product/order read → 
+disconnect) instead of the code-level-only verification this phase relied
+on for those three providers.
+
 ## Payments
 
 | Item | Why needed | Staging? | Production? | Cost category |
@@ -123,6 +140,24 @@ by the end user, nothing platform-level to provision.
 | Item | Why needed | Staging? | Production? | Cost category |
 |---|---|---|---|---|
 | A transactional email provider (none currently integrated) | `routes/organizations.js`'s member-invite flow has a code comment noting "no outbound email exists yet" — invited users must be told out-of-band today. Password reset (`/auth/forgot-password`) likely has the same gap — **not verified in this review pass**, flagging for the next security/privacy pass | Recommended | Required for a real invite/password-reset flow | Low (most transactional email providers have a free tier sufficient for early-stage volume) |
+
+## Developer Webhooks (Outbound Delivery)
+
+| Item | Why needed | Staging? | Production? | Cost category |
+|---|---|---|---|---|
+| A real, independently-reachable HTTP endpoint to deliver a test webhook to | Signing, timestamp/replay protection, retry/backoff, and SSRF protection are all real and regression-tested (Public API security suite, 30/30) — the one thing untested is an actual outbound delivery to something outside this sandbox | Recommended before offering this feature to real developers | N/A — developers provide their own endpoints in production; this is purely a staging verification step | Free (any HTTP endpoint you control — a serverless function, a small VPS, even a temporary tool like webhook.site) |
+
+**Phase 19 note — this was genuinely attempted, not skipped**: this
+session tried delivering to several public test endpoints (httpbin.org,
+postman-echo.com, webhook.site, requestbin.com, plain example.com) and
+every one was rejected with a `403` by this sandbox's own organizational
+network egress policy, which only allows an explicit list of domains
+(GitHub, npm, PyPI, a few others) and blocks everything else at a proxy
+level — confirmed via the proxy's own status/log output, which explicitly
+instructs not to retry or route around a policy denial. This is a
+property of *this specific sandbox*, not of the code or of a real staging
+host — a real deployment target should have normal outbound internet
+access and this test should simply work there with no code changes.
 
 ## Monitoring / Error Tracking / Alerting
 
