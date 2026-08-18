@@ -110,6 +110,7 @@ jobs:
           rm -f app.sqlite app.sqlite-shm app.sqlite-wal
           SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
           BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PLATFORM_ADMIN_EMAIL="ci-platform-admin@example.com" \
           PORT=4102 node index.js &
           echo $! > server.pid
           for i in $(seq 1 20); do
@@ -135,9 +136,75 @@ jobs:
         run: node test/integrationActionRegression.js http://localhost:4102
         working-directory: server
 
+      - name: Production logging regression (Phase 18.1)
+        run: node test/productionLoggingRegression.js http://localhost:4102
+        working-directory: server
+
       - name: Stop server
         if: always()
         run: kill $(cat server.pid) 2>/dev/null || true
+        working-directory: server
+
+      - name: Data retention regression (Phase 18.1, standalone — no HTTP server)
+        run: node test/dataRetentionRegression.js
+        working-directory: server
+
+      # csrf/credentialLeakage/adminPanel each get their OWN fresh server
+      # boot rather than sharing the one above — the shared auth rate
+      # limiter (10 req/60s per IP across signup/login/forgot-password) was
+      # empirically found, in this same phase, to starve suites that run
+      # back-to-back against one long-lived server once enough signups from
+      # earlier suites have used up the window. A fresh boot resets it.
+      - name: CSRF regression (Phase 18.1, fresh server)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PORT=4105 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4105/api/health/live > /dev/null && break
+            sleep 1
+          done
+          node test/csrfRegression.js http://localhost:4105
+          RESULT=$?
+          kill $SERVER_PID 2>/dev/null || true
+          exit $RESULT
+        working-directory: server
+
+      - name: Credential leakage regression (Phase 18.1, fresh server)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PORT=4105 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4105/api/health/live > /dev/null && break
+            sleep 1
+          done
+          node test/credentialLeakageRegression.js http://localhost:4105
+          RESULT=$?
+          kill $SERVER_PID 2>/dev/null || true
+          exit $RESULT
+        working-directory: server
+
+      - name: Admin panel security regression (Phase 18.1, fresh server)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PLATFORM_ADMIN_EMAIL="ci-platform-admin@example.com" \
+          PORT=4105 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4105/api/health/live > /dev/null && break
+            sleep 1
+          done
+          PLATFORM_ADMIN_EMAIL="ci-platform-admin@example.com" node test/adminPanelSecurityRegression.js http://localhost:4105
+          RESULT=$?
+          kill $SERVER_PID 2>/dev/null || true
+          exit $RESULT
         working-directory: server
 
       - name: Real Redis connectivity check (Phase 18.2/18.3 providers)
@@ -162,6 +229,89 @@ jobs:
           echo "Redis health: $RESULT"
           kill $SERVER_PID 2>/dev/null || true
           echo "$RESULT" | grep -q '"ok":true' || { echo "Redis health check did not report ok:true"; exit 1; }
+        working-directory: server
+
+  phase18-2-credential-lifecycle-regression:
+    name: Phase 18.2 credential lifecycle regression (standalone, no shared server)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: server
+
+      # Each of these suites boots its own in-process app/DB (see each
+      # file's own header comment) — no shared server or Redis needed.
+      - name: OAuth disconnect revocation regression
+        run: node test/oauthRevocationRegression.js
+        working-directory: server
+
+      - name: Queued job credential safety regression
+        run: node test/queuedJobCredentialSafetyRegression.js
+        working-directory: server
+
+      - name: Token refresh safety regression
+        run: node test/tokenRefreshSafetyRegression.js
+        working-directory: server
+
+      - name: Reconnect + cross-user/cross-org isolation regression
+        run: node test/reconnectAndIsolationRegression.js
+        working-directory: server
+
+      - name: Audit logging + API response security regression
+        run: node test/auditLoggingAndApiResponseRegression.js
+        working-directory: server
+
+      - name: Failure handling + idempotent disconnect + concurrency regression
+        run: node test/failureHandlingAndConcurrencyRegression.js
+        working-directory: server
+
+  reverse-proxy-regression:
+    name: Reverse-proxy / session security regression (direct + proxy mode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: server
+
+      - name: Direct mode (NODE_ENV unset — trust proxy off)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PORT=4104 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4104/api/health/live > /dev/null && break
+            sleep 1
+          done
+          node test/reverseProxyRegression.js direct http://localhost:4104
+          RESULT=$?
+          kill $SERVER_PID 2>/dev/null || true
+          exit $RESULT
+        working-directory: server
+
+      - name: Proxy mode (NODE_ENV=production — trust proxy on)
+        run: |
+          rm -f app.sqlite app.sqlite-shm app.sqlite-wal
+          NODE_ENV=production \
+          SESSION_SECRET="ci-test-session-secret-at-least-32-characters-long" \
+          BYOK_ENCRYPTION_KEY="ci-test-encryption-key" \
+          PORT=4104 node index.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:4104/api/health/live > /dev/null && break
+            sleep 1
+          done
+          node test/reverseProxyRegression.js proxy http://localhost:4104
+          RESULT=$?
+          kill $SERVER_PID 2>/dev/null || true
+          exit $RESULT
         working-directory: server
 
   openapi-validation:
