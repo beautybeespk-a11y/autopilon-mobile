@@ -16,7 +16,8 @@
     "test:security:public-api": "node test/publicApiSecurityRegression.js",
     "test:idempotency": "node test/idempotencyRegression.js",
     "test:integration-actions": "node test/integrationActionRegression.js",
-    "test:credential-leakage": "node test/credentialLeakageRegression.js"
+    "test:credential-leakage": "node test/credentialLeakageRegression.js",
+    "test:reverse-proxy": "node test/reverseProxyRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",
