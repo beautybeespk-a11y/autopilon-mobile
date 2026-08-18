@@ -66,8 +66,26 @@ job-processing topology is ever needed.
 | A real Meta developer app (Ads + WhatsApp Business) | `META_APP_ID`/`META_APP_SECRET`/`META_REDIRECT_URI` — same status as Google: code-reviewed and one real bug fixed, never tested against a real Meta account | Required to test the real OAuth flow before launch | Required if these integrations are offered | Free for the app itself; WhatsApp Business API has its own usage-based pricing |
 
 See `PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md` for the exact staging setup
-steps for both, and `PHASE18_1_NOTES.md` for Phase 18.1's follow-up
-hardening pass on this same OAuth/integration credential path.
+steps for both, `PHASE18_1_NOTES.md` for Phase 18.1's follow-up hardening
+pass, and `PHASE18_2_NOTES.md` for Phase 18.2's — disconnect now calls the
+real Google/Meta revoke endpoint before wiping the local record, so once
+real credentials exist, the staging OAuth test in
+`PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md` should also confirm the
+disconnected app actually disappears from the user's "Apps with access
+to your account" list on Google's/Meta's side, not just from this app's
+own UI.
+
+**Phase 18.2 addition — provider-specific revocation limitations to know
+before staging**: Gmail/Calendar/Drive/Docs/Sheets and Meta Ads both get
+a real revoke call on disconnect (this app calls it automatically, no
+staging config needed). WhatsApp Business, Shopify, WooCommerce, and
+WordPress do not — see `PHASE18_2_NOTES.md` §3 for exactly why each one
+is inherent to that credential type, not a missing feature. For those
+four, if a real staging tester wants to fully revoke a connection at the
+provider (not just disconnect it in this app), they need to do so
+manually: remove the custom app/API key in Shopify's or WooCommerce's
+admin, revoke the application password in WordPress's Users profile
+page, or regenerate the System User token in Meta Business Manager.
 
 **Phase 18.1 addition — token encryption at rest is now real**: every
 stored `accessToken`/`refreshToken` (OAuth or manual, e.g. a WooCommerce

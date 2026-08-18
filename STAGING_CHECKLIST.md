@@ -28,10 +28,16 @@ doesn't have; genuinely untested either way).
 | | Connectivity health check (`/health/redis`) | PASS | Tested in all 3 real states (unconfigured/reachable/unreachable). |
 | **Secrets** | `SESSION_SECRET`/`BYOK_ENCRYPTION_KEY` enforcement | PASS | Startup validator refuses a weak/missing value in production. |
 | | Secrets never logged | PASS | Structured logger has a redaction safety net; manual review found no secret-logging call sites. |
-| | OAuth tokens encrypted at rest | FAIL (known gap) | Stored in plaintext — see `PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md`. Not blocking a staging deploy, but should be fixed before handling real user OAuth connections at any scale. |
-| **OAuth** | Gmail/Google-services OAuth flow | NOT AVAILABLE | Code-reviewed, one real CSRF bug fixed, never run against a real Google account. |
-| | Meta OAuth flow | NOT AVAILABLE | Same status as Google. |
-| | Cross-org connection isolation | PASS (by design, unverified live) | Existing `saveOrgConnection`/`getOrgConnection` design is org-scoped; worth a real confirmation once credentials exist. |
+| | OAuth tokens encrypted at rest | PASS (fixed Phase 18.1) | AES-256-GCM, transparent decrypt-on-read, 27 real assertions. Old plaintext connections from before this fix safely degrade to "please reconnect," never a crash or a garbage token. |
+| **OAuth** | Gmail/Google-services OAuth flow (real account) | NOT AVAILABLE | Code-reviewed, CSRF/encryption/revocation all real and tested at the code level, never run against a real Google account. |
+| | Meta OAuth flow (real account) | NOT AVAILABLE | Same status as Google. |
+| | OAuth revocation on real disconnect (provider side) | PASS (implemented Phase 18.2) / EXTERNAL TEST REQUIRED for the live-provider round trip | Google (`/revoke`) and Meta (`/me/permissions`) both get a real revoke call on disconnect, with a bounded 10s timeout and honest success/failure reporting — verified with 11 real regression checks against a mocked provider boundary (no live Google/Meta account in this sandbox to confirm the real endpoint accepts the call). |
+| | Local credentials cleared on disconnect regardless of revocation outcome | PASS | A failed provider-side revocation is never treated as a reason to leave local credentials usable — verified explicitly. |
+| | Shopify/WooCommerce/WordPress/WhatsApp revocation | NOT SUPPORTED (inherent to the credential type, not a code gap) | Manual tokens/API keys/application passwords have no revoke call this app can make — see `PHASE18_2_NOTES.md` §3 for the per-provider reasoning. Local credentials are still fully deleted on disconnect. |
+| | Cross-org connection isolation | PASS (verified live, Phase 18.2) | 15 real regression checks — personal + 2 orgs' connections for the same provider coexist and are independently readable/disconnectable/reconnectable, including a 3rd unrelated org. |
+| | Disconnect-during-refresh race | PASS (found and fixed Phase 18.2) | A refresh in flight when a disconnect lands no longer resurrects the connection with the old refresh token — verified with a real race simulation. |
+| | Queued job / worker credential safety | PASS | A job queued before a disconnect, but processed after, fails safely instead of using the stale credential — verified against the real Job Manager. |
+| | Cache invalidation | PASS (by construction) | No integration connection or token is ever cached anywhere (in-process or Redis) — every read is a fresh, real, decrypted DB read, confirmed by code audit and a direct regression check. |
 | **Webhooks** | Stripe webhook signature verification | PASS | Real code review — Stripe's own SDK, correct. |
 | | Stripe webhook idempotency | PASS | Real dedup table, namespaced correctly. |
 | | Stripe webhook — actually received a real event | NOT AVAILABLE | No Stripe account in this sandbox. |
@@ -58,7 +64,7 @@ doesn't have; genuinely untested either way).
 | **Security** | Security headers (CSP/HSTS/etc.) | PASS | Real browser-verified, zero violations. |
 | | CORS (dev permissive / prod fail-closed) | PASS | Verified both modes via real requests. |
 | | Tenant isolation / IDOR / privilege escalation | PASS | 24/24 regression checks, every configuration. |
-| | Org/API-key deletion cascades | PASS (fixed this phase) | Was a real, significant data-retention bug (17 orphaned tables including real files on disk) — fixed and tested. |
+| | Org/API-key deletion cascades | PASS (fixed across two phases) | Originally found and fixed as a significant data-retention bug (17 orphaned tables including real files on disk); Phase 18.1 found and fixed one more gap this original fix missed (orphaned conversations/messages tied to a deleted org's agents) — both are now covered by real regression tests. |
 | | User account self-deletion | NOT IMPLEMENTED | No such feature exists — only org deletion. |
 | | CI/CD pipeline | PASS | Every job dry-run locally against this repo before commit. |
 | | Docker build | NOT AVAILABLE | Syntax-reviewed + `docker compose config`-validated only; no Docker daemon here. |

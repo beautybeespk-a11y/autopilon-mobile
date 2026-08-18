@@ -272,9 +272,16 @@ by Phase 18.1, run from `server/` against the live staging URL.
 13. **Run OAuth test** **(EXTERNAL)** — the manual step-by-step account
     connect/refresh/disconnect walkthrough in
     `PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md`, against a real Google/Meta
-    account. `npm run test:csrf -- https://<staging>` (7/7 expected) can
-    run automatically first to confirm the state-token mechanics are
-    intact before doing the manual walkthrough.
+    account. `npm run test:csrf -- https://<staging>` (7/7 expected) and
+    `npm run test:oauth-revocation` (11/11 expected, in-process — doesn't
+    need staging, just the app's own code) can run automatically first to
+    confirm the state-token and revocation mechanics are intact before
+    doing the manual walkthrough. On the manual walkthrough's disconnect
+    step, specifically confirm the app now appears removed from Google's
+    "Third-party apps with account access" page (myaccount.google.com/
+    permissions) or Meta's "Apps and Websites" settings — this app calls
+    the real revoke endpoint on disconnect (Phase 18.2), but that call has
+    never been confirmed against a live account in this sandbox.
 14. **Run billing test** **(EXTERNAL)** — Stripe TEST mode checkout,
     upgrade/downgrade/cancel, and a real webhook delivery from Stripe's
     dashboard "Send test webhook" feature; confirm `activity_logs` records
@@ -305,3 +312,12 @@ behavior against staging's actual proxy, not this sandbox's simulation),
 fixture org, doesn't touch anything else), and `npm run test:admin-panel
 -- https://<staging>` (needs `PLATFORM_ADMIN_EMAIL` set to a real
 throwaway staging admin account).
+
+Phase 18.2 added six more, none of which need staging infrastructure —
+they're safe to run against `localhost` at any time, including in CI —
+but worth running once against staging too, since they exercise the real
+database/queue/encryption stack rather than a simulation of it:
+`npm run test:oauth-revocation` (11/11), `npm run test:queued-job-credential-safety`
+(4/4), `npm run test:token-refresh-safety` (7/7), `npm run test:reconnect-isolation`
+(15/15), `npm run test:audit-api-response` (5/5), and
+`npm run test:failure-concurrency` (9/9).
