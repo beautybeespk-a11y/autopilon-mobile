@@ -30,7 +30,8 @@
     "test:failure-concurrency": "node test/failureHandlingAndConcurrencyRegression.js",
     "test:worker-crash-reclaim": "node test/workerCrashReclaimRegression.js",
     "test:multi-worker-real-process": "node test/multiWorkerRealProcessRegression.js",
-    "test:db-migration": "node test/dbMigrationRegression.js"
+    "test:db-migration": "node test/dbMigrationRegression.js",
+    "test:redis-outage-failsafe": "node test/redisOutageFailSafeRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",

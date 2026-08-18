@@ -45,6 +45,18 @@ async function redisHealth() {
 
 // --- Public: liveness/readiness only, no operational detail. ---
 
+// Also exported standalone (see liveReadyRoutes below) so index.js can
+// mount JUST these two routes before session/rate-limit middleware —
+// found via Phase 19's Redis-outage failure testing that mounting the
+// FULL router that early broke requireAuth below (req.session doesn't
+// exist yet that early), while leaving it at its original later position
+// made liveness/readiness themselves depend on Redis through the session/
+// rate-limiter middleware that runs before this router. Kept here too
+// (reachable at the same paths through the main router) purely so nothing
+// that already imports the default export and expects /live to exist
+// breaks — in practice index.js's early liveReadyRoutes mount always
+// answers these two first.
+
 // Is the process itself running and able to respond at all? No dependency
 // checks — a DB outage should NOT make this fail, or an orchestrator would
 // kill and restart a perfectly-fine process that's correctly reporting
@@ -54,6 +66,17 @@ router.get("/live", (req, res) => res.json({ ok: true }));
 // Is the app ready to actually serve real requests? Checks the one
 // dependency nothing here works without — the database.
 router.get("/ready", (req, res) => {
+  try {
+    db.prepare("SELECT 1").get();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(503).json({ ok: false, reason: "database" });
+  }
+});
+
+export const liveReadyRoutes = Router();
+liveReadyRoutes.get("/live", (req, res) => res.json({ ok: true }));
+liveReadyRoutes.get("/ready", (req, res) => {
   try {
     db.prepare("SELECT 1").get();
     res.json({ ok: true });

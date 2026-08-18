@@ -7,6 +7,7 @@ import cors from "cors";
 import { securityHeaders, permissionsPolicy, corsOptions } from "./config/security.js";
 import { sessionStore } from "./config/sessionStore.js";
 import { requestId, requestLogger } from "./config/requestLogging.js";
+import { logger } from "./config/logger.js";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import fs from "fs";
@@ -68,7 +69,7 @@ import woocommerceAuthRoutes from "./routes/woocommerceAuth.js";
 import gmailAuthRoutes from "./routes/gmailAuth.js";
 import automationRoutes from "./routes/automations.js";
 import eventWebhookRoutes from "./routes/eventWebhooks.js";
-import healthRoutes from "./routes/health.js";
+import healthRoutes, { liveReadyRoutes } from "./routes/health.js";
 import publicApiV1 from "./publicApi/router.js";
 import { ensurePublicApiFlags } from "./publicApi/featureGate.js";
 import { sweepExpiredIdempotencyKeys } from "./publicApi/idempotency.js";
@@ -121,6 +122,25 @@ app.use(permissionsPolicy());
 // production this is an explicit allowlist (CLIENT_ORIGIN) that fails
 // closed if unset — see config/security.js's corsOptions().
 app.use(cors(corsOptions()));
+
+// Just /live and /ready, mounted here — before session/rate-limit
+// middleware, not just before requireAuth-gated routers — so liveness/
+// readiness genuinely reflect "is this Node process able to handle a
+// request," independent of Redis. Found via Phase 19's required
+// Redis-outage failure testing: with SESSION_STORE=redis and
+// RATE_LIMIT_PROVIDER=redis, a real Redis outage made /api/health/live
+// hang for the full length of ioredis's retry exhaustion (session
+// middleware trying to read/write the store) instead of responding
+// instantly — exactly backwards for a liveness probe, whose entire
+// purpose is telling an orchestrator "the process itself is fine" even
+// when a downstream dependency isn't. The rest of health.js's diagnostic
+// surface (/database, /queue, /storage, /ai, /integrations, /redis, and
+// the "/" rollup) needs req.session for its own requireAuth +
+// requirePlatformAdmin gate, so THAT stays mounted below, after session —
+// see the full healthRoutes mount further down for why (mounting the
+// whole router this early broke its own auth check the first time this
+// was tried, since req.session doesn't exist yet at this point).
+app.use("/api/health", liveReadyRoutes);
 
 app.use(
   session({
@@ -188,14 +208,12 @@ app.use("/api/stripe", stripeWebhookRoutes);
 app.use("/api/integrations/whatsapp", whatsappWebhookRoutes);
 app.use("/api/integrations/shopify", shopifyWebhookRoutes);
 app.use("/api/share", fileSharesRoutes);
-// Same reasoning as the block above — health.js's /live and /ready must be
-// reachable with no session (infra liveness/readiness probes can't
-// authenticate), so this has to be mounted here too, not down with the
-// rest of the routes below billingRoutes/couponRoutes/workspaceRoutes/
-// projectRoutes' blanket requireAuth. health.js still gates its OWN deeper
-// diagnostic sub-routes (/database, /queue, /storage, /ai, /integrations)
-// behind requireAuth + requirePlatformAdmin internally — mounting early
-// only affects /live and /ready's reachability, not what's protected.
+// The full health router (adds /database, /queue, /storage, /ai,
+// /integrations, /redis, and "/" on top of the /live + /ready already
+// mounted above) — needs to be here, after session, so its own
+// requireAuth + requirePlatformAdmin gate has req.session to check. /live
+// and /ready are already answered by the early liveReadyRoutes mount
+// above by the time a request would reach this instance's copies of them.
 app.use("/api/health", healthRoutes);
 
 // Public API v1 (Phase 17) — mounted here, before any bare-"/api"-mounted
@@ -271,6 +289,29 @@ if (fs.existsSync(clientDist)) {
     res.sendFile(join(clientDist, "index.html"));
   });
 }
+
+// Global JSON error handler (Phase 19 §16/§34/§36) — must be registered
+// last, after every route/static handler, and must take all 4 arguments
+// for Express to recognize it as an error handler rather than ordinary
+// middleware. Found via Phase 19's required Redis-outage failure testing:
+// with no handler here, an unhandled rejection from a Redis-backed
+// middleware (rate limiter, session store) fell through to Express's own
+// default error page — an HTML stack trace, including this server's real
+// filesystem paths, returned with every other route's JSON-only
+// contract broken. Logged server-side with the real error (never sent to
+// the client); the client only ever sees a generic message plus the
+// request id already stamped by requestId() above, so a report from a
+// user can still be correlated to the real error in structured logs
+// without exposing anything about the server's internals.
+app.use((err, req, res, next) => {
+  logger.error("Unhandled request error", {
+    requestId: req.requestId,
+    endpoint: `${req.method} ${req.path}`,
+    error: err.message,
+  });
+  if (res.headersSent) return next(err);
+  res.status(500).json({ error: "Internal server error.", requestId: req.requestId || null });
+});
 
 app.listen(PORT, () => {
   console.log(`AI Agent Platform API running on http://localhost:${PORT}`);

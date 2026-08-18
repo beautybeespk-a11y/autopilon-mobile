@@ -312,6 +312,42 @@ jobs:
         run: node test/workerCrashReclaimRegression.js
         working-directory: server
 
+      - name: Database migration regression (Phase 19, fresh + existing DB)
+        if: always()
+        run: node test/dbMigrationRegression.js
+        working-directory: server
+
+  phase19-real-process-regression:
+    name: Phase 19 real multi-process + Redis-outage regression (needs a real redis-server binary + real child processes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+        working-directory: server
+
+      # These two spawn/kill REAL child processes (worker.js, redis-server)
+      # directly — deliberately not the services: container pattern the
+      # other jobs use, since these tests need to actually terminate the
+      # process mid-test, which isn't possible against a Docker service
+      # container from inside a job step.
+      - name: Install redis-server
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-server
+        env:
+          DEBIAN_FRONTEND: noninteractive
+
+      - name: Multi-worker real-process durability regression
+        if: always()
+        run: node test/multiWorkerRealProcessRegression.js
+        working-directory: server
+
+      - name: Redis-outage fail-safe regression
+        if: always()
+        run: node test/redisOutageFailSafeRegression.js
+        working-directory: server
+
   reverse-proxy-regression:
     name: Reverse-proxy / session security regression (direct + proxy mode)
     runs-on: ubuntu-latest

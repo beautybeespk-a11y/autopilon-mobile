@@ -17,6 +17,7 @@
 // its callers cascade into billing's enforceQuota().
 import Redis from "ioredis";
 import db from "../db.js";
+import { logger } from "../config/logger.js";
 
 const WINDOW_SWEEP_INTERVAL_MS = 60_000;
 
@@ -81,11 +82,26 @@ const RedisRateLimiter = {
   async check(key, { windowMs, max }) {
     const client = getRedisClient();
     const redisKey = `ratelimit:${key}`;
-    const count = await client.incr(redisKey);
-    if (count === 1) await client.pexpire(redisKey, windowMs);
-    const ttl = await client.pttl(redisKey);
-    const resetAt = Date.now() + (ttl > 0 ? ttl : windowMs);
-    return { allowed: count <= max, remaining: Math.max(0, max - count), resetAt };
+    try {
+      const count = await client.incr(redisKey);
+      if (count === 1) await client.pexpire(redisKey, windowMs);
+      const ttl = await client.pttl(redisKey);
+      const resetAt = Date.now() + (ttl > 0 ? ttl : windowMs);
+      return { allowed: count <= max, remaining: Math.max(0, max - count), resetAt };
+    } catch (err) {
+      // Fail OPEN, not closed. Found via Phase 19's real Redis-outage
+      // failure testing: this same limiter is applied to literally every
+      // /api/* request (index.js's global limiter), so failing closed here
+      // meant a Redis blip took down 100% of API traffic with 500s — a far
+      // worse outcome than briefly running without rate limiting. A
+      // temporarily-unenforced abuse guard during a real infrastructure
+      // outage is an acceptable trade against a total self-inflicted
+      // outage; logged as degraded so it's visible in monitoring, not
+      // silent. This does not apply to authentication/authorization checks
+      // elsewhere, which correctly stay fail-closed.
+      logger.warn("rate_limiter.redis_unavailable_failing_open", { key, error: err.message });
+      return { allowed: true, remaining: max, resetAt: Date.now() + windowMs, degraded: true };
+    }
   },
 };
 
