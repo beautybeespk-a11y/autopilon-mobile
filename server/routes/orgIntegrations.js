@@ -15,10 +15,21 @@ router.use(requireAuth);
 // this slice — OAuth providers (Gmail, Meta Ads, Calendar/Drive/Docs/Sheets)
 // would each need their own org-aware callback route, which is a larger,
 // separate follow-up. Disclosed scope cut, not silently missing.
+//
+// `secretField` names exactly which submitted field is the real long-lived
+// credential — it goes into the encrypted accessToken column (via
+// saveOrgConnection(), Phase 18.1 §1) and is stripped out of `meta`
+// (everything else in the submission is not a secret by itself: a site
+// URL, a username, a consumer *key* as opposed to secret, a shop domain).
+// This mirrors the equivalent personal-connection routes (routes/
+// wordpressAuth.js, woocommerceAuth.js, shopifyAuth.js), which already did
+// this correctly — this generic org-level handler previously did not:
+// it picked `consumerKey` (not the real secret) for WooCommerce, and
+// copied the raw secret into `meta` in plaintext for every provider here.
 const MANUAL_PROVIDERS = {
-  wordpress: { label: "WordPress", verify: (f) => checkWordPressSite(f.siteUrl, f.username, f.appPassword), fields: ["siteUrl", "username", "appPassword"] },
-  woocommerce: { label: "WooCommerce", verify: (f) => checkWooCommerceStore(f.siteUrl, f.consumerKey, f.consumerSecret), fields: ["siteUrl", "consumerKey", "consumerSecret"] },
-  shopify: { label: "Shopify", verify: (f) => checkShopifyStore(f.shopDomain, f.accessToken), fields: ["shopDomain", "accessToken"] },
+  wordpress: { label: "WordPress", verify: (f) => checkWordPressSite(f.siteUrl, f.username, f.appPassword), fields: ["siteUrl", "username", "appPassword"], secretField: "appPassword" },
+  woocommerce: { label: "WooCommerce", verify: (f) => checkWooCommerceStore(f.siteUrl, f.consumerKey, f.consumerSecret), fields: ["siteUrl", "consumerKey", "consumerSecret"], secretField: "consumerSecret" },
+  shopify: { label: "Shopify", verify: (f) => checkShopifyStore(f.shopDomain, f.accessToken), fields: ["shopDomain", "accessToken"], secretField: "accessToken" },
 };
 
 router.get("/:orgId/integrations", (req, res) => {
@@ -49,8 +60,7 @@ router.post("/:orgId/integrations/:provider/connect", async (req, res) => {
   try {
     enforceQuota(orgId, "maxIntegrations", "connected integrations");
     await config.verify(req.body);
-    const meta = { ...req.body };
-    const accessToken = meta.appPassword || meta.accessToken || meta.consumerKey; // whichever credential this provider actually uses as its "token"
+    const { [config.secretField]: accessToken, ...meta } = req.body; // real secret goes to the encrypted column, never into meta
     saveOrgConnection(orgId, req.session.userId, provider, { accessToken, meta });
     logActivity(db, req.session.userId, "org_integration_connected", `Connected ${config.label} for the organization`, { orgId, req });
     res.json({ ok: true });

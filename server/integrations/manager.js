@@ -1,6 +1,62 @@
 import db from "../db.js";
 import { cryptoRandom } from "../middleware.js";
 import { hasPermission } from "../orchestrator/rbac.js";
+import { encryptSecret, decryptSecret } from "../orchestrator/secretsCrypto.js";
+import { logger } from "../config/logger.js";
+
+// Phase 18.1 §1 — accessToken/refreshToken are real, long-lived credentials
+// (OAuth tokens, WordPress application passwords, WooCommerce API secrets,
+// Shopify manual tokens) that grant real access to a connected external
+// account. Encrypted at rest with the same AES-256-GCM helper already used
+// for BYOK provider keys and developer webhook signing secrets — nothing
+// new invented, no plaintext token ever written to the `integrations`
+// table from here on.
+//
+// Decryption is centralized in the three read functions below
+// (getConnection/getOrgConnection/listOrgConnections), NOT scattered
+// across every one of this app's ~12 call sites that read `.accessToken`
+// off a connection row — every existing caller (gmail/api.js,
+// google/tokenHelper.js, the shopify/woocommerce/wordpress health checks,
+// requireValidToken(), connectionHealth(), etc.) keeps working completely
+// unchanged, since by the time any of them see a connection row, its
+// tokens are already plaintext again.
+//
+// Migration for pre-existing plaintext tokens (dev-only data, no real
+// production users ever existed against this schema): decryptToken()
+// below treats anything that fails to decrypt — including old plaintext
+// values, which aren't even in the `iv:authTag:ciphertext` format this
+// expects — as unreadable and returns null. connectionHealth() already
+// treats a falsy accessToken as "not connected," so an old plaintext
+// token silently becomes "please reconnect" rather than a crash or a
+// silently-broken integration. This is the intended, safe migration
+// path: reconnect once, the new token is encrypted, done.
+function encryptToken(token) {
+  if (!token) return null;
+  return encryptSecret(token);
+}
+
+function decryptToken(stored, { provider } = {}) {
+  if (!stored) return null;
+  try {
+    return decryptSecret(stored);
+  } catch (err) {
+    logger.warn("integrations.token_decrypt_failed", { provider: provider || null, reason: err.message });
+    return null;
+  }
+}
+
+// Applies decryptToken() to a raw `integrations` row's accessToken/
+// refreshToken fields — every SELECT * FROM integrations read path routes
+// through this so a caller always sees plaintext tokens (or null, if
+// undecryptable) exactly as before this change.
+function withDecryptedTokens(row) {
+  if (!row) return row;
+  return {
+    ...row,
+    accessToken: decryptToken(row.accessToken, { provider: row.provider }),
+    refreshToken: decryptToken(row.refreshToken, { provider: row.provider }),
+  };
+}
 
 // Registry of integration *definitions* — metadata about what each provider
 // offers. Connection *state* (tokens, status) lives in the integrations
@@ -45,30 +101,34 @@ export function getConnection(userId, provider) {
   if (user?.activeOrgId) {
     const orgConn = db.prepare("SELECT * FROM integrations WHERE orgId = ? AND provider = ? AND status = 'connected'").get(user.activeOrgId, provider);
     if (orgConn) {
-      if (hasPermission(user.activeOrgId, userId, "integrations")) return orgConn;
+      if (hasPermission(user.activeOrgId, userId, "integrations")) return withDecryptedTokens(orgConn);
     }
   }
-  return db.prepare("SELECT * FROM integrations WHERE userId = ? AND provider = ? AND orgId IS NULL").get(userId, provider);
+  return withDecryptedTokens(db.prepare("SELECT * FROM integrations WHERE userId = ? AND provider = ? AND orgId IS NULL").get(userId, provider));
 }
 
 // Upserts the connection row for (userId, provider). Never logs the token
 // values themselves — callers pass them in, this only ever writes to the DB.
+// accessToken/refreshToken are encrypted here, right before they touch the
+// database — everything upstream of this call still passes plaintext.
 export function saveConnection(userId, provider, { accessToken, refreshToken, expiresAt, scopes, meta }) {
   const existing = db.prepare("SELECT * FROM integrations WHERE userId = ? AND provider = ? AND orgId IS NULL").get(userId, provider);
   const scopesJson = JSON.stringify(scopes || []);
   const metaJson = JSON.stringify(meta || {});
+  const encryptedAccessToken = encryptToken(accessToken);
+  const encryptedRefreshToken = encryptToken(refreshToken);
   if (existing) {
     db.prepare(
       `UPDATE integrations SET status = 'connected', accessToken = ?, refreshToken = COALESCE(?, refreshToken),
        tokenExpiresAt = ?, scopes = ?, meta = ?, updatedAt = ? WHERE id = ?`
-    ).run(accessToken, refreshToken || null, expiresAt || null, scopesJson, metaJson, now(), existing.id);
+    ).run(encryptedAccessToken, encryptedRefreshToken, expiresAt || null, scopesJson, metaJson, now(), existing.id);
     return existing.id;
   }
   const id = cryptoRandom();
   db.prepare(
     `INSERT INTO integrations (id, userId, provider, status, accessToken, refreshToken, tokenExpiresAt, scopes, meta, createdAt, updatedAt)
      VALUES (?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, userId, provider, accessToken, refreshToken || null, expiresAt || null, scopesJson, metaJson, now(), now());
+  ).run(id, userId, provider, encryptedAccessToken, encryptedRefreshToken, expiresAt || null, scopesJson, metaJson, now(), now());
   return id;
 }
 
@@ -82,30 +142,40 @@ export function disconnectIntegration(userId, provider) {
 // set of functions rather than overloading the personal ones above, so a
 // route has to deliberately opt into creating an org-shared connection
 // rather than it happening as a side effect of some default parameter. ---
-export function getOrgConnection(orgId, provider) {
+// NOTE: returns the row with tokens still encrypted — getOrgConnection()'s
+// own callers below decrypt it; this internal helper is also reused by
+// saveOrgConnection() below, which only needs the row's id, never its
+// tokens, so decrypting here would be pure waste.
+function getOrgConnectionRaw(orgId, provider) {
   return db.prepare("SELECT * FROM integrations WHERE orgId = ? AND provider = ?").get(orgId, provider);
 }
 
+export function getOrgConnection(orgId, provider) {
+  return withDecryptedTokens(getOrgConnectionRaw(orgId, provider));
+}
+
 export function listOrgConnections(orgId) {
-  return db.prepare("SELECT * FROM integrations WHERE orgId = ?").all(orgId);
+  return db.prepare("SELECT * FROM integrations WHERE orgId = ?").all(orgId).map(withDecryptedTokens);
 }
 
 export function saveOrgConnection(orgId, connectedByUserId, provider, { accessToken, refreshToken, expiresAt, scopes, meta }) {
-  const existing = getOrgConnection(orgId, provider);
+  const existing = getOrgConnectionRaw(orgId, provider);
   const scopesJson = JSON.stringify(scopes || []);
   const metaJson = JSON.stringify(meta || {});
+  const encryptedAccessToken = encryptToken(accessToken);
+  const encryptedRefreshToken = encryptToken(refreshToken);
   if (existing) {
     db.prepare(
       `UPDATE integrations SET status = 'connected', accessToken = ?, refreshToken = COALESCE(?, refreshToken),
        tokenExpiresAt = ?, scopes = ?, meta = ?, updatedAt = ? WHERE id = ?`
-    ).run(accessToken, refreshToken || null, expiresAt || null, scopesJson, metaJson, now(), existing.id);
+    ).run(encryptedAccessToken, encryptedRefreshToken, expiresAt || null, scopesJson, metaJson, now(), existing.id);
     return existing.id;
   }
   const id = cryptoRandom();
   db.prepare(
     `INSERT INTO integrations (id, userId, orgId, provider, status, accessToken, refreshToken, tokenExpiresAt, scopes, meta, createdAt, updatedAt)
      VALUES (?, ?, ?, ?, 'connected', ?, ?, ?, ?, ?, ?, ?)`
-  ).run(id, connectedByUserId, orgId, provider, accessToken, refreshToken || null, expiresAt || null, scopesJson, metaJson, now(), now());
+  ).run(id, connectedByUserId, orgId, provider, encryptedAccessToken, encryptedRefreshToken, expiresAt || null, scopesJson, metaJson, now(), now());
   return id;
 }
 
