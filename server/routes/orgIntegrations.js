@@ -65,6 +65,7 @@ router.post("/:orgId/integrations/:provider/connect", async (req, res) => {
     logActivity(db, req.session.userId, "org_integration_connected", `Connected ${config.label} for the organization`, { orgId, req });
     res.json({ ok: true });
   } catch (err) {
+    logActivity(db, req.session.userId, "org_integration_connection_failed", `${config.label} connection failed for the organization: ${err.message}`, { orgId, req, result: "failure" });
     res.status(400).json({ error: "Could not verify this connection.", detail: err.message });
   }
 });

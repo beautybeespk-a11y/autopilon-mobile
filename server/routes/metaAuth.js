@@ -39,6 +39,7 @@ router.get("/callback", requireAuth, async (req, res) => {
     logActivity(db, req.session.userId, "integration_connected", "Connected Meta Ads");
     res.redirect("/app/integrations?meta_connected=1");
   } catch (err) {
+    logActivity(db, req.session.userId, "integration_connection_failed", `Meta Ads connection failed: ${err.message}`, { req, result: "failure" });
     res.redirect(`/app/integrations?meta_error=${encodeURIComponent(err.message)}`);
   }
 });

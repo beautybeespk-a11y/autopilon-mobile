@@ -35,6 +35,7 @@ router.post("/connect", async (req, res) => {
     logActivity(db, req.session.userId, "integration_connected", "Connected WordPress");
     res.json({ ok: true, siteName: info.name });
   } catch (err) {
+    logActivity(db, req.session.userId, "integration_connection_failed", `WordPress connection failed: ${err.message}`, { req, result: "failure" });
     res.status(400).json({ error: "Could not verify this WordPress connection.", detail: err.message });
   }
 });

@@ -1,5 +1,7 @@
 import { getConnection, saveConnection } from "../manager.js";
 import { refreshAccessToken } from "./oauth.js";
+import db from "../../db.js";
+import { logActivity } from "../../middleware.js";
 
 // Centralizes "is the token expired, refresh if so, persist the new one" for
 // all four Calendar/Drive/Docs/Sheets tools, same pattern as Gmail's api.js.
@@ -32,5 +34,6 @@ export async function getValidAccessToken(userId, service, label) {
     scopes: JSON.parse(conn.scopes || "[]"),
     meta,
   });
+  logActivity(db, userId, "integration_refreshed", `Refreshed ${label} access token`); // Phase 18.2 §11 — never logs a token value
   return refreshed.accessToken;
 }

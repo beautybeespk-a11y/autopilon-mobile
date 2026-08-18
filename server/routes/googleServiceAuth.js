@@ -38,6 +38,7 @@ export function createGoogleServiceRouter(service, label) {
       logActivity(db, req.session.userId, "integration_connected", `Connected ${label}`);
       res.redirect(`/app/integrations?${service}_connected=1`);
     } catch (err) {
+      logActivity(db, req.session.userId, "integration_connection_failed", `${label} connection failed: ${err.message}`, { req, result: "failure" });
       res.redirect(`/app/integrations?${service}_error=${encodeURIComponent(err.message)}`);
     }
   });

@@ -1,5 +1,7 @@
 import { getConnection, saveConnection } from "../manager.js";
 import { refreshAccessToken } from "./oauth.js";
+import db from "../../db.js";
+import { logActivity } from "../../middleware.js";
 
 const BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 
@@ -40,6 +42,7 @@ async function getValidAccessToken(userId) {
     scopes: JSON.parse(conn.scopes || "[]"),
     meta,
   });
+  logActivity(db, userId, "integration_refreshed", "Refreshed Gmail access token"); // Phase 18.2 §11 — never logs a token value
   return refreshed.accessToken;
 }
 

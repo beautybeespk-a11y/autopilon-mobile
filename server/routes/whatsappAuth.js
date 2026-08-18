@@ -56,6 +56,7 @@ router.post("/connect", async (req, res) => {
     logActivity(db, req.session.userId, "integration_connected", "Connected WhatsApp Business");
     res.json({ ok: true });
   } catch (err) {
+    logActivity(db, req.session.userId, "integration_connection_failed", `WhatsApp Business connection failed: ${err.message}`, { req, result: "failure" });
     res.status(400).json({ error: "Could not verify this WhatsApp connection.", detail: err.message });
   }
 });

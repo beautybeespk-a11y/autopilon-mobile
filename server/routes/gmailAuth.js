@@ -32,6 +32,10 @@ router.get("/callback", requireAuth, async (req, res) => {
     logActivity(db, req.session.userId, "integration_connected", "Connected Gmail");
     res.redirect("/app/integrations?gmail_connected=1");
   } catch (err) {
+    // Phase 18.2 §11: err.message here is Google's own token-exchange
+    // error text (see gmail/oauth.js's exchangeCodeForToken) — never the
+    // authorization code or any credential value, safe to log as-is.
+    logActivity(db, req.session.userId, "integration_connection_failed", `Gmail connection failed: ${err.message}`, { req, result: "failure" });
     res.redirect(`/app/integrations?gmail_error=${encodeURIComponent(err.message)}`);
   }
 });

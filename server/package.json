@@ -25,7 +25,8 @@
     "test:oauth-revocation": "node test/oauthRevocationRegression.js",
     "test:queued-job-credential-safety": "node test/queuedJobCredentialSafetyRegression.js",
     "test:token-refresh-safety": "node test/tokenRefreshSafetyRegression.js",
-    "test:reconnect-isolation": "node test/reconnectAndIsolationRegression.js"
+    "test:reconnect-isolation": "node test/reconnectAndIsolationRegression.js",
+    "test:audit-api-response": "node test/auditLoggingAndApiResponseRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",
