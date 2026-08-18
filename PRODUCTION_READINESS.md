@@ -47,7 +47,9 @@ document says which is which.
 | Redis-backed rate limiter (`RATE_LIMIT_PROVIDER=redis`) | READY | Fully converted, real, tested — including a full run of all 4 regression suites with it active. |
 | Redis-backed session store (`SESSION_STORE=redis`) | READY | Real custom store (not connect-redis — found incompatible with ioredis, removed). Tested for real restart-durability: killed the server process, booted a new one, same cookie still authenticated. |
 | Redis-backed job queue (`RedisQueueProvider`) | ARCHITECTURE ONLY | Real, independently tested (39 assertions against real Redis) but not wired into the app's default job-enqueue path — deliberate, documented boundary (see `jobs/queueProvider.js`). |
-| Standalone worker (`worker.js`) | READY | Real multi-process test: two independent worker processes sharing one SQLite file correctly split real job load with zero duplication; graceful shutdown on SIGTERM confirmed. |
+| Standalone worker (`worker.js`) | READY | Real multi-process test: two independent worker processes sharing one SQLite file correctly split real job load with zero duplication; graceful shutdown on SIGTERM confirmed. Extended in Phase 19 with a real hard-`SIGKILL` mid-burst (300 real jobs, one of two processes killed abruptly) — still zero duplicate execution. |
+| Worker-crash job reclaim | READY (real gap found and fixed Phase 19) | A worker that crashes (killed, not gracefully shut down) mid-job used to leave that job at `status='running'` forever — nothing ever noticed or retried it. Fixed with a stale-job reclaim sweep, reusing the exact retry/dead-letter branching an ordinary handler failure already gets. 5 real regression checks. |
+| Rate limiter behavior on a real Redis outage | READY (real gap found and fixed Phase 19) | The global rate limiter (applied to every `/api/*` request) used to fail CLOSED on a Redis error — a single Redis blip took down 100% of API traffic with 500s. Fixed to fail OPEN (logged as degraded), verified against a real `redis-server` that was spawned and then killed mid-run. |
 | Session cookie security | READY (after this phase's fix) | Phase 18.11 found and fixed a real, critical bug: without `trust proxy`, the production `secure: true` cookie was **never sent** behind any real reverse proxy — verified via realistic `X-Forwarded-Proto` simulation. |
 
 ## Security
@@ -77,7 +79,8 @@ document says which is which.
 | Component | Status | Notes |
 |---|---|---|
 | Structured logging | READY | Real JSON logs with request IDs, verified matching between the `X-Request-Id` response header and the actual log line for a real request. |
-| Health checks (liveness/readiness/deep) | READY | `/live`, `/ready` public and minimal (correct for infra probes); admin-gated deep checks including a real Redis connectivity check tested in all 3 real states (unconfigured/reachable/unreachable). |
+| Health checks (liveness/readiness/deep) | READY | `/live`, `/ready` public and minimal (correct for infra probes); admin-gated deep checks including a real Redis connectivity check tested in all 3 real states (unconfigured/reachable/unreachable). Phase 19 found and fixed a real bug via a real Redis-outage chaos test: `/live` used to hang for the length of ioredis's retry exhaustion because session middleware (which touches Redis on every request) ran before it — fixed by mounting `/live`+`/ready` before session/rate-limit middleware entirely, so liveness now genuinely reflects "is the process itself fine," independent of any downstream dependency. |
+| Unhandled-error response safety | READY (real gap found and fixed Phase 19) | The same chaos test found that an unhandled Redis error fell through to Express's default HTML error page, leaking real server filesystem paths in a stack trace and breaking the JSON-only response contract every other endpoint has. Fixed with a global 4-arg error-handling middleware: the real error is logged server-side via the structured logger; the client only ever sees a generic message + request id. 3 real regression checks lock this in (`test:redis-outage-failsafe`). |
 | Error tracking (external service) | NOT IMPLEMENTED | No Sentry/equivalent integrated. Structured logs are real, useful input for one, but nothing external is wired up. |
 | Alerting | NOT IMPLEMENTED | No paging/alerting system exists. This is inherent to not having a monitoring service in the loop at all. |
 | Cost visibility dashboard | NOT IMPLEMENTED | No AI-cost/infra-cost/margin tracking beyond what Phase 16's existing per-org spend limits already provide. |
@@ -86,7 +89,9 @@ document says which is which.
 
 | Component | Status | Notes |
 |---|---|---|
-| Database backup/restore scripts | READY | Real, tested end-to-end: backup against a live server, genuine corruption of the working DB, restore, verified row-level data survives — including proof that post-backup writes are correctly *not* restored (real RPO characteristic). |
+| Database backup/restore scripts | READY | Real, tested end-to-end: backup against a live server, genuine corruption of the working DB, restore, verified row-level data survives — including proof that post-backup writes are correctly *not* restored (real RPO characteristic). Re-verified fully in Phase 19 with fresh data, plus a new check: the restored database boots a real server and a real user can log in against it (not just "the file passes integrity_check"). |
+| Existing-database migration (real pre-existing data) | READY (Phase 19) | Hand-built a database using the OLDEST base-column schema shape (taken verbatim from `db.js`'s own base `CREATE TABLE` statements) with real data in it, then booted the current code against it. Every outstanding `ALTER TABLE ADD COLUMN` applied correctly, zero data loss, a `NOT NULL DEFAULT` column backfilled correctly on pre-existing rows. 4 real assertions (`test:db-migration`). |
+| Migration rollback strategy | READY (by construction) | No separate migration framework exists — every schema change is an additive, PRAGMA-guarded `ALTER TABLE ADD COLUMN`. Confirmed by direct source grep: zero `DROP TABLE`/`DROP COLUMN`/`RENAME` statements anywhere in `db.js`, so a code rollback to an older release after a schema change is safe by construction (older code simply never reads/writes the new column) — documented rather than "tested," since there is no destructive operation to roll back in the first place. |
 | Continuous replication (Litestream) | ARCHITECTURE ONLY | Documented as the recommended real production strategy; requires an S3 bucket and a long-running sidecar process not available here. |
 | Disaster recovery beyond DB | NOT IMPLEMENTED | No documented/tested recovery procedure for object storage, secrets, DNS, or a full app redeploy — only the database layer was covered in this phase. |
 
@@ -94,11 +99,11 @@ document says which is which.
 
 | Component | Status | Notes |
 |---|---|---|
-| CI workflow (`.github/workflows/ci.yml`) | READY | Every job's exact commands dry-run locally against this repo before being committed: syntax check, client build, fresh-DB boot, all 4 regression suites, real Redis connectivity check, OpenAPI validation, both SDK smoke tests. |
-| Dockerfile / docker-compose.yml | REQUIRES TESTING | Syntax-reviewed, `docker compose config` validated the full schema — but **never actually built or run**, no Docker daemon available in this sandbox. |
-| Deployment runbook | READY (as documentation) | See `DEPLOYMENT_RUNBOOK.md` — the procedure is written and internally consistent with everything built in this phase, but has not been executed against a real target. |
-| Rollback procedure | REQUIRES TESTING | Documented in `DEPLOYMENT_RUNBOOK.md`; the backup/restore mechanism it depends on is real and tested, but a full app-rollback rehearsal has not been performed. |
-| Zero-downtime deployment | NOT IMPLEMENTED | Not measured or engineered for — no claim of zero downtime is made anywhere in this phase's documentation. |
+| CI workflow (`.github/workflows/ci.yml`) | READY — genuinely verified on real GitHub Actions (Phase 19) | Previously only dry-run locally. Phase 19 expanded the pipeline from 4 to all 20 regression suite files (adding csrf/credentialLeakage/productionLogging/dataRetention/adminPanel/reverseProxy-both-modes and all 10 new Phase 18.2/19 suites), added a `workflow_dispatch` trigger, and fired it for real against a genuine GitHub Actions runner 3 times via the GitHub API. The first real run caught a real bug no local dry-run had (an env-var propagation gap specific to how GitHub Actions steps don't share inline `run:` env vars) — fixed, and the pipeline is now fully green: all 8 jobs, including a new job that installs a real `redis-server` binary via `apt-get` on a fresh runner and spawns/kills real child processes for the multi-worker and Redis-outage chaos tests. |
+| Dockerfile / docker-compose.yml | REQUIRES TESTING | Syntax-reviewed, `docker compose config` validated the full schema — but **never actually built or run**; re-confirmed in Phase 19 that no Docker daemon is reachable in this sandbox (`docker info` fails on the socket, though the CLI itself is present). |
+| Deployment runbook | READY (verified reproducible, Phase 19) | See `DEPLOYMENT_RUNBOOK.md`. Phase 19 performed a real clean-checkout deployment test: a completely separate `git clone` of this branch, `npm ci` for server and client, a real client build, a fresh-database migrate, boot, health check, and a real regression suite run (24/24) — all reproduced successfully from nothing but the checkout, proving the documented procedure isn't just internally consistent, it actually works end to end. |
+| Rollback procedure | READY (as documentation, real backup/restore verified) | Documented in `DEPLOYMENT_RUNBOOK.md`; the backup/restore mechanism it depends on is real and tested (including, in Phase 19, a full restore→boot→login cycle). A full multi-instance app-rollback rehearsal (blue/green or similar) has not been performed — that needs real hosting infrastructure this sandbox doesn't have. |
+| Zero-downtime deployment | NOT IMPLEMENTED (as a measured claim) | Graceful shutdown (`worker.js`'s SIGTERM handler, letting in-flight jobs finish before exiting) and readiness/liveness separation are real and code-reviewed, but no actual zero-downtime deploy has been measured — that needs a real load balancer/orchestrator in front of more than one instance, which this sandbox doesn't have. |
 
 ## Load & Capacity
 
@@ -119,7 +124,7 @@ document says which is which.
 | Component | Status | Notes |
 |---|---|---|
 | Transactional email | NOT IMPLEMENTED | No email provider is integrated anywhere in this codebase. `routes/organizations.js`'s member-invite flow and `routes/auth.js`'s `/forgot-password` both explicitly have no outbound-email path (invited users are told out-of-band today; forgot-password returns an acknowledgment with no actual email sent). This is a missing feature, not an untested one — nothing to stage-test until it's built. |
-| Developer webhook delivery (outbound, Public API) | READY (code) / EXTERNAL STAGING TEST REQUIRED | Signing, timestamp/replay protection, retry/backoff, and SSRF protection on webhook creation are all real and covered by the Public API security regression suite (30/30, including 5 dedicated signing/SSRF checks). Never delivered to a real, independently-reachable external endpoint outside this sandbox — see `DEPLOYMENT_RUNBOOK.md` §12 step 15 for the exact staging checklist (real endpoint, real delivery, dead-letter/retry behavior under a deliberately-failing receiver). |
+| Developer webhook delivery (outbound, Public API) | READY (code) / BLOCKED for the live round trip specifically in this sandbox | Signing, timestamp/replay protection, retry/backoff, and SSRF protection on webhook creation are all real and covered by the Public API security regression suite (30/30, including 5 dedicated signing/SSRF checks). Phase 19 attempted a real delivery to several genuinely public test endpoints (httpbin.org, postman-echo.com, webhook.site, requestbin.com, example.com) — all were rejected with `403` by this sandbox's own organizational network egress policy (confirmed via the proxy's own status/logs, which explicitly say not to retry or route around it). This is a sandbox network restriction, not a code gap or a "needs an account" situation — a real staging host with normal internet egress should complete this test with no code changes. See `DEPLOYMENT_RUNBOOK.md` §12 step 15 for the exact staging checklist. |
 
 ## Mobile Production Config
 
@@ -128,6 +133,14 @@ document says which is which.
 | Environment config (`--dart-define`) | REQUIRES TESTING | Replaces the hardcoded dev URL with real dev/staging/prod resolution — code-reviewed, brace/paren-balance-checked, but not compiled. |
 | App Store / Play Store readiness | NOT READY | Platform folders (`android/`, `ios/`) aren't fully scaffolded; no real build has ever been produced. |
 | Push notifications | READY AFTER EXTERNAL CONFIGURATION | Implemented (Firebase Admin SDK) since an earlier phase; needs a real Firebase project + APNs cert to actually deliver anything. |
+
+## Hosting & Real Staging Deployment (Phase 19)
+
+| Component | Status | Notes |
+|---|---|---|
+| Real hosting platform | NOT READY / PRODUCTION BLOCKER for an actual staging URL | No hosting has been purchased or provisioned from this sandbox — it cannot create accounts, provide payment details, or reach arbitrary hosting-provider consoles. The application code is deployable as-is (Docker image, or a plain Node process) to any Node-capable host; see `PRODUCTION_COST_ESTIMATE.md` for the infrastructure categories to budget and `EXTERNAL_INFRASTRUCTURE.md` for exact setup steps. A `REPLIT_SETUP.md` already exists in this repo and a `Replit` MCP connector was visible but unauthenticated during this phase — authorizing it would let a future session attempt a real deployment there directly. |
+| Real domain + DNS + TLS | NOT READY / PRODUCTION BLOCKER | No domain purchased or pointed at anything. `trust proxy`/CORS/cookie behavior is all real and tested against simulated proxy headers (Phase 18.1/18.11); the one thing genuinely untested is the real browser-to-real-domain round trip, which needs an actual domain + TLS cert to exist. |
+| Multi-tenant isolation against a real staging database | READY (verified against the real production schema, sandbox-hosted) | Every isolation check in this document (24/24 tenant-isolation regression, 15/15 reconnect/cross-org, 30/30 Public API cross-org) already runs against the real `db.js` schema, real foreign keys, real WAL-mode SQLite — the same database engine and schema staging would use. What's untested is a *separately-provisioned* database service (Postgres-as-a-service, a managed SQLite host, etc.) if the hosting choice moves away from a co-located SQLite file — that's a hosting decision this sandbox can't make on the owner's behalf. |
 
 ## What genuinely changed this phase that a reader should trust without re-verifying
 
@@ -198,3 +211,33 @@ forward from an earlier run.
 | Real Stripe account/webhooks | NOT AVAILABLE | — | Unchanged from Phase 18.1. |
 | Flutter mobile compilation | NOT AVAILABLE | — | No Flutter SDK in this sandbox — unchanged from Phase 18.1. |
 | Transactional email delivery | NOT AVAILABLE | — | No email provider integrated — unchanged, known gap. |
+
+## Phase 19 Final Test Matrix
+
+Phase 19 re-ran every Phase 18.2 suite plus 4 new ones written for this
+phase's required failure/migration testing (`test:worker-crash-reclaim`,
+`test:db-migration`, `test:multi-worker-real-process`,
+`test:redis-outage-failsafe`), and additionally fired the full CI
+pipeline for real against a genuine GitHub Actions runner (not a local
+dry-run) three times.
+
+| Test | Result | Environment | Notes |
+|---|---|---|---|
+| Everything in the Phase 18.2 matrix above | 174/174 | Sandbox | Unchanged, re-verified. |
+| Worker-crash job reclaim | 5/5 | Sandbox | `test:worker-crash-reclaim`. Real gap found and fixed this phase. |
+| Database migration (fresh + existing DB with real data) | 4/4 | Sandbox | `test:db-migration`. |
+| Multi-process worker durability (real hard-kill) | 4/4 | Sandbox, real `worker.js` OS processes | `test:multi-worker-real-process`. |
+| Redis-outage fail-safe (real redis-server spawned and killed) | 3/3 | Sandbox, real `redis-server` binary | `test:redis-outage-failsafe`. 2 real gaps found and fixed this phase (liveness hang, stack-trace leak) plus 1 more (rate-limiter fail-open) verified manually but not re-asserted with brittle timing in this suite. |
+| **Total (sandbox regression suites)** | **190/190** | — | Across 20 suite files. |
+| Real GitHub Actions CI run | PASS, 3/3 real runs (1 failure found+fixed, 2 clean) | Real external service (github.com) | Not a local dry-run — actually fired via `workflow_dispatch` and observed via the GitHub API. Found one real, CI-only bug (an env-var propagation gap) the sandbox alone never would have caught. |
+| Real clean-checkout deployment reproducibility | PASS | Sandbox (separate scratch `git clone`) | Checkout → `npm ci` (server+client) → client build → fresh-DB migrate → boot → health check → 24/24 real regression suite, all from nothing but the checkout. |
+| Real backup → restore → boot → login cycle | PASS | Sandbox | Not just integrity-check — a real user logs into a real server booted against the restored database. |
+| Real load test re-run | PASS, zero errors | Sandbox | See `LOAD_TEST_RESULTS.md` — consistent with the Phase 18.8 numbers. |
+| Real outbound webhook delivery to a public endpoint | BLOCKED | — | This sandbox's network egress policy rejects every generic public test endpoint tried; a real staging host should not have this restriction. See `EXTERNAL_INFRASTRUCTURE.md`. |
+| Real Google/Meta OAuth account | EXTERNAL SETUP REQUIRED | — | Unchanged. |
+| Real Stripe account/webhooks | EXTERNAL SETUP REQUIRED | — | Unchanged. |
+| Flutter mobile compilation | EXTERNAL SETUP REQUIRED | — | No Flutter SDK in this sandbox — unchanged. |
+| Real hosting / domain | EXTERNAL SETUP REQUIRED / PRODUCTION BLOCKER | — | New this phase — see "Hosting & Real Staging Deployment" above. |
+
+See `PHASE19_NOTES.md` for the full completion report and
+`LAUNCH_BLOCKERS.md` for every remaining item prioritized P0-P3.
