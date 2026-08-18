@@ -1,8 +1,15 @@
-# Load Test Results (Phase 18 §40)
+# Load Test Results (Phase 18 §40, re-verified Phase 19 §35)
 
 **Every number below is measured, not estimated** — from a real run of
 `server/scripts/load-test.js` (autocannon-based) against a locally-booted
 dev server in this sandboxed environment, run on 2026-08-17.
+
+**Re-run for Phase 19 on 2026-08-18** against a freshly booted server —
+same methodology, same scenarios. Results below are the Phase 19 numbers;
+they're consistent with the original Phase 18 run (single-digit-ms p50s
+across health/authenticated endpoints, bcrypt-dominated login latency, zero
+errors) — see "Known limitations" for why this is still a staging-sandbox
+measurement, not a production capacity claim, in both runs.
 
 ## What these numbers are — and are not
 
@@ -51,6 +58,8 @@ app's rate limits are active and correctly enforced throughout.
 
 ## Results — genuine handler latency (within real rate-limit budgets)
 
+Phase 18 original run (2026-08-17):
+
 | Scenario | Requests | Connections | req/s (avg) | Latency p50 | Latency p99 | Latency max | Non-2xx |
 |---|---|---|---|---|---|---|---|
 | `GET /api/health/live` (unauthenticated) | 250 | 5 | 250 | 3ms | 15ms | 21ms | 0 |
@@ -60,8 +69,21 @@ app's rate limits are active and correctly enforced throughout.
 | `GET /api/tasks` (session-authenticated) | 250 | 5 | 250 | 4ms | 13ms | 13ms | 0 |
 | `GET /api/v1/agents` (Public API, free-plan 60/60s budget) | 55 | 5 | 55 | 6ms | 12ms | 12ms | 0 |
 
+Phase 19 re-run (2026-08-18), freshly booted server, same scenarios:
+
+| Scenario | Requests | Connections | req/s (avg) | Latency p50 | Latency p99 | Latency max | Non-2xx |
+|---|---|---|---|---|---|---|---|
+| `GET /api/health/live` (unauthenticated) | 250 | 5 | 250 | 4ms | 17ms | 18ms | 0 |
+| `GET /api/health/ready` (unauthenticated, DB check) | 250 | 5 | 250 | 2ms | 8ms | 12ms | 0 |
+| `POST /api/auth/login` (bcrypt password check) | 8 | 2 | 8 | 175ms | 278ms | 278ms | 0 |
+| `GET /api/agents` (session-authenticated) | 250 | 5 | 250 | 5ms | 11ms | 11ms | 0 |
+| `GET /api/tasks` (session-authenticated) | 250 | 5 | 250 | 4ms | 7ms | 11ms | 0 |
+| `GET /api/v1/agents` (Public API, free-plan 60/60s budget) | 55 | 5 | 55 | 5ms | 23ms | 23ms | 0 |
+
 **Zero errors, zero timeouts, zero unexpected non-2xx responses across
-every scenario above.**
+every scenario, both runs.** The small run-to-run variance (a few ms here
+and there, login p50 175ms vs 213ms) is normal sandbox-hardware noise, not
+a regression — both runs are well within the same overall shape.
 
 Notable, real observations:
 - **Login is ~40-70x slower than every other endpoint** (p50 213ms vs.
@@ -82,12 +104,12 @@ A separate, deliberately labeled run: `GET /api/health/live` sustained for
 approach described above, kept here because the result itself is a real,
 useful finding.
 
-| Metric | Value |
-|---|---|
-| Total requests sent | 16,436 |
-| Requests returning non-2xx (429) | 16,126 (98.1%) |
-| req/s avg (including rejected requests) | 2,053 |
-| Latency p50 / p99 (including rejected requests) | 4ms / 11ms |
+| Metric | Value (Phase 18, 2026-08-17) | Value (Phase 19 re-run, 2026-08-18) |
+|---|---|---|
+| Total requests sent | 16,436 | 18,863 |
+| Requests returning non-2xx (429) | 16,126 (98.1%) | 18,553 (98.4%) |
+| req/s avg (including rejected requests) | 2,053 | 2,357 |
+| Latency p50 / p99 (including rejected requests) | 4ms / 11ms | 3ms / 17ms |
 
 **What this shows:** once a single source IP exceeds the global 300/60s
 budget (which happens almost immediately at this concurrency), the app
@@ -130,3 +152,17 @@ node index.js &            # boot the server (needs SESSION_SECRET/BYOK_ENCRYPTI
                             # in production; dev defaults work locally)
 npm run load-test          # takes ~7 minutes due to the deliberate cooldowns
 ```
+
+## Phase 19 addition: controlled failure/chaos testing
+
+Load testing measures the happy path; Phase 19 also added real controlled
+failure testing (kill Redis mid-run, kill a worker process mid-job) —
+see `PHASE19_NOTES.md` and `server/test/redisOutageFailSafeRegression.js`
+/ `server/test/multiWorkerRealProcessRegression.js` /
+`server/test/workerCrashReclaimRegression.js` for the methodology and
+real bugs found and fixed as a result (a liveness check that used to hang
+during a Redis outage, a rate limiter that used to fail closed and take
+down the whole API, an unhandled-error path that used to leak a stack
+trace, and a worker-crash job reclaim gap). This section is about
+throughput/latency only; that section is about what happens when a
+dependency actually goes down.
