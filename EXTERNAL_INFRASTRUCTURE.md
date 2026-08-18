@@ -66,7 +66,21 @@ job-processing topology is ever needed.
 | A real Meta developer app (Ads + WhatsApp Business) | `META_APP_ID`/`META_APP_SECRET`/`META_REDIRECT_URI` — same status as Google: code-reviewed and one real bug fixed, never tested against a real Meta account | Required to test the real OAuth flow before launch | Required if these integrations are offered | Free for the app itself; WhatsApp Business API has its own usage-based pricing |
 
 See `PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md` for the exact staging setup
-steps for both.
+steps for both, and `PHASE18_1_NOTES.md` for Phase 18.1's follow-up
+hardening pass on this same OAuth/integration credential path.
+
+**Phase 18.1 addition — token encryption at rest is now real**: every
+stored `accessToken`/`refreshToken` (OAuth or manual, e.g. a WooCommerce
+consumer secret or WordPress application password) is AES-256-GCM
+encrypted using `BYOK_ENCRYPTION_KEY` before it ever touches the
+database — the same key already required above for BYOK provider keys
+and webhook signing secrets, nothing new to provision. One consequence
+worth knowing before staging: **any integration connection made before
+this change, against a database carrying old plaintext tokens, will stop
+working and prompt "please reconnect"** the first time it's read — this
+is the intended, safe migration path (see `PHASE18_1_NOTES.md` §1), not
+data loss, but worth a heads-up before a staging cutover so it isn't
+mistaken for a regression.
 
 Shopify/WooCommerce/WordPress do **not** need OAuth apps — they're
 manual-token/application-password integrations configured per-connection

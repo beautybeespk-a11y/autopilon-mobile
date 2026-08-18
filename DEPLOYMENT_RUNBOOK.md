@@ -221,3 +221,87 @@ scheduled backup," set up Litestream (see `BACKUP_RESTORE.md`).
 None of the above has been rehearsed against a real deployment in this
 sandbox — treat the first real rollback as a drill worth doing
 deliberately (not for the first time during a real incident).
+
+## 12. Staging test runbook (Phase 18.1 §17)
+
+The exact 18-step checklist for the remaining real-environment tests this
+sandbox cannot perform. Each step names what "done" looks like; steps
+marked **EXTERNAL** need a real credential/service this environment has
+never had access to — see `EXTERNAL_INFRASTRUCTURE.md` for what to
+provision. Steps marked **(regression suite)** reference commands added
+by Phase 18.1, run from `server/` against the live staging URL.
+
+1. **Deploy staging** — follow Steps 1–8 above against real staging
+   infrastructure (not this sandbox).
+2. **Configure environment variables** — Step 2 above; use a *staging*
+   `SESSION_SECRET`/`BYOK_ENCRYPTION_KEY` distinct from production's.
+3. **Configure database** — Step 4 above; confirm the persistent volume
+   survives a container restart before trusting it.
+4. **Configure Redis** — `REDIS_URL`, `CACHE_PROVIDER=redis`,
+   `RATE_LIMIT_PROVIDER=redis`, `SESSION_STORE=redis` if staging runs more
+   than one app process; verify with `GET /api/health/redis`.
+5. **Configure storage** — `STORAGE_PROVIDER=s3` + bucket credentials if
+   staging's filesystem isn't guaranteed persistent; otherwise confirm the
+   local `uploads/` volume persists across a restart.
+6. **Configure OAuth** **(EXTERNAL)** — real Google Cloud OAuth client and/or
+   Meta developer app, redirect URIs registered per Step 7 above.
+7. **Configure Stripe test mode** **(EXTERNAL)** — a real Stripe account in
+   TEST mode, `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` set.
+8. **Configure email** — **NOT APPLICABLE YET**: no transactional email
+   provider is integrated in this codebase at all (`routes/
+   organizations.js`'s invite flow and `/auth/forgot-password` both have
+   no outbound email path — see `PHASE18_1_NOTES.md` §5). Nothing to
+   configure until that's built; don't skip past this thinking it's
+   already working.
+9. **Configure webhook endpoint** **(EXTERNAL)** — register a real receiving
+   endpoint (e.g. `webhook.site` for a first smoke test, or a real
+   subscriber) against a developer webhook created via
+   `POST /api/v1/webhooks`.
+10. **Configure domain/SSL** — Step 7.1 above; confirm `https://` resolves
+    and the certificate is valid before testing anything else.
+11. **Run health checks** — `curl https://<staging>/api/health/live` and
+    `/ready`; as a platform admin, `/api/health/`, `/api/health/redis`,
+    `/api/health/queue` (Step 9 above).
+12. **Run security suite (regression suite)** —
+    `npm run test:security -- https://<staging>` and
+    `npm run test:security:public-api -- https://<staging>` from
+    `server/`. Both must be 24/24 and 30/30 as they were in this sandbox
+    (Phase 18.1 §14) — a real staging run is the first time these execute
+    against infrastructure this sandbox never had (a real reverse proxy,
+    real TLS, possibly real Redis).
+13. **Run OAuth test** **(EXTERNAL)** — the manual step-by-step account
+    connect/refresh/disconnect walkthrough in
+    `PHASE18_10_OAUTH_BILLING_ADMIN_REVIEW.md`, against a real Google/Meta
+    account. `npm run test:csrf -- https://<staging>` (7/7 expected) can
+    run automatically first to confirm the state-token mechanics are
+    intact before doing the manual walkthrough.
+14. **Run billing test** **(EXTERNAL)** — Stripe TEST mode checkout,
+    upgrade/downgrade/cancel, and a real webhook delivery from Stripe's
+    dashboard "Send test webhook" feature; confirm `activity_logs` records
+    each transition and `subscriptions`/`invoices` update correctly.
+15. **Run webhook test** **(EXTERNAL, regression suite)** — create a real
+    developer webhook, trigger an event (e.g. create a task via the
+    Public API), confirm real delivery, correct HMAC signature, and retry
+    behavior on a deliberately-failing endpoint. Complements (does not
+    replace) the code-level checks already covered by
+    `npm run test:security:public-api -- https://<staging>`'s webhook
+    signing/replay/SSRF checks.
+16. **Verify logs (regression suite)** — `npm run test:production-logging
+    -- https://<staging> <path-to-staging's-real-log-output>` (4/4
+    expected); separately, manually grep staging's real log aggregator for
+    the test account's password used above — confirm it never appears.
+17. **Verify monitoring** **(EXTERNAL)** — confirm whatever uptime/error
+    tracking service was provisioned (see `EXTERNAL_INFRASTRUCTURE.md`'s
+    Monitoring section — none is integrated by default) actually receives
+    an event; deliberately trigger a 500 and confirm it's captured.
+18. **Verify rollback** — actually perform Step 11's rollback procedure
+    once, against staging, before trusting it applies to production.
+
+Also worth running once staging exists, even though not in the spec's
+original 18: `npm run test:credential-leakage`, `npm run test:reverse-proxy
+-- proxy <staging-url>` (verifies the real reverse-proxy trust-boundary
+behavior against staging's actual proxy, not this sandbox's simulation),
+`npm run test:data-retention` (safe — it seeds and deletes its own
+fixture org, doesn't touch anything else), and `npm run test:admin-panel
+-- https://<staging>` (needs `PLATFORM_ADMIN_EMAIL` set to a real
+throwaway staging admin account).
