@@ -198,6 +198,13 @@ export function connectionHealth(userId, provider) {
 
 // Returns a valid access token for the connection, or throws a clear error
 // a tool's execute() can surface as a normal failed step (never a crash).
+// Phase 18.2 §5: retryable = false — if this ever propagates all the way
+// up to a Job Manager handler (rather than being caught per-tool-call),
+// it needs the same "don't blindly retry" treatment jobs/handlers.js
+// already gives a deleted/disabled webhook: no amount of retrying fixes
+// "not connected" or "expired," only the user reconnecting does, so
+// retrying just delays an inevitable dead-letter instead of failing
+// cleanly and immediately.
 export function requireValidToken(userId, provider) {
   const conn = getConnection(userId, provider);
   const health = connectionHealth(userId, provider);
@@ -208,6 +215,7 @@ export function requireValidToken(userId, provider) {
         : `${provider} is not connected. Connect it first in Integrations.`
     );
     err.code = "INTEGRATION_NOT_CONNECTED";
+    err.retryable = false;
     throw err;
   }
   return conn.accessToken;
