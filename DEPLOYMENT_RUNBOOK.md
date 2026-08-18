@@ -218,9 +218,20 @@ scheduled backup," set up Litestream (see `BACKUP_RESTORE.md`).
   (`POST /api/admin/maintenance`) takes the app read-only or fully down
   for non-admins without a redeploy.
 
-None of the above has been rehearsed against a real deployment in this
-sandbox — treat the first real rollback as a drill worth doing
-deliberately (not for the first time during a real incident).
+Phase 19 verified the two pieces this sandbox genuinely can rehearse for
+real: a clean-checkout-to-running deployment (a separate `git clone` of
+this exact branch → `npm ci` → build → fresh-DB migrate → boot → health
+check → 24/24 real regression suite, all reproduced successfully) and a
+real backup → restore → boot → login cycle (not just an integrity check —
+a real user logged into a real server booted against the restored
+database). A full **rollback** rehearsal — deploying an OLD version
+against a database a NEWER version already wrote to, confirming it still
+works — was not performed this phase (git-based code rollback and the
+additive-migration-safety argument above are both real, but "an old
+binary running against new-shaped data" is still worth a deliberate first
+rehearsal against real staging, not assumed from the schema-additivity
+argument alone). Multi-instance rollback (blue/green, canary) needs real
+hosting with more than one instance, which this sandbox doesn't have.
 
 ## 12. Staging test runbook (Phase 18.1 §17)
 
@@ -321,3 +332,64 @@ database/queue/encryption stack rather than a simulation of it:
 (4/4), `npm run test:token-refresh-safety` (7/7), `npm run test:reconnect-isolation`
 (15/15), `npm run test:audit-api-response` (5/5), and
 `npm run test:failure-concurrency` (9/9).
+
+Phase 19 added four more, same story — no staging infrastructure needed,
+safe to run against `localhost` or CI at any time, but genuinely worth
+running once against real staging too: `npm run test:worker-crash-reclaim`
+(5/5), `npm run test:db-migration` (4/4, though this one is most useful
+run against a copy of a real pre-existing staging database rather than
+the synthetic fixture it builds by default — see the test file's own
+comments), `npm run test:multi-worker-real-process` (4/4, spawns two real
+`node worker.js` processes and hard-kills one — needs the ability to spawn
+child processes, which a serverless/managed-container platform may not
+allow the same way a VM does), and `npm run test:redis-outage-failsafe`
+(3/3, spawns and kills a real `redis-server` — same caveat, and doubly
+useful to re-run against staging's actual managed Redis if the platform
+allows temporarily blocking network access to it, since a managed Redis
+can't be `SIGKILL`ed the way this test's local one is).
+
+## 13. Phase 19 additions — real chaos/durability findings and CI changes
+
+Three real bugs were found via genuine failure/chaos testing this phase
+(spawn a real `redis-server`, boot the app pointed at it with every
+Redis-backed provider active, then `SIGKILL` Redis mid-run) — all fixed,
+all covered by `npm run test:redis-outage-failsafe`:
+
+1. **`/api/health/live` used to hang during a Redis outage** instead of
+   responding instantly, because session middleware (which touches Redis
+   on every request) ran before health routes. Fixed by mounting
+   `/live`+`/ready` before session/rate-limit middleware entirely — verify
+   this specifically after any future middleware-ordering change in
+   `index.js`, since it's easy to accidentally reintroduce.
+2. **Unhandled Redis errors used to leak a raw stack trace** (including
+   real server file paths) via Express's default error page. Fixed with a
+   global JSON error handler at the end of `index.js` — verify any new
+   route still gets a clean JSON error on an unexpected throw, not HTML.
+3. **The global rate limiter used to fail CLOSED on a Redis error**,
+   meaning a Redis blip took down 100% of `/api/*` traffic. Fixed to fail
+   OPEN (logged as degraded). If `RATE_LIMIT_PROVIDER=redis` is used in
+   staging/production, expect a brief window of unenforced rate limits
+   during any real Redis incident — this is the intended, safer trade-off,
+   not a bug, but worth knowing before it happens for the first time on
+   call.
+
+A worker-crash job reclaim gap was also found and fixed: a `worker.js`
+process that crashes (not a graceful `SIGTERM`) mid-job used to leave
+that job stuck at `status='running'` forever. Fixed with a stale-job
+reclaim sweep (`JOB_STALE_TIMEOUT_MS`, default 10 minutes) — if a real
+staging/production job legitimately takes longer than that to run, raise
+this env var, or the job will be reclaimed and retried while still
+genuinely in progress.
+
+The CI pipeline (`.github/workflows/ci.yml`) was expanded from 4 to all
+20 regression suite files, given a `workflow_dispatch` trigger so it can
+be run manually on any branch (not just on push/PR to `main`), and
+**actually fired against a real GitHub Actions runner** three times this
+phase — not just dry-run locally. The first real run caught a genuine
+CI-only bug (`BYOK_ENCRYPTION_KEY` wasn't propagated to a test step that
+needed it — GitHub Actions steps don't share inline `run:` env vars the
+way one continuous local shell session does) that no amount of local
+dry-running would have found. If you add a new regression suite to this
+repo, add it to `ci.yml` too and actually fire the workflow at least once
+(`gh workflow run ci.yml --ref <branch>` or the GitHub UI's "Run
+workflow" button) rather than trusting a local pass alone.
