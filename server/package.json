@@ -17,7 +17,9 @@
     "test:idempotency": "node test/idempotencyRegression.js",
     "test:integration-actions": "node test/integrationActionRegression.js",
     "test:credential-leakage": "node test/credentialLeakageRegression.js",
-    "test:reverse-proxy": "node test/reverseProxyRegression.js"
+    "test:reverse-proxy": "node test/reverseProxyRegression.js",
+    "test:csrf": "node test/csrfRegression.js",
+    "test:production-logging": "node test/productionLoggingRegression.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.686.0",
