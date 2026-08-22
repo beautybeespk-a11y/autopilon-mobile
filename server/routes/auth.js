@@ -14,6 +14,14 @@ router.post("/signup", authLimiter, (req, res) => {
   const { name, email, password } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: "Name, email and password are required." });
   if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+  // Closed-beta / pre-launch switch — unset (default) means signup stays
+  // open, same as before this existed. The platform admin's own email is
+  // always exempt, so PLATFORM_ADMIN_EMAIL can still bootstrap an admin
+  // account on a fresh install even with this set to "false".
+  const isPlatformAdminEmail = process.env.PLATFORM_ADMIN_EMAIL && email.toLowerCase() === process.env.PLATFORM_ADMIN_EMAIL.toLowerCase();
+  if (process.env.PUBLIC_SIGNUP_ENABLED === "false" && !isPlatformAdminEmail) {
+    return res.status(403).json({ error: "Public signup is currently disabled. Contact the administrator for access." });
+  }
   const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(email.toLowerCase());
   if (exists) return res.status(409).json({ error: "An account with this email already exists." });
 
