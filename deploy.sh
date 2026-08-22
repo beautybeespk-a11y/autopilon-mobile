@@ -81,8 +81,10 @@ fi
 require_env_file # reload with the (possibly just-updated) tag
 
 log "Pulling ${IMAGE_REPO}:${IMAGE_TAG}..."
-if ! $COMPOSE pull; then
-  die "Pull failed for ${IMAGE_REPO}:${IMAGE_TAG}. If this tag was just pushed by build-and-push.yml, GitHub Actions may still be running — check the Actions tab. If the GHCR package is private, see install-production.sh's registry-access step / PRODUCTION_DEPLOYMENT.md for how to 'docker login ghcr.io' on this VPS."
+if ! $COMPOSE pull app worker; then
+  warn "Pull failed for ${IMAGE_REPO}:${IMAGE_TAG} — falling back to building on this VPS instead (same path install-production.sh uses when no pre-built image is available yet, e.g. before this branch's first build-and-push.yml run, or while the GHCR package is still private). If this tag was just pushed by build-and-push.yml, GitHub Actions may still be running — check the Actions tab. If the GHCR package is private, see install-production.sh's registry-access step / PRODUCTION_DEPLOYMENT.md for how to 'docker login ghcr.io' on this VPS instead."
+  $COMPOSE build app worker
+  $COMPOSE pull redis traefik
 fi
 
 log "Restarting containers (named volumes are preserved — this never runs 'docker compose down -v')..."
