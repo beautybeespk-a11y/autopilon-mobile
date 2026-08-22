@@ -94,15 +94,18 @@ services:
   # mount) rather than a hand-maintained static config, so no separate
   # routing file needs to be kept in sync with docker-compose.yml.
   traefik:
-    image: traefik:v3.1
+    # Traefik v3.1's bundled Docker client defaulted to API version 1.24
+    # and didn't negotiate a newer one, which Docker Engine 29.x (a real,
+    # widely-reported break — traefik/traefik#12253) rejects outright as
+    # below its minimum supported version (1.40+), confirmed live against
+    # Engine 29.7.2 on this deployment. A pinned DOCKER_API_VERSION env
+    # var does NOT fix this on v3.1 specifically (confirmed live too —
+    # the old client ignores it). The real fix is v3.6.1+, which added
+    # automatic Docker API version negotiation, so no version needs to be
+    # hardcoded here at all (and won't need bumping again on Docker's
+    # next release either).
+    image: traefik:v3.7.11
     restart: unless-stopped
-    # Traefik v3.1's bundled Docker client defaults to API version 1.24
-    # when it doesn't negotiate one, which recent Docker Engine releases
-    # (this repo has seen it happen against Engine 29.7.2) reject as
-    # below their minimum supported version (1.40+). Pin an explicit,
-    # comfortably-current version instead of relying on that default.
-    environment:
-      - DOCKER_API_VERSION=1.44
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
