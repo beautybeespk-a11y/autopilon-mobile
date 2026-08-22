@@ -132,7 +132,11 @@ step_configure_firewall() {
   ufw allow 80/tcp
   ufw allow 443/tcp
 
-  if ! ufw status | grep -qE '22(/tcp)?\s+ALLOW'; then
+  # NOTE: "ufw status" only lists rules once ufw is active — before that it
+  # just prints "Status: inactive" with no rule detail, even with rules
+  # already staged. "ufw show added" lists staged rules regardless of
+  # active state, which is what we actually need to check here.
+  if ! ufw show added | grep -qE '22(/tcp)?$|allow 22'; then
     die "Refusing to enable the firewall — could not confirm an SSH-allow rule was staged. Your current SSH session is safe (ufw isn't enabled yet); fix this manually (ufw allow 22/tcp) before re-running."
   fi
 
