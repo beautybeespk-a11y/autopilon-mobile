@@ -63,7 +63,7 @@ services:
     restart: unless-stopped
     labels:
       - "traefik.enable=true"
-      - "traefik.docker.network=web"
+      - "traefik.docker.network=autopilon_web"
       - "traefik.http.routers.autopilon.rule=Host(`${DOMAIN_NAME}`) || Host(`www.${DOMAIN_NAME}`)"
       - "traefik.http.routers.autopilon.entrypoints=websecure"
       - "traefik.http.routers.autopilon.tls=true"
@@ -109,7 +109,16 @@ services:
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=web"
+      - "--providers.docker.network=autopilon_web"
+      # Internal-only entrypoint (never published to the host) purely so
+      # the container's own healthcheck ("traefik healthcheck --ping",
+      # which targets localhost:8080/ping by default) has something to
+      # hit. Without both of these two lines, that healthcheck always
+      # fails regardless of whether Traefik itself is working correctly —
+      # confirmed live (container ran and routed fine once the network
+      # name below was also fixed, but still reported "unhealthy").
+      - "--entrypoints.traefik.address=:8080"
+      - "--ping=true"
       - "--entrypoints.web.address=:80"
       - "--entrypoints.websecure.address=:443"
       - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
@@ -142,11 +151,22 @@ services:
       start_period: 10s
 
 networks:
+  # Explicit `name:` on both networks below, rather than leaving Compose
+  # to prefix them with the project name (e.g. "autopilon_web") — Traefik's
+  # --providers.docker.network static option needs an exact network name
+  # to route over, and letting that drift with whatever directory this
+  # gets deployed into broke real HTTP routing (confirmed live: Traefik
+  # silently fell back to a network it wasn't even connected to, causing
+  # every request to time out with a 504). Pinning it here means this
+  # works the same regardless of the clone directory's name.
+  #
   # Redis/app-internal traffic — never touches the host's public interface.
   internal:
+    name: autopilon_internal
     driver: bridge
   # Only Traefik and whatever it needs to route to (app) join this one.
   web:
+    name: autopilon_web
     driver: bridge
 
 volumes:
