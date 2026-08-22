@@ -25,23 +25,42 @@ require_env_file() {
 
 mkdir_state() { mkdir -p "$STATE_DIR"; }
 
+# All three prompt functions below read from /dev/tty explicitly, not
+# plain stdin. When this script is run as `curl ... | sudo bash` (the
+# documented one-command install path), stdin is connected to the pipe
+# carrying the script's own source, not the user's terminal — a plain
+# `read` would silently get EOF/empty input instead of waiting for real
+# input. /dev/tty is the actual controlling terminal whenever one exists
+# (an interactive SSH session, piped or not) and is absent only in a
+# genuinely non-interactive context (cron, CI), which is exactly the
+# case each function's non-interactive fallback below is for.
+_has_tty() { [[ -r /dev/tty ]] 2>/dev/null; }
+
 # Visible prompt with an optional default. Secrets use prompt_secret()
 # instead so nothing sensitive is ever echoed to the terminal/history.
 prompt() {
   local __var="$1" __text="$2" __default="${3:-}" __input
-  if [[ -n "$__default" ]]; then
-    read -r -p "$__text [$__default]: " __input || true
-    __input="${__input:-$__default}"
+  if _has_tty; then
+    if [[ -n "$__default" ]]; then
+      read -r -p "$__text [$__default]: " __input < /dev/tty || true
+      __input="${__input:-$__default}"
+    else
+      read -r -p "$__text: " __input < /dev/tty || true
+    fi
   else
-    read -r -p "$__text: " __input || true
+    __input="$__default"
   fi
   printf -v "$__var" '%s' "$__input"
 }
 
 prompt_secret() {
   local __var="$1" __text="$2" __input
-  read -r -s -p "$__text (input hidden): " __input || true
-  echo
+  if _has_tty; then
+    read -r -s -p "$__text (input hidden): " __input < /dev/tty || true
+    echo
+  else
+    __input=""
+  fi
   printf -v "$__var" '%s' "$__input"
 }
 
@@ -50,11 +69,11 @@ prompt_secret() {
 # hanging forever on a `read` that will never get input.
 prompt_yn() {
   local __text="$1" __default="${2:-y}" __input
-  if [[ ! -t 0 ]]; then
+  if ! _has_tty; then
     [[ "$__default" == y ]]
     return
   fi
-  read -r -p "$__text [$([[ $__default == y ]] && echo Y/n || echo y/N)]: " __input || true
+  read -r -p "$__text [$([[ $__default == y ]] && echo Y/n || echo y/N)]: " __input < /dev/tty || true
   __input="${__input:-$__default}"
   [[ "$__input" =~ ^[Yy] ]]
 }
