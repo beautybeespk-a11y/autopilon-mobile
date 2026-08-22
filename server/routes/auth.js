@@ -23,7 +23,7 @@ router.post("/signup", authLimiter, (req, res) => {
   db.prepare("INSERT INTO users (id, name, email, password, isPlatformAdmin, createdAt) VALUES (?, ?, ?, ?, ?, ?)")
     .run(id, name, email.toLowerCase(), hash, isPlatformAdmin, new Date().toISOString());
   req.session.userId = id;
-  res.json({ user: { id, name, email: email.toLowerCase() } });
+  res.json({ user: { id, name, email: email.toLowerCase(), avatar: null, isPlatformAdmin: Boolean(isPlatformAdmin) } });
 });
 
 router.post("/login", authLimiter, (req, res) => {
@@ -34,11 +34,13 @@ router.post("/login", authLimiter, (req, res) => {
     return res.status(401).json({ error: "Incorrect email or password." });
   }
   req.session.userId = user.id;
-  if (process.env.PLATFORM_ADMIN_EMAIL && user.email.toLowerCase() === process.env.PLATFORM_ADMIN_EMAIL.toLowerCase() && !user.isPlatformAdmin) {
+  let isPlatformAdmin = Boolean(user.isPlatformAdmin);
+  if (process.env.PLATFORM_ADMIN_EMAIL && user.email.toLowerCase() === process.env.PLATFORM_ADMIN_EMAIL.toLowerCase() && !isPlatformAdmin) {
     db.prepare("UPDATE users SET isPlatformAdmin = 1 WHERE id = ?").run(user.id);
+    isPlatformAdmin = true;
   }
   logActivity(db, user.id, "login", "Logged in", { req });
-  res.json({ user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar } });
+  res.json({ user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, isPlatformAdmin } });
 });
 
 router.post("/logout", (req, res) => {
