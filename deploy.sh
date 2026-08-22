@@ -62,9 +62,23 @@ if [[ -d .git ]]; then
     die "Commit, stash, or discard these first, or investigate why they're there before re-running deploy.sh."
   fi
   BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  BEFORE_HASH="$(git rev-parse HEAD)"
   log "Updating checkout (git fetch + reset --hard origin/$BRANCH)..."
   git fetch --depth 1 origin "$BRANCH"
   git reset --hard "origin/$BRANCH"
+
+  # If that update changed anything — deploy.sh itself included — the
+  # already-running process is still executing the OLD file content from
+  # memory; bash doesn't notice its own script changing underneath it
+  # mid-run. Re-exec from scratch rather than risk silently running stale
+  # logic for the rest of this deploy (confirmed live: a fix to the
+  # fallback logic below this point had zero effect on the run that
+  # updated it, because the running process never picked it up without
+  # this). Harmless no-op re-run if only unrelated files changed.
+  if [[ "$(git rev-parse HEAD)" != "$BEFORE_HASH" && -z "${DEPLOY_SH_REEXECED:-}" ]]; then
+    log "This update changed the checkout — re-executing deploy.sh from the start to pick up any changes to it..."
+    exec env DEPLOY_SH_REEXECED=1 "${BASH_SOURCE[0]}" "$@"
+  fi
 else
   warn "Not a git checkout — skipping repository update, deploying the image only."
 fi
