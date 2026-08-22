@@ -1,0 +1,68 @@
+name: Build Mobile APK
+
+# Builds a real, installable Android APK from autopilon_mobile/, pointed at
+# a real backend via --dart-define=API_BASE_URL (the app has no in-app way
+# to change this — see lib/core/config/app_config.dart — so a rebuild is
+# the only way to point it at a different server).
+#
+# Manual (workflow_dispatch) so you control exactly which API URL a given
+# build targets, plus automatic on any push to this branch that touches
+# the mobile app itself, defaulting to production
+# (https://autopilon.com/api) so there's always a current build to test
+# against without remembering to trigger one by hand.
+#
+# Signing: uses the default DEBUG signing config Flutter's own template
+# wires into the release build type (see android/app/build.gradle.kts —
+# "Signing with the debug keys for now, so `flutter run --release`
+# works.") — fine for installing on your own device for testing, NOT
+# something to submit to the Play Store as-is. Real release signing (a
+# real keystore, kept as a GitHub secret) is a separate, later step once
+# this is actually headed to a store listing.
+on:
+  workflow_dispatch:
+    inputs:
+      api_base_url:
+        description: "Backend API base URL the built app will talk to"
+        required: false
+        default: "https://autopilon.com/api"
+  push:
+    branches: [claude/mobile-app-context-0p96wm]
+    paths:
+      - "autopilon_mobile/**"
+      - ".github/workflows/build-mobile-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: autopilon_mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.47.1"
+          channel: stable
+
+      - run: flutter pub get
+
+      - name: Build release APK
+        run: |
+          flutter build apk --release \
+            --dart-define=ENVIRONMENT=production \
+            --dart-define=API_BASE_URL="${{ github.event.inputs.api_base_url || 'https://autopilon.com/api' }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autopilon-android-apk
+          path: autopilon_mobile/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
