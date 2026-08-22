@@ -1,0 +1,124 @@
+name: Build and Push Production Image
+
+# Phase 20 — builds the EXISTING Dockerfile (unchanged) and pushes it to
+# GitHub Container Registry, so the VPS only ever has to `docker pull` a
+# finished image instead of compiling anything on a 2-vCPU box (npm ci +
+# a Vite client build + compiling better-sqlite3's native binding is real
+# work — see PHASE19_NOTES.md's RAM/CPU analysis for why that matters on
+# a small VPS).
+#
+# Triggered only after the real CI workflow (ci.yml — syntax check, all
+# 20 regression suites, OpenAPI validation, both SDK smoke tests) has
+# ACTUALLY PASSED on main, via workflow_run — this is the "Tests → Build"
+# gate the phase asked for, without duplicating ci.yml's own test jobs
+# here. Also runnable manually (workflow_dispatch) for a one-off release
+# build, e.g. right after this workflow file itself is first merged.
+#
+# No new secret is required for this job — GITHUB_TOKEN (automatically
+# provided to every workflow run) is sufficient to push to this repo's
+# own GitHub Container Registry package.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build (existing Dockerfile) and push to GHCR
+    runs-on: ubuntu-latest
+    # For the workflow_run trigger, only proceed if CI actually succeeded
+    # — a failed/cancelled CI run must never produce a deployable image.
+    # workflow_dispatch (manual) always proceeds, since a human explicitly
+    # asked for this build.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    steps:
+      - name: Checkout the exact commit CI validated
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+            type=ref,event=tag
+
+      # Builds the SAME Dockerfile that already exists in this repo
+      # (server + client multi-stage build, Phase 18.7/20) — nothing
+      # about the build itself changes, only where it runs.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image reference for this run
+        run: |
+          echo "Pushed: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.event.workflow_run.head_sha || github.sha }}"
+          echo "Also tagged: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "Run ./deploy.sh on the VPS to pull and deploy this image — see PRODUCTION_DEPLOYMENT.md."
+
+  # ---------------------------------------------------------------------
+  # OPTIONAL: automatic SSH deploy to the VPS after a successful push.
+  #
+  # Disabled by default (see the `if:` guard below) — this repo has never
+  # had a real VPS to test an SSH-push deploy against, and pretending it
+  # works without ever exercising it would be dishonest. The PRIMARY,
+  # tested deployment mechanism is: SSH into the VPS yourself (or a cron
+  # job there) and run ./deploy.sh, which pulls the image this job just
+  # published. That's real and doesn't need any GitHub secret beyond what
+  # already exists.
+  #
+  # To turn this job on once you're ready: add two repository secrets
+  # (Settings → Secrets and variables → Actions):
+  #   DEPLOY_HOST       the VPS's IP or hostname
+  #   DEPLOY_SSH_KEY     a private key whose PUBLIC half is authorized on
+  #                      the VPS for a user allowed to run
+  #                      `cd /opt/autopilon && ./deploy.sh` — a dedicated
+  #                      deploy key, not your personal SSH key
+  # then change the `if: false` below to `if: true`.
+  # ---------------------------------------------------------------------
+  deploy-to-vps:
+    name: (optional, disabled by default) SSH deploy to VPS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: false
+    steps:
+      - name: SSH in and run the existing deploy.sh
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /opt/autopilon
+            ./deploy.sh

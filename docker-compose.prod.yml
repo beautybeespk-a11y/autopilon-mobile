@@ -1,0 +1,140 @@
+# Production overlay (Phase 20) — layered on top of the existing
+# docker-compose.yml, not a replacement for it. Run both together:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# What this overlay changes, and why:
+#
+#   1. Adds a real reverse proxy (Traefik) — Phase 19 identified "no real
+#      domain + TLS" as the one remaining production blocker; this is
+#      that missing piece, not a new architecture. Traefik was NOT
+#      present anywhere in this repo before Phase 20 (confirmed by a
+#      full-repo grep) — it is genuinely new, added because the app has
+#      never had a real HTTPS entrypoint, not because the existing
+#      Docker/Redis/SQLite/worker architecture was unsuitable. That
+#      architecture is kept exactly as designed.
+#   2. `app`/`worker` switch from `build:` (compiling on the VPS) to
+#      `image:` (pulling a pre-built image from GitHub Container
+#      Registry) — per Phase 20's instruction to avoid heavy on-VPS
+#      builds on a 2-vCPU box. The image comes from
+#      .github/workflows/build-and-push.yml. Set IMAGE_TAG in .env
+#      (deploy.sh manages this for you) to pick which build runs.
+#   3. `app`'s host port publish (4000:4000) is removed — Traefik is the
+#      only public entrypoint now, reached via the shared `web` network.
+#      `redis`'s host port publish (6379:6379) is removed entirely —
+#      Redis is reachable only over the internal `internal` network, by
+#      service name, exactly as the app already expects
+#      (REDIS_URL=redis://redis:6379 is unchanged).
+#   4. `env_file: .env` is added to `app`/`worker` so every variable a
+#      real deployment needs (Stripe, OAuth, storage, search/STT/TTS
+#      provider keys — see .env.example) actually reaches the container.
+#      The base docker-compose.yml's explicit `environment:` list only
+#      ever forwards a subset (session/BYOK/AI-provider/Redis-provider
+#      vars) — fine for the local "app + redis" smoke-test compose was
+#      originally written for, not complete enough for a real production
+#      deployment offering the OAuth/Stripe integrations this app has.
+#      `environment:` values still take precedence over `env_file:` for
+#      the same key, so nothing already working changes.
+#
+# Nothing about the base file's services, volumes, or healthchecks is
+# removed or replaced beyond what's listed above — this is an overlay,
+# not a rewrite.
+
+services:
+  app:
+    build: !reset null
+    image: ${IMAGE_REPO:-ghcr.io/OWNER/REPO}:${IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    ports: !reset []
+    # Bind-mounted (not a named volume) specifically so backup.sh/
+    # restore.sh on the HOST can read/write these files directly, with no
+    # `docker cp` needed — backup.sh runs backup-db.js inside this
+    # container with --out /app/backups, which lands here.
+    volumes:
+      - ./backups:/app/backups
+    networks:
+      - internal
+      - web
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.autopilon.rule=Host(`${DOMAIN_NAME}`) || Host(`www.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.autopilon.entrypoints=websecure"
+      - "traefik.http.routers.autopilon.tls=true"
+      - "traefik.http.routers.autopilon.tls.certresolver=le"
+      - "traefik.http.services.autopilon.loadbalancer.server.port=4000"
+      # HTTP->HTTPS redirect is handled at the entrypoint level (see the
+      # traefik service's command below), so no separate redirect router
+      # is needed per-service.
+
+  worker:
+    build: !reset null
+    image: ${IMAGE_REPO:-ghcr.io/OWNER/REPO}:${IMAGE_TAG:-latest}
+    env_file:
+      - .env
+    networks:
+      - internal
+    restart: unless-stopped
+    labels:
+      - "traefik.enable=false"
+
+  redis:
+    ports: !reset []
+    networks:
+      - internal
+    restart: unless-stopped
+
+  # Real Let's Encrypt reverse proxy — the only container with a public
+  # port. Discovers `app` via the Docker provider (read-only socket
+  # mount) rather than a hand-maintained static config, so no separate
+  # routing file needs to be kept in sync with docker-compose.yml.
+  traefik:
+    image: traefik:v3.1
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=web"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      # No dashboard/API exposed anywhere, on purpose — one less public
+      # attack surface. Enable deliberately later (behind its own auth
+      # and Traefik router) if you actually want it; see VPS_SETUP.md.
+      - "--api.dashboard=false"
+      - "--api.insecure=false"
+      - "--log.level=INFO"
+      - "--accesslog=false"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik_letsencrypt:/letsencrypt
+    networks:
+      - web
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+networks:
+  # Redis/app-internal traffic — never touches the host's public interface.
+  internal:
+    driver: bridge
+  # Only Traefik and whatever it needs to route to (app) join this one.
+  web:
+    driver: bridge
+
+volumes:
+  traefik_letsencrypt:
