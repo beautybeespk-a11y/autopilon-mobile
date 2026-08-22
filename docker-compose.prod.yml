@@ -96,6 +96,13 @@ services:
   traefik:
     image: traefik:v3.1
     restart: unless-stopped
+    # Traefik v3.1's bundled Docker client defaults to API version 1.24
+    # when it doesn't negotiate one, which recent Docker Engine releases
+    # (this repo has seen it happen against Engine 29.7.2) reject as
+    # below their minimum supported version (1.40+). Pin an explicit,
+    # comfortably-current version instead of relying on that default.
+    environment:
+      - DOCKER_API_VERSION=1.44
     command:
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
