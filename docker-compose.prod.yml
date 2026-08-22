@@ -13,12 +13,17 @@
 #      never had a real HTTPS entrypoint, not because the existing
 #      Docker/Redis/SQLite/worker architecture was unsuitable. That
 #      architecture is kept exactly as designed.
-#   2. `app`/`worker` switch from `build:` (compiling on the VPS) to
-#      `image:` (pulling a pre-built image from GitHub Container
-#      Registry) — per Phase 20's instruction to avoid heavy on-VPS
-#      builds on a 2-vCPU box. The image comes from
-#      .github/workflows/build-and-push.yml. Set IMAGE_TAG in .env
-#      (deploy.sh manages this for you) to pick which build runs.
+#   2. `app`/`worker` gain an `image:` tag on top of the base file's
+#      existing `build:` context (kept, not removed) — per Phase 20's
+#      instruction to prefer a pre-built image from GitHub Container
+#      Registry over compiling on a 2-vCPU box. `docker compose pull`
+#      uses the `image:` tag; `docker compose build` still uses the
+#      base file's `build:` context and tags the result with that same
+#      name — both point at the exact same Dockerfile
+#      .github/workflows/build-and-push.yml also builds. `docker compose
+#      up` uses whichever of the two is already present locally rather
+#      than pulling unnecessarily. Set IMAGE_TAG in .env (deploy.sh
+#      manages this for you) to pick which build to pull.
 #   3. `app`'s host port publish (4000:4000) is removed — Traefik is the
 #      only public entrypoint now, reached via the shared `web` network.
 #      `redis`'s host port publish (6379:6379) is removed entirely —
@@ -42,7 +47,6 @@
 
 services:
   app:
-    build: !reset null
     image: ${IMAGE_REPO:-ghcr.io/OWNER/REPO}:${IMAGE_TAG:-latest}
     env_file:
       - .env
@@ -70,7 +74,6 @@ services:
       # is needed per-service.
 
   worker:
-    build: !reset null
     image: ${IMAGE_REPO:-ghcr.io/OWNER/REPO}:${IMAGE_TAG:-latest}
     env_file:
       - .env
