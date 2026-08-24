@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import * as Icons from "lucide-react";
 import { AlertTriangle, CheckCircle2, Unplug, X } from "lucide-react";
-import { Card, Badge, Button, Input } from "../components/ui/index.jsx";
+import { Card, Badge, Button, Input, EmptyState } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
 const ICON = {
@@ -133,6 +133,13 @@ export default function Integrations() {
         </div>
       )}
 
+      {items.length === 0 ? (
+        <EmptyState
+          icon={Icons.Puzzle}
+          title="No integrations available"
+          description="Integrations couldn't be loaded — try refreshing the page. If this keeps happening, let us know via Give Feedback."
+        />
+      ) : (
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {items.map((it) => {
           const Icon = Icons[ICON[it.provider]] || Icons.Puzzle;
@@ -180,6 +187,7 @@ export default function Integrations() {
           );
         })}
       </div>
+      )}
     </div>
   );
 }

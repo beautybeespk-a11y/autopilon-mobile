@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import * as Icons from "lucide-react";
-import { Card, Badge } from "../components/ui/index.jsx";
+import { Card, Badge, EmptyState } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 import { BUILTIN_SKILLS } from "../lib/skills.js";
 
@@ -14,8 +14,15 @@ export default function Skills() {
     <div className="space-y-6">
       <div>
         <h1 className="font-display text-2xl font-semibold">Skills</h1>
-        <p className="mt-1 text-muted">The registry of capabilities agents can use. More skills arrive in later phases.</p>
+        <p className="mt-1 text-muted">Capabilities you can give an agent — assign them when creating or editing an agent.</p>
       </div>
+      {skills.length === 0 ? (
+        <EmptyState
+          icon={Icons.Wrench}
+          title="No skills available"
+          description="Skills couldn't be loaded — try refreshing the page."
+        />
+      ) : (
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {skills.map((s) => {
           const Icon = Icons[ICON_BY_ID[s.id]] || Icons.Wrench;
@@ -32,6 +39,7 @@ export default function Skills() {
           );
         })}
       </div>
+      )}
     </div>
   );
 }

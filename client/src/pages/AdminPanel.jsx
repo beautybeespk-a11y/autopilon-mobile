@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity, ToggleLeft, Trash2, History } from "lucide-react";
+import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity, ToggleLeft, Trash2, History, MessageSquareText } from "lucide-react";
 import { Card, Button, Badge, Input } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
@@ -22,6 +22,7 @@ export default function AdminPanel() {
   const [apiUsage, setApiUsage] = useState(null);
   const [flags, setFlags] = useState([]);
   const [flagAuditLog, setFlagAuditLog] = useState([]);
+  const [feedback, setFeedback] = useState([]);
   const [newFlagForm, setNewFlagForm] = useState({ key: "", name: "", description: "", enabled: true, rolloutPercent: "100" });
   const [overrideDrafts, setOverrideDrafts] = useState({}); // flagKey -> { scopeType, scopeId }
 
@@ -35,8 +36,11 @@ export default function AdminPanel() {
     api.get("/admin/api-usage?sinceDays=7").then(setApiUsage).catch(() => {});
     api.get("/admin/feature-flags").then(setFlags).catch(() => {});
     api.get("/admin/feature-flags/audit-log?limit=30").then(setFlagAuditLog).catch(() => {});
+    api.get("/feedback").then(setFeedback).catch(() => {});
   };
   useEffect(load, []);
+
+  const setFeedbackStatus = async (id, status) => { await api.patch(`/feedback/${id}`, { status }); load(); };
 
   const createFlag = async () => {
     if (!newFlagForm.key.trim() || !newFlagForm.name.trim()) return;
@@ -481,6 +485,33 @@ export default function AdminPanel() {
             {logs.length === 0 && <tr><td className="px-5 py-6 text-center text-muted">No billing activity yet.</td></tr>}
           </tbody>
         </table>
+      </Card>
+
+      <Card className="p-5">
+        <h3 className="mb-3 flex items-center gap-2 font-display font-semibold"><MessageSquareText size={16} /> Beta feedback</h3>
+        <div className="space-y-2.5">
+          {feedback.map((f) => (
+            <div key={f.id} className="rounded-xl border border-line p-3.5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Badge tone={f.type === "bug" ? "warn" : f.type === "feature" ? "accent" : "muted"}>{f.type}</Badge>
+                  <span className="text-xs text-muted">{f.userName} ({f.userEmail}) · {f.page || "—"} · {new Date(f.createdAt).toLocaleString()}</span>
+                </div>
+                <select
+                  value={f.status}
+                  onChange={(e) => setFeedbackStatus(f.id, e.target.value)}
+                  className="rounded-lg border border-line bg-bg px-2 py-1 text-xs"
+                >
+                  <option value="new">New</option>
+                  <option value="reviewed">Reviewed</option>
+                  <option value="resolved">Resolved</option>
+                </select>
+              </div>
+              <p className="mt-2 text-sm">{f.message}</p>
+            </div>
+          ))}
+          {feedback.length === 0 && <p className="text-sm text-muted">No feedback submitted yet.</p>}
+        </div>
       </Card>
     </div>
   );

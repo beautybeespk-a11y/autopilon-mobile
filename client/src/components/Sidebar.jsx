@@ -1,10 +1,13 @@
+import { useState } from "react";
 import { NavLink } from "react-router-dom";
-import { Sparkles, Shield } from "lucide-react";
+import { Sparkles, Shield, MessageSquareText } from "lucide-react";
 import { NAV } from "./nav-items.js";
 import { useAuth } from "../lib/auth.jsx";
+import FeedbackModal from "./FeedbackModal.jsx";
 
 export default function Sidebar() {
   const { user } = useAuth();
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
   return (
     <aside className="hidden w-64 shrink-0 flex-col border-r border-line bg-surface md:flex">
       <div className="flex items-center gap-2.5 px-5 py-5">
@@ -46,10 +49,15 @@ export default function Sidebar() {
       </nav>
 
       <div className="px-4 py-4">
-        <div className="rounded-xl border border-line bg-elevated p-3 text-xs text-muted">
-          <span className="font-medium text-ink">Phase 1 foundation.</span> Integrations are wired up but not yet connected.
-        </div>
+        <button
+          onClick={() => setFeedbackOpen(true)}
+          className="flex w-full items-center gap-2.5 rounded-xl border border-line px-3 py-2.5 text-sm font-medium text-muted transition hover:border-accent/40 hover:text-ink"
+        >
+          <MessageSquareText size={16} className="shrink-0" />
+          Give feedback
+        </button>
       </div>
+      {feedbackOpen && <FeedbackModal onClose={() => setFeedbackOpen(false)} />}
     </aside>
   );
 }

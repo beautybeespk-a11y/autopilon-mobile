@@ -31,7 +31,7 @@ router.post("/signup", authLimiter, (req, res) => {
   db.prepare("INSERT INTO users (id, name, email, password, isPlatformAdmin, createdAt) VALUES (?, ?, ?, ?, ?, ?)")
     .run(id, name, email.toLowerCase(), hash, isPlatformAdmin, new Date().toISOString());
   req.session.userId = id;
-  res.json({ user: { id, name, email: email.toLowerCase(), avatar: null, isPlatformAdmin: Boolean(isPlatformAdmin) } });
+  res.json({ user: { id, name, email: email.toLowerCase(), avatar: null, isPlatformAdmin: Boolean(isPlatformAdmin), onboardingCompleted: false } });
 });
 
 router.post("/login", authLimiter, (req, res) => {
@@ -48,7 +48,7 @@ router.post("/login", authLimiter, (req, res) => {
     isPlatformAdmin = true;
   }
   logActivity(db, user.id, "login", "Logged in", { req });
-  res.json({ user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, isPlatformAdmin } });
+  res.json({ user: { id: user.id, name: user.name, email: user.email, avatar: user.avatar, isPlatformAdmin, onboardingCompleted: Boolean(user.onboardingCompletedAt) } });
 });
 
 router.post("/logout", (req, res) => {
@@ -59,9 +59,10 @@ router.post("/logout", (req, res) => {
 
 router.get("/me", (req, res) => {
   if (!req.session?.userId) return res.status(401).json({ error: "Not authenticated" });
-  const user = db.prepare("SELECT id, name, email, avatar, isPlatformAdmin FROM users WHERE id = ?").get(req.session.userId);
+  const user = db.prepare("SELECT id, name, email, avatar, isPlatformAdmin, onboardingCompletedAt FROM users WHERE id = ?").get(req.session.userId);
   if (!user) return res.status(401).json({ error: "Not authenticated" });
-  res.json({ user: { ...user, isPlatformAdmin: Boolean(user.isPlatformAdmin) } });
+  const { onboardingCompletedAt, ...rest } = user;
+  res.json({ user: { ...rest, isPlatformAdmin: Boolean(user.isPlatformAdmin), onboardingCompleted: Boolean(onboardingCompletedAt) } });
 });
 
 // Phase 1: no email delivery yet. Endpoint acknowledges without leaking which

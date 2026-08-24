@@ -1,9 +1,19 @@
+import { useState } from "react";
 import { Outlet } from "react-router-dom";
 import Sidebar from "./Sidebar.jsx";
 import MobileNav from "./MobileNav.jsx";
 import Topbar from "./Topbar.jsx";
+import OnboardingFlow from "./OnboardingFlow.jsx";
+import { useAuth } from "../lib/auth.jsx";
 
 export default function Layout() {
+  const { user } = useAuth();
+  // Dismissed locally the instant the user finishes/skips, without waiting
+  // on a refetch of `user` — the backend call still happens (see
+  // OnboardingFlow's finish()), this just keeps the UI responsive.
+  const [onboardingDismissed, setOnboardingDismissed] = useState(false);
+  const showOnboarding = user && !user.onboardingCompleted && !onboardingDismissed;
+
   return (
     <div className="flex h-full">
       <Sidebar />
@@ -16,6 +26,7 @@ export default function Layout() {
           </div>
         </main>
       </div>
+      {showOnboarding && <OnboardingFlow onDone={() => setOnboardingDismissed(true)} />}
     </div>
   );
 }

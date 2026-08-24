@@ -449,6 +449,7 @@ const userCols = db.prepare("PRAGMA table_info(users)").all().map((c) => c.name)
 if (!userCols.includes("activeOrgId")) db.exec("ALTER TABLE users ADD COLUMN activeOrgId TEXT");
 if (!userCols.includes("isPlatformAdmin")) db.exec("ALTER TABLE users ADD COLUMN isPlatformAdmin INTEGER NOT NULL DEFAULT 0");
 if (!userCols.includes("stripeCustomerId")) db.exec("ALTER TABLE users ADD COLUMN stripeCustomerId TEXT"); // for personal Marketplace purchases — distinct from the per-org subscription customer
+if (!userCols.includes("onboardingCompletedAt")) db.exec("ALTER TABLE users ADD COLUMN onboardingCompletedAt TEXT"); // Phase 21 — NULL means the first-run onboarding flow hasn't been shown/finished yet
 
 const integrationOrgCols = db.prepare("PRAGMA table_info(integrations)").all().map((c) => c.name);
 if (!integrationOrgCols.includes("orgId")) db.exec("ALTER TABLE integrations ADD COLUMN orgId TEXT");
@@ -1885,6 +1886,25 @@ CREATE TABLE IF NOT EXISTS api_idempotency_keys (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency_key ON api_idempotency_keys(apiKeyId, idempotencyKey);
 CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON api_idempotency_keys(expiresAt);
+`);
+
+// Phase 21 — beta feedback. Deliberately minimal: no separate feedback
+// service/table family, just what's needed to collect and triage real
+// beta input. userId nullable (not orgId-scoped) since feedback is a
+// personal act, not something that needs multi-tenant isolation the way
+// agents/integrations do.
+db.exec(`
+CREATE TABLE IF NOT EXISTS feedback (
+  id        TEXT PRIMARY KEY,
+  userId    TEXT NOT NULL,
+  type      TEXT NOT NULL, -- bug | feature | general
+  message   TEXT NOT NULL,
+  page      TEXT,          -- the client route the user was on when they submitted this
+  status    TEXT NOT NULL DEFAULT 'new', -- new | reviewed | resolved
+  createdAt TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(createdAt);
 `);
 
 export default db;
