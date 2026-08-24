@@ -58,6 +58,15 @@ prompt_secret() {
   if _has_tty; then
     read -r -s -p "$__text (input hidden): " __input < /dev/tty || true
     echo
+    # No visual feedback while typing/pasting a hidden field means there's
+    # no way to tell if a paste landed once, landed three times (a real
+    # incident: a corrupted, multi-pasted OpenAI key caused every AI
+    # request to fail with a 401 until this was noticed), or didn't land
+    # at all. Echoing the character count — never the value — gives an
+    # immediate, safe sanity check without compromising the secret.
+    if [[ -n "$__input" ]]; then
+      log "Received ${#__input} characters."
+    fi
   else
     __input=""
   fi
