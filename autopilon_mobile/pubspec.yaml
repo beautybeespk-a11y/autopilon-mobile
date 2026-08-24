@@ -111,6 +111,17 @@ dependencies:
   # API this code uses (introduced in 11.0.0, unchanged through 12.x).
   share_plus: ^12.0.2
 
+  # Phase 21 — Integrations screen. Meta Ads/Gmail/Google Calendar/Drive/
+  # Docs/Sheets all connect through our own /api/integrations/*/connect
+  # endpoint, which requires the same authenticated session the rest of the
+  # app already carries (server/routes/metaAuth.js etc. are behind
+  # requireAuth). An external system-browser launch (url_launcher, used for
+  # Stripe checkout above) wouldn't carry that session cookie and would just
+  # land on a login page — so this flow needs an in-app WebView instead,
+  # seeded with the session cookie from ApiClient's own cookie jar before
+  # navigating. See oauth_webview_screen.dart.
+  webview_flutter: ^4.10.0
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:

@@ -209,6 +209,14 @@ class ApiClient {
   /// session is also destroyed via the normal POST /auth/logout call;
   /// this just clears what the device is holding onto.
   Future<void> clearSession() => _cookieJar.deleteAll();
+
+  /// The current session cookie(s) for our own API host — used only to seed
+  /// an in-app WebView's cookie store before navigating it to one of our
+  /// own OAuth /connect endpoints (see integrations/presentation/
+  /// oauth_webview_screen.dart). Never sent anywhere else; this just lets a
+  /// second "browser" (the WebView) present the same already-authenticated
+  /// session Dio is carrying, so requireAuth on the server accepts it.
+  Future<List<Cookie>> cookiesForBaseUrl() => _cookieJar.loadForRequest(Uri.parse(baseUrl));
 }
 
 /// A tiny Result type so every screen handles "worked" vs "didn't" the same
