@@ -209,6 +209,15 @@ class ApiClient {
   /// session is also destroyed via the normal POST /auth/logout call;
   /// this just clears what the device is holding onto.
   Future<void> clearSession() => _cookieJar.deleteAll();
+
+  /// Exposes the persisted session cookie(s) for `baseUrl`'s host — used by
+  /// OAuthConnectWebViewScreen to copy this Dio client's cookie jar into the
+  /// in-app WebView's own (separate) cookie store before loading a
+  /// `requireAuth`-gated connect URL (Meta/Gmail/Google connect + callback
+  /// routes need the same "autopilon.sid" session cookie a browser would
+  /// send). Without this, the WebView would hit those routes unauthenticated
+  /// and get a 401 instead of Meta's consent screen.
+  Future<List<Cookie>> sessionCookies() => _cookieJar.loadForRequest(Uri.parse(baseUrl));
 }
 
 /// A tiny Result type so every screen handles "worked" vs "didn't" the same

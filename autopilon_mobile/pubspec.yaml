@@ -111,6 +111,18 @@ dependencies:
   # API this code uses (introduced in 11.0.0, unchanged through 12.x).
   share_plus: ^12.0.2
 
+  # Phase 21 — Meta/Gmail/Google "Connect" flow. The backend's OAuth
+  # connect/callback routes are session-cookie-gated (requireAuth) and
+  # already work for the web client because a browser just carries its
+  # cookies along; an in-app WebView is the mobile equivalent of that same
+  # browser tab, loading the platform's own /api/integrations/<provider>/
+  # connect URL (built server-side from the platform owner's META_APP_ID —
+  # never a per-user credential) so the OAuth dialog and token exchange
+  # stay entirely server-side, exactly as they do on web. No custom URL
+  # scheme or deep link is needed: Meta's redirect_uri is unchanged and
+  # still points at the server's own /callback route, not the device.
+  webview_flutter: ^4.10.0
+
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
