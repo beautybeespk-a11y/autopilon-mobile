@@ -69,6 +69,44 @@ exactly when that would change (in short: when you need workers/app
 instances on more than one physical machine, which is a topology
 requirement, not a raw performance one).
 
+## Queue architecture: why `in_process`, and what the `worker` container actually does
+
+The production health endpoint (`/api/health/`) reports `queue.provider:
+"in_process"`, not `"redis"`, even though `REDIS_URL` is configured and
+Redis itself is healthy. **This is correct, not a misconfiguration** —
+confirmed by reading `server/jobs/queueProvider.js` and
+`server/jobs/jobManager.js` directly (Phase 20.6 investigation, correcting
+an earlier, incorrect "non-critical issue" note in this deployment's
+validation report):
+
+- **Two queue providers are genuinely implemented**: `InProcessQueueProvider`
+  (SQLite-backed, `jobs` table, WAL mode) and `RedisQueueProvider` (Phase 16,
+  real and separately tested). Both are real code, not a stub.
+- **`jobManager.js` always uses the SQLite one**, regardless of
+  `QUEUE_PROVIDER` — its `createJob()`/`cancelJob()`/`retryJob()`/etc. are
+  called *synchronously* from deep inside core business logic (webhook
+  events, cost controls, automations — 8+ call sites). A real Redis client
+  is unavoidably async; converting those call sites would mean rewriting
+  core business logic, which is out of scope for a deployment phase.
+  `QUEUE_PROVIDER=redis` only affects a separate accessor
+  (`getQueueProvider()`) that nothing in the current call path uses — so
+  setting it in `.env` would have **zero effect** on what actually runs.
+- **The SQLite-backed queue is not a lesser fallback** — WAL mode natively
+  supports multiple OS processes reading/writing the same file
+  concurrently, so it already gives real horizontal job-processing scaling
+  (multiple `worker.js` processes on the same machine/disk) without Redis.
+  `RedisQueueProvider` exists for a *genuinely distributed* (multi-machine)
+  deployment, which this single-VPS architecture is not.
+- **The `worker` container is not idle.** `docker-compose.yml` sets
+  `RUN_INLINE_JOB_PROCESSOR: "false"` on `app` specifically — the API
+  server does not poll the job queue itself; `worker.js` (always polls,
+  regardless of that flag) is the sole job processor in production, as
+  intended by having a dedicated container for it in the first place.
+- **A future Redis-backed distributed queue would only become necessary**
+  if this application ever needs to run `app`/`worker` processes across
+  more than one physical machine — a real architectural change, not
+  something to force prematurely by flipping an unused env var.
+
 ## Why images are built by GitHub Actions, not on the VPS
 
 `.github/workflows/build-and-push.yml` builds the existing `Dockerfile`
@@ -141,17 +179,38 @@ by a real test built in Phase 19 (`test:db-migration`) that boots current
 code against a database shaped like the oldest pre-migration schema with
 real data in it and confirms zero data loss.
 
-## Rollback
+## Rollback and version tracking
 
-`./rollback.sh` reverts to whatever image `deploy.sh` most recently
-replaced — tracked in `.deploy-state/previous-image`, updated on every
-deploy. It:
+`./rollback.sh` reverts to whatever `deploy.sh` most recently replaced —
+tracked in `.deploy-state/` (`previous-image`, `previous-digest`,
+`previous-commit`, `previous-deployed-at`, and the `current-*` equivalents,
+updated on every deploy/rollback). Tracking by **digest** (the image's real
+content hash, e.g. `sha256:...`), not just by tag, matters specifically
+because the floating `latest` tag can point at two genuinely different
+builds over time — comparing tags alone couldn't tell them apart, which is
+what made an early version of rollback effectively a no-op. `deploy.sh`'s
+local-build fallback path (used whenever no pre-built GHCR image is
+available yet) also stamps each build with a second, permanent tag —
+`${IMAGE_REPO}:local-<git-short-sha>-<UTC-timestamp>` — so a specific past
+build stays reachable by name even after `latest` moves on. Once
+`build-and-push.yml` is producing real registry images (after this
+branch merges to `main`), `./deploy.sh <sha-tag>` deploys a specific,
+already-identifiable commit-tagged build directly — no extra tagging
+needed for that path, `docker/metadata-action` already tags every push
+with `sha-<full-commit>`.
 
-1. Shows you the current vs. target image and asks for confirmation
-   (skip with `--yes`).
+`rollback.sh`:
+
+1. Shows you the current vs. target image, **digest, git commit, and
+   original deploy timestamp** — not just a bare tag — and asks for
+   confirmation (skip with `--yes`).
 2. Updates `IMAGE_TAG` in `.env` to the previous value.
-3. Pulls that image and restarts `app`/`worker`.
-4. Runs the same real health checks as every other script.
+3. Pulls that image if it exists in a registry; for a local-only version
+   tag (never pushed anywhere), the pull is expected to fail and is
+   treated as non-fatal — the existing local image under that tag is used
+   directly.
+4. Restarts `app`/`worker`.
+5. Runs the same real health checks as every other script.
 
 **Everything is preserved** — users, database, agents, projects,
 integrations, settings: rollback only ever changes which container image

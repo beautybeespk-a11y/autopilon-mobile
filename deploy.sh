@@ -42,11 +42,22 @@ echo "=============================================================="
 
 # 1. Record the currently-running image so rollback.sh has something real
 #    to go back to — read straight from Docker, not from .env (which
-#    could already be stale relative to what's actually deployed).
+#    could already be stale relative to what's actually deployed). Also
+#    records the image DIGEST (immutable, unlike the tag — two genuinely
+#    different deploys can both be tagged "latest") plus which git commit
+#    and when, so "previous version" is a real, identifiable thing even
+#    when the tag alone can't tell two builds apart.
 PREV_IMAGE="$(current_running_image)"
+PREV_DIGEST="$(current_image_digest)"
 if [[ -n "$PREV_IMAGE" ]]; then
   echo "$PREV_IMAGE" > "$STATE_DIR/previous-image"
-  log "Recorded currently-running image for rollback: $PREV_IMAGE"
+  echo "$PREV_DIGEST" > "$STATE_DIR/previous-digest"
+  # Carry forward whatever commit/timestamp the LAST successful deploy
+  # recorded as "current" — that's the real provenance of what's running
+  # right now, not something this run can know on its own.
+  [[ -f "$STATE_DIR/current-commit" ]] && cp "$STATE_DIR/current-commit" "$STATE_DIR/previous-commit"
+  [[ -f "$STATE_DIR/current-deployed-at" ]] && cp "$STATE_DIR/current-deployed-at" "$STATE_DIR/previous-deployed-at"
+  log "Recorded currently-running image for rollback: $PREV_IMAGE ($PREV_DIGEST)"
 else
   warn "No currently-running 'app' container found — nothing to record as 'previous' yet. Expected right after a fresh install; rollback.sh will have nothing to revert to until this deploy completes and a later one runs."
 fi
@@ -94,11 +105,21 @@ if [[ "$TARGET_TAG" != "${IMAGE_TAG:-}" ]]; then
 fi
 require_env_file # reload with the (possibly just-updated) tag
 
+GIT_SHA="$(current_git_commit)"
+
 log "Pulling ${IMAGE_REPO}:${IMAGE_TAG}..."
 if ! $COMPOSE pull app worker; then
   warn "Pull failed for ${IMAGE_REPO}:${IMAGE_TAG} — falling back to building on this VPS instead (same path install-production.sh uses when no pre-built image is available yet, e.g. before this branch's first build-and-push.yml run, or while the GHCR package is still private). If this tag was just pushed by build-and-push.yml, GitHub Actions may still be running — check the Actions tab. If the GHCR package is private, see install-production.sh's registry-access step / PRODUCTION_DEPLOYMENT.md for how to 'docker login ghcr.io' on this VPS instead."
   $COMPOSE build app worker
   $COMPOSE pull redis traefik
+  # A locally-built image is tagged ${IMAGE_TAG} (usually the floating
+  # "latest") by the compose build itself — indistinguishable from any
+  # OTHER local build also tagged "latest". Stamp a second, permanent tag
+  # keyed by git commit so this specific build stays identifiable and
+  # reachable even after a later deploy moves "latest" elsewhere.
+  LOCAL_VERSION_TAG="local-${GIT_SHA}-$(date -u +%Y%m%dT%H%M%SZ)"
+  docker tag "${IMAGE_REPO}:${IMAGE_TAG}" "${IMAGE_REPO}:${LOCAL_VERSION_TAG}"
+  log "Tagged this build as ${IMAGE_REPO}:${LOCAL_VERSION_TAG} (permanent, in addition to :${IMAGE_TAG})."
 fi
 
 log "Restarting containers (named volumes are preserved — this never runs 'docker compose down -v')..."
@@ -109,7 +130,10 @@ log "No separate migration step needed — the new containers apply any additive
 log "Running health checks..."
 if run_health_checks; then
   echo "${IMAGE_REPO}:${IMAGE_TAG}" > "$STATE_DIR/current-image"
-  log "Deploy succeeded and is healthy: ${IMAGE_REPO}:${IMAGE_TAG}"
+  current_image_digest > "$STATE_DIR/current-digest"
+  echo "$GIT_SHA" > "$STATE_DIR/current-commit"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/current-deployed-at"
+  log "Deploy succeeded and is healthy: ${IMAGE_REPO}:${IMAGE_TAG} (commit $GIT_SHA, digest $(current_image_digest))"
   exit 0
 else
   err "Deploy completed but one or more health checks failed."

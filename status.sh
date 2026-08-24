@@ -68,7 +68,9 @@ fi
 
 echo
 echo "-- Deployed image --"
-echo "Currently running: $(current_running_image || echo unknown)"
+echo "Currently running: $(current_running_image || echo unknown)  (digest $(current_image_digest || echo unknown))"
+[[ -f "$STATE_DIR/current-commit" ]] && echo "  commit: $(cat "$STATE_DIR/current-commit"), deployed: $(cat "$STATE_DIR/current-deployed-at" 2>/dev/null || echo unknown)"
 if [[ -f "$STATE_DIR/previous-image" ]]; then
-  echo "Previous (rollback target): $(cat "$STATE_DIR/previous-image")"
+  echo "Previous (rollback target): $(cat "$STATE_DIR/previous-image")  (digest $(cat "$STATE_DIR/previous-digest" 2>/dev/null || echo unknown))"
+  [[ -f "$STATE_DIR/previous-commit" ]] && echo "  commit: $(cat "$STATE_DIR/previous-commit"), deployed: $(cat "$STATE_DIR/previous-deployed-at" 2>/dev/null || echo unknown)"
 fi

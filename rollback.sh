@@ -45,19 +45,33 @@ PREV_IMAGE="$(cat "$PREV_FILE")"
 [[ -n "$PREV_IMAGE" ]] || die "Recorded previous image is empty — refusing to roll back to nothing. Check $PREV_FILE."
 
 CURRENT_IMAGE="$(current_running_image)"
+CURRENT_DIGEST="$(current_image_digest)"
 PREV_TAG="${PREV_IMAGE##*:}"
+PREV_DIGEST="$(cat "$STATE_DIR/previous-digest" 2>/dev/null || echo "unknown")"
+PREV_COMMIT="$(cat "$STATE_DIR/previous-commit" 2>/dev/null || echo "unknown")"
+PREV_DEPLOYED_AT="$(cat "$STATE_DIR/previous-deployed-at" 2>/dev/null || echo "unknown")"
 
 echo
 echo "=============================================================="
 echo " Rollback"
 echo "=============================================================="
-echo " Currently running: ${CURRENT_IMAGE:-unknown}"
-echo " Will roll back to: ${PREV_IMAGE}"
+echo " Currently running: ${CURRENT_IMAGE:-unknown} (digest ${CURRENT_DIGEST:-unknown})"
+echo " Will roll back to: ${PREV_IMAGE} (digest ${PREV_DIGEST})"
+echo "   commit: ${PREV_COMMIT}, deployed: ${PREV_DEPLOYED_AT}"
 echo " Data preserved:    database, uploads, Redis data, TLS cert (all untouched)"
 echo "=============================================================="
 
-if [[ "$CURRENT_IMAGE" == "$PREV_IMAGE" ]]; then
-  warn "Currently-running image already matches the recorded 'previous' image — nothing to do."
+# Compare by DIGEST, not tag string — two genuinely different builds can
+# both be tagged "latest" (the exact scenario that made rollback a no-op
+# before per-deploy version tagging existed). Falls back to a tag
+# comparison only if a digest is missing (e.g. state predates this check).
+if [[ -n "$CURRENT_DIGEST" && -n "$PREV_DIGEST" && "$PREV_DIGEST" != "unknown" ]]; then
+  if [[ "$CURRENT_DIGEST" == "$PREV_DIGEST" ]]; then
+    warn "Currently-running image is already the same build (digest $CURRENT_DIGEST) as the recorded 'previous' — nothing to do."
+    exit 0
+  fi
+elif [[ "$CURRENT_IMAGE" == "$PREV_IMAGE" ]]; then
+  warn "Currently-running image already matches the recorded 'previous' image tag, and no digest was recorded to check further — nothing to do."
   exit 0
 fi
 
@@ -77,7 +91,13 @@ log "Updated .env: IMAGE_TAG=${PREV_TAG}"
 require_env_file
 
 log "Pulling ${PREV_IMAGE}..."
-$COMPOSE pull
+# A best-effort pull, not a hard requirement: deploy.sh's local-build
+# fallback path tags images like "local-<commit>-<timestamp>" that only
+# ever exist on THIS Docker daemon, never pushed to any registry — pulling
+# one of those is EXPECTED to fail. If the image genuinely doesn't exist
+# anywhere (not pulled, not local), the follow-up `up -d` fails loudly and
+# clearly instead, which is the right place for that error to surface.
+$COMPOSE pull || warn "Pull failed for ${PREV_IMAGE} — expected if this is a local-only version tag (never pushed to a registry). Continuing with whatever image already exists locally under this tag."
 
 log "Restarting containers on the previous image (named volumes untouched)..."
 $COMPOSE up -d --remove-orphans
@@ -89,8 +109,14 @@ if run_health_checks; then
   # so running rollback.sh a second time in a row correctly rolls
   # forward again instead of being a no-op.
   echo "$PREV_IMAGE" > "$STATE_DIR/current-image"
-  [[ -n "$CURRENT_IMAGE" ]] && echo "$CURRENT_IMAGE" > "$STATE_DIR/previous-image"
-  log "Rollback succeeded and is healthy: $PREV_IMAGE"
+  echo "$PREV_DIGEST" > "$STATE_DIR/current-digest"
+  echo "$PREV_COMMIT" > "$STATE_DIR/current-commit"
+  echo "$PREV_DEPLOYED_AT" > "$STATE_DIR/current-deployed-at"
+  if [[ -n "$CURRENT_IMAGE" ]]; then
+    echo "$CURRENT_IMAGE" > "$STATE_DIR/previous-image"
+    echo "$CURRENT_DIGEST" > "$STATE_DIR/previous-digest"
+  fi
+  log "Rollback succeeded and is healthy: $PREV_IMAGE (commit $PREV_COMMIT, digest $PREV_DIGEST)"
 else
   err "Rollback completed but health checks failed. This means BOTH the version you rolled back from AND the one you rolled back to are showing problems right now — check ./logs.sh for every service (traefik, app, worker, redis), this is likely an infrastructure issue (DNS, Redis, disk) rather than an application-version issue."
   exit 1

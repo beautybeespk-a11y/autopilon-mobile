@@ -97,6 +97,25 @@ current_running_image() {
   docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null || echo ""
 }
 
+# Returns the CURRENTLY-running app container's actual local image ID
+# (a content digest, e.g. "sha256:abc123...") — immutable and distinct per
+# build, unlike current_running_image()'s tag string, which can be the same
+# floating "latest" across two genuinely different deploys. This is what
+# lets deploy.sh/rollback.sh tell two "latest"-tagged builds apart.
+current_image_digest() {
+  local cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q app 2>/dev/null || true)"
+  [[ -n "$cid" ]] || { echo ""; return; }
+  docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || echo ""
+}
+
+# Short git commit hash of the checkout deploy.sh is running from, or
+# "unknown" outside a git checkout (shouldn't happen in production, but
+# state-tracking should never crash over it).
+current_git_commit() {
+  (cd "$APP_DIR" && git rev-parse --short HEAD 2>/dev/null) || echo "unknown"
+}
+
 # Real health verification — same checks install-production.sh runs after
 # first boot, reused here so deploy.sh/rollback.sh/status.sh all agree on
 # what "healthy" means instead of three slightly different definitions.
