@@ -27,5 +27,7 @@ import "./shopify/webhooks.js";
 import "./agentCollaboration.js";
 import "./files.js";
 import "./content.js";
+import "./seo/auditPageSeo.js";
+import "./seo/checkPageSpeed.js";
 
 export { listTools, listToolsForSkills, getTool } from "./registry.js";

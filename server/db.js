@@ -1907,4 +1907,14 @@ CREATE TABLE IF NOT EXISTS feedback (
 CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(createdAt);
 `);
 
+// Phase 21 — SEO skill (on-page audit + Core Web Vitals via Google's free
+// PageSpeed Insights API). Rank tracking / competitor backlink data are
+// deliberately NOT part of this — those need a paid third-party SEO data
+// provider (no free API exists for either), out of scope until that's a
+// real subscription someone has decided to pay for.
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("seo", "SEO Audit", "Audit a page's on-page SEO (title, meta description, headings, alt text) and check Core Web Vitals / page speed.", "marketing");
+db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
+  .run("Audit a page's on-page SEO (title, meta description, headings, alt text) and check Core Web Vitals / page speed.", "marketing", "seo");
+
 export default db;

@@ -39,6 +39,7 @@ const BASE_USER_PERMISSIONS = new Set([
   // unusable. Fixed alongside adding "content_studio" for Phase 15's tools.
   "files",
   "content_studio",
+  "seo.read",
 ]);
 
 export function checkPermission({ agentId, permission }) {

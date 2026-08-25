@@ -54,6 +54,11 @@ you give it.
 - Content Studio (AI-assisted content/image/video generation).
 - Organizations — invite teammates, share agents within an org, per-org
   usage tracking and quota limits.
+- SEO audit skill — an agent can audit a page's on-page SEO (title, meta
+  description, headings, alt text, canonical/robots tags) and check Core
+  Web Vitals/page speed via Google PageSpeed Insights. This does NOT
+  include keyword rank tracking or competitor backlink analysis — those
+  need a paid third-party SEO data provider, not built yet.
 - A public developer API + SDKs (JS/TS, Python) for anyone who wants to
   build against the platform programmatically.
 

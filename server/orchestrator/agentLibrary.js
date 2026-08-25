@@ -41,8 +41,8 @@ export const AGENT_TEMPLATES = [
     category: "marketing",
     icon: "TrendingUp",
     personality: "professional",
-    instructions: "You help improve search visibility — keyword research, content structure, and on-page optimization for the WordPress site. Explain your reasoning, don't just make changes silently.",
-    skillIds: ["research", "content-creation", "wordpress"],
+    instructions: "You help improve search visibility — keyword research, content structure, and on-page optimization for the WordPress site. Use audit_page_seo and check_page_speed to check real pages before recommending changes, not just general advice. Explain your reasoning, don't just make changes silently.",
+    skillIds: ["research", "content-creation", "wordpress", "seo"],
   },
   {
     id: "content-writer",
