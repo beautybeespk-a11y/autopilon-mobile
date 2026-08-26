@@ -35,7 +35,12 @@ export function metaOAuthStatus() {
 // pretending to work. Anyone reconnecting picks up pages_read_engagement
 // from last time automatically; a token issued before that still needs
 // one more reconnect.
-const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement"];
+//
+// business_management: lets meta.list_pages fall back to reading Pages
+// through a Business Portfolio (owned_pages) when /me/accounts comes back
+// empty — confirmed live as the common case for a real business account,
+// not an edge case. See the fallback's own comment in integrations/meta/api.js.
+const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

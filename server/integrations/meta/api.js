@@ -64,9 +64,39 @@ export async function getCampaignInsights(accessToken, campaignId, datePreset = 
 
 // Needed to pick which Facebook Page an ad creative posts as
 // (object_story_spec.page_id below) — requires the pages_show_list scope.
+//
+// /me/accounts ONLY returns Pages where the user has a classic, direct
+// per-Page role — confirmed live: a real account with 3 real Pages, all
+// managed through a Business Portfolio (Business Manager) with only
+// portfolio-level "Full access" assigned rather than a classic Page role,
+// got an empty result here every time despite being a genuine Page admin
+// through Business Settings. This is a known, common gap for any business
+// using Meta's newer Business Portfolio structure, not an edge case — so
+// falling back to the Business Portfolio path isn't optional polish, it's
+// what most real business accounts actually need. business_management
+// scope required for the fallback; if it's missing (not granted, or the
+// call fails for any other reason) this degrades to just the classic
+// /me/accounts result rather than throwing.
 export async function listPages(accessToken) {
-  const data = await metaFetch("/me/accounts?fields=id,name,category", { accessToken });
-  return data.data || [];
+  const direct = await metaFetch("/me/accounts?fields=id,name,category", { accessToken });
+  if (direct.data?.length) return direct.data;
+
+  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
+  const perBusiness = await Promise.all(
+    (businesses.data || []).map((b) =>
+      metaFetch(`/${b.id}/owned_pages?fields=id,name,category`, { accessToken }).catch(() => ({ data: [] }))
+    )
+  );
+  const seen = new Set();
+  const pages = [];
+  for (const result of perBusiness) {
+    for (const page of result.data || []) {
+      if (seen.has(page.id)) continue;
+      seen.add(page.id);
+      pages.push(page);
+    }
+  }
+  return pages;
 }
 
 export async function createAdSet(accessToken, adAccountId, fields) {
