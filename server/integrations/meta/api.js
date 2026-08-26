@@ -150,10 +150,26 @@ export async function listPagePosts(accessToken, pageId) {
 
 // A Page's Instagram Business Account isn't the Page itself — it's a
 // separate id one hop away, only present if the Page actually has an IG
-// account connected in Meta Business Suite.
+// account connected via the CLASSIC per-Page link. Same Business Portfolio
+// gap as listPages() above: an Instagram account owned by a Business
+// Portfolio (Business Settings > Instagram accounts) doesn't show up here
+// at all — confirmed live for the same real account whose Pages hit this
+// exact issue. Falls back to checking the account's Business Portfolios
+// directly. Not strictly page-specific (a Business Portfolio's Instagram
+// accounts aren't necessarily tied to one particular Page in this API
+// response) — correct for the common one-portfolio-one-IG-account case;
+// someone with several portfolios each holding their own Instagram account
+// could get an ambiguous match here.
 export async function getInstagramAccountId(accessToken, pageId) {
   const data = await metaFetch(`/${pageId}?fields=instagram_business_account`, { accessToken });
-  return data.instagram_business_account?.id || null;
+  if (data.instagram_business_account?.id) return data.instagram_business_account.id;
+
+  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
+  for (const business of businesses.data || []) {
+    const igAccounts = await metaFetch(`/${business.id}/instagram_accounts?fields=id,username`, { accessToken }).catch(() => ({ data: [] }));
+    if (igAccounts.data?.length) return igAccounts.data[0].id;
+  }
+  return null;
 }
 
 export async function listInstagramPosts(accessToken, igAccountId) {
