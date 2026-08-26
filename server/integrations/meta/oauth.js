@@ -20,11 +20,22 @@ export function metaOAuthStatus() {
 // pages_show_list: lists which Pages the account manages (meta.list_pages).
 // pages_read_engagement: read a Page's own posts (meta.list_page_posts) —
 // pages_show_list alone only says WHICH pages exist, not their content.
-// instagram_basic: read the Page's connected Instagram Business Account's
-// media (meta.list_instagram_posts). Anyone already connected needs to
-// reconnect to pick up any of these — a token issued under an older scope
-// list doesn't retroactively gain new ones.
-const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "instagram_basic"];
+//
+// instagram_basic deliberately NOT requested — real production error,
+// confirmed live: "Invalid Scopes: instagram_basic" (Facebook rejects the
+// WHOLE authorization request if any one requested scope is invalid for
+// this app, so this alone was blocking reconnection entirely, not just
+// Instagram). Meta shut down the old Instagram Basic Display API in Dec
+// 2024; reaching a Business/Creator account's media through Facebook
+// Login now needs the app to have the Instagram product added in
+// developers.facebook.com first, which grants the actual current scope
+// name — not something this code can request its way around. Until that
+// product is added and the real scope name confirmed, meta.list_instagram_posts
+// fails with a clear "not available" error instead of silently
+// pretending to work. Anyone reconnecting picks up pages_read_engagement
+// from last time automatically; a token issued before that still needs
+// one more reconnect.
+const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

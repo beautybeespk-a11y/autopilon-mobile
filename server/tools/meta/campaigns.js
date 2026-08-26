@@ -190,7 +190,7 @@ registerTool({
 
 registerTool({
   name: "meta.list_instagram_posts",
-  description: "Lists recent posts from the Instagram Business Account connected to a Facebook Page — use this to let the user pick an existing Instagram post/reel to boost as an ad with meta.boost_post. Returns an empty list (not an error) if the Page has no Instagram account connected.",
+  description: "Lists recent posts from the Instagram Business Account connected to a Facebook Page — use this to let the user pick an existing Instagram post/reel to boost as an ad with meta.boost_post. Returns an empty list (not an error) if the Page has no Instagram account connected, or if reading Instagram content isn't available on this deployment yet (tell the user Facebook post boosting still works either way).",
   category: "meta_ads",
   parameters: { type: "object", properties: { pageId: { type: "string" } }, required: ["pageId"] },
   requiredPermissions: ["meta.read"],
@@ -199,11 +199,21 @@ registerTool({
     const accessToken = token(context);
     const igAccountId = await meta.getInstagramAccountId(accessToken, parameters.pageId);
     if (!igAccountId) return { posts: [], instagramConnected: false };
-    const posts = await meta.listInstagramPosts(accessToken, igAccountId);
-    return {
-      instagramConnected: true,
-      posts: posts.map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, mediaUrl: p.media_url, permalink: p.permalink, timestamp: p.timestamp })),
-    };
+    // Reading Page metadata (above) and reading actual Instagram content
+    // (below) need different permissions — this app currently only
+    // requests the former (see oauth.js's SCOPES comment on why
+    // instagram_basic isn't requested), so this can legitimately fail
+    // even when an IG account IS linked. Degrade to an empty list with a
+    // clear reason rather than surfacing Meta's raw permission error.
+    try {
+      const posts = await meta.listInstagramPosts(accessToken, igAccountId);
+      return {
+        instagramConnected: true,
+        posts: posts.map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, mediaUrl: p.media_url, permalink: p.permalink, timestamp: p.timestamp })),
+      };
+    } catch (err) {
+      return { instagramConnected: true, posts: [], reason: `Instagram account is linked, but reading its posts isn't available yet (${err.message}). Facebook post boosting still works.` };
+    }
   },
 });
 
