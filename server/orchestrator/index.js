@@ -25,15 +25,23 @@ const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search
 // (won't match "I checked and found..."): only future/present-intent
 // phrasing that specifically implies an action is still pending.
 //
-// A second real occurrence (live) escaped the first version of this
-// regex: "Let me do that now." — the verb "do" wasn't on the original
-// whitelist (check|retrieve|fetch|pull|gather|look), because that list
-// can never enumerate every verb a model might use. Fixed by matching
-// the general SHAPE of the promise instead of specific verbs: "let
-// me/let's/I'll/I will <any single verb> that/this/it" — this is what
-// actually marks a sentence as a forward-looking promise rather than a
-// completed action, regardless of which verb fills the slot.
-const NARRATION_WITHOUT_ACTION = /\b((let me|let's|i'll|i will) \w+ (that|this|it)\b|hold on|one moment|give me a moment|please wait|i need to (check|retrieve|fetch|pull|gather|verify|do that|do this))\b/i;
+// Two more real occurrences (live) escaped the "verb + immediate object"
+// version of this regex: "I will first retrieve the recent posts..." and
+// "Let me proceed with that." — both have a word (an adverb, a
+// preposition) between the modal verb and its object, so a shape that
+// required them adjacent still missed real cases. Chasing the exact
+// grammatical shape of every way a model can phrase "I'm about to do
+// this" is whack-a-mole. Matching on the commitment PHRASE alone — no
+// requirement about what follows it — is far more robust, at the cost of
+// occasionally nudging a legitimate final answer that happens to contain
+// one of these (e.g. "I will continue monitoring this weekly" as a
+// closing remark on completed work). That's an acceptable trade: the
+// nudge is capped at one retry (MAX_NARRATION_NUDGES) and a correct final
+// answer survives being asked to confirm it has nothing left to do,
+// whereas a real unfulfilled action silently returned as done does not
+// recover on its own. "let me know" is excluded — it's asking the user
+// something, not promising an action.
+const NARRATION_WITHOUT_ACTION = /\b(let me(?!\s+know)|let's|i'll|i will|i'm going to|i am going to|i plan to|i need to|i'm about to|i am about to|hold on|one moment|give me a moment|please wait)\b/i;
 // Exactly one retry — this must never become a second way to loop
 // indefinitely alongside MAX_STEPS/stepsRun (which this doesn't touch,
 // since a narrated-but-toolless response was never counted as a step to
