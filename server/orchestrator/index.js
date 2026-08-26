@@ -24,7 +24,16 @@ const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search
 // prompt as the pattern turns up. Deliberately narrow and past-tense-safe
 // (won't match "I checked and found..."): only future/present-intent
 // phrasing that specifically implies an action is still pending.
-const NARRATION_WITHOUT_ACTION = /\b(let me (check|retrieve|fetch|pull|gather|look)|i'll (check|retrieve|fetch|pull|gather|look)|i will (check|retrieve|fetch|pull|gather|look)|hold on|one moment|give me a moment|please wait|i need to (check|retrieve|fetch|pull|gather|verify))\b/i;
+//
+// A second real occurrence (live) escaped the first version of this
+// regex: "Let me do that now." — the verb "do" wasn't on the original
+// whitelist (check|retrieve|fetch|pull|gather|look), because that list
+// can never enumerate every verb a model might use. Fixed by matching
+// the general SHAPE of the promise instead of specific verbs: "let
+// me/let's/I'll/I will <any single verb> that/this/it" — this is what
+// actually marks a sentence as a forward-looking promise rather than a
+// completed action, regardless of which verb fills the slot.
+const NARRATION_WITHOUT_ACTION = /\b((let me|let's|i'll|i will) \w+ (that|this|it)\b|hold on|one moment|give me a moment|please wait|i need to (check|retrieve|fetch|pull|gather|verify|do that|do this))\b/i;
 // Exactly one retry — this must never become a second way to loop
 // indefinitely alongside MAX_STEPS/stepsRun (which this doesn't touch,
 // since a narrated-but-toolless response was never counted as a step to
