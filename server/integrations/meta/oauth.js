@@ -17,11 +17,14 @@ export function metaOAuthStatus() {
   };
 }
 
-// pages_show_list added for meta.list_pages (needed to pick the page an
-// ad's creative posts as — ads_management alone doesn't expose /me/accounts).
-// Anyone already connected before this needs to reconnect to grant it; a
-// token issued under the old scope list doesn't retroactively gain it.
-const SCOPES = ["ads_read", "ads_management", "pages_show_list"];
+// pages_show_list: lists which Pages the account manages (meta.list_pages).
+// pages_read_engagement: read a Page's own posts (meta.list_page_posts) —
+// pages_show_list alone only says WHICH pages exist, not their content.
+// instagram_basic: read the Page's connected Instagram Business Account's
+// media (meta.list_instagram_posts). Anyone already connected needs to
+// reconnect to pick up any of these — a token issued under an older scope
+// list doesn't retroactively gain new ones.
+const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "instagram_basic"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

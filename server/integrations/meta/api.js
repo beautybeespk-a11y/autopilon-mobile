@@ -107,3 +107,26 @@ export async function createAdCreative(accessToken, adAccountId, fields) {
 export async function createAd(accessToken, adAccountId, fields) {
   return metaFetch(`/${normalizeAdAccountId(adAccountId)}/ads`, { accessToken, method: "POST", body: fields });
 }
+
+// A Page's own recent organic posts — for "boost this post" (meta.boost_post),
+// same mechanism as the "Boost" button in Meta's own tools: an ad creative
+// that points at an existing post (object_story_id) instead of uploading new
+// creative content. Requires pages_read_engagement in addition to
+// pages_show_list (which only lists which Pages exist, not their content).
+export async function listPagePosts(accessToken, pageId) {
+  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken });
+  return data.data || [];
+}
+
+// A Page's Instagram Business Account isn't the Page itself — it's a
+// separate id one hop away, only present if the Page actually has an IG
+// account connected in Meta Business Suite.
+export async function getInstagramAccountId(accessToken, pageId) {
+  const data = await metaFetch(`/${pageId}?fields=instagram_business_account`, { accessToken });
+  return data.instagram_business_account?.id || null;
+}
+
+export async function listInstagramPosts(accessToken, igAccountId) {
+  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp`, { accessToken });
+  return data.data || [];
+}

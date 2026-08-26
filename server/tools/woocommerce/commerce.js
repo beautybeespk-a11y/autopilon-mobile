@@ -27,7 +27,17 @@ registerTool({
     const products = await wc.listProducts(siteUrl, consumerKey, consumerSecret, {
       search: parameters.search || "", stock_status: parameters.stockStatus || "", per_page: 20,
     });
-    return { products: products.map((p) => ({ id: p.id, name: p.name, price: p.price, stockQuantity: p.stock_quantity, stockStatus: p.stock_status })) };
+    return {
+      products: products.map((p) => ({
+        id: p.id, name: p.name, price: p.price, stockQuantity: p.stock_quantity, stockStatus: p.stock_status,
+        // For meta.create_image_ad's imageUrl/link — a WooCommerce product's
+        // own images and permalink are already public (the live store),
+        // unlike a chat attachment or a Content Studio asset, so no upload
+        // bridge is needed to use one directly as an ad's image/link.
+        imageUrl: p.images?.[0]?.src || null,
+        permalink: p.permalink || null,
+      })),
+    };
   },
 });
 

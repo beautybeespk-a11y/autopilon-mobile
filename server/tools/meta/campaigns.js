@@ -4,6 +4,7 @@ import * as meta from "../../integrations/meta/api.js";
 import { publishEvent } from "../../automation/triggers.js";
 import { linkAssetToCampaign } from "../../orchestrator/contentService.js";
 import { resolveChatImage } from "../shared/chatImage.js";
+import { resolveContentImageAsset } from "../shared/contentAsset.js";
 
 function token(context) {
   // Every Meta tool needs a live connection; this throws a clear, tool-level
@@ -170,8 +171,94 @@ registerTool({
 });
 
 registerTool({
+  name: "meta.list_page_posts",
+  description: "Lists a Facebook Page's recent organic posts — use this to let the user pick an existing post to boost as an ad with meta.boost_post, instead of creating new ad creative from scratch.",
+  category: "meta_ads",
+  parameters: { type: "object", properties: { pageId: { type: "string" } }, required: ["pageId"] },
+  requiredPermissions: ["meta.read"],
+  requiresConfirmation: false,
+  async execute(parameters, context) {
+    const posts = await meta.listPagePosts(token(context), parameters.pageId);
+    return {
+      posts: posts.map((p) => ({
+        id: p.id, message: p.message || null, createdTime: p.created_time, permalink: p.permalink_url,
+        mediaType: p.attachments?.data?.[0]?.media_type || null,
+      })),
+    };
+  },
+});
+
+registerTool({
+  name: "meta.list_instagram_posts",
+  description: "Lists recent posts from the Instagram Business Account connected to a Facebook Page — use this to let the user pick an existing Instagram post/reel to boost as an ad with meta.boost_post. Returns an empty list (not an error) if the Page has no Instagram account connected.",
+  category: "meta_ads",
+  parameters: { type: "object", properties: { pageId: { type: "string" } }, required: ["pageId"] },
+  requiredPermissions: ["meta.read"],
+  requiresConfirmation: false,
+  async execute(parameters, context) {
+    const accessToken = token(context);
+    const igAccountId = await meta.getInstagramAccountId(accessToken, parameters.pageId);
+    if (!igAccountId) return { posts: [], instagramConnected: false };
+    const posts = await meta.listInstagramPosts(accessToken, igAccountId);
+    return {
+      instagramConnected: true,
+      posts: posts.map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, mediaUrl: p.media_url, permalink: p.permalink, timestamp: p.timestamp })),
+    };
+  },
+});
+
+registerTool({
+  name: "meta.boost_post",
+  description: "Creates an ad from an EXISTING Facebook Page post or Instagram post/reel (Meta's own 'Boost Post' mechanism) instead of new creative — the ad runs the post's own content as-is. Created PAUSED. Requires an ad set already created with meta.create_ad_set. Pass exactly one of: postId (a Facebook post id from meta.list_page_posts) or instagramMediaId + pageId (an Instagram post from meta.list_instagram_posts).",
+  category: "meta_ads",
+  parameters: {
+    type: "object",
+    properties: {
+      adAccountId: { type: "string" },
+      adSetId: { type: "string" },
+      name: { type: "string" },
+      postId: { type: "string" },
+      instagramMediaId: { type: "string" },
+      pageId: { type: "string", description: "Required when using instagramMediaId — not needed for postId." },
+    },
+    required: ["adAccountId", "adSetId", "name"],
+  },
+  requiredPermissions: ["meta.write"],
+  requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
+  async execute(parameters, context) {
+    if (Boolean(parameters.postId) === Boolean(parameters.instagramMediaId)) {
+      throw new Error("Provide exactly one of: postId (a Facebook post) or instagramMediaId (an Instagram post).");
+    }
+    if (parameters.instagramMediaId && !parameters.pageId) {
+      throw new Error("pageId is required when boosting an Instagram post.");
+    }
+    const accessToken = token(context);
+    let creativeFields;
+    if (parameters.postId) {
+      // postId from meta.list_page_posts is already in Meta's own
+      // "{page_id}_{post_id}" composite form — object_story_id wants
+      // exactly that, no reconstruction needed.
+      creativeFields = { name: `${parameters.name} — creative`, object_story_id: parameters.postId };
+    } else {
+      const igAccountId = await meta.getInstagramAccountId(accessToken, parameters.pageId);
+      if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected.");
+      creativeFields = { name: `${parameters.name} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId };
+    }
+    const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, creativeFields);
+    const ad = await meta.createAd(accessToken, parameters.adAccountId, {
+      name: parameters.name,
+      adset_id: parameters.adSetId,
+      creative: { creative_id: creative.id },
+      status: "PAUSED",
+    });
+    publishEvent(context.userId, "meta_ads", "meta_ads_event", { eventSubtype: "ad_created", adId: ad.id, adSetId: parameters.adSetId, name: parameters.name, format: "boosted_post" });
+    return { adId: ad.id, creativeId: creative.id, status: "PAUSED" };
+  },
+});
+
+registerTool({
   name: "meta.create_image_ad",
-  description: "Creates a single-image Meta ad — uploads the image, creates the ad creative, and creates the ad, all PAUSED so nothing spends until manually resumed. Requires an ad set already created with meta.create_ad_set and a page id from meta.list_pages. Pass either imageReferenceId (a photo the user attached in this chat) or imageUrl (a public image URL), not both.",
+  description: "Creates a single-image Meta ad — uploads the image, creates the ad creative, and creates the ad, all PAUSED so nothing spends until manually resumed. Requires an ad set already created with meta.create_ad_set and a page id from meta.list_pages. Pass exactly one image source: imageReferenceId (a photo the user attached in this chat), imageUrl (a public image URL — e.g. a WooCommerce/Shopify product's own image from woocommerce.list_products/shopify.list_products), or contentAssetId (an image id returned by generate_image, for an ad the agent designed itself).",
   category: "meta_ads",
   parameters: {
     type: "object",
@@ -182,6 +269,7 @@ registerTool({
       name: { type: "string" },
       imageReferenceId: { type: "string" },
       imageUrl: { type: "string" },
+      contentAssetId: { type: "string" },
       primaryText: { type: "string" },
       headline: { type: "string" },
       description: { type: "string" },
@@ -193,13 +281,17 @@ registerTool({
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
   async execute(parameters, context) {
-    if (!parameters.imageReferenceId && !parameters.imageUrl) {
-      throw new Error("Provide either imageReferenceId (a photo attached in this chat) or imageUrl (a public image URL).");
+    const imageSourcesGiven = [parameters.imageReferenceId, parameters.imageUrl, parameters.contentAssetId].filter(Boolean).length;
+    if (imageSourcesGiven !== 1) {
+      throw new Error("Provide exactly one of: imageReferenceId (a chat-attached photo), imageUrl (a public image URL), or contentAssetId (a generate_image result).");
     }
     const accessToken = token(context);
     let base64;
     if (parameters.imageReferenceId) {
       const { buffer } = resolveChatImage(context.userId, parameters.imageReferenceId);
+      base64 = buffer.toString("base64");
+    } else if (parameters.contentAssetId) {
+      const { buffer } = await resolveContentImageAsset(context.userId, parameters.contentAssetId);
       base64 = buffer.toString("base64");
     } else {
       const imgRes = await fetch(parameters.imageUrl);

@@ -19,7 +19,11 @@ registerTool({
   async execute(parameters, context) {
     const { shop, token } = shopCreds(context.userId);
     const products = await shopify.listProducts(shop, token, { limit: parameters.limit || 20 });
-    return { products };
+    // Shopify's raw product object already includes images[].src and a
+    // handle, so nothing needs uploading anywhere to use one as an ad's
+    // image (like meta.create_image_ad's imageUrl) — just add the actual
+    // storefront URL, which the raw API doesn't build for you.
+    return { products: products.map((p) => ({ ...p, url: `https://${shop}/products/${p.handle}` })) };
   },
 });
 
