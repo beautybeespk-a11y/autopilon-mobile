@@ -99,6 +99,36 @@ export async function listPages(accessToken) {
   return pages;
 }
 
+// Reading a Page's own content (/{page-id}/posts) needs a PAGE access
+// token — confirmed live: the user access token, even with
+// pages_read_engagement granted, gets rejected outright with "(#190)
+// Invalid OAuth 2.0 Access Token" on this specific edge, while metadata
+// calls (listPages, getInstagramAccountId) using that same user token
+// worked fine moments earlier. This is a real, separate Graph API
+// requirement, not another instance of the Business Portfolio gap:
+// Meta exchanges a page-scoped token per Page, and content-reading edges
+// require it explicitly rather than accepting the broader user token.
+// /{pageId}?fields=access_token returns it directly for classically-
+// linked pages; Business Portfolio-owned pages need the same
+// owned_pages fallback as listPages(), requesting access_token instead
+// of category this time. Returns null (never throws) so callers can
+// fall back to the user token rather than hard-failing when neither
+// path has it — e.g. a page role that doesn't include content access.
+// Never returned through a tool response — this is a live secret, kept
+// server-side only.
+export async function getPageAccessToken(accessToken, pageId) {
+  const direct = await metaFetch(`/${pageId}?fields=access_token`, { accessToken }).catch(() => ({}));
+  if (direct.access_token) return direct.access_token;
+
+  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
+  for (const business of businesses.data || []) {
+    const pages = await metaFetch(`/${business.id}/owned_pages?fields=id,access_token`, { accessToken }).catch(() => ({ data: [] }));
+    const match = (pages.data || []).find((p) => p.id === pageId);
+    if (match?.access_token) return match.access_token;
+  }
+  return null;
+}
+
 export async function createAdSet(accessToken, adAccountId, fields) {
   return metaFetch(`/${normalizeAdAccountId(adAccountId)}/adsets`, { accessToken, method: "POST", body: fields });
 }
@@ -144,7 +174,8 @@ export async function createAd(accessToken, adAccountId, fields) {
 // creative content. Requires pages_read_engagement in addition to
 // pages_show_list (which only lists which Pages exist, not their content).
 export async function listPagePosts(accessToken, pageId) {
-  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken });
+  const pageToken = await getPageAccessToken(accessToken, pageId);
+  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken: pageToken || accessToken });
   return data.data || [];
 }
 
