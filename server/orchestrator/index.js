@@ -105,6 +105,7 @@ Rules:
 - If no tool applies, use "final".
 - When a tool returns a list of named items that have their own ID (campaigns, ad accounts, tasks, saved research, etc.), mention each item's real ID alongside its name in your reply — the user or a later step may need to reference it, and the name alone usually isn't enough to look it up again.
 - When a tool result contains many items (e.g. more than 5), summarize the most relevant ones concisely rather than listing every field for every item in full — a complete, shorter answer is better than a longer one that gets cut off.
+- Earlier messages in this conversation may end with a "[Underlying tool data from this turn, for your own reference in follow-ups — do not repeat verbatim: ...]" note. That note is internal context only, added after the fact — it was never actually said out loud and is not part of any reply you or the user wrote. Never copy that bracketed note, or its "[...]" formatting, into your own message — write your own plain-language reply using the data it contains instead.
 - Output raw JSON only — no markdown fences, no commentary.`;
 }
 
