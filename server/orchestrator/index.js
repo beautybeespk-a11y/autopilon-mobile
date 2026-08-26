@@ -130,6 +130,30 @@ function safeParseDecision(text) {
       message = message.replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
       return { type: "final", message: message.trim() || "I ran into trouble formatting that reply — could you ask again, maybe for fewer items at once?" };
     }
+    // Confirmed live: a model attempted a tool_call with an unfilled
+    // placeholder token as a parameter value (e.g. "dailyBudget":
+    // YOUR_DAILY_BUDGET — a bare, unquoted word, not valid JSON) instead of
+    // either resolving the real value or asking the user for it. That has
+    // no "message" field to salvage, so the old fallback below
+    // (`{type:"final", message: text.trim()}`) dumped the raw, broken
+    // tool_call scaffolding straight into the chat as if it were a normal
+    // reply — exactly the "never show raw JSON scaffolding to the user"
+    // bug the orchestrate() loop's own unrecognized-shape branch already
+    // guards against, just reached through a different path. Anything that
+    // still looks like an attempted JSON envelope (starts with "{") is
+    // flagged instead of shown verbatim; orchestrate() nudges the model to
+    // retry with a real value once rather than silently failing outright,
+    // same pattern as the narration nudge. Only genuinely freeform,
+    // non-JSON prose (no leading "{") falls through to being shown as-is —
+    // that's an intentional, permissive fallback for the rare case a model
+    // replies without the structured envelope at all.
+    if (cleaned.startsWith("{")) {
+      return {
+        type: "final",
+        message: "I wasn't able to put that request together correctly — let me try again.",
+        _malformedEnvelope: true,
+      };
+    }
     return { type: "final", message: text.trim() };
   }
 }
@@ -237,6 +261,8 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // caller in the return value, which nothing previously did.
   const usageTotals = { promptTokens: 0, completionTokens: 0 };
   let narrationNudges = 0;
+  let malformedNudges = 0;
+  const MAX_MALFORMED_NUDGES = 1;
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -264,6 +290,18 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     const decision = safeParseDecision(raw);
 
     if (decision.type === "final") {
+      if (decision._malformedEnvelope && malformedNudges < MAX_MALFORMED_NUDGES) {
+        malformedNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: raw },
+          {
+            role: "user",
+            content: `That wasn't valid — it looks like you tried to call a tool but used a placeholder instead of a real value (e.g. a bare word like YOUR_AD_ACCOUNT_ID or YOUR_DAILY_BUDGET where a real id or number belongs). Never use placeholder tokens. If you don't have a real value yet, call the tool that resolves it first (e.g. meta.list_ad_accounts for an ad account id, meta.list_pages for a page id) — don't guess or invent one. If a value can only come from the user, ask them for it directly with type "final" instead of attempting the tool call.`,
+          },
+        ];
+        continue;
+      }
       const soundsLikeUnfulfilledAction =
         availableTools.length > 0 &&
         typeof decision.message === "string" &&

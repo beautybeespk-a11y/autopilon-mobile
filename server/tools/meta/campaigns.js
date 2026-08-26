@@ -12,7 +12,23 @@ function token(context) {
   return requireValidToken(context.userId, "meta_ads");
 }
 
-registerTool({
+// Confirmed live: an agent called "meta.list_ad_accounts" and got
+// "Unknown tool" — this file's older tools (list_ad_accounts,
+// list_campaigns, create_campaign, update_campaign, pause_campaign,
+// resume_campaign, get_campaign_insights) were never given the "meta."
+// prefix the newer ones (meta.list_pages, meta.create_ad_set, etc.) use,
+// and the registry does an exact-string lookup — no reasonable way for
+// the model to know which half of one integration's tools are prefixed.
+// Registering both names (rather than a breaking rename) means whichever
+// form the model reaches for resolves to the same tool.
+function registerToolAliased(config) {
+  registerTool(config);
+  if (!config.name.startsWith("meta.")) {
+    registerTool({ ...config, name: `meta.${config.name}` });
+  }
+}
+
+registerToolAliased({
   name: "list_ad_accounts",
   description: "Lists the Meta ad accounts the connected user has access to.",
   category: "meta_ads",
@@ -25,7 +41,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "list_campaigns",
   description: "Lists campaigns in a given Meta ad account. Accepts the account ID with or without the 'act_' prefix.",
   category: "meta_ads",
@@ -42,7 +58,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "create_campaign",
   description: "Creates a new Meta ad campaign (created PAUSED so nothing spends until manually resumed). This is the top level only — after this, use meta.create_ad_set, then meta.create_image_ad or meta.upload_ad_video + meta.create_video_ad to actually build a runnable ad with a real creative. Optionally pass contentAssetId to link a Content Studio image/copy asset to this campaign for reference — that alone does NOT upload it to Meta as a creative, it just records which generated content the campaign was conceptually built from.",
   category: "meta_ads",
@@ -77,7 +93,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "update_campaign",
   description: "Updates fields on an existing Meta campaign (name, budget, etc).",
   category: "meta_ads",
@@ -404,7 +420,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "pause_campaign",
   description: "Pauses a running Meta campaign, stopping spend.",
   category: "meta_ads",
@@ -422,7 +438,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "resume_campaign",
   description: "Resumes a paused Meta campaign, allowing it to spend budget again.",
   category: "meta_ads",
@@ -440,7 +456,7 @@ registerTool({
   },
 });
 
-registerTool({
+registerToolAliased({
   name: "get_campaign_insights",
   description: "Returns performance insights (impressions, clicks, spend, CTR, CPC, reach) for a campaign.",
   category: "meta_ads",
