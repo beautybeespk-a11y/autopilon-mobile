@@ -11,6 +11,29 @@ import { resolveOrgId } from "./voiceUsage.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
+// A real, recurring failure mode with faster/smaller models (this
+// deployment's default is gpt-4o-mini): the model responds with type
+// "final" and text like "let me check that for you" or "please hold on,"
+// but never actually attaches a tool call — the turn just ends there, and
+// whatever it said it would do never happens. Caught live in production
+// (Meta Ads Manager narrating "I'll retrieve the posts" with an empty
+// trace, three separate times in one debugging session). This can't be
+// fully prevented by agent instructions alone (models don't follow
+// wording 100% of the time) — this catches it at the one place every
+// agent's response passes through, instead of re-patching each agent's
+// prompt as the pattern turns up. Deliberately narrow and past-tense-safe
+// (won't match "I checked and found..."): only future/present-intent
+// phrasing that specifically implies an action is still pending.
+const NARRATION_WITHOUT_ACTION = /\b(let me (check|retrieve|fetch|pull|gather|look)|i'll (check|retrieve|fetch|pull|gather|look)|i will (check|retrieve|fetch|pull|gather|look)|hold on|one moment|give me a moment|please wait|i need to (check|retrieve|fetch|pull|gather|verify))\b/i;
+// Exactly one retry — this must never become a second way to loop
+// indefinitely alongside MAX_STEPS/stepsRun (which this doesn't touch,
+// since a narrated-but-toolless response was never counted as a step to
+// begin with). If the model narrates again even after being told to
+// stop, just return that reply rather than keep spending real tokens on
+// it — same "stop trying" instinct as the tool-failure retry message a
+// few lines below already has for a different failure shape.
+const MAX_NARRATION_NUDGES = 1;
+
 function createPlan({ userId, conversationId, goal }) {
   const id = cryptoRandom();
   const now = new Date().toISOString();
@@ -196,6 +219,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // usage_records for billing; this is just also handing them back to the
   // caller in the return value, which nothing previously did.
   const usageTotals = { promptTokens: 0, completionTokens: 0 };
+  let narrationNudges = 0;
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -223,6 +247,22 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     const decision = safeParseDecision(raw);
 
     if (decision.type === "final") {
+      const soundsLikeUnfulfilledAction =
+        availableTools.length > 0 &&
+        typeof decision.message === "string" &&
+        NARRATION_WITHOUT_ACTION.test(decision.message);
+      if (soundsLikeUnfulfilledAction && narrationNudges < MAX_NARRATION_NUDGES) {
+        narrationNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          {
+            role: "user",
+            content: `You said you'd do that, but didn't actually call a tool — nothing happened. If you have what you need, call the right tool now with type "tool_call" (or "plan" for multiple steps) instead of describing the next step. If something's genuinely missing that only the user can provide, ask for that specific thing with type "final" instead.`,
+          },
+        ];
+        continue;
+      }
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));
       if (planId) setPlanStatus(planId, "completed");
