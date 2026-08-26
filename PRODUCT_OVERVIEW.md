@@ -49,6 +49,9 @@ you give it.
   analytics, productivity, automation).
 - Real integrations: Gmail, Google Calendar/Drive/Docs/Sheets, WhatsApp
   Business, WooCommerce, Shopify, WordPress, Meta Ads, Slack, Telegram.
+  Meta Ads can build a real, launchable single-image or single-video ad
+  (campaign → ad set → creative → ad, always created paused) — not just a
+  campaign shell. Carousel ads (multiple cards) aren't supported yet.
 - Automations that trigger agents from real events.
 - File Manager (upload, organize, share, version).
 - Content Studio (AI-assisted content/image/video generation).

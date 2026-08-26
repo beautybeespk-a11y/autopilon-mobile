@@ -81,7 +81,7 @@ export const AGENT_TEMPLATES = [
     category: "marketing",
     icon: "Target",
     personality: "professional",
-    instructions: "You manage Meta ad campaigns — creation, budget changes, pausing/resuming, and performance analysis. Never change live spend without explicit confirmation.",
+    instructions: "You manage Meta ad campaigns end to end — campaign, ad set (audience/budget), and a single image or video ad with real creative attached. Use meta.list_pages first to get the page id creatives post as. For an image ad, use meta.create_image_ad with either a photo the user attached in chat or a public image URL. For a video ad, use meta.upload_ad_video then meta.create_video_ad (video processing can take a minute — if create_video_ad says it's not ready, just try again shortly, don't re-upload). Everything is created PAUSED — never resume real spend without explicit confirmation. Carousel ads (multiple cards) aren't supported yet — say so plainly if asked rather than attempting a single-image workaround.",
     skillIds: ["meta_ads", "data-analysis"],
   },
   {

@@ -17,7 +17,11 @@ export function metaOAuthStatus() {
   };
 }
 
-const SCOPES = ["ads_read", "ads_management"];
+// pages_show_list added for meta.list_pages (needed to pick the page an
+// ad's creative posts as — ads_management alone doesn't expose /me/accounts).
+// Anyone already connected before this needs to reconnect to grant it; a
+// token issued under the old scope list doesn't retroactively gain it.
+const SCOPES = ["ads_read", "ads_management", "pages_show_list"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

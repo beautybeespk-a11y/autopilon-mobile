@@ -61,3 +61,49 @@ export async function getCampaignInsights(accessToken, campaignId, datePreset = 
   );
   return data.data?.[0] || null;
 }
+
+// Needed to pick which Facebook Page an ad creative posts as
+// (object_story_spec.page_id below) — requires the pages_show_list scope.
+export async function listPages(accessToken) {
+  const data = await metaFetch("/me/accounts?fields=id,name,category", { accessToken });
+  return data.data || [];
+}
+
+export async function createAdSet(accessToken, adAccountId, fields) {
+  return metaFetch(`/${normalizeAdAccountId(adAccountId)}/adsets`, { accessToken, method: "POST", body: fields });
+}
+
+// Meta's Ad Images endpoint accepts base64 bytes directly in a JSON body
+// (the `bytes` field) as an alternative to a multipart file upload — no
+// multipart handling needed. Response is keyed by an arbitrary internal
+// name Meta assigns, not something a caller picks, so just take whichever
+// single entry comes back.
+export async function uploadAdImage(accessToken, adAccountId, base64Bytes) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/adimages`, {
+    accessToken, method: "POST", body: { bytes: base64Bytes },
+  });
+  const first = Object.values(data.images || {})[0];
+  if (!first) throw new Error("Meta did not return an image hash for the uploaded image.");
+  return { hash: first.hash, url: first.url };
+}
+
+// file_url has Meta's own server fetch and transcode the video, instead of
+// this app doing a multipart/chunked upload of the bytes itself — much
+// simpler, and the only reason a video upload can be scoped to "single
+// video ads" without a much bigger chunked-upload implementation. Returns
+// immediately; the video isn't necessarily ready to reference in a creative
+// yet (tools/meta/campaigns.js's create_video_ad handles that boundary).
+export async function uploadAdVideoFromUrl(accessToken, adAccountId, videoUrl, name) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/advideos`, {
+    accessToken, method: "POST", body: { file_url: videoUrl, name },
+  });
+  return { videoId: data.id };
+}
+
+export async function createAdCreative(accessToken, adAccountId, fields) {
+  return metaFetch(`/${normalizeAdAccountId(adAccountId)}/adcreatives`, { accessToken, method: "POST", body: fields });
+}
+
+export async function createAd(accessToken, adAccountId, fields) {
+  return metaFetch(`/${normalizeAdAccountId(adAccountId)}/ads`, { accessToken, method: "POST", body: fields });
+}

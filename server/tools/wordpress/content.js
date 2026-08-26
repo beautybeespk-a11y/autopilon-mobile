@@ -1,9 +1,8 @@
-import fs from "fs";
 import { registerTool } from "../registry.js";
 import { requireValidToken, getConnection } from "../../integrations/manager.js";
 import * as wp from "../../integrations/wordpress/api.js";
 import { publishEvent } from "../../automation/triggers.js";
-import db from "../../db.js";
+import { resolveChatImage } from "../shared/chatImage.js";
 
 function site(userId) {
   const accessToken = requireValidToken(userId, "wordpress"); // app password, stored as the "token"
@@ -131,27 +130,6 @@ registerTool({
     return { mediaId: media.id, url: media.source_url };
   },
 });
-
-// Same knowledge_items lookup + userId scoping as conversationService.js
-// uses to hand the model this photo as a vision input — reading it again
-// here rather than threading the bytes through the tool-call machinery,
-// since a tool's execute() only ever receives {userId, agentId}, not
-// anything about the message that triggered this turn.
-function resolveChatImage(userId, imageReferenceId) {
-  const row = db.prepare("SELECT content FROM knowledge_items WHERE id = ? AND userId = ? AND type = 'image'").get(imageReferenceId, userId);
-  if (!row) {
-    const err = new Error("That attached photo wasn't found — it may belong to a different conversation or account.");
-    err.code = "NOT_FOUND";
-    throw err;
-  }
-  const meta = JSON.parse(row.content || "{}");
-  if (!meta.storagePath || !fs.existsSync(meta.storagePath)) {
-    const err = new Error("That attached photo's file is no longer available.");
-    err.code = "NOT_FOUND";
-    throw err;
-  }
-  return { buffer: fs.readFileSync(meta.storagePath), mimeType: meta.mimeType || "image/jpeg" };
-}
 
 registerTool({
   name: "wordpress.upload_chat_image",
