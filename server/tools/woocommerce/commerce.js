@@ -45,6 +45,12 @@ registerTool({
       sku: { type: "string" },
       status: { type: "string" },
       categoryIds: { type: "array" },
+      // Must be publicly reachable — WooCommerce's own server downloads
+      // each URL directly, it doesn't go through Autopilon. A link to a
+      // Content Studio-generated image won't work here since those sit
+      // behind login; this is for an image that's already public
+      // somewhere (a stock photo URL, a public CDN link, etc).
+      imageUrls: { type: "array", items: { type: "string" } },
     },
     required: ["title"],
   },
@@ -61,8 +67,9 @@ registerTool({
       status: parameters.status || "draft",
     };
     if (parameters.categoryIds?.length) fields.categories = parameters.categoryIds.map((id) => ({ id }));
+    if (parameters.imageUrls?.length) fields.images = parameters.imageUrls.map((src) => ({ src }));
     const product = await wc.createProduct(siteUrl, consumerKey, consumerSecret, fields);
-    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink };
+    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink, images: product.images?.map((i) => i.src) };
   },
 });
 
@@ -80,6 +87,10 @@ registerTool({
       price: { type: "string" },
       sku: { type: "string" },
       status: { type: "string" },
+      // Same public-URL-only constraint as woocommerce.create_product —
+      // replaces the product's existing image set, doesn't append to it
+      // (matches WooCommerce's own REST API behavior for this field).
+      imageUrls: { type: "array", items: { type: "string" } },
     },
     required: ["productId"],
   },
@@ -87,7 +98,7 @@ registerTool({
   requiresConfirmation: true, // Changes a real, potentially customer-visible product — confirm first.
   async execute(parameters, context) {
     const { siteUrl, consumerKey, consumerSecret } = store(context.userId);
-    const { productId, title, description, shortDescription, price, sku, status } = parameters;
+    const { productId, title, description, shortDescription, price, sku, status, imageUrls } = parameters;
     const fields = {};
     if (title !== undefined) fields.name = title;
     if (description !== undefined) fields.description = description;
@@ -95,8 +106,9 @@ registerTool({
     if (price !== undefined) fields.regular_price = price;
     if (sku !== undefined) fields.sku = sku;
     if (status !== undefined) fields.status = status;
+    if (imageUrls?.length) fields.images = imageUrls.map((src) => ({ src }));
     const product = await wc.updateProduct(siteUrl, consumerKey, consumerSecret, productId, fields);
-    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink };
+    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink, images: product.images?.map((i) => i.src) };
   },
 });
 

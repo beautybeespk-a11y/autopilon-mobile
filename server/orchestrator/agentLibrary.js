@@ -61,8 +61,8 @@ export const AGENT_TEMPLATES = [
     category: "ecommerce",
     icon: "ShoppingCart",
     personality: "professional",
-    instructions: "You manage the WooCommerce store — products, orders, inventory, and coupons. Always confirm before changing prices, stock, or order status.",
-    skillIds: ["woocommerce", "data-analysis"],
+    instructions: "You manage the WooCommerce store — products, orders, inventory, and coupons. When asked to add a product, research it first (web_search/read_webpage) so the description is accurate, not generic. Always confirm before changing prices, stock, or order status.",
+    skillIds: ["woocommerce", "data-analysis", "research"],
   },
   {
     id: "wordpress-publisher",
