@@ -60,6 +60,13 @@ export async function handleIncomingMessage({
       const meta = JSON.parse(row.content || "{}");
       if (meta.storagePath && fs.existsSync(meta.storagePath)) {
         extraImage = { mimeType: meta.mimeType, base64: fs.readFileSync(meta.storagePath).toString("base64") };
+        // The model only SEES the pixels via extraImage above — it has no
+        // way to refer back to this specific photo in a later tool call
+        // unless told the id as text too. wordpress.upload_chat_image
+        // (tools/wordpress/content.js) accepts this same id to re-read the
+        // file and upload it somewhere the model can't reach directly.
+        const imageNote = `[The user attached a photo (reference id: "${attachmentImageId}"). If asked to use this photo somewhere that needs a real image URL (e.g. as a product image), call wordpress.upload_chat_image with imageReferenceId "${attachmentImageId}" first to get one — you cannot pass this id directly to a tool expecting a URL.]`;
+        extraContext = extraContext ? `${extraContext}\n\n${imageNote}` : imageNote;
       }
     }
     // Temporary diagnostic — remove once image attachments are confirmed

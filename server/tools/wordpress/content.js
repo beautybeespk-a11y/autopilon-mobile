@@ -1,7 +1,9 @@
+import fs from "fs";
 import { registerTool } from "../registry.js";
 import { requireValidToken, getConnection } from "../../integrations/manager.js";
 import * as wp from "../../integrations/wordpress/api.js";
 import { publishEvent } from "../../automation/triggers.js";
+import db from "../../db.js";
 
 function site(userId) {
   const accessToken = requireValidToken(userId, "wordpress"); // app password, stored as the "token"
@@ -126,6 +128,46 @@ registerTool({
   async execute(parameters, context) {
     const { siteUrl, username, appPassword } = site(context.userId);
     const media = await wp.uploadImageFromUrl(siteUrl, username, appPassword, parameters.imageUrl, parameters.filename);
+    return { mediaId: media.id, url: media.source_url };
+  },
+});
+
+// Same knowledge_items lookup + userId scoping as conversationService.js
+// uses to hand the model this photo as a vision input — reading it again
+// here rather than threading the bytes through the tool-call machinery,
+// since a tool's execute() only ever receives {userId, agentId}, not
+// anything about the message that triggered this turn.
+function resolveChatImage(userId, imageReferenceId) {
+  const row = db.prepare("SELECT content FROM knowledge_items WHERE id = ? AND userId = ? AND type = 'image'").get(imageReferenceId, userId);
+  if (!row) {
+    const err = new Error("That attached photo wasn't found — it may belong to a different conversation or account.");
+    err.code = "NOT_FOUND";
+    throw err;
+  }
+  const meta = JSON.parse(row.content || "{}");
+  if (!meta.storagePath || !fs.existsSync(meta.storagePath)) {
+    const err = new Error("That attached photo's file is no longer available.");
+    err.code = "NOT_FOUND";
+    throw err;
+  }
+  return { buffer: fs.readFileSync(meta.storagePath), mimeType: meta.mimeType || "image/jpeg" };
+}
+
+registerTool({
+  name: "wordpress.upload_chat_image",
+  description: "Uploads a photo the user attached in THIS chat to the WordPress media library, returning a public URL. Use this to turn an attached photo (referenced by the id given alongside it) into a real image URL — e.g. before attaching it to a WooCommerce product with woocommerce.create_product/update_product's imageUrls. Cannot be used for images from anywhere else (generated art, a web search result) — those already have their own URL.",
+  category: "wordpress",
+  parameters: {
+    type: "object",
+    properties: { imageReferenceId: { type: "string" }, filename: { type: "string" } },
+    required: ["imageReferenceId"],
+  },
+  requiredPermissions: ["wordpress.write"],
+  requiresConfirmation: false, // Uploading to the media library alone doesn't publish anything publicly — same as wordpress.upload_image.
+  async execute(parameters, context) {
+    const { siteUrl, username, appPassword } = site(context.userId);
+    const { buffer, mimeType } = resolveChatImage(context.userId, parameters.imageReferenceId);
+    const media = await wp.uploadImageBuffer(siteUrl, username, appPassword, buffer, mimeType, parameters.filename);
     return { mediaId: media.id, url: media.source_url };
   },
 });

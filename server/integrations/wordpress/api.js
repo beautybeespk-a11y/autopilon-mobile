@@ -51,20 +51,16 @@ export const listTags = (site, u, p) => wpFetch(site, u, p, "/tags?per_page=100"
 export const listComments = (site, u, p, params = {}) => wpFetch(site, u, p, `/comments?${new URLSearchParams(params)}`);
 export const listUsers = (site, u, p) => wpFetch(site, u, p, "/users?per_page=50");
 
-// Media upload takes raw bytes fetched from a public URL — the AI supplies
-// a URL (from generated art, research, etc.), not a local file, since the
-// backend has no user-uploaded-file storage wired to this tool.
-export async function uploadImageFromUrl(site, u, p, imageUrl, filename) {
-  const imgRes = await fetch(imageUrl);
-  if (!imgRes.ok) throw new Error(`Could not fetch image from ${imageUrl}`);
-  const buffer = Buffer.from(await imgRes.arrayBuffer());
-  const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+// Shared by both media-upload paths below — the WP Media Library endpoint
+// itself just wants raw bytes + a content type, regardless of where they
+// came from.
+async function postMediaBuffer(site, u, p, buffer, contentType, filename) {
   const url = `${site.replace(/\/$/, "")}/wp-json/wp/v2/media`;
   const res = await fetch(url, {
     method: "POST",
     headers: {
       authorization: authHeader(u, p),
-      "content-type": contentType,
+      "content-type": contentType || "image/jpeg",
       "content-disposition": `attachment; filename="${filename || "image.jpg"}"`,
     },
     body: buffer,
@@ -73,3 +69,20 @@ export async function uploadImageFromUrl(site, u, p, imageUrl, filename) {
   if (!res.ok) throw new Error(data?.message || `Media upload failed (${res.status})`);
   return data;
 }
+
+// Media upload from a public URL — the AI supplies a URL (from generated
+// art, research, etc.), not a local file, since the backend has no
+// user-uploaded-file storage wired to this path.
+export async function uploadImageFromUrl(site, u, p, imageUrl, filename) {
+  const imgRes = await fetch(imageUrl);
+  if (!imgRes.ok) throw new Error(`Could not fetch image from ${imageUrl}`);
+  const buffer = Buffer.from(await imgRes.arrayBuffer());
+  const contentType = imgRes.headers.get("content-type") || "image/jpeg";
+  return postMediaBuffer(site, u, p, buffer, contentType, filename);
+}
+
+// Media upload from bytes already on this server — used for a photo the
+// user attached directly in chat (tools/wordpress/content.js's
+// upload_chat_image), which has no public URL to fetch from at all.
+export const uploadImageBuffer = (site, u, p, buffer, contentType, filename) =>
+  postMediaBuffer(site, u, p, buffer, contentType, filename);

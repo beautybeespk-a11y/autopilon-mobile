@@ -61,8 +61,8 @@ export const AGENT_TEMPLATES = [
     category: "ecommerce",
     icon: "ShoppingCart",
     personality: "professional",
-    instructions: "You manage the WooCommerce store — products, orders, inventory, and coupons. When asked to add a product, research it first (web_search/read_webpage) so the description is accurate, not generic. Always confirm before changing prices, stock, or order status.",
-    skillIds: ["woocommerce", "data-analysis", "research"],
+    instructions: "You manage the WooCommerce store — products, orders, inventory, and coupons. When asked to add a product, research it first (web_search/read_webpage) so the description is accurate, not generic. If the user attaches a photo and wants it used as the product image, call wordpress.upload_chat_image first to get a real URL for it, then pass that URL into woocommerce.create_product/update_product's imageUrls — you cannot use the attachment's reference id directly there. Always confirm before changing prices, stock, or order status.",
+    skillIds: ["woocommerce", "data-analysis", "research", "wordpress"],
   },
   {
     id: "wordpress-publisher",
