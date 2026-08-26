@@ -32,6 +32,89 @@ registerTool({
 });
 
 registerTool({
+  name: "woocommerce.create_product",
+  description: "Creates a new product in the connected WooCommerce store (draft by default — set status to 'publish' to make it live immediately).",
+  category: "woocommerce",
+  parameters: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      description: { type: "string" },
+      shortDescription: { type: "string" },
+      price: { type: "string" },
+      sku: { type: "string" },
+      status: { type: "string" },
+      categoryIds: { type: "array" },
+    },
+    required: ["title"],
+  },
+  requiredPermissions: ["woocommerce.manage"],
+  requiresConfirmation: true, // Creates a real, potentially customer-visible product — confirm first, same as wordpress.create_post.
+  async execute(parameters, context) {
+    const { siteUrl, consumerKey, consumerSecret } = store(context.userId);
+    const fields = {
+      name: parameters.title,
+      description: parameters.description,
+      short_description: parameters.shortDescription,
+      regular_price: parameters.price,
+      sku: parameters.sku,
+      status: parameters.status || "draft",
+    };
+    if (parameters.categoryIds?.length) fields.categories = parameters.categoryIds.map((id) => ({ id }));
+    const product = await wc.createProduct(siteUrl, consumerKey, consumerSecret, fields);
+    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink };
+  },
+});
+
+registerTool({
+  name: "woocommerce.update_product",
+  description: "Updates an existing WooCommerce product's title, description, price, SKU, or status. Only pass the fields you want to change.",
+  category: "woocommerce",
+  parameters: {
+    type: "object",
+    properties: {
+      productId: { type: "number" },
+      title: { type: "string" },
+      description: { type: "string" },
+      shortDescription: { type: "string" },
+      price: { type: "string" },
+      sku: { type: "string" },
+      status: { type: "string" },
+    },
+    required: ["productId"],
+  },
+  requiredPermissions: ["woocommerce.manage"],
+  requiresConfirmation: true, // Changes a real, potentially customer-visible product — confirm first.
+  async execute(parameters, context) {
+    const { siteUrl, consumerKey, consumerSecret } = store(context.userId);
+    const { productId, title, description, shortDescription, price, sku, status } = parameters;
+    const fields = {};
+    if (title !== undefined) fields.name = title;
+    if (description !== undefined) fields.description = description;
+    if (shortDescription !== undefined) fields.short_description = shortDescription;
+    if (price !== undefined) fields.regular_price = price;
+    if (sku !== undefined) fields.sku = sku;
+    if (status !== undefined) fields.status = status;
+    const product = await wc.updateProduct(siteUrl, consumerKey, consumerSecret, productId, fields);
+    return { productId: product.id, name: product.name, status: product.status, permalink: product.permalink };
+  },
+});
+
+registerTool({
+  name: "woocommerce.list_categories",
+  description: "Lists product categories in the connected WooCommerce store — useful for finding a category's id before creating or updating a product.",
+  category: "woocommerce",
+  parameters: { type: "object", properties: {}, required: [] },
+  requiredPermissions: ["woocommerce.read"],
+  requiresConfirmation: false,
+  async execute(parameters, context) {
+    const { siteUrl, consumerKey, consumerSecret } = store(context.userId);
+    const categories = await wc.listCategories(siteUrl, consumerKey, consumerSecret);
+    return { categories: categories.map((c) => ({ id: c.id, name: c.name, count: c.count })) };
+  },
+});
+
+registerTool({
   name: "woocommerce.update_inventory",
   description: "Updates a product's stock quantity.",
   category: "woocommerce",

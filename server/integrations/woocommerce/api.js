@@ -38,6 +38,7 @@ export async function checkStore(siteUrl, consumerKey, consumerSecret) {
 
 export const listProducts = (site, k, s, params = {}) => wcFetch(site, k, s, `/products?${new URLSearchParams(params)}`);
 export const getProduct = (site, k, s, id) => wcFetch(site, k, s, `/products/${id}`);
+export const createProduct = (site, k, s, fields) => wcFetch(site, k, s, "/products", { method: "POST", body: fields });
 export const updateProduct = (site, k, s, id, fields) => wcFetch(site, k, s, `/products/${id}`, { method: "PUT", body: fields });
 export const updateInventory = (site, k, s, id, stockQuantity) =>
   wcFetch(site, k, s, `/products/${id}`, { method: "PUT", body: { stock_quantity: stockQuantity, manage_stock: true } });
