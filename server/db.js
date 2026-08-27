@@ -2000,6 +2000,28 @@ if (!metaPlanCols.includes("conversationId")) db.exec("ALTER TABLE meta_campaign
 if (!metaPlanCols.includes("revisesPlanId")) db.exec("ALTER TABLE meta_campaign_plans ADD COLUMN revisesPlanId TEXT");
 db.exec("CREATE INDEX IF NOT EXISTS idx_meta_plans_conversation ON meta_campaign_plans(conversationId)");
 
+// Live testing (round 2) surfaced that asset choices don't persist: a user
+// picks "Beautybeespk" once, but the next plan/revision in the SAME
+// conversation re-resolves the Facebook Page from scratch and can land on
+// a different one. One row per conversation, one column per asset type —
+// server/agents/metaExpert/assetSelection.js is the only reader/writer.
+// Every value here is still re-verified against a live Meta list call
+// before use (see resolveWithMemory() in planner.js) — this table is a
+// hint of what was chosen, never a bypass of the "cross-check against
+// Meta" rule that resolveAdAccountId/resolvePageId/etc. already enforce.
+db.exec(`
+CREATE TABLE IF NOT EXISTS meta_conversation_assets (
+  conversationId       TEXT PRIMARY KEY,
+  userId                TEXT NOT NULL,
+  selectedAdAccountId   TEXT,
+  selectedFacebookPageId TEXT,
+  selectedPixelId       TEXT,
+  selectedCatalogId     TEXT,
+  selectedInstagramId   TEXT,
+  updatedAt             TEXT NOT NULL
+);
+`);
+
 db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
   .run("meta_expert", "Meta Ads Expert Planner", "Research business/account context and build a validated, approval-gated Meta campaign strategy from a stated goal, instead of guessing individual campaign settings.", "marketing");
 db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")

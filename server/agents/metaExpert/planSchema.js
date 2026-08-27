@@ -17,7 +17,11 @@ const ENUM_FIELDS = {
   cta: INTERNAL_PLAN_SCHEMA.properties.cta.enum,
   campaign_status: INTERNAL_PLAN_SCHEMA.properties.campaign_status.enum,
   confidence: INTERNAL_PLAN_SCHEMA.properties.confidence.enum,
+  audience_basis: INTERNAL_PLAN_SCHEMA.properties.audience_basis.enum,
 };
+
+const GOAL_CLASSIFICATION_OBJECTIVE_ENUM = INTERNAL_PLAN_SCHEMA.properties.goal_classification.properties.recommended_meta_objective.enum;
+export const BUDGET_BASIS_VALUES = INTERNAL_PLAN_SCHEMA.properties.budget_basis.enum;
 
 // No JSON Schema library is a dependency of this project today (confirmed:
 // no ajv in package.json) — rather than add one for a single schema, this
@@ -87,6 +91,21 @@ export function validatePlanStructure(plan) {
 
   if (plan.daily_budget !== undefined && plan.daily_budget !== null) {
     if (typeof plan.daily_budget !== "number" || plan.daily_budget < 0) fail("daily_budget", "daily_budget must be a non-negative number, or null.");
+    if (!plan.budget_basis || !BUDGET_BASIS_VALUES.includes(plan.budget_basis)) {
+      fail("budget_basis", `budget_basis is required whenever daily_budget is set — one of: ${BUDGET_BASIS_VALUES.join(", ")}. Never propose a real number without saying where it came from.`);
+    }
+  }
+
+  if (!plan.goal_classification || typeof plan.goal_classification !== "object") {
+    fail("goal_classification", "goal_classification is required: { literal_goal, inferred_business_outcome, recommended_meta_objective, requires_goal_confirmation }.");
+  } else {
+    const gc = plan.goal_classification;
+    if (typeof gc.literal_goal !== "string" || !gc.literal_goal.trim()) fail("goal_classification.literal_goal", "goal_classification.literal_goal is required.");
+    if (typeof gc.inferred_business_outcome !== "string" || !gc.inferred_business_outcome.trim()) fail("goal_classification.inferred_business_outcome", "goal_classification.inferred_business_outcome is required.");
+    if (!GOAL_CLASSIFICATION_OBJECTIVE_ENUM.includes(gc.recommended_meta_objective)) {
+      fail("goal_classification.recommended_meta_objective", `goal_classification.recommended_meta_objective must be one of: ${GOAL_CLASSIFICATION_OBJECTIVE_ENUM.join(", ")}.`);
+    }
+    if (typeof gc.requires_goal_confirmation !== "boolean") fail("goal_classification.requires_goal_confirmation", "goal_classification.requires_goal_confirmation must be a boolean.");
   }
 
   if (plan.campaign_status !== undefined && plan.campaign_status !== "PAUSED") {

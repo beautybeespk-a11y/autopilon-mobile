@@ -3,6 +3,7 @@ import { cryptoRandom } from "../middleware.js";
 import { getTool, validateParameters, toolRequiresConfirmation } from "../tools/registry.js";
 import { toolAvailableToAgent } from "./permissions.js";
 import { createNotification } from "./notifications.js";
+import { getStoredPlan, getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 
 const now = () => new Date().toISOString();
 
@@ -77,7 +78,7 @@ export async function runTool({ toolName, parameters, userId, agentId, conversat
 
   if (toolRequiresConfirmation(toolName, userId)) {
     setExecutionStatus(executionId, "awaiting_confirmation");
-    const reason = confirmationReason(toolName, parameters);
+    const reason = confirmationReason(toolName, parameters, { userId, conversationId });
     const confirmationId = createConfirmationRequest({ executionId, userId, toolName, reason, automationRunId });
     return { executionId, status: "awaiting_confirmation", confirmationId, reason };
   }
@@ -139,7 +140,22 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
   return executeNow({ executionId, tool, parameters, userId: execution.userId, agentId: execution.agentId, conversationId: execution.conversationId });
 }
 
-function confirmationReason(toolName, parameters) {
+function confirmationReason(toolName, parameters, context = {}) {
+  if (toolName === "meta_expert.execute_campaign_plan") {
+    // Live testing round 3: the generic fallback message below ("This
+    // action requires your approval before it runs") told the user nothing
+    // about WHAT they were approving — clicking through it, they'd only
+    // find out something was wrong when Meta itself rejected the campaign
+    // afterward. Show the real plan (objective, budget, Page) so an
+    // obviously-wrong or stale plan is visible before the click, not after.
+    const stored = parameters.planId
+      ? getStoredPlan(context.userId, parameters.planId)
+      : getActivePlanForConversation(context.userId, context.conversationId);
+    if (!stored) return "This creates a real (paused) Meta Campaign and Ad Set — but no valid plan was found to execute. Approving this will fail.";
+    const { plan } = stored.planData;
+    const budget = plan.daily_budget != null ? `${plan.daily_budget}/day` : "no budget set yet";
+    return `This creates a real Meta Campaign + Ad Set (PAUSED) for: "${plan.goal}" — Objective: ${plan.objective}, Budget: ${budget}. Nothing spends until you separately resume it in Meta.`;
+  }
   if (toolName === "create_memory") {
     return `This permanently stores in your long-term memory: "${parameters.content}"`;
   }

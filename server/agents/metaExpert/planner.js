@@ -1,13 +1,56 @@
 import db from "../../db.js";
 import { cryptoRandom } from "../../middleware.js";
 import * as meta from "../../integrations/meta/api.js";
+import { getConnection } from "../../integrations/manager.js";
 import { resolvePageId } from "../../tools/shared/metaPageId.js";
 import { resolveAdAccountId } from "../../tools/shared/metaAdAccountId.js";
 import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
+import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
+import { checkBudgetPolicy, checkGoalClassificationPolicy } from "./policy.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
+
+// Shared shape behind every asset resolution below (Issue 1 / Issue 4, live
+// testing round 3): try an explicit real id first, then a REMEMBERED
+// selection for this conversation, then whatever the underlying resolver
+// does with neither (single-available auto-use, or ask). If a remembered
+// selection turns out to be stale (the resolver's own "verified but not
+// found" code), forget it and retry with a clean slate — same "clear on
+// invalid, don't keep re-trying a dead value" rule the Default Ad Account
+// feature already established. Every returned id has been through the
+// underlying resolver's live-Meta cross-check either way; this layer only
+// decides WHICH id to try, never skips verification.
+//
+// `resolve(id)` must resolve to a plain id string, or null/undefined when
+// nothing could be resolved (e.g. a Pixel that's genuinely optional and
+// ambiguous) — resolveAdAccountId/resolvePageId already return a bare
+// string; resolvePixelId/resolveCatalogId return `{ pixelId/catalogId,
+// available }`, so their call sites below extract the id before passing it
+// in here (`.then((r) => r.pixelId)`), keeping this helper's contract
+// uniform instead of guessing at each resolver's own return shape.
+async function resolveWithMemory({ conversationId, userId, field, explicitId, savedId, resolve, staleCodes }) {
+  let candidate = explicitId;
+  let usingSaved = false;
+  if (!candidate && savedId) {
+    candidate = savedId;
+    usingSaved = true;
+  }
+  let id;
+  try {
+    id = await resolve(candidate);
+  } catch (err) {
+    if (usingSaved && staleCodes.includes(err.code)) {
+      clearConversationAsset(conversationId, field);
+      id = await resolve(undefined);
+    } else {
+      throw err;
+    }
+  }
+  if (conversationId && id) saveConversationAsset(conversationId, userId, field, id);
+  return id;
+}
 
 // Turns a plan's SEMANTIC asset references ("default_ad_account", or a
 // real id the model already confirmed earlier this conversation) into
@@ -16,26 +59,36 @@ const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "d
 // these goes through the same deterministic resolvers the rest of this
 // app's Meta tools use (server/tools/shared/*), never trusted from the
 // plan directly.
-export async function resolvePlanAssets(plan, { userId, accessToken }) {
+export async function resolvePlanAssets(plan, { userId, accessToken, conversationId }) {
   const resolved = { adAccountId: null, pageId: null, instagramId: null, pixelId: null, catalogId: null };
   const resolutionErrors = [];
+  const saved = getConversationAssets(conversationId);
 
   try {
-    const providedAdAccountId = SEMANTIC_REFS.has(plan.ad_account?.ref) ? undefined : plan.ad_account?.ref;
-    resolved.adAccountId = await resolveAdAccountId({ userId, accessToken, providedAdAccountId });
+    const explicitId = SEMANTIC_REFS.has(plan.ad_account?.ref) ? undefined : plan.ad_account?.ref;
+    resolved.adAccountId = await resolveWithMemory({
+      conversationId, userId, field: "adAccount", explicitId, savedId: saved.selectedAdAccountId,
+      resolve: (id) => resolveAdAccountId({ userId, accessToken, providedAdAccountId: id }),
+      staleCodes: ["META_AD_ACCOUNT_NOT_FOUND"],
+    });
   } catch (err) {
     resolutionErrors.push({ field: "ad_account", message: err.message, code: err.code });
   }
 
   try {
-    const providedPageId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
-    resolved.pageId = await resolvePageId({ accessToken, providedPageId });
+    const explicitId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
+    resolved.pageId = await resolveWithMemory({
+      conversationId, userId, field: "facebookPage", explicitId, savedId: saved.selectedFacebookPageId,
+      resolve: (id) => resolvePageId({ accessToken, providedPageId: id }),
+      staleCodes: ["META_PAGE_NOT_FOUND"],
+    });
   } catch (err) {
     resolutionErrors.push({ field: "facebook_page", message: err.message, code: err.code });
   }
 
   if (plan.instagram_identity && resolved.pageId) {
     resolved.instagramId = await meta.getInstagramAccountId(accessToken, resolved.pageId).catch(() => null);
+    if (conversationId && resolved.instagramId) saveConversationAsset(conversationId, userId, "instagram", resolved.instagramId);
   }
 
   // Attempted whenever the plan references a pixel OR the optimization
@@ -44,11 +97,21 @@ export async function resolvePlanAssets(plan, { userId, accessToken }) {
   // shouldn't skip this check just because it forgot a related field;
   // validatePlanAgainstContext() enforces the actual "Pixel required for
   // this optimization_event" rule regardless of which path resolved it.
+  //
+  // resolvePixelId already auto-uses the single available Pixel when no id
+  // is supplied (server/tools/shared/metaPixelId.js) — Issue 1's "use it
+  // automatically" requirement was already true here structurally; what was
+  // missing was that a REMEMBERED explicit choice (when more than one
+  // Pixel exists) didn't carry forward, which resolveWithMemory now fixes
+  // the same way it does for the ad account and Page.
   if ((plan.pixel || PURCHASE_LIKE_EVENTS.has(plan.optimization_event)) && resolved.adAccountId) {
     try {
-      const providedPixelId = !plan.pixel || SEMANTIC_REFS.has(plan.pixel.ref) ? undefined : plan.pixel.ref;
-      const { pixelId } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId });
-      resolved.pixelId = pixelId;
+      const explicitId = !plan.pixel || SEMANTIC_REFS.has(plan.pixel.ref) ? undefined : plan.pixel.ref;
+      resolved.pixelId = await resolveWithMemory({
+        conversationId, userId, field: "pixel", explicitId, savedId: saved.selectedPixelId,
+        resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id }).then((r) => r.pixelId),
+        staleCodes: ["META_PIXEL_NOT_FOUND"],
+      });
     } catch (err) {
       resolutionErrors.push({ field: "pixel", message: err.message, code: err.code });
     }
@@ -56,9 +119,12 @@ export async function resolvePlanAssets(plan, { userId, accessToken }) {
 
   if (plan.catalog && resolved.adAccountId) {
     try {
-      const providedCatalogId = SEMANTIC_REFS.has(plan.catalog.ref) ? undefined : plan.catalog.ref;
-      const { catalogId } = await resolveCatalogId({ accessToken, adAccountId: resolved.adAccountId, providedCatalogId });
-      resolved.catalogId = catalogId;
+      const explicitId = SEMANTIC_REFS.has(plan.catalog.ref) ? undefined : plan.catalog.ref;
+      resolved.catalogId = await resolveWithMemory({
+        conversationId, userId, field: "catalog", explicitId, savedId: saved.selectedCatalogId,
+        resolve: (id) => resolveCatalogId({ accessToken, adAccountId: resolved.adAccountId, providedCatalogId: id }).then((r) => r.catalogId),
+        staleCodes: ["META_CATALOG_NOT_FOUND"],
+      });
     } catch (err) {
       resolutionErrors.push({ field: "catalog", message: err.message, code: err.code });
     }
@@ -145,7 +211,7 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     }
   }
 
-  const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, { userId, accessToken });
+  const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, { userId, accessToken, conversationId });
   const contextual = validatePlanAgainstContext(effectivePlan, {
     resolvedAdAccountId: resolved.adAccountId,
     resolvedPageId: resolved.pageId,
@@ -154,7 +220,18 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     resolvedCatalogId: resolved.catalogId,
   });
 
-  const errors = [...resolutionErrors, ...contextual.errors];
+  // Real, independently-checkable facts (not the model's own claims) that
+  // the deterministic policy layer (policy.js) needs — Issue 8: "the LLM
+  // can propose strategy, but the backend should reject unsafe or
+  // contradictory plans." A commerce platform connection is a DB read, not
+  // a network call; resolved.pixelId already required a live Meta call
+  // above, so this adds no extra latency.
+  const businessSignals = {
+    clearEcommerceWithPurchaseTracking: !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify")) && !!resolved.pixelId,
+  };
+  const policyErrors = [...checkGoalClassificationPolicy(effectivePlan, businessSignals), ...checkBudgetPolicy(effectivePlan)];
+
+  const errors = [...resolutionErrors, ...contextual.errors, ...policyErrors];
   if (errors.length) {
     return { ok: false, errors };
   }

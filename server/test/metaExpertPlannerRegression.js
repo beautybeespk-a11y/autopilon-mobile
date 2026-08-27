@@ -18,15 +18,24 @@ process.env.DB_PATH = process.env.DB_PATH || "/tmp/meta-expert-planner-regressio
 process.env.BYOK_ENCRYPTION_KEY = process.env.BYOK_ENCRYPTION_KEY || "test-byok-encryption-key-for-meta-expert-test";
 process.env.META_APP_ID = process.env.META_APP_ID || "test-app-id";
 process.env.META_APP_SECRET = process.env.META_APP_SECRET || "test-app-secret";
+// Fixed, known values (rather than trusting policy.js's defaults) so this
+// suite's budget-cap assertions stay meaningful even if the shipped
+// defaults change later. Must be set before policy.js is imported anywhere
+// (including transitively) — it reads these once at module load.
+process.env.META_EXPERT_MAX_SUGGESTED_DAILY_BUDGET = "5000";
+process.env.META_EXPERT_MAX_EXECUTABLE_DAILY_BUDGET = "10000";
 
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection } = await import("../integrations/manager.js");
 const { validatePlanStructure, validatePlanAgainstContext, validatePlan } = await import("../agents/metaExpert/planSchema.js");
 const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
+const { checkGoalClassificationPolicy, checkBudgetPolicy, messageIndicatesExecutionApproval, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
+const { getConversationAssets, saveConversationAsset } = await import("../agents/metaExpert/assetSelection.js");
 const { gatherBusinessContext } = await import("../agents/metaExpert/research.js");
 const { getTool } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
+const { checkExecutionApprovalGate } = await import("../orchestrator/index.js");
 await import("../tools/index.js"); // registers meta_expert.* tools
 
 const results = [];
@@ -94,9 +103,19 @@ function connectMeta(userId) {
   saveConnection(userId, "meta_ads", { accessToken: `fake-meta-token-${userId}`, expiresAt: null, scopes: ["ads_read", "ads_management", "pages_show_list", "business_management"] });
 }
 
+function connectWooCommerce(userId) {
+  saveConnection(userId, "woocommerce", { accessToken: "fake-consumer-secret", expiresAt: null, scopes: [], meta: { siteUrl: "https://store.example.com", consumerKey: "ck_fake" } });
+}
+
 function basePlan(overrides = {}) {
   return {
     goal: "I want more website sales",
+    goal_classification: {
+      literal_goal: "more website sales",
+      inferred_business_outcome: "revenue from purchases",
+      recommended_meta_objective: "OUTCOME_SALES",
+      requires_goal_confirmation: false,
+    },
     objective: "OUTCOME_SALES",
     conversion_location: "WEBSITE",
     optimization_event: "PURCHASE",
@@ -104,12 +123,14 @@ function basePlan(overrides = {}) {
     age_min: 21,
     age_max: 44,
     gender: "ALL",
+    audience_basis: "HEURISTIC",
     locations: ["Karachi", "Lahore"],
     countries: ["PK"],
     placements: "ADVANTAGE_PLUS",
     creative_strategy: { source: "EXISTING_PAGE_POST", description: "Best recent reel" },
     budget_strategy: "DAILY",
     daily_budget: 2000,
+    budget_basis: "USER_PROVIDED",
     bid_strategy: "LOWEST_COST_WITHOUT_CAP",
     facebook_page: { ref: "default_facebook_page" },
     instagram_identity: null,
@@ -558,6 +579,361 @@ async function run() {
       assert.equal(adSetWrite.body.promoted_object.pixel_id, "px1");
     } finally {
       restoreFetch();
+    }
+  });
+
+  // --- 12. Conversation-scoped asset selection (Issue 1 / Issue 4, live
+  //    testing round 3): the exact live bug was "I selected Beautybeespk,
+  //    then the plan used Careonabudget.pk instead." This reproduces the
+  //    fix — an explicit real Page id chosen once carries forward
+  //    automatically to a LATER plan in the same conversation that only
+  //    supplies a semantic ref, even though multiple Pages exist (which,
+  //    without memory, would otherwise force asking again every time).
+  await check("a Page chosen once (real id) is remembered and reused automatically for a later plan in the same conversation — the exact live wrong-Page bug", async () => {
+    const userId = makeUser(`page-memory-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "555555555555555", name: "Careonabudget.pk" }],
+    }));
+    try {
+      const first = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }), // the user's real, explicit choice
+      });
+      assert.equal(first.ok, true, JSON.stringify(first.errors));
+      assert.equal(first.resolved.pageId, "717559728109412");
+
+      // A later plan in the SAME conversation that only says "the default
+      // Page" (no explicit choice re-supplied, e.g. "create a sales
+      // campaign") must still land on Beautybeespk, not silently fall back
+      // to Careonabudget.pk (or fail asking again) — even though two Pages
+      // are connected and no user/account-level default is saved.
+      const second = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "default_facebook_page" } }),
+      });
+      assert.equal(second.ok, true, JSON.stringify(second.errors));
+      assert.equal(second.resolved.pageId, "717559728109412", "the earlier explicit Page choice must be remembered, not re-asked or defaulted elsewhere");
+      assert.match(second.recommendationText, /Beautybeespk/);
+      assert.doesNotMatch(second.recommendationText, /Careonabudget/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("the remembered Page selection is preserved through a revision (revisesPlanId)", async () => {
+    const userId = makeUser(`page-memory-revision-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "555555555555555", name: "Careonabudget.pk" }],
+    }));
+    try {
+      const original = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }),
+      });
+      assert.equal(original.ok, true, JSON.stringify(original.errors));
+
+      const revised = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, gender: "MALE", facebook_page: { ref: "default_facebook_page" } }),
+        revisesPlanId: original.planId,
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.errors));
+      assert.equal(revised.resolved.pageId, "717559728109412", "a revision must keep the Page that was already chosen, not re-ask or drift");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("exactly one Pixel among several assets is used automatically, with no explicit choice needed", async () => {
+    const userId = makeUser(`single-pixel-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "999888777", name: "The Only Pixel" }],
+    }));
+    try {
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan: basePlan() }); // PURCHASE optimization, pixel: null (semantic/unset)
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.resolved.pixelId, "999888777");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a Pixel chosen among several is remembered for a later plan in the same conversation", async () => {
+    const userId = makeUser(`pixel-memory-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "111111111", name: "Pixel A" }, { id: "222222222", name: "Pixel B" }],
+    }));
+    try {
+      const first = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ pixel: { ref: "111111111" } }),
+      });
+      assert.equal(first.ok, true, JSON.stringify(first.errors));
+      assert.equal(first.resolved.pixelId, "111111111");
+
+      const second = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ pixel: { ref: "default_pixel" } }),
+      });
+      assert.equal(second.ok, true, JSON.stringify(second.errors));
+      assert.equal(second.resolved.pixelId, "111111111", "the earlier explicit Pixel choice must be remembered");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a stale remembered Page selection (no longer connected) is cleared and falls through to asking/auto-resolving again, not reused blindly", async () => {
+    const userId = makeUser(`stale-page-memory-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    saveConversationAsset(conversationId, userId, "facebookPage", "999999999999999"); // a Page that no longer exists
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }], // only one real Page now
+    }));
+    try {
+      const result = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "default_facebook_page" } }),
+      });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.resolved.pageId, "717559728109412", "a stale saved selection must be cleared and fall through to the single real Page, not block resolution");
+      assert.equal(getConversationAssets(conversationId).selectedFacebookPageId, "717559728109412", "the stale value should have been replaced by the freshly-resolved one, not left dangling");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- 13. resolvePageId now cross-checks a supplied id against the real
+  //    connected Pages, the same shape-is-not-enough lesson already applied
+  //    to ad account ids — a numeric id that ISN'T actually one of this
+  //    user's Pages (e.g. stale, or belonging to a different account) must
+  //    be rejected, not trusted on shape alone.
+  await check("resolvePageId rejects a numeric, correctly-shaped id that isn't one of this user's actual connected Pages", async () => {
+    const userId = makeUser(`page-not-found-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ pages: [{ id: "717559728109412", name: "Beautybeespk" }] }));
+    try {
+      const { resolvePageId } = await import("../tools/shared/metaPageId.js");
+      await assert.rejects(
+        () => resolvePageId({ accessToken: `fake-meta-token-${userId}`, providedPageId: "111111111111111" }),
+        (err) => err.code === "META_PAGE_NOT_FOUND"
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- 14. Deterministic goal-classification policy (Issue 2): a Traffic
+  //    plan must never be silently built for a business that's clearly
+  //    e-commerce with real purchase tracking — the exact live bug ("I
+  //    want more traffic" -> a plain Traffic/Link Clicks plan for a store).
+  await check("goal classification policy: a Traffic plan for clear e-commerce (real Pixel) with no confirmation flag is rejected", () => {
+    const plan = basePlan({
+      objective: "OUTCOME_TRAFFIC",
+      optimization_event: "LINK_CLICKS",
+      goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: false },
+    });
+    const errors = checkGoalClassificationPolicy(plan, { clearEcommerceWithPurchaseTracking: true });
+    assert.ok(errors.some((e) => e.field === "goal_classification"), JSON.stringify(errors));
+  });
+
+  await check("goal classification policy: requires_goal_confirmation=true but objective still set to the literal (Traffic) one, not the recommendation, is rejected", () => {
+    const plan = basePlan({
+      objective: "OUTCOME_TRAFFIC",
+      optimization_event: "LINK_CLICKS",
+      approval_required: true,
+      open_questions: ["Traffic vs. Sales — which do you actually want?"],
+      goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: true },
+    });
+    const errors = checkGoalClassificationPolicy(plan, { clearEcommerceWithPurchaseTracking: true });
+    assert.ok(errors.some((e) => e.field === "objective"), JSON.stringify(errors));
+  });
+
+  await check("goal classification policy: requires_goal_confirmation=true, objective matches the recommendation, open_questions present -> passes", () => {
+    const plan = basePlan({
+      objective: "OUTCOME_SALES",
+      approval_required: true,
+      open_questions: ["If you genuinely only want website visits rather than purchases, I can build a Traffic campaign instead — let me know."],
+      goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: true },
+    });
+    const errors = checkGoalClassificationPolicy(plan, { clearEcommerceWithPurchaseTracking: true });
+    assert.deepEqual(errors, []);
+  });
+
+  await check("goal classification policy: a Traffic plan for a non-commerce business (no clear signal) is left alone — deliberately conservative scope", () => {
+    const plan = basePlan({
+      objective: "OUTCOME_TRAFFIC",
+      optimization_event: "LINK_CLICKS",
+      goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "more visits", recommended_meta_objective: "OUTCOME_TRAFFIC", requires_goal_confirmation: false },
+    });
+    const errors = checkGoalClassificationPolicy(plan, { clearEcommerceWithPurchaseTracking: false });
+    assert.deepEqual(errors, []);
+  });
+
+  await check("createPlan end-to-end: a Traffic plan is rejected for a connected e-commerce business with a real Pixel — the exact live bug, through the real function", async () => {
+    const userId = makeUser(`traffic-ecommerce-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "px1", name: "Store Pixel" }],
+    }));
+    try {
+      const plan = basePlan({
+        goal: "I want more traffic to my website",
+        objective: "OUTCOME_TRAFFIC",
+        optimization_event: "LINK_CLICKS",
+        pixel: { ref: "default_pixel" }, // so the Pixel actually resolves and the e-commerce+tracking signal is true
+        goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: false },
+      });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false);
+      assert.ok(result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("missing goal_classification entirely fails structural validation", () => {
+    const { goal_classification, ...planWithout } = basePlan();
+    const result = validatePlanStructure(planWithout);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((e) => e.field === "goal_classification"));
+  });
+
+  // --- 15. Deterministic budget policy (Issue 3): the exact live bug was
+  //    an unprompted PKR 80,000/day recommendation with no evidence.
+  await check(`budget policy: a HEURISTIC_STARTING_TEST budget above the suggested maximum (${MAX_SUGGESTED_DAILY_BUDGET}) is rejected — the exact live bug shape`, () => {
+    const errors = checkBudgetPolicy(basePlan({ daily_budget: 80000, budget_basis: "HEURISTIC_STARTING_TEST" }));
+    assert.ok(errors.some((e) => e.field === "daily_budget"), JSON.stringify(errors));
+  });
+
+  await check("budget policy: a USER_PROVIDED budget above the suggested (but below the hard) maximum is allowed — it's the user's own instruction, not a guess", () => {
+    const errors = checkBudgetPolicy(basePlan({ daily_budget: MAX_SUGGESTED_DAILY_BUDGET + 1000, budget_basis: "USER_PROVIDED" }));
+    assert.deepEqual(errors, []);
+  });
+
+  await check(`budget policy: NO budget may exceed the hard executable maximum (${MAX_EXECUTABLE_DAILY_BUDGET}), even USER_PROVIDED`, () => {
+    const errors = checkBudgetPolicy(basePlan({ daily_budget: MAX_EXECUTABLE_DAILY_BUDGET + 1, budget_basis: "USER_PROVIDED" }));
+    assert.ok(errors.some((e) => e.field === "daily_budget"), JSON.stringify(errors));
+  });
+
+  await check("daily_budget set without budget_basis fails structural validation", () => {
+    const plan = basePlan();
+    delete plan.budget_basis;
+    const result = validatePlanStructure(plan);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((e) => e.field === "budget_basis"));
+  });
+
+  await check("createPlan end-to-end: an 80,000/day heuristic budget is rejected — the exact live bug, through the real function", async () => {
+    const userId = makeUser(`budget-80k-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const plan = basePlan({ optimization_event: "LINK_CLICKS", pixel: null, daily_budget: 80000, budget_basis: "HEURISTIC_STARTING_TEST" });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false);
+      assert.ok(result.errors.some((e) => e.field === "daily_budget"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("execute_campaign_plan refuses to execute a stored plan whose budget exceeds the CURRENT executable cap (defense in depth)", async () => {
+    const userId = makeUser(`budget-cap-execute-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null, daily_budget: 3000, budget_basis: "USER_PROVIDED" }), { userId });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      // Simulate a cap having been lowered (or an old row predating this
+      // check) by mutating the stored plan's budget directly — this must
+      // never be trusted just because it made it into the DB.
+      const row = getStoredPlan(userId, created.planId);
+      const mutated = { ...row.planData, plan: { ...row.planData.plan, daily_budget: MAX_EXECUTABLE_DAILY_BUDGET + 5000 } };
+      db.prepare("UPDATE meta_campaign_plans SET planJson = ? WHERE id = ?").run(JSON.stringify(mutated), created.planId);
+
+      const execTool = getTool("meta_expert.execute_campaign_plan");
+      await assert.rejects(
+        () => execTool.execute({ planId: created.planId }, { userId }),
+        (err) => err.code === "META_BUDGET_LIMIT_EXCEEDED"
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- 16. Orchestrator-level execution approval gate (Issue 6): the exact
+  //    live bug was "Create the best campaign you recommend for my
+  //    business" causing execute_campaign_plan to be called with no plan
+  //    ever proposed, reaching Meta and failing with "Invalid parameter."
+  //    This is checked in the orchestrator BEFORE the tool is dispatched —
+  //    tested directly here without needing a mocked model round-trip,
+  //    same reasoning as INTERNAL_LEAK_PATTERNS's own direct test.
+  await check("execution approval gate: blocks when no active plan exists for the conversation", () => {
+    const userId = makeUser(`gate-no-plan-${stamp}@example.com`);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const gate = checkExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+    assert.ok(gate, "expected a blocking message");
+  });
+
+  await check("execution approval gate: blocks the exact live-bug message even though it contains the word \"create\" — 'create the best campaign' is not approval", async () => {
+    const userId = makeUser(`gate-create-best-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), { userId, conversationId });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      const gate = checkExecutionApprovalGate({ userId, conversationId, userMessage: "Create the best campaign you recommend for my business." });
+      assert.ok(gate, "expected this to be blocked — a request to plan is not approval of a plan");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("execution approval gate: passes when an active plan exists AND the user's message contains real approval language", async () => {
+    const userId = makeUser(`gate-approved-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), { userId, conversationId });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      for (const approval of ["approve", "Yes, proceed.", "run it", "Yes, create it."]) {
+        const gate = checkExecutionApprovalGate({ userId, conversationId, userMessage: approval });
+        assert.equal(gate, null, `expected "${approval}" to satisfy the gate, got: ${gate}`);
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("messageIndicatesExecutionApproval: does not false-positive on ordinary planning/adjustment language", () => {
+    for (const text of ["Create the best campaign you recommend for my business.", "I want more website sales.", "Change the audience and make it more conservative.", "What campaign should I run?"]) {
+      assert.equal(messageIndicatesExecutionApproval(text), false, `expected "${text}" NOT to read as approval`);
     }
   });
 

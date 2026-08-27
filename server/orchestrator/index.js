@@ -8,6 +8,8 @@ import { enforceQuota } from "./billing.js";
 import { enforceSpendLimit } from "./costControls.js";
 import { recordAiTextUsage } from "./costEngine.js";
 import { resolveOrgId } from "./voiceUsage.js";
+import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
+import { messageIndicatesExecutionApproval } from "../agents/metaExpert/policy.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -67,8 +69,58 @@ const MAX_NARRATION_NUDGES = 1;
 // Exported so a regression test can assert directly against this exact
 // pattern (server/test/internalLeakageGuardRegression.js) without needing
 // a full mocked model round-trip through orchestrate().
-export const INTERNAL_LEAK_PATTERNS = /underlying tool data|do not repeat verbatim|\bplanId\b|\binternal_plan\b|"toolName"\s*:|"resolved(AdAccountId|PageId|PixelId|CatalogId)"|resolvedAdAccountId|resolvedPageId/i;
+//
+// Round 3 (live testing) added: a raw "Plan ID: ..." line appearing
+// directly in a customer-facing recommendation — formatRecommendation()
+// (server/agents/metaExpert/planner.js) never puts one there, so this was
+// the model adding it itself; caught the same way as everything else here,
+// by pattern-matching the leak rather than trusting the prompt not to
+// produce it. conversationId and raw plan-status enum values (proposed/
+// approved/executing/superseded — internal state words, distinct from the
+// human-facing "Status: Paused" line the formatter DOES produce) join the
+// same list for the same reason.
+export const INTERNAL_LEAK_PATTERNS = new RegExp(
+  [
+    /underlying tool data/i,
+    /do not repeat verbatim/i,
+    /\bplanId\b/i,
+    /\bplan[_ ]id\s*[:#]/i,
+    /\binternal_plan\b/i,
+    /\bconversationId\b/i,
+    /"toolName"\s*:/i,
+    /"resolved(AdAccountId|PageId|PixelId|CatalogId)"/i,
+    /resolvedAdAccountId/i,
+    /resolvedPageId/i,
+    /\bstatus"?\s*[:=]\s*"?(proposed|approved|executing|executed|failed|rejected|superseded)"?/i,
+  ]
+    .map((r) => r.source)
+    .join("|"),
+  "i"
+);
 const MAX_LEAK_NUDGES = 1;
+
+// Issue 6 (live testing round 3): "Create the best campaign you recommend
+// for my business" led the model to call meta_expert.execute_campaign_plan
+// as its very first action, with no plan ever proposed — which reached
+// Meta and failed with a raw "Invalid parameter" error. The tool's own
+// state-machine checks (planner.js/tools/meta/metaExpert.js) already
+// refuse to execute when no valid plan exists, but that's still the model
+// being ALLOWED to try and finding out after the fact. This gate runs in
+// the orchestrator, before the tool is ever dispatched — the model is
+// never even given the chance to call Meta without (a) an active plan for
+// this conversation and (b) genuine approval language in the user's own,
+// current message. Presenting a recommendation is not approval; only the
+// user's own words are.
+export function checkExecutionApprovalGate({ userId, conversationId, userMessage }) {
+  const active = getActivePlanForConversation(userId, conversationId);
+  if (!active) {
+    return "No active campaign plan exists for this conversation yet. Call meta_expert.create_campaign_plan first (after meta_expert.research_business_context if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
+  }
+  if (!messageIndicatesExecutionApproval(userMessage)) {
+    return 'The user has not explicitly approved the current plan in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
+  }
+  return null;
+}
 
 function createPlan({ userId, conversationId, goal }) {
   const id = cryptoRandom();
@@ -394,14 +446,21 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       }
       trace.push(traceStep("tool", `Selected: ${call.toolName}`, "active"));
 
-      const outcome = await runTool({
-        toolName: call.toolName,
-        parameters: call.parameters || {},
-        userId,
-        agentId,
-        conversationId,
-        planId,
-      });
+      let outcome;
+      if (call.toolName === "meta_expert.execute_campaign_plan") {
+        const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
+        if (gateError) outcome = { status: "failed", error: gateError };
+      }
+      if (!outcome) {
+        outcome = await runTool({
+          toolName: call.toolName,
+          parameters: call.parameters || {},
+          userId,
+          agentId,
+          conversationId,
+          planId,
+        });
+      }
 
       if (outcome.status === "awaiting_confirmation") {
         trace[trace.length - 1].state = "done";

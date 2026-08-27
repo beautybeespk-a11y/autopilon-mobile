@@ -9,7 +9,8 @@
     "targeting_strategy", "age_min", "age_max", "gender", "locations", "countries",
     "placements", "creative_strategy", "budget_strategy", "bid_strategy",
     "facebook_page", "ad_account", "cta", "campaign_status",
-    "assumptions", "reasoning_summary", "confidence", "approval_required"
+    "assumptions", "reasoning_summary", "confidence", "approval_required",
+    "goal_classification", "audience_basis"
   ],
   "properties": {
     "goal": {
@@ -21,6 +22,17 @@
       "type": "string",
       "enum": ["OUTCOME_SALES", "OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_ENGAGEMENT", "OUTCOME_AWARENESS", "OUTCOME_APP_PROMOTION"],
       "description": "A real Meta campaign objective value. Must genuinely match `goal` — see validatePlan()'s goal/objective alignment check."
+    },
+    "goal_classification": {
+      "type": "object",
+      "required": ["literal_goal", "inferred_business_outcome", "recommended_meta_objective", "requires_goal_confirmation"],
+      "description": "Deterministic pre-planning step (Issue 3, live testing round 3): forces the literal wording of what the user asked for to be reasoned about separately from what actually serves the business, BEFORE objective is picked — not left to prompt wording alone. server/agents/metaExpert/policy.js enforces: if the connected business is clearly e-commerce with real purchase tracking and objective is OUTCOME_TRAFFIC, requires_goal_confirmation must be true AND objective must equal recommended_meta_objective (i.e. the plan proposes the RECOMMENDED objective, with open_questions offering the literal one as an alternative) — a Traffic plan is never silently built for that business.",
+      "properties": {
+        "literal_goal": { "type": "string", "minLength": 1, "description": "What the user literally asked for, in their words (e.g. \"more traffic\")." },
+        "inferred_business_outcome": { "type": "string", "minLength": 1, "description": "What the business is actually likely to need, based on real connected data (e.g. \"revenue/purchases — this is a connected e-commerce store with real products and purchase tracking\")." },
+        "recommended_meta_objective": { "type": "string", "enum": ["OUTCOME_SALES", "OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_ENGAGEMENT", "OUTCOME_AWARENESS", "OUTCOME_APP_PROMOTION"], "description": "What objective actually serves inferred_business_outcome — may differ from `objective` above only when requires_goal_confirmation is true and the user hasn't chosen yet." },
+        "requires_goal_confirmation": { "type": "boolean", "description": "true when literal_goal and inferred_business_outcome point to different Meta objectives and the user hasn't already confirmed which one they actually want." }
+      }
     },
     "conversion_location": {
       "type": "string",
@@ -37,6 +49,11 @@
     "age_min": { "type": "integer", "minimum": 13, "maximum": 65 },
     "age_max": { "type": "integer", "minimum": 13, "maximum": 65 },
     "gender": { "type": "string", "enum": ["ALL", "MALE", "FEMALE"] },
+    "audience_basis": {
+      "type": "string",
+      "enum": ["ACCOUNT_HISTORY", "STORE_DATA", "PRODUCT_CATEGORY", "META_PERFORMANCE", "HEURISTIC"],
+      "description": "What this audience (age/gender/locations/targeting_strategy) was actually derived from — required so a generic 'All genders 18-65' guess can't be presented as if it were evidence-backed. HEURISTIC is a legitimate, honest choice when no real account/store data exists yet; it's not honest when real data was available and ignored."
+    },
     "locations": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 },
@@ -72,6 +89,11 @@
       "type": ["number", "null"],
       "minimum": 0,
       "description": "In the ad account's smallest currency unit. null when a budget policy/user input is still needed — see approval_required."
+    },
+    "budget_basis": {
+      "type": "string",
+      "enum": ["USER_PROVIDED", "SAVED_POLICY", "HISTORICAL_PERFORMANCE", "HEURISTIC_STARTING_TEST"],
+      "description": "Required whenever daily_budget is set — where this number came from. USER_PROVIDED (the user stated it) and SAVED_POLICY (an account-level approved default) are trusted as-is. HISTORICAL_PERFORMANCE and HEURISTIC_STARTING_TEST are capped by server/agents/metaExpert/policy.js's MAX_SUGGESTED_DAILY_BUDGET — a model-recommended number that size needs real evidence, not an invented 'reasonable-sounding' spend level."
     },
     "bid_strategy": {
       "type": "string",
