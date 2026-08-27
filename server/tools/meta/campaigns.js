@@ -5,6 +5,7 @@ import { publishEvent } from "../../automation/triggers.js";
 import { linkAssetToCampaign } from "../../orchestrator/contentService.js";
 import { resolveChatImage } from "../shared/chatImage.js";
 import { resolveContentImageAsset } from "../shared/contentAsset.js";
+import { resolvePageId } from "../shared/metaPageId.js";
 
 function token(context) {
   // Every Meta tool needs a live connection; this throws a clear, tool-level
@@ -188,13 +189,15 @@ registerTool({
 
 registerTool({
   name: "meta.list_page_posts",
-  description: "Lists a Facebook Page's recent organic posts — use this to let the user pick an existing post to boost as an ad with meta.boost_post, instead of creating new ad creative from scratch.",
+  description: "Lists a Facebook Page's recent organic posts, INCLUDING Facebook Reels — Facebook has its own Reels feature separate from Instagram, so the word 'reel' by itself does not mean Instagram. Use this whenever the user names Facebook (post, reel, or video), to let them pick an existing one to boost as an ad with meta.boost_post. pageId is optional — omit it to auto-resolve (works automatically when exactly one Facebook Page is connected; asks for a choice, with the real Page names, if there's more than one). Never pass a made-up pageId.",
   category: "meta_ads",
-  parameters: { type: "object", properties: { pageId: { type: "string" } }, required: ["pageId"] },
+  parameters: { type: "object", properties: { pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve." } }, required: [] },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
-    const posts = await meta.listPagePosts(token(context), parameters.pageId);
+    const accessToken = token(context);
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const posts = await meta.listPagePosts(accessToken, pageId);
     return {
       posts: posts.map((p) => ({
         id: p.id, message: p.message || null, createdTime: p.created_time, permalink: p.permalink_url,
@@ -206,14 +209,15 @@ registerTool({
 
 registerTool({
   name: "meta.list_instagram_posts",
-  description: "Lists recent posts from the Instagram Business Account connected to a Facebook Page — use this to let the user pick an existing Instagram post/reel to boost as an ad with meta.boost_post. Returns an empty list (not an error) if the Page has no Instagram account connected, or if reading Instagram content isn't available on this deployment yet (tell the user Facebook post boosting still works either way).",
+  description: "Lists recent posts from the Instagram Business Account connected to a Facebook Page. Use ONLY when the user explicitly says Instagram — Facebook Pages have their own Reels too, so 'reel' by itself is not enough to mean Instagram; for Facebook content (including Facebook Reels) use meta.list_page_posts instead. Use this to let the user pick an existing Instagram post/reel to boost as an ad with meta.boost_post. Returns an empty list (not an error) if the Page has no Instagram account connected, or if reading Instagram content isn't available on this deployment yet (tell the user Facebook post boosting still works either way). pageId is optional — omit it to auto-resolve (works automatically when exactly one Facebook Page is connected; asks for a choice, with the real Page names, if there's more than one). Never pass a made-up pageId.",
   category: "meta_ads",
-  parameters: { type: "object", properties: { pageId: { type: "string" } }, required: ["pageId"] },
+  parameters: { type: "object", properties: { pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve." } }, required: [] },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
     const accessToken = token(context);
-    const igAccountId = await meta.getInstagramAccountId(accessToken, parameters.pageId);
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
     if (!igAccountId) return { posts: [], instagramConnected: false };
     // Reading Page metadata (above) and reading actual Instagram content
     // (below) need different permissions — this app currently only
@@ -245,7 +249,7 @@ registerTool({
       name: { type: "string" },
       postId: { type: "string" },
       instagramMediaId: { type: "string" },
-      pageId: { type: "string", description: "Required when using instagramMediaId — not needed for postId." },
+      pageId: { type: "string", description: "Only relevant with instagramMediaId — not needed for postId. Optional even then: omit it to auto-resolve. Never pass a made-up value." },
     },
     required: ["adAccountId", "adSetId", "name"],
   },
@@ -255,9 +259,6 @@ registerTool({
     if (Boolean(parameters.postId) === Boolean(parameters.instagramMediaId)) {
       throw new Error("Provide exactly one of: postId (a Facebook post) or instagramMediaId (an Instagram post).");
     }
-    if (parameters.instagramMediaId && !parameters.pageId) {
-      throw new Error("pageId is required when boosting an Instagram post.");
-    }
     const accessToken = token(context);
     let creativeFields;
     if (parameters.postId) {
@@ -266,7 +267,8 @@ registerTool({
       // exactly that, no reconstruction needed.
       creativeFields = { name: `${parameters.name} — creative`, object_story_id: parameters.postId };
     } else {
-      const igAccountId = await meta.getInstagramAccountId(accessToken, parameters.pageId);
+      const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+      const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
       if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected.");
       creativeFields = { name: `${parameters.name} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId };
     }
@@ -291,7 +293,7 @@ registerTool({
     properties: {
       adAccountId: { type: "string" },
       adSetId: { type: "string" },
-      pageId: { type: "string" },
+      pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve. Never pass a made-up value." },
       name: { type: "string" },
       imageReferenceId: { type: "string" },
       imageUrl: { type: "string" },
@@ -302,7 +304,7 @@ registerTool({
       link: { type: "string" },
       callToAction: { type: "string", description: "e.g. LEARN_MORE, SHOP_NOW, SIGN_UP, DOWNLOAD" },
     },
-    required: ["adAccountId", "adSetId", "pageId", "name", "primaryText", "headline", "link"],
+    required: ["adAccountId", "adSetId", "name", "primaryText", "headline", "link"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
@@ -312,6 +314,7 @@ registerTool({
       throw new Error("Provide exactly one of: imageReferenceId (a chat-attached photo), imageUrl (a public image URL), or contentAssetId (a generate_image result).");
     }
     const accessToken = token(context);
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
     let base64;
     if (parameters.imageReferenceId) {
       const { buffer } = resolveChatImage(context.userId, parameters.imageReferenceId);
@@ -328,7 +331,7 @@ registerTool({
     const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, {
       name: `${parameters.name} — creative`,
       object_story_spec: {
-        page_id: parameters.pageId,
+        page_id: pageId,
         link_data: {
           image_hash: hash,
           message: parameters.primaryText,
@@ -380,7 +383,7 @@ registerTool({
     properties: {
       adAccountId: { type: "string" },
       adSetId: { type: "string" },
-      pageId: { type: "string" },
+      pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve. Never pass a made-up value." },
       name: { type: "string" },
       videoId: { type: "string" },
       thumbnailUrl: { type: "string", description: "Public image URL to use as the video's thumbnail" },
@@ -389,16 +392,17 @@ registerTool({
       link: { type: "string" },
       callToAction: { type: "string", description: "e.g. LEARN_MORE, SHOP_NOW, SIGN_UP, DOWNLOAD" },
     },
-    required: ["adAccountId", "adSetId", "pageId", "name", "videoId", "link"],
+    required: ["adAccountId", "adSetId", "name", "videoId", "link"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
   async execute(parameters, context) {
     const accessToken = token(context);
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
     const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, {
       name: `${parameters.name} — creative`,
       object_story_spec: {
-        page_id: parameters.pageId,
+        page_id: pageId,
         video_data: {
           video_id: parameters.videoId,
           image_url: parameters.thumbnailUrl,
