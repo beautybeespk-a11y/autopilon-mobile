@@ -412,6 +412,19 @@ if (!agentCols.includes("aiProvider")) db.exec("ALTER TABLE agents ADD COLUMN ai
 if (!agentCols.includes("aiModel")) db.exec("ALTER TABLE agents ADD COLUMN aiModel TEXT"); // NULL = that provider's default model
 if (!agentCols.includes("orgId")) db.exec("ALTER TABLE agents ADD COLUMN orgId TEXT"); // NULL = personal agent (default, unchanged behavior)
 if (!agentCols.includes("workspaceId")) db.exec("ALTER TABLE agents ADD COLUMN workspaceId TEXT"); // set only when scoped to one workspace, not the whole org
+// Which Agent Library template (server/orchestrator/agentLibrary.js) this
+// agent was installed from, if any — NULL for agents built from scratch.
+// Fixing a template's instructions (a real, recurring need — see the Meta
+// Ads Manager fixes this same session) previously had no way to reach
+// customers who already installed it; every prior installer was stuck on
+// whatever text existed at install time forever. templateSyncedInstructions
+// is a snapshot of the instructions text as of the last install/sync —
+// comparing it against the agent's CURRENT instructions tells an update
+// whether the customer has hand-edited their copy since (and must not be
+// silently overwritten), independent of comparing against the template's
+// latest text (which tells it whether an update exists at all).
+if (!agentCols.includes("templateId")) db.exec("ALTER TABLE agents ADD COLUMN templateId TEXT");
+if (!agentCols.includes("templateSyncedInstructions")) db.exec("ALTER TABLE agents ADD COLUMN templateSyncedInstructions TEXT");
 
 const execCols = db.prepare("PRAGMA table_info(tool_executions)").all().map((c) => c.name);
 if (!execCols.includes("agentId")) db.exec("ALTER TABLE tool_executions ADD COLUMN agentId TEXT");

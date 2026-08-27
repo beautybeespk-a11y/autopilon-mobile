@@ -18,7 +18,39 @@ export default function AgentBuilder() {
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(!id);
   const [error, setError] = useState("");
+  const [templateSync, setTemplateSync] = useState(null);
+  const [syncing, setSyncing] = useState(false);
   const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+
+  const loadTemplateSync = () => {
+    if (!id) return;
+    api.get(`/agent-library/agents/${id}/template-sync`).then(setTemplateSync).catch(() => setTemplateSync(null));
+  };
+  useEffect(loadTemplateSync, [id]);
+
+  // force=true only after the user has confirmed they want to overwrite
+  // their own hand edits — the first attempt always goes through without
+  // it, so a real edit never gets silently discarded.
+  const updateFromTemplate = async (force = false) => {
+    setSyncing(true);
+    try {
+      const agent = await api.post(`/agent-library/agents/${id}/template-sync`, { force });
+      setForm((f) => ({ ...f, instructions: agent.instructions }));
+      setSkillIds((agent.skills || []).map((s) => s.id));
+      loadTemplateSync();
+    } catch (err) {
+      if (err.data?.code === "CUSTOMIZED") {
+        if (window.confirm(`${err.message}\n\nOverwrite your changes with the latest template instructions?`)) {
+          await updateFromTemplate(true);
+          return;
+        }
+      } else {
+        setError(err.message);
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   useEffect(() => { api.get("/chat/provider-options").then(setProviderOptions).catch(() => {}); }, []);
   useEffect(() => {
@@ -68,6 +100,24 @@ export default function AgentBuilder() {
         <h1 className="font-display text-2xl font-semibold">{id ? "Edit agent" : "Agent Builder"}</h1>
         <p className="mt-1 text-muted">{id ? "Update this agent's behavior and enabled skills." : "Define how your agent behaves and what it can do."}</p>
       </div>
+
+      {templateSync?.fromTemplate && templateSync.updateAvailable && (
+        <Card className="flex items-center justify-between gap-4 border-accent/40 bg-accent/5 p-4">
+          <div>
+            <div className="text-sm font-medium">An update is available for this agent</div>
+            <p className="mt-0.5 text-xs text-muted">
+              {templateSync.templateRemoved
+                ? "The template this was installed from no longer exists."
+                : `"${templateSync.templateName}" has been improved since this agent was installed or last updated.${templateSync.customized ? " Note: you've edited this agent's instructions since then." : ""}`}
+            </p>
+          </div>
+          {!templateSync.templateRemoved && (
+            <Button variant="outline" onClick={() => updateFromTemplate(false)} disabled={syncing}>
+              {syncing ? "Updating…" : "Update to latest"}
+            </Button>
+          )}
+        </Card>
+      )}
 
       <Card className="space-y-5 p-6">
         <Input label="Agent name" value={form.name} onChange={set("name")} placeholder="e.g. Marketing Assistant" />

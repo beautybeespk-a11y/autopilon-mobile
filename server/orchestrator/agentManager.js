@@ -90,19 +90,63 @@ function setSkills(agentId, skillIds) {
 }
 
 export function createAgent(userId, fields) {
-  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, skillIds } = fields;
+  const { name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, skillIds, templateId, templateSyncedInstructions } = fields;
   if (!name?.trim()) throw new Error("Agent name is required.");
   if (orgId) enforceQuota(orgId, "maxAgents", "agents");
   const id = cryptoRandom();
   const ts = now();
   db.prepare(
-    `INSERT INTO agents (id, userId, name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, status, version, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`
-  ).run(id, userId, name, description || "", instructions || "", personality || "professional", avatar || null, category || "general", aiProvider || null, aiModel || null, orgId || null, workspaceId || null, ts, ts);
+    `INSERT INTO agents (id, userId, name, description, instructions, personality, avatar, category, aiProvider, aiModel, orgId, workspaceId, templateId, templateSyncedInstructions, status, version, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)`
+  ).run(id, userId, name, description || "", instructions || "", personality || "professional", avatar || null, category || "general", aiProvider || null, aiModel || null, orgId || null, workspaceId || null, templateId || null, templateSyncedInstructions || null, ts, ts);
   setSkills(id, skillIds);
   const agent = loadAgentWithSkills(id);
   recordVersion(id, 1, snapshotOf(agent), "Created");
   return agent;
+}
+
+// Whether an agent installed from a template can be auto-updated, and
+// whether there's anything to update to. `customized` (agent's current
+// instructions differ from the last-synced snapshot) means the customer
+// hand-edited their copy — an update should refuse to silently overwrite
+// that without force. `updateAvailable` (the template's current
+// instructions differ from that same snapshot) is a separate question —
+// the template can have moved on regardless of whether the customer also
+// touched their copy.
+export function getTemplateSyncInfo(userId, agentId, currentTemplateInstructions) {
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
+  if (!agent.templateId) return { fromTemplate: false };
+  return {
+    fromTemplate: true,
+    templateId: agent.templateId,
+    customized: agent.instructions !== agent.templateSyncedInstructions,
+    updateAvailable: currentTemplateInstructions !== undefined ? currentTemplateInstructions !== agent.templateSyncedInstructions : null,
+  };
+}
+
+// Applies a template's current instructions/skillIds to an agent that was
+// installed from it. Refuses (throws, code "CUSTOMIZED") if the customer's
+// instructions have diverged from the last-synced snapshot, unless force is
+// set — an update must never silently discard a real hand edit. skillIds
+// are merged additively (the template's required skills are ensured
+// present, nothing existing is removed) so a skill the customer manually
+// added on top survives a sync.
+export function syncAgentFromTemplate(userId, agentId, { instructions, skillIds, templateName }, force = false) {
+  const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
+  if (!agent || !canManageAgent(userId, agent)) throw new Error("Agent not found.");
+  if (!agent.templateId) throw new Error("This agent wasn't installed from a template.");
+  const customized = agent.instructions !== agent.templateSyncedInstructions;
+  if (customized && !force) {
+    const err = new Error("This agent's instructions have been edited since it was installed — updating will overwrite those changes.");
+    err.code = "CUSTOMIZED";
+    throw err;
+  }
+  const existingSkillIds = db.prepare("SELECT skillId FROM agent_skills WHERE agentId = ?").all(agentId).map((r) => r.skillId);
+  const mergedSkillIds = [...new Set([...existingSkillIds, ...(skillIds || [])])];
+  const updated = updateAgent(userId, agentId, { instructions, skillIds: mergedSkillIds }, `Updated from template "${templateName}"`);
+  db.prepare("UPDATE agents SET templateSyncedInstructions = ? WHERE id = ?").run(instructions, agentId);
+  return updated;
 }
 
 // Every edit bumps `version` and writes a snapshot of the *new* state to

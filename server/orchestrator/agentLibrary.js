@@ -1,4 +1,5 @@
-import { createAgent } from "./agentManager.js";
+import db from "../db.js";
+import { createAgent, getTemplateSyncInfo, syncAgentFromTemplate } from "./agentManager.js";
 
 // Static starter templates. Installing one just calls the same createAgent()
 // every hand-built agent goes through — a template is nothing more than a
@@ -141,5 +142,30 @@ export function installTemplate(userId, templateId, overrideName) {
     category: template.category,
     avatar: template.icon,
     skillIds: template.skillIds,
+    templateId: template.id,
+    templateSyncedInstructions: template.instructions,
   });
+}
+
+// Whether an agent that was installed from a template can be refreshed to
+// the template's current instructions — see the ALTER TABLE comment in
+// db.js for why this exists: a template fix previously had no way to reach
+// anyone who'd already installed it.
+export function getTemplateSyncStatus(userId, agentId) {
+  const agent = db.prepare("SELECT templateId FROM agents WHERE id = ?").get(agentId);
+  const template = agent?.templateId ? AGENT_TEMPLATES.find((t) => t.id === agent.templateId) : null;
+  const info = getTemplateSyncInfo(userId, agentId, template?.instructions);
+  if (!info.fromTemplate) return info;
+  return { ...info, templateName: template?.name || null, templateRemoved: !template };
+}
+
+// Refreshes an agent to its template's current instructions/skills. Throws
+// with code "CUSTOMIZED" if the agent's instructions were hand-edited since
+// install/last sync and force isn't set — never silently discards that.
+export function updateAgentFromTemplate(userId, agentId, force = false) {
+  const agent = db.prepare("SELECT templateId FROM agents WHERE id = ?").get(agentId);
+  if (!agent?.templateId) throw new Error("This agent wasn't installed from a template.");
+  const template = AGENT_TEMPLATES.find((t) => t.id === agent.templateId);
+  if (!template) throw new Error(`Template "${agent.templateId}" no longer exists.`);
+  return syncAgentFromTemplate(userId, agentId, { instructions: template.instructions, skillIds: template.skillIds, templateName: template.name }, force);
 }
