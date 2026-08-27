@@ -143,7 +143,7 @@ registerTool({
 // is a much bigger and shakier surface than a few common fields with
 // sensible defaults. Covers the common case; doesn't attempt interest/
 // behavior targeting, custom audiences, or placement overrides.
-function buildTargeting({ countries, ageMin, ageMax, gender }) {
+export function buildTargeting({ countries, ageMin, ageMax, gender }) {
   const targeting = {
     geo_locations: { countries: countries?.length ? countries : ["US"] },
     age_min: ageMin || 18,

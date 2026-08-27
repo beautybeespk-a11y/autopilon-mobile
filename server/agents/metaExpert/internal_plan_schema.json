@@ -1,0 +1,146 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://autopilon.internal/schemas/meta_expert/internal_plan_schema.json",
+  "title": "Meta Expert Internal Campaign Plan",
+  "description": "The structured plan the Meta Expert planner (Phase 1) produces from a user's stated goal, before any real Meta object is created. Asset fields are SEMANTIC references (e.g. \"default_ad_account\"), never raw Meta ids — the backend resolves those separately via the deterministic resolvers in server/tools/shared/. This file is the source of truth both a human reading it and server/agents/metaExpert/planSchema.js's validatePlan() agree on; validatePlan() enforces every rule below without an external JSON Schema library.",
+  "type": "object",
+  "required": [
+    "goal", "objective", "conversion_location", "optimization_event",
+    "targeting_strategy", "age_min", "age_max", "gender", "locations", "countries",
+    "placements", "creative_strategy", "budget_strategy", "bid_strategy",
+    "facebook_page", "ad_account", "cta", "campaign_status",
+    "assumptions", "reasoning_summary", "confidence", "approval_required"
+  ],
+  "properties": {
+    "goal": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The user's own stated business goal, in their words (e.g. \"more website sales\"). Not the Meta objective — that's derived from this."
+    },
+    "objective": {
+      "type": "string",
+      "enum": ["OUTCOME_SALES", "OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_ENGAGEMENT", "OUTCOME_AWARENESS", "OUTCOME_APP_PROMOTION"],
+      "description": "A real Meta campaign objective value. Must genuinely match `goal` — see validatePlan()'s goal/objective alignment check."
+    },
+    "conversion_location": {
+      "type": "string",
+      "enum": ["WEBSITE", "APP", "MESSAGING_APP", "ON_FACEBOOK", "CALLS"]
+    },
+    "optimization_event": {
+      "type": "string",
+      "enum": ["PURCHASE", "ADD_TO_CART", "LEAD", "COMPLETE_REGISTRATION", "LINK_CLICKS", "LANDING_PAGE_VIEWS", "IMPRESSIONS", "REACH", "THRUPLAY", "CONVERSATIONS"]
+    },
+    "targeting_strategy": {
+      "type": "string",
+      "enum": ["BROAD", "BROAD_WITH_TEST", "INTEREST_BASED", "LOOKALIKE", "RETARGETING"]
+    },
+    "age_min": { "type": "integer", "minimum": 13, "maximum": 65 },
+    "age_max": { "type": "integer", "minimum": 13, "maximum": 65 },
+    "gender": { "type": "string", "enum": ["ALL", "MALE", "FEMALE"] },
+    "locations": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1,
+      "description": "Human-readable place names (e.g. \"Karachi\") for the customer-facing recommendation — display only, not used to build the real Meta targeting object directly."
+    },
+    "countries": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[A-Z]{2}$" },
+      "minItems": 1,
+      "description": "ISO 3166-1 alpha-2 country codes (e.g. [\"PK\"]) — this IS what execute_campaign_plan uses to build the real Meta ad-set targeting (geo_locations.countries), via the existing country-level targeting mechanism. Phase 1 supports country-level Meta targeting only; city/region-level geo-search resolution (matching the finer city names in `locations`) is deferred, not built in this pass — see the Phase 1 completion report."
+    },
+    "placements": {
+      "type": "string",
+      "enum": ["ADVANTAGE_PLUS", "MANUAL"],
+      "description": "MANUAL requires manual_placements to list which ones."
+    },
+    "manual_placements": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Only used when placements = MANUAL."
+    },
+    "creative_strategy": {
+      "type": "object",
+      "required": ["source", "description"],
+      "properties": {
+        "source": { "type": "string", "enum": ["EXISTING_PAGE_POST", "EXISTING_INSTAGRAM_POST", "PRODUCT_IMAGE", "GENERATED", "USER_ATTACHED"] },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "budget_strategy": { "type": "string", "enum": ["DAILY", "LIFETIME"] },
+    "daily_budget": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "description": "In the ad account's smallest currency unit. null when a budget policy/user input is still needed — see approval_required."
+    },
+    "bid_strategy": {
+      "type": "string",
+      "enum": ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"]
+    },
+    "facebook_page": {
+      "type": "object",
+      "required": ["ref"],
+      "properties": {
+        "ref": { "type": "string", "description": "\"default_facebook_page\", or a real numeric Page id already confirmed via meta.list_pages this conversation. Never invented." }
+      }
+    },
+    "instagram_identity": {
+      "type": ["object", "null"],
+      "properties": {
+        "ref": { "type": "string" }
+      },
+      "description": "null when Instagram isn't connected — that's a valid, expected state, not an error."
+    },
+    "ad_account": {
+      "type": "object",
+      "required": ["ref"],
+      "properties": {
+        "ref": { "type": "string", "description": "\"default_ad_account\", or a real act_... id already confirmed via meta.list_ad_accounts this conversation." }
+      }
+    },
+    "pixel": {
+      "type": ["object", "null"],
+      "properties": {
+        "ref": { "type": "string" }
+      },
+      "description": "null when no Pixel exists or one isn't needed for this optimization_event."
+    },
+    "catalog": {
+      "type": ["object", "null"],
+      "properties": {
+        "ref": { "type": "string" }
+      },
+      "description": "null unless this is a catalog/dynamic-ad campaign."
+    },
+    "cta": {
+      "type": "string",
+      "enum": ["LEARN_MORE", "SHOP_NOW", "SIGN_UP", "DOWNLOAD", "CONTACT_US", "GET_QUOTE", "BOOK_TRAVEL", "SUBSCRIBE"]
+    },
+    "campaign_status": {
+      "type": "string",
+      "enum": ["PAUSED"],
+      "default": "PAUSED",
+      "description": "Always PAUSED for a newly proposed plan — nothing in Phase 1 ever proposes a campaign that starts ACTIVE."
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Plain-language list of what was assumed/inferred rather than confirmed (Step 4's \"infer when possible\")."
+    },
+    "reasoning_summary": {
+      "type": "string",
+      "minLength": 1,
+      "description": "A short expert-style explanation of why this plan was chosen — shown to the user (Step 7)."
+    },
+    "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+    "approval_required": {
+      "type": "boolean",
+      "description": "true whenever any field materially affecting spend/risk (budget, sensitive category, ambiguous asset choice, etc.) couldn't be safely inferred and needs explicit user input before execution."
+    },
+    "open_questions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Only present when approval_required is true — the specific things the user still needs to decide/confirm (Step 4's \"ask only when necessary\")."
+    }
+  }
+}

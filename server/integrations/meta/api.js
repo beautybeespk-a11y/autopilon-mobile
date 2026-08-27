@@ -207,3 +207,22 @@ export async function listInstagramPosts(accessToken, igAccountId) {
   const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp`, { accessToken });
   return data.data || [];
 }
+
+// Meta Pixels (conversion tracking) live under the ad account, not the
+// user — /act_{id}/adspixels. Needed by the Meta Expert planner (Phase 1)
+// to know whether Purchase-optimized campaigns are even possible before
+// recommending one. Most accounts that have never run conversion
+// campaigns simply have none — that's a normal, expected empty result,
+// not an error.
+export async function listPixels(accessToken, adAccountId) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/adspixels?fields=id,name`, { accessToken });
+  return data.data || [];
+}
+
+// Product catalogs (for dynamic/catalog ads) — also ad-account-scoped.
+// Same "commonly empty, not an error" reasoning as listPixels: most
+// accounts without a product feed set up will simply have none.
+export async function listCatalogs(accessToken, adAccountId) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/product_catalogs?fields=id,name`, { accessToken });
+  return data.data || [];
+}

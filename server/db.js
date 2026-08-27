@@ -1930,4 +1930,36 @@ db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, statu
 db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
   .run("Audit a page's on-page SEO (title, meta description, headings, alt text) and check Core Web Vitals / page speed.", "marketing", "seo");
 
+// Meta Ads Expert planner (Phase 1) — server/agents/metaExpert/. Stores
+// the internal campaign plan the LLM proposes (goal, objective, targeting,
+// budget, semantic asset references, etc.) as a validated, schema-checked
+// JSON document, separately from whether/when it gets executed. Deliberately
+// its own table rather than reusing an existing one: a plan is a distinct
+// lifecycle (proposed -> approved -> executed, or rejected) from an actual
+// Meta campaign, and needs to exist and be inspectable even before any
+// real Meta object is created. planJson never contains resolved secrets —
+// only ids Meta itself already returns for objects this user's own token
+// can already see (page/ad-account/pixel/catalog ids), the same as every
+// other Meta tool result already exposed to the model.
+db.exec(`
+CREATE TABLE IF NOT EXISTS meta_campaign_plans (
+  id          TEXT PRIMARY KEY,
+  userId      TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'proposed', -- proposed | approved | executed | rejected
+  planJson    TEXT NOT NULL,   -- the validated internal plan (see internal_plan_schema.json)
+  contextJson TEXT,            -- the business-research context the plan was built from (known/inferred/unavailable)
+  recommendationText TEXT,     -- the customer-facing recommendation presented for this plan
+  executionResultJson TEXT,    -- set once execute_campaign_plan runs: created campaign/adSet/ad ids
+  createdAt   TEXT NOT NULL,
+  updatedAt   TEXT NOT NULL,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_meta_plans_user ON meta_campaign_plans(userId);
+`);
+
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("meta_expert", "Meta Ads Expert Planner", "Research business/account context and build a validated, approval-gated Meta campaign strategy from a stated goal, instead of guessing individual campaign settings.", "marketing");
+db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
+  .run("Research business/account context and build a validated, approval-gated Meta campaign strategy from a stated goal, instead of guessing individual campaign settings.", "marketing", "meta_expert");
+
 export default db;
