@@ -56,7 +56,7 @@ registerToolAliased({
   requiresConfirmation: false,
   async execute(parameters, context) {
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const campaigns = await meta.listCampaigns(accessToken, adAccountId);
     return { campaigns };
   },
@@ -81,7 +81,7 @@ registerToolAliased({
   requiresConfirmation: true, // Creating a campaign involves a budget — always confirm first.
   async execute(parameters, context) {
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const result = await meta.createCampaign(accessToken, adAccountId, {
       name: parameters.name,
       objective: parameters.objective,
@@ -178,7 +178,7 @@ registerTool({
   requiresConfirmation: true, // Sets real budget + audience — always confirm.
   async execute(parameters, context) {
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const result = await meta.createAdSet(accessToken, adAccountId, {
       name: parameters.name,
       campaign_id: parameters.campaignId,
@@ -267,7 +267,7 @@ registerTool({
       throw new Error("Provide exactly one of: postId (a Facebook post) or instagramMediaId (an Instagram post).");
     }
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     let creativeFields;
     if (parameters.postId) {
       // postId from meta.list_page_posts is already in Meta's own
@@ -322,7 +322,7 @@ registerTool({
       throw new Error("Provide exactly one of: imageReferenceId (a chat-attached photo), imageUrl (a public image URL), or contentAssetId (a generate_image result).");
     }
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
     let base64;
     if (parameters.imageReferenceId) {
@@ -379,7 +379,7 @@ registerTool({
   requiresConfirmation: false, // Uploading alone doesn't create anything that spends — the ad creation step does.
   async execute(parameters, context) {
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const result = await meta.uploadAdVideoFromUrl(accessToken, adAccountId, parameters.videoUrl, parameters.name);
     return { videoId: result.videoId, status: "processing" };
   },
@@ -409,7 +409,7 @@ registerTool({
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
   async execute(parameters, context) {
     const accessToken = token(context);
-    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
     const creative = await meta.createAdCreative(accessToken, adAccountId, {
       name: `${parameters.name} — creative`,

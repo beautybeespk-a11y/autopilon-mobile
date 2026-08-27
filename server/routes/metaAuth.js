@@ -2,7 +2,9 @@ import { Router } from "express";
 import { requireAuth, secureRandomToken, logActivity } from "../middleware.js";
 import db from "../db.js";
 import { buildAuthorizationUrl, exchangeCodeForToken, metaOAuthStatus, revokeToken } from "../integrations/meta/oauth.js";
-import { saveConnection, disconnectIntegration, connectionHealth, getConnection } from "../integrations/manager.js";
+import { saveConnection, disconnectIntegration, connectionHealth, getConnection, requireValidToken, updateConnectionMeta } from "../integrations/manager.js";
+import * as meta from "../integrations/meta/api.js";
+import { isPlausibleAdAccountId } from "../tools/shared/metaAdAccountId.js";
 
 const router = Router();
 
@@ -62,6 +64,65 @@ router.post("/disconnect", requireAuth, async (req, res) => {
   disconnectIntegration(req.session.userId, "meta_ads");
   logActivity(db, req.session.userId, "integration_disconnected", "Disconnected Meta Ads");
   res.json({ ok: true, revoked: tokenToRevoke ? !revocationError : null, revocationError });
+});
+
+// Integrations → Meta Ads' ad account selector: the real connected
+// accounts (name + id, requirement 8) plus whichever one (if any) is
+// currently saved as the Default Ad Account — read straight from the same
+// `integrations.meta` JSON blob resolveAdAccountId() itself reads
+// (server/tools/shared/metaAdAccountId.js), so the UI and the resolver can
+// never disagree about what "the default" currently is.
+router.get("/ad-accounts", requireAuth, async (req, res) => {
+  try {
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const accounts = await meta.listAdAccounts(accessToken);
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const savedDefault = JSON.parse(conn?.meta || "{}").defaults?.adAccountId || null;
+    // Same self-healing the resolver does: don't show a default in the UI
+    // that no longer corresponds to a real connected account.
+    const defaultAdAccountId = savedDefault && accounts.some((a) => a.id === savedDefault) ? savedDefault : null;
+    res.json({ accounts, defaultAdAccountId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Sets (or clears, with adAccountId: null) the Default Ad Account. Always
+// re-verifies the id against a fresh meta.listAdAccounts() call before
+// saving — never trusts a client-supplied id just because it's shaped
+// like one, same principle resolveAdAccountId() applies to a tool call.
+router.post("/default-ad-account", requireAuth, async (req, res) => {
+  const { adAccountId } = req.body || {};
+  // updateConnectionMeta() merges shallowly at the top level — writing
+  // `defaults` wholesale would silently drop any other key already inside
+  // it (e.g. a future defaultPageId), so the existing `defaults` object is
+  // read and spread first rather than replaced outright.
+  const setDefault = (value) => {
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    return updateConnectionMeta(req.session.userId, "meta_ads", { defaults: { ...currentDefaults, adAccountId: value } });
+  };
+  try {
+    if (adAccountId === null || adAccountId === undefined) {
+      const updated = setDefault(null);
+      if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
+      return res.json({ defaultAdAccountId: null });
+    }
+    if (!isPlausibleAdAccountId(adAccountId)) {
+      return res.status(400).json({ error: `"${adAccountId}" is not a valid Meta ad account id.` });
+    }
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const accounts = await meta.listAdAccounts(accessToken);
+    const match = accounts.find((a) => a.id === adAccountId);
+    if (!match) {
+      return res.status(404).json({ error: `"${adAccountId}" is not one of this account's connected Meta ad accounts.`, accounts });
+    }
+    setDefault(match.id);
+    logActivity(db, req.session.userId, "integration_updated", `Set Default Ad Account for Meta Ads: ${match.name} (${match.id})`);
+    res.json({ defaultAdAccountId: match.id });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 export default router;

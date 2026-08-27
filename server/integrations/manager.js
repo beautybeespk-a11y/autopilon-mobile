@@ -132,6 +132,23 @@ export function saveConnection(userId, provider, { accessToken, refreshToken, ex
   return id;
 }
 
+// Merges `patch` into a connection's `meta` JSON blob (e.g. a saved
+// default ad account id) WITHOUT touching accessToken/refreshToken/scopes
+// — deliberately separate from saveConnection() so a per-user preference
+// like this can never accidentally re-encrypt, clobber, or otherwise
+// disturb the OAuth token itself. No-ops (does not create a row) if the
+// user has no connection for this provider — there is nothing meaningful
+// to attach a preference to yet.
+export function updateConnectionMeta(userId, provider, patch) {
+  const existing = db.prepare("SELECT meta FROM integrations WHERE userId = ? AND provider = ? AND orgId IS NULL").get(userId, provider);
+  if (!existing) return null;
+  const currentMeta = JSON.parse(existing.meta || "{}");
+  const nextMeta = { ...currentMeta, ...patch };
+  db.prepare("UPDATE integrations SET meta = ?, updatedAt = ? WHERE userId = ? AND provider = ? AND orgId IS NULL")
+    .run(JSON.stringify(nextMeta), now(), userId, provider);
+  return nextMeta;
+}
+
 export function disconnectIntegration(userId, provider) {
   db.prepare(
     "UPDATE integrations SET status = 'not_connected', accessToken = NULL, refreshToken = NULL, tokenExpiresAt = NULL, updatedAt = ? WHERE userId = ? AND provider = ? AND orgId IS NULL"

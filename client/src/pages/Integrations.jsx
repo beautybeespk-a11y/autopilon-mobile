@@ -91,6 +91,66 @@ function ManualConnectForm({ provider, onConnected, onCancel }) {
   );
 }
 
+// Requirement 1/2/8: shows every ad account Meta actually returns (name +
+// id), lets the user pick one as the Default Ad Account so
+// resolveAdAccountId() (server/tools/shared/metaAdAccountId.js) can stop
+// asking each time when more than one is connected. Only rendered once
+// Meta Ads is connected — nothing here duplicates or touches the
+// connect/disconnect OAuth flow above it.
+function MetaAdAccountSelector() {
+  const [accounts, setAccounts] = useState([]);
+  const [defaultId, setDefaultId] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = () => {
+    api.get("/integrations/meta/ad-accounts")
+      .then((data) => {
+        setAccounts(data.accounts || []);
+        setDefaultId(data.defaultAdAccountId || "");
+        setLoaded(true);
+      })
+      .catch((err) => { setError(err.message); setLoaded(true); });
+  };
+
+  useEffect(load, []);
+
+  const setDefault = async (id) => {
+    setSaving(true); setError("");
+    const previous = defaultId;
+    setDefaultId(id); // optimistic — reverted below on failure
+    try {
+      await api.post("/integrations/meta/default-ad-account", { adAccountId: id || null });
+    } catch (err) {
+      setDefaultId(previous);
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!loaded || accounts.length === 0) return null;
+
+  return (
+    <div className="mt-3 rounded-xl border border-line bg-elevated p-3">
+      <span className="mb-1.5 block text-xs font-medium text-muted">Default Ad Account</span>
+      <select
+        value={defaultId}
+        onChange={(e) => setDefault(e.target.value)}
+        disabled={saving}
+        className="w-full rounded-lg border border-line bg-surface px-2.5 py-2 text-sm"
+      >
+        <option value="">{accounts.length === 1 ? "Auto (only one connected)" : "None — ask which one each time"}</option>
+        {accounts.map((a) => (
+          <option key={a.id} value={a.id}>{a.name} ({a.id})</option>
+        ))}
+      </select>
+      {error && <p className="mt-1.5 text-xs text-red-500">{error}</p>}
+    </div>
+  );
+}
+
 export default function Integrations() {
   const [items, setItems] = useState([]);
   const [notice, setNotice] = useState(null);
@@ -183,6 +243,8 @@ export default function Integrations() {
                   onCancel={() => setConnectingProvider(null)}
                 />
               )}
+
+              {connected && it.provider === "meta_ads" && <MetaAdAccountSelector />}
             </Card>
           );
         })}
