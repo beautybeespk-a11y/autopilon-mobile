@@ -51,6 +51,25 @@ const NARRATION_WITHOUT_ACTION = /\b(let me(?!\s+know)|let's|i'll|i will|i'm goi
 // few lines below already has for a different failure shape.
 const MAX_NARRATION_NUDGES = 1;
 
+// A hard output boundary against internal data reaching the user — not
+// just an instruction (buildSystemPrompt() below already tells the model
+// never to copy the "[Underlying tool data...]" history annotation
+// forward, but confirmed live: that instruction alone was NOT reliable
+// enough — the exact same leak recurred). Every one of these strings is
+// something a human-written recommendation would never naturally
+// produce — a bracketed internal-context marker, an internal identifier
+// in camelCase/snake_case, or raw tool-call JSON syntax — so their mere
+// presence in a "final" message is itself the signal, without needing to
+// know which specific internal mechanism produced it this time (today
+// it's the tool-data-history annotation; tomorrow it could be a raw
+// planId echoed from a tool result, or JSON scaffolding — all covered by
+// the same check rather than chasing each source individually).
+// Exported so a regression test can assert directly against this exact
+// pattern (server/test/internalLeakageGuardRegression.js) without needing
+// a full mocked model round-trip through orchestrate().
+export const INTERNAL_LEAK_PATTERNS = /underlying tool data|do not repeat verbatim|\bplanId\b|\binternal_plan\b|"toolName"\s*:|"resolved(AdAccountId|PageId|PixelId|CatalogId)"|resolvedAdAccountId|resolvedPageId/i;
+const MAX_LEAK_NUDGES = 1;
+
 function createPlan({ userId, conversationId, goal }) {
   const id = cryptoRandom();
   const now = new Date().toISOString();
@@ -263,6 +282,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const usageTotals = { promptTokens: 0, completionTokens: 0 };
   let narrationNudges = 0;
   let malformedNudges = 0;
+  let leakNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
 
   while (stepsRun < MAX_STEPS) {
@@ -302,6 +322,27 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           },
         ];
         continue;
+      }
+      const leaked = typeof decision.message === "string" && INTERNAL_LEAK_PATTERNS.test(decision.message);
+      if (leaked && leakNudges < MAX_LEAK_NUDGES) {
+        leakNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          {
+            role: "user",
+            content: `Your reply included internal data that must NEVER be shown to a user — a bracketed "[Underlying tool data...]" note, a raw internal id, or tool-call-shaped text. Rewrite your answer as a plain-language recommendation only: no ids, no mention of tools, schemas, or internal state — just what you're recommending and why.`,
+          },
+        ];
+        continue;
+      }
+      if (leaked) {
+        // Leaked again even after one retry — never show it. Fail safe with
+        // a generic message rather than risk showing internal data twice.
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", null, "done"));
+        if (planId) setPlanStatus(planId, "completed");
+        return { reply: "I've put together a recommendation, but I'm having trouble phrasing it cleanly — could you ask me to summarize it again?", trace, toolResults, usage: usageTotals };
       }
       const soundsLikeUnfulfilledAction =
         availableTools.length > 0 &&

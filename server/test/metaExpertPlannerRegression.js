@@ -23,9 +23,10 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection } = await import("../integrations/manager.js");
 const { validatePlanStructure, validatePlanAgainstContext, validatePlan } = await import("../agents/metaExpert/planSchema.js");
-const { createPlan, resolvePlanAssets, getStoredPlan } = await import("../agents/metaExpert/planner.js");
+const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
 const { gatherBusinessContext } = await import("../agents/metaExpert/research.js");
 const { getTool } = await import("../tools/registry.js");
+const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 await import("../tools/index.js"); // registers meta_expert.* tools
 
 const results = [];
@@ -396,6 +397,165 @@ async function run() {
       assert.ok(context.unavailable.some((u) => u.includes("commerce platform")));
       assert.ok(context.unavailable.some((u) => u.includes("Pixel")));
       assert.ok(Array.isArray(context.knownFacts.meta.adAccounts) && context.knownFacts.meta.adAccounts.length === 1);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- 11. State machine (Issues 4/6): supersede on new plan, execute
+  //    without an explicit planId, META_PLAN_REQUIRED when there's nothing
+  //    valid to execute, cross-conversation stale-id rejection, and the
+  //    approval-decline -> 'rejected' hook.
+  await check("creating a second plan in the same conversation supersedes the first proposed one", async () => {
+    const userId = makeUser(`supersede-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const first = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null }) });
+      assert.equal(first.ok, true, JSON.stringify(first.errors));
+      const second = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null }) });
+      assert.equal(second.ok, true, JSON.stringify(second.errors));
+
+      const firstRow = getStoredPlan(userId, first.planId);
+      const secondRow = getStoredPlan(userId, second.planId);
+      assert.equal(firstRow.status, "superseded");
+      assert.equal(secondRow.status, "proposed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("execute_campaign_plan with no planId uses the current active plan for the conversation", async () => {
+    const userId = makeUser(`omit-planid-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), { userId, conversationId });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      const execTool = getTool("meta_expert.execute_campaign_plan");
+      const result = await execTool.execute({}, { userId, conversationId }); // no planId at all
+      assert.equal(result.status, "PAUSED");
+      assert.equal(getStoredPlan(userId, created.planId).status, "executed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("execute_campaign_plan with no plan at all fails with META_PLAN_REQUIRED, not a raw error", async () => {
+    const userId = makeUser(`plan-required-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const execTool = getTool("meta_expert.execute_campaign_plan");
+      await assert.rejects(
+        () => execTool.execute({}, { userId, conversationId: `conv-${cryptoRandom()}` }),
+        (err) => err.code === "META_PLAN_REQUIRED"
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("execute_campaign_plan refuses a planId from a DIFFERENT conversation (stale/hallucinated-id protection)", async () => {
+    const userId = makeUser(`cross-conv-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationA = `conv-a-${cryptoRandom()}`;
+    const conversationB = `conv-b-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), { userId, conversationId: conversationA });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      const execTool = getTool("meta_expert.execute_campaign_plan");
+      await assert.rejects(
+        () => execTool.execute({ planId: created.planId }, { userId, conversationId: conversationB }),
+        (err) => err.code === "META_PLAN_REQUIRED" && /different conversation/.test(err.message)
+      );
+      assert.equal(getStoredPlan(userId, created.planId).status, "proposed", "the plan itself must be untouched by the refused attempt");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("declining the approval prompt marks the plan 'rejected', not left dangling as 'proposed'", async () => {
+    const userId = makeUser(`declined-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), { userId, conversationId });
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      // Simulate the executor's own "awaiting_confirmation" state directly
+      // (bypassing runTool()'s agent/skill checks, which need a fully
+      // configured agent — orthogonal to what this test is verifying)
+      // rather than the full request having actually gone through
+      // requiresConfirmation. resumeAfterConfirmation() is the real
+      // production function; only how the row got into this state is
+      // simplified here.
+      const executionId = cryptoRandom();
+      db.prepare(
+        `INSERT INTO tool_executions (id, userId, conversationId, toolName, parameters, status, createdAt)
+         VALUES (?, ?, ?, 'meta_expert.execute_campaign_plan', ?, 'awaiting_confirmation', ?)`
+      ).run(executionId, userId, conversationId, JSON.stringify({ planId: created.planId }), new Date().toISOString());
+
+      const outcome = await resumeAfterConfirmation({ executionId, approved: false });
+      assert.equal(outcome.status, "failed");
+      assert.equal(getStoredPlan(userId, created.planId).status, "rejected");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a revision (revisesPlanId) carries the prior daily_budget forward when the new call omits it", async () => {
+    const userId = makeUser(`revision-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const original = await createTool.execute({ ...basePlan({ optimization_event: "LINK_CLICKS", pixel: null }), daily_budget: 3000 }, { userId, conversationId });
+      assert.equal(original.valid, true, JSON.stringify(original.errors));
+
+      const { daily_budget, ...planWithoutBudget } = basePlan({ optimization_event: "LINK_CLICKS", pixel: null, gender: "MALE" });
+      const revised = await createTool.execute({ ...planWithoutBudget, revisesPlanId: original.planId }, { userId, conversationId });
+      assert.equal(revised.valid, true, JSON.stringify(revised.errors));
+
+      const revisedRow = getStoredPlan(userId, revised.planId);
+      assert.equal(revisedRow.planData.plan.daily_budget, 3000, "budget should carry forward from the plan being revised");
+      assert.equal(revisedRow.planData.plan.gender, "MALE", "the actually-changed field should reflect the revision");
+      assert.equal(getStoredPlan(userId, original.planId).status, "superseded");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("PURCHASE optimization maps to Meta's real optimization_goal (OFFSITE_CONVERSIONS + promoted_object), never the raw internal enum value", async () => {
+    const userId = makeUser(`opt-goal-mapping-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes }));
+    try {
+      const createTool = getTool("meta_expert.create_campaign_plan");
+      const created = await createTool.execute(basePlan(), { userId, conversationId }); // basePlan() defaults to PURCHASE + pixel ref
+      assert.equal(created.valid, true, JSON.stringify(created.errors));
+
+      const execTool = getTool("meta_expert.execute_campaign_plan");
+      await execTool.execute({ planId: created.planId }, { userId, conversationId });
+
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.ok(adSetWrite, "expected an ad set create call");
+      assert.equal(adSetWrite.body.optimization_goal, "OFFSITE_CONVERSIONS");
+      assert.notEqual(adSetWrite.body.optimization_goal, "PURCHASE", "Meta's real API does not accept \"PURCHASE\" as optimization_goal — this was the live (#100) Invalid parameter bug");
+      assert.equal(adSetWrite.body.promoted_object.custom_event_type, "PURCHASE");
+      assert.equal(adSetWrite.body.promoted_object.pixel_id, "px1");
     } finally {
       restoreFetch();
     }

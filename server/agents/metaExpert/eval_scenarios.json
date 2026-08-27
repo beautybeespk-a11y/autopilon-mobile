@@ -1,0 +1,85 @@
+{
+  "description": "LLM-graded evaluation scenarios for the Meta Ads Expert planner (Phase 1). These test AGENT REASONING/BEHAVIOR — whether it acts like a senior media buyer rather than an intake form — which cannot be verified by a deterministic unit test the way server/test/metaExpertPlannerRegression.js's schema/resolver/state-machine checks can. Run each prompt against a real agent with the meta_expert skill enabled and a connected Meta account, and grade the transcript against passCriteria/failCriteria. Not automated CI — a human (or a future LLM-judge harness) reads the transcript.",
+  "scenarios": [
+    {
+      "id": "sales_goal_no_location_form",
+      "issue": "Issue 1 / Acceptance Test A",
+      "prompt": "I want more website sales.",
+      "preconditions": "A connected Meta account (ad account + Page), a connected commerce store (WooCommerce/Shopify) with real products, no prior plan in this conversation.",
+      "passCriteria": [
+        "meta_expert.research_business_context is called before any plan is proposed.",
+        "The agent recommends objective, audience (age/gender), location strategy, and placements itself — stated as decisions/recommendations, not questions.",
+        "The agent does NOT ask the user to select which Pakistani (or other) cities to target, or any equivalent 'which locations' question.",
+        "The only question asked, if any, is about budget — and only if no budget was given and no policy exists — and it's phrased as approving a proposed number, not an open 'what's your budget' question."
+      ],
+      "failCriteria": [
+        "Any question resembling 'which locations/cities should we target', 'what age would you like', 'what gender', 'what placements', 'what audience do you want'.",
+        "A raw JSON plan, planId, or schema/validation language shown to the user."
+      ]
+    },
+    {
+      "id": "budget_and_purchases_stated_no_friction",
+      "issue": "Acceptance Test B",
+      "prompt": "My budget is PKR 3,000/day and I want purchases.",
+      "preconditions": "Same as above.",
+      "passCriteria": [
+        "No unnecessary clarifying questions — budget and objective are both already known.",
+        "A full recommendation is presented in one reply (audience, locations, placements, creative approach, optimization, the stated budget, status paused).",
+        "No internal tool data, planId, or JSON appears anywhere in the reply.",
+        "The agent offers to proceed (approval) or to adjust the strategy — not a generic 'let me know if you have questions'."
+      ],
+      "failCriteria": [
+        "Asking for the budget again, or for information already given.",
+        "Any leaked internal marker (see server/test/internalLeakageGuardRegression.js for the exact strings that must never appear)."
+      ]
+    },
+    {
+      "id": "traffic_ask_ecommerce_business",
+      "issue": "Issue 3 / Acceptance Test C — the primary scenario this eval file exists for",
+      "prompt": "I want more traffic to my website.",
+      "preconditions": "A connected, clearly e-commerce business (real products with real prices in the connected store).",
+      "passCriteria": [
+        "The agent evaluates whether Traffic is actually the right choice for this business, not just complies with the literal word.",
+        "If the business context indicates e-commerce/sales intent, the agent recommends Sales optimized for Purchase INSTEAD, and explains why in substantially the shape of: 'If your real objective is sales, I recommend Sales optimized for Purchase instead of Traffic, because Traffic optimizes for visits rather than buyers. If you genuinely only want website visits, I can build a Traffic campaign.'",
+        "The recommendation comes FIRST, in the same reply — not as a question."
+      ],
+      "failCriteria": [
+        "Any vague clarifying question — explicitly disallowed examples from the spec: 'What considerations do you have?', 'What audience do you want?', 'What targeting would you like?'",
+        "Silently building a Traffic campaign without ever raising the Sales-vs-Traffic tradeoff for a business where it clearly applies."
+      ]
+    },
+    {
+      "id": "create_best_campaign_no_premature_execution",
+      "issue": "Issue 4 / Acceptance Test D",
+      "prompt": "Create the best campaign you recommend for my business.",
+      "preconditions": "No plan proposed yet in this conversation (a fresh conversation, or one where any prior plan is not what this request is about).",
+      "passCriteria": [
+        "research_business_context runs (if not already done this conversation).",
+        "A new plan is created via meta_expert.create_campaign_plan and a recommendation is presented.",
+        "The user is asked for approval before execute_campaign_plan is ever called.",
+        "meta_expert.execute_campaign_plan is NEVER called against an old, unrelated, or stale plan — if it's called at all in this transcript, it must be for the plan JUST proposed in this same exchange."
+      ],
+      "failCriteria": [
+        "execute_campaign_plan is called immediately, without a preceding create_campaign_plan + presented recommendation + user approval in this conversation.",
+        "Any raw Meta or internal error (e.g. 'Invalid parameter', a stack trace, a raw error code) shown directly to the user instead of being handled or explained in plain language."
+      ]
+    },
+    {
+      "id": "revise_existing_plan_conservative_audience",
+      "issue": "Acceptance Test E",
+      "prompt": "Change the audience and make it more conservative.",
+      "preconditions": "A plan was already proposed and presented earlier in this same conversation (not yet executed).",
+      "passCriteria": [
+        "The agent revises the EXISTING plan (meta_expert.create_campaign_plan called with revisesPlanId set to the prior plan) rather than starting over from scratch.",
+        "The reply shows what changed (e.g. narrower age range, different gender mix) — not the entire plan restated as if new.",
+        "research_business_context is NOT re-run unless the requested change genuinely requires new facts.",
+        "The previously-established budget is preserved unless the requested change specifically requires adjusting it."
+      ],
+      "failCriteria": [
+        "A completely fresh plan with no reference to what was being revised.",
+        "Re-running full business research for a simple audience tweak.",
+        "The budget silently changing without the user asking for that."
+      ]
+    }
+  ]
+}

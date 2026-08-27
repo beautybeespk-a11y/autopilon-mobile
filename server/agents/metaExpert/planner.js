@@ -109,17 +109,44 @@ export function formatRecommendation(plan, names) {
   return lines.join("\n");
 }
 
+// Statuses execute_campaign_plan may act on — everything else (executed,
+// failed, rejected, superseded) is terminal or requires a fresh plan.
+export const EXECUTABLE_STATUSES = new Set(["proposed", "approved"]);
+
 // Full create-plan flow: structural validation -> asset resolution ->
 // contextual validation -> store -> format recommendation. Never touches
 // Meta beyond read-only resolution calls — no campaign is created here.
-export async function createPlan({ userId, accessToken, plan, contextSummary }) {
+//
+// conversationId anchors the state machine (Issue 6): any OTHER plan for
+// this same user+conversation still sitting in 'proposed' gets marked
+// 'superseded' before the new one is inserted — a fresh create_campaign_
+// plan call always means either a genuinely new campaign concept or a
+// revision, never two simultaneously-live proposals a stale id could
+// later be confused between.
+//
+// revisesPlanId (Scenario E — "change the audience, make it more
+// conservative"): when set, the prior plan's daily_budget carries forward
+// automatically if this new plan doesn't specify one — "preserve the
+// user-approved budget unless the change requires otherwise." Research
+// is NOT re-run here; the caller (the agent, per its own instructions)
+// only calls research_business_context again if the revision genuinely
+// needs new facts, not on every revision.
+export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
   const structural = validatePlanStructure(plan); // structural-only pass — context-dependent checks run after resolution, below
   if (!structural.valid) {
     return { ok: false, errors: structural.errors };
   }
 
-  const { resolved, resolutionErrors } = await resolvePlanAssets(plan, { userId, accessToken });
-  const contextual = validatePlanAgainstContext(plan, {
+  let effectivePlan = plan;
+  if (revisesPlanId) {
+    const prior = getStoredPlan(userId, revisesPlanId);
+    if (prior && (plan.daily_budget === undefined || plan.daily_budget === null) && prior.planData.plan.daily_budget != null) {
+      effectivePlan = { ...plan, daily_budget: prior.planData.plan.daily_budget };
+    }
+  }
+
+  const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, { userId, accessToken });
+  const contextual = validatePlanAgainstContext(effectivePlan, {
     resolvedAdAccountId: resolved.adAccountId,
     resolvedPageId: resolved.pageId,
     resolvedPixelId: resolved.pixelId,
@@ -141,28 +168,61 @@ export async function createPlan({ userId, accessToken, plan, contextSummary }) 
     instagramUsername: null, // Phase 1 doesn't fetch the IG username separately — accountId is enough to prove the resolution
   };
 
-  const recommendationText = formatRecommendation(plan, names);
+  const recommendationText = formatRecommendation(effectivePlan, names);
+
+  const now = new Date().toISOString();
+  if (conversationId) {
+    db.prepare("UPDATE meta_campaign_plans SET status = 'superseded', updatedAt = ? WHERE userId = ? AND conversationId = ? AND status = 'proposed'")
+      .run(now, userId, conversationId);
+  }
 
   const id = cryptoRandom();
-  const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO meta_campaign_plans (id, userId, status, planJson, contextJson, recommendationText, createdAt, updatedAt)
-     VALUES (?, ?, 'proposed', ?, ?, ?, ?, ?)`
-  ).run(id, userId, JSON.stringify({ plan, resolved, names }), JSON.stringify(contextSummary || {}), recommendationText, now, now);
+    `INSERT INTO meta_campaign_plans (id, userId, conversationId, status, planJson, contextJson, recommendationText, revisesPlanId, createdAt, updatedAt)
+     VALUES (?, ?, ?, 'proposed', ?, ?, ?, ?, ?, ?)`
+  ).run(id, userId, conversationId || null, JSON.stringify({ plan: effectivePlan, resolved, names }), JSON.stringify(contextSummary || {}), recommendationText, revisesPlanId || null, now, now);
 
-  return { ok: true, planId: id, recommendationText, resolved, plan };
+  return { ok: true, planId: id, recommendationText, resolved, plan: effectivePlan };
 }
 
-// Loads a stored plan for execution — re-verifies ownership and that it's
-// still in a state that can be executed (never re-executes an already-
-// executed plan, never executes another user's plan).
+// Loads a stored plan — re-verifies ownership (never another user's plan).
 export function getStoredPlan(userId, planId) {
   const row = db.prepare("SELECT * FROM meta_campaign_plans WHERE id = ? AND userId = ?").get(planId, userId);
   if (!row) return null;
   return { ...row, planData: JSON.parse(row.planJson) };
 }
 
+// The plan execute_campaign_plan should act on when the caller doesn't
+// name one explicitly — the most recent still-executable (proposed or
+// approved) plan for this exact conversation. Never reaches across
+// conversations, and never returns an executed/rejected/superseded plan —
+// those require a fresh create_campaign_plan call, not silent reuse.
+export function getActivePlanForConversation(userId, conversationId) {
+  if (!conversationId) return null;
+  const row = db.prepare(
+    `SELECT * FROM meta_campaign_plans WHERE userId = ? AND conversationId = ? AND status IN ('proposed','approved')
+     ORDER BY createdAt DESC LIMIT 1`
+  ).get(userId, conversationId);
+  if (!row) return null;
+  return { ...row, planData: JSON.parse(row.planJson) };
+}
+
+export function setPlanStatus(planId, status, extra = {}) {
+  const fields = ["status = ?", "updatedAt = ?"];
+  const args = [status, new Date().toISOString()];
+  if (extra.executionResult !== undefined) { fields.push("executionResultJson = ?"); args.push(JSON.stringify(extra.executionResult)); }
+  args.push(planId);
+  db.prepare(`UPDATE meta_campaign_plans SET ${fields.join(", ")} WHERE id = ?`).run(...args);
+}
+
 export function markPlanExecuted(planId, executionResult) {
-  db.prepare("UPDATE meta_campaign_plans SET status = 'executed', executionResultJson = ?, updatedAt = ? WHERE id = ?")
-    .run(JSON.stringify(executionResult), new Date().toISOString(), planId);
+  setPlanStatus(planId, "executed", { executionResult });
+}
+
+export function markPlanFailed(planId, errorMessage) {
+  setPlanStatus(planId, "failed", { executionResult: { error: errorMessage } });
+}
+
+export function markPlanRejected(planId) {
+  setPlanStatus(planId, "rejected");
 }

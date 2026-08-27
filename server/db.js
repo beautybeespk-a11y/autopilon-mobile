@@ -1935,27 +1935,70 @@ db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
 // budget, semantic asset references, etc.) as a validated, schema-checked
 // JSON document, separately from whether/when it gets executed. Deliberately
 // its own table rather than reusing an existing one: a plan is a distinct
-// lifecycle (proposed -> approved -> executed, or rejected) from an actual
-// Meta campaign, and needs to exist and be inspectable even before any
-// real Meta object is created. planJson never contains resolved secrets —
-// only ids Meta itself already returns for objects this user's own token
-// can already see (page/ad-account/pixel/catalog ids), the same as every
-// other Meta tool result already exposed to the model.
+// lifecycle from an actual Meta campaign, and needs to exist and be
+// inspectable even before any real Meta object is created. planJson never
+// contains resolved secrets — only ids Meta itself already returns for
+// objects this user's own token can already see (page/ad-account/pixel/
+// catalog ids), the same as every other Meta tool result already exposed
+// to the model.
+//
+// Explicit state machine (confirmed live: a stale/wrong-conversation plan
+// getting executed by a hallucinated planId was a real production bug —
+// status alone, checked deterministically here, is what execute_
+// campaign_plan gates on, never inferred from conversation text):
+//   proposed   — validated + resolved, stored, awaiting user approval. The
+//                only status execute_campaign_plan will act on directly.
+//   approved   — set the instant execute_campaign_plan begins running
+//                (the orchestrator's own confirmation gate already required
+//                user approval to reach this call at all) — also a valid
+//                status for execute_campaign_plan to accept, covering the
+//                case a plan was marked approved but the actual Meta calls
+//                hadn't completed yet (e.g. a retry after a transient error).
+//   executing  — set for the duration of the real Meta API calls.
+//   executed   — the terminal success state. Never re-executable.
+//   failed     — a Meta API call errored during execution; the plan can be
+//                retried (transitions back to 'approved') or a fresh plan
+//                created instead.
+//   rejected   — the user declined the approval prompt.
+//   superseded — a newer plan was created for the same conversation while
+//                this one was still 'proposed' — see createPlan()'s
+//                supersede-on-create behavior in planner.js. Never
+//                re-executable, same as 'executed'.
+// 'draft' / 'researched' / 'validated' (also named in the spec) are NOT
+// separate persisted rows here — create_campaign_plan performs structural
+// validation, asset resolution, and contextual validation synchronously
+// inside one function call before any row exists at all, so those states
+// only ever exist for the duration of that call, never as durable state
+// worth persisting or querying later.
 db.exec(`
 CREATE TABLE IF NOT EXISTS meta_campaign_plans (
   id          TEXT PRIMARY KEY,
   userId      TEXT NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'proposed', -- proposed | approved | executed | rejected
+  status      TEXT NOT NULL DEFAULT 'proposed', -- proposed | approved | executing | executed | failed | rejected | superseded
   planJson    TEXT NOT NULL,   -- the validated internal plan (see internal_plan_schema.json)
   contextJson TEXT,            -- the business-research context the plan was built from (known/inferred/unavailable)
   recommendationText TEXT,     -- the customer-facing recommendation presented for this plan
-  executionResultJson TEXT,    -- set once execute_campaign_plan runs: created campaign/adSet/ad ids
+  executionResultJson TEXT,    -- set once execute_campaign_plan runs: created campaign/adSet/ad ids, or the failure reason
   createdAt   TEXT NOT NULL,
   updatedAt   TEXT NOT NULL,
   FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_meta_plans_user ON meta_campaign_plans(userId);
 `);
+const metaPlanCols = db.prepare("PRAGMA table_info(meta_campaign_plans)").all().map((c) => c.name);
+// Which conversation this plan belongs to — the anchor for "is this the
+// CURRENT plan" (execute_campaign_plan refuses a planId from a different
+// conversation) and for auto-superseding an old proposed plan when a new
+// one is created in the same conversation, rather than leaving it able to
+// be accidentally executed later by a stale id.
+if (!metaPlanCols.includes("conversationId")) db.exec("ALTER TABLE meta_campaign_plans ADD COLUMN conversationId TEXT");
+// When create_campaign_plan is called as a REVISION (Scenario E — "change
+// the audience, make it more conservative") rather than a brand new
+// campaign concept, this links the new row back to the one it revises —
+// purely informational/audit trail; supersede behavior itself is driven by
+// conversationId + status, not this column.
+if (!metaPlanCols.includes("revisesPlanId")) db.exec("ALTER TABLE meta_campaign_plans ADD COLUMN revisesPlanId TEXT");
+db.exec("CREATE INDEX IF NOT EXISTS idx_meta_plans_conversation ON meta_campaign_plans(conversationId)");
 
 db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
   .run("meta_expert", "Meta Ads Expert Planner", "Research business/account context and build a validated, approval-gated Meta campaign strategy from a stated goal, instead of guessing individual campaign settings.", "marketing");

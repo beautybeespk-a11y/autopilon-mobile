@@ -7,16 +7,47 @@
 //   as every other Meta write tool — the existing Approve/Reject UI is
 //   the final gate before anything real happens).
 import { registerTool } from "../registry.js";
+import { registerOnRejectedHandler } from "../../orchestrator/executor.js";
 import { requireValidToken } from "../../integrations/manager.js";
 import * as meta from "../../integrations/meta/api.js";
 import { publishEvent } from "../../automation/triggers.js";
 import { gatherBusinessContext } from "../../agents/metaExpert/research.js";
-import { createPlan, getStoredPlan, markPlanExecuted } from "../../agents/metaExpert/planner.js";
+import {
+  createPlan, getStoredPlan, getActivePlanForConversation, setPlanStatus,
+  markPlanExecuted, markPlanFailed, markPlanRejected, EXECUTABLE_STATUSES,
+} from "../../agents/metaExpert/planner.js";
 import { INTERNAL_PLAN_SCHEMA } from "../../agents/metaExpert/planSchema.js";
 import { buildTargeting } from "./campaigns.js";
 
 function token(context) {
   return requireValidToken(context.userId, "meta_ads");
+}
+
+// Meta's real Ad Set `optimization_goal` enum does NOT include "PURCHASE"
+// (or any of this plan's other custom-event-style optimization_event
+// values except the ones that ARE also real Meta enum values, like
+// LINK_CLICKS/REACH/etc.) — confirmed as the likely cause of a live
+// "(#100) Invalid parameter" failure. Conversion events (Purchase, Add to
+// Cart, Lead, Complete Registration) are optimized via
+// optimization_goal: "OFFSITE_CONVERSIONS" plus a `promoted_object`
+// naming the Pixel and which specific event to optimize for — Meta's own
+// real mechanism, not this app's internal enum name. Every other
+// optimization_event value in the schema already matches a real Meta
+// optimization_goal value directly, so no mapping is needed for those.
+const CONVERSION_EVENT_TO_META_GOAL = {
+  PURCHASE: "OFFSITE_CONVERSIONS",
+  ADD_TO_CART: "OFFSITE_CONVERSIONS",
+  LEAD: "OFFSITE_CONVERSIONS",
+  COMPLETE_REGISTRATION: "OFFSITE_CONVERSIONS",
+};
+
+function buildOptimizationFields(plan, resolvedPixelId) {
+  const metaGoal = CONVERSION_EVENT_TO_META_GOAL[plan.optimization_event];
+  if (!metaGoal) return { optimization_goal: plan.optimization_event };
+  return {
+    optimization_goal: metaGoal,
+    promoted_object: { pixel_id: resolvedPixelId, custom_event_type: plan.optimization_event },
+  };
 }
 
 registerTool({
@@ -84,6 +115,10 @@ registerTool({
       confidence: { type: "string", enum: INTERNAL_PLAN_SCHEMA.properties.confidence.enum },
       approval_required: { type: "boolean" },
       open_questions: { type: "array", items: { type: "string" } },
+      revisesPlanId: {
+        type: "string",
+        description: "Optional — set this to an existing proposed plan's id when this call is a REVISION of it (e.g. the user asked to change the audience or budget), not a brand-new campaign concept. Carries the prior daily_budget forward automatically if this call doesn't set one, per 'preserve the approved budget unless the change requires otherwise.' Omit for a genuinely new campaign.",
+      },
     },
     required: INTERNAL_PLAN_SCHEMA.required,
   },
@@ -91,8 +126,8 @@ registerTool({
   requiresConfirmation: false, // Nothing external happens yet — this only validates + stores a proposal.
   async execute(parameters, context) {
     const accessToken = token(context);
-    const plan = { ...parameters };
-    const result = await createPlan({ userId: context.userId, accessToken, plan });
+    const { revisesPlanId, ...plan } = parameters;
+    const result = await createPlan({ userId: context.userId, conversationId: context.conversationId, accessToken, plan, revisesPlanId });
     if (!result.ok) {
       return { valid: false, errors: result.errors };
     }
@@ -103,55 +138,106 @@ registerTool({
 registerTool({
   name: "meta_expert.execute_campaign_plan",
   description:
-    "Executes a previously created and user-approved campaign plan (from meta_expert.create_campaign_plan) — creates the real Meta Campaign and Ad Set, both PAUSED. Only call this after the user has explicitly approved the recommendation in chat. Phase 1 builds the Campaign + Ad Set structure only (country-level targeting, budget, objective) — attaching the final creative/ad (the specific image, video, or boosted post) is the next step, either using the existing meta.create_image_ad / meta.boost_post / meta.create_video_ad tools against the returned adSetId, or Phase 2's creative intelligence once that's built.",
+    "Executes a previously created and user-approved campaign plan (from meta_expert.create_campaign_plan) — creates the real Meta Campaign and Ad Set, both PAUSED. Only call this after the user has explicitly approved the recommendation in chat, and only with a planId meta_expert.create_campaign_plan returned EARLIER IN THIS SAME CONVERSATION — never a remembered/guessed id from a different conversation or an old test. planId is optional: omit it to use the current active plan for this conversation automatically. If this fails with META_PLAN_REQUIRED, that means there is no valid current plan to execute — call meta_expert.create_campaign_plan first (after research_business_context if you haven't already), present the recommendation, and only call this again once the user approves that. Never retry this tool with a different/older planId to work around the error. Phase 1 builds the Campaign + Ad Set structure only — attaching the final creative/ad is the next step, either using the existing meta.create_image_ad / meta.boost_post / meta.create_video_ad tools against the returned adSetId, or Phase 2's creative intelligence once that's built.",
   category: "meta_expert",
-  parameters: { type: "object", properties: { planId: { type: "string" } }, required: ["planId"] },
+  parameters: { type: "object", properties: { planId: { type: "string", description: "Optional — omit to use the current active plan for this conversation." } }, required: [] },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // The one real Meta mutation in this flow — same approval gate every other write tool uses.
   async execute(parameters, context) {
-    const stored = getStoredPlan(context.userId, parameters.planId);
-    if (!stored) throw new Error(`No plan found with id "${parameters.planId}" for this account.`);
-    if (stored.status === "executed") throw new Error("This plan has already been executed — create a new plan for another campaign.");
+    let stored = parameters.planId ? getStoredPlan(context.userId, parameters.planId) : null;
+    if (!parameters.planId) {
+      stored = getActivePlanForConversation(context.userId, context.conversationId);
+    }
+
+    if (!stored) {
+      const err = new Error(
+        parameters.planId
+          ? `No plan found with id "${parameters.planId}" for this account.`
+          : "No current campaign plan exists for this conversation."
+      );
+      err.code = "META_PLAN_REQUIRED";
+      throw err;
+    }
+
+    // A planId belonging to a DIFFERENT conversation is the exact shape of
+    // bug confirmed live: an old/stale/hallucinated id getting executed
+    // for an unrelated request. Reject rather than trust it — a plan is
+    // only ever "the intended plan" for the conversation it was proposed
+    // in, unless the caller supplies no id at all (in which case
+    // getActivePlanForConversation already scoped it correctly above).
+    if (parameters.planId && stored.conversationId && context.conversationId && stored.conversationId !== context.conversationId) {
+      const err = new Error(`Plan "${parameters.planId}" belongs to a different conversation, not this one — it can't be executed here.`);
+      err.code = "META_PLAN_REQUIRED";
+      throw err;
+    }
+
+    if (!EXECUTABLE_STATUSES.has(stored.status)) {
+      const err = new Error(
+        stored.status === "executed"
+          ? "This plan has already been executed — create a new plan for another campaign."
+          : `This plan is no longer active (status: ${stored.status}) — create a new plan.`
+      );
+      err.code = "META_PLAN_REQUIRED";
+      throw err;
+    }
+
+    setPlanStatus(stored.id, "approved");
 
     const accessToken = token(context);
     const { plan, resolved } = stored.planData;
 
-    // Defense in depth: re-verify the resolved ids are STILL valid right
-    // before spending anything real — time may have passed since the plan
-    // was proposed, and access can be revoked in between.
-    const [adAccounts, pages] = await Promise.all([meta.listAdAccounts(accessToken), meta.listPages(accessToken)]);
-    if (!adAccounts.some((a) => a.id === resolved.adAccountId)) {
-      throw new Error(`The ad account this plan was built for (${resolved.adAccountId}) is no longer connected — create a new plan.`);
+    try {
+      setPlanStatus(stored.id, "executing");
+
+      // Defense in depth: re-verify the resolved ids are STILL valid right
+      // before spending anything real — time may have passed since the
+      // plan was proposed, and access can be revoked in between.
+      const [adAccounts, pages] = await Promise.all([meta.listAdAccounts(accessToken), meta.listPages(accessToken)]);
+      if (!adAccounts.some((a) => a.id === resolved.adAccountId)) {
+        throw new Error(`The ad account this plan was built for (${resolved.adAccountId}) is no longer connected — create a new plan.`);
+      }
+      if (!pages.some((p) => p.id === resolved.pageId)) {
+        throw new Error(`The Facebook Page this plan was built for (${resolved.pageId}) is no longer connected — create a new plan.`);
+      }
+
+      const campaign = await meta.createCampaign(accessToken, resolved.adAccountId, {
+        name: `${plan.goal} — ${plan.objective}`,
+        objective: plan.objective,
+        dailyBudget: plan.daily_budget,
+        status: "PAUSED",
+      });
+
+      const adSet = await meta.createAdSet(accessToken, resolved.adAccountId, {
+        name: `${plan.goal} — ad set`,
+        campaign_id: campaign.id,
+        daily_budget: plan.daily_budget,
+        billing_event: "IMPRESSIONS",
+        ...buildOptimizationFields(plan, resolved.pixelId),
+        bid_strategy: plan.bid_strategy,
+        targeting: buildTargeting({ countries: plan.countries, ageMin: plan.age_min, ageMax: plan.age_max, gender: plan.gender === "ALL" ? undefined : plan.gender?.toLowerCase() }),
+        status: "PAUSED",
+      });
+
+      const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolved.adAccountId, pageId: resolved.pageId, status: "PAUSED" };
+      markPlanExecuted(stored.id, executionResult);
+      publishEvent(context.userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: campaign.id, name: plan.goal, source: "meta_expert" });
+
+      return {
+        ...executionResult,
+        nextStep: "Campaign and ad set are created and PAUSED. Attach a creative next — either an existing post (meta.boost_post), a product/generated image (meta.create_image_ad), or a video (meta.upload_ad_video + meta.create_video_ad) — using this adSetId, adAccountId, and pageId.",
+      };
+    } catch (err) {
+      markPlanFailed(stored.id, err.message);
+      throw err;
     }
-    if (!pages.some((p) => p.id === resolved.pageId)) {
-      throw new Error(`The Facebook Page this plan was built for (${resolved.pageId}) is no longer connected — create a new plan.`);
-    }
-
-    const campaign = await meta.createCampaign(accessToken, resolved.adAccountId, {
-      name: `${plan.goal} — ${plan.objective}`,
-      objective: plan.objective,
-      dailyBudget: plan.daily_budget,
-      status: "PAUSED",
-    });
-
-    const adSet = await meta.createAdSet(accessToken, resolved.adAccountId, {
-      name: `${plan.goal} — ad set`,
-      campaign_id: campaign.id,
-      daily_budget: plan.daily_budget,
-      billing_event: "IMPRESSIONS",
-      optimization_goal: plan.optimization_event,
-      bid_strategy: plan.bid_strategy,
-      targeting: buildTargeting({ countries: plan.countries, ageMin: plan.age_min, ageMax: plan.age_max, gender: plan.gender === "ALL" ? undefined : plan.gender?.toLowerCase() }),
-      status: "PAUSED",
-    });
-
-    const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolved.adAccountId, pageId: resolved.pageId, status: "PAUSED" };
-    markPlanExecuted(parameters.planId, executionResult);
-    publishEvent(context.userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: campaign.id, name: plan.goal, source: "meta_expert" });
-
-    return {
-      ...executionResult,
-      nextStep: "Campaign and ad set are created and PAUSED. Attach a creative next — either an existing post (meta.boost_post), a product/generated image (meta.create_image_ad), or a video (meta.upload_ad_video + meta.create_video_ad) — using this adSetId, adAccountId, and pageId.",
-    };
   },
+});
+
+// See executor.js's registerOnRejectedHandler — when the user declines the
+// approval prompt for this specific tool, the plan is marked 'rejected'
+// rather than left dangling in 'proposed' (which getActivePlanForConversation
+// would otherwise keep treating as the active plan for this conversation).
+registerOnRejectedHandler("meta_expert.execute_campaign_plan", async (parameters, { userId, conversationId }) => {
+  const stored = parameters.planId ? getStoredPlan(userId, parameters.planId) : getActivePlanForConversation(userId, conversationId);
+  if (stored) markPlanRejected(stored.id);
 });

@@ -82,19 +82,30 @@ export async function runTool({ toolName, parameters, userId, agentId, conversat
     return { executionId, status: "awaiting_confirmation", confirmationId, reason };
   }
 
-  return executeNow({ executionId, tool, parameters, userId, agentId });
+  return executeNow({ executionId, tool, parameters, userId, agentId, conversationId });
 }
 
-async function executeNow({ executionId, tool, parameters, userId, agentId }) {
+async function executeNow({ executionId, tool, parameters, userId, agentId, conversationId }) {
   setExecutionStatus(executionId, "running", { startedAt: now() });
   try {
-    const result = await tool.execute(parameters, { userId, agentId });
+    const result = await tool.execute(parameters, { userId, agentId, conversationId });
     setExecutionStatus(executionId, "completed", { result, completedAt: now() });
     return { executionId, status: "completed", result };
   } catch (err) {
     setExecutionStatus(executionId, "failed", { error: err.message, completedAt: now() });
     return { executionId, status: "failed", error: err.message };
   }
+}
+
+// A small number of tools need to react to their OWN confirmation being
+// declined — e.g. the Meta Expert planner (server/agents/metaExpert/)
+// marking its proposed plan 'rejected' rather than leaving it dangling in
+// 'proposed' state forever. Same precedent as confirmationReason() below
+// (per-tool special cases already live in this file); kept to a plain
+// name->callback map rather than a new plugin system for one real case.
+const onRejectedHandlers = {};
+export function registerOnRejectedHandler(toolName, handler) {
+  onRejectedHandlers[toolName] = handler;
 }
 
 // Called once a pending confirmation is resolved (approve/reject).
@@ -106,6 +117,14 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
   }
   if (!approved) {
     setExecutionStatus(executionId, "failed", { error: "Rejected by user", completedAt: now() });
+    const onRejected = onRejectedHandlers[execution.toolName];
+    if (onRejected) {
+      try {
+        await onRejected(JSON.parse(execution.parameters || "{}"), { userId: execution.userId, conversationId: execution.conversationId });
+      } catch {
+        // Best-effort — a failure here must never mask the real rejection outcome above.
+      }
+    }
     return { executionId, status: "failed", error: "Rejected by user" };
   }
   const tool = getTool(execution.toolName, execution.userId);
@@ -117,7 +136,7 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
     setExecutionStatus(executionId, "completed", { result: { approved: true }, completedAt: now() });
     return { executionId, status: "completed", result: { approved: true } };
   }
-  return executeNow({ executionId, tool, parameters, userId: execution.userId, agentId: execution.agentId });
+  return executeNow({ executionId, tool, parameters, userId: execution.userId, agentId: execution.agentId, conversationId: execution.conversationId });
 }
 
 function confirmationReason(toolName, parameters) {
