@@ -6,6 +6,7 @@ import { linkAssetToCampaign } from "../../orchestrator/contentService.js";
 import { resolveChatImage } from "../shared/chatImage.js";
 import { resolveContentImageAsset } from "../shared/contentAsset.js";
 import { resolvePageId } from "../shared/metaPageId.js";
+import { resolveAdAccountId } from "../shared/metaAdAccountId.js";
 
 function token(context) {
   // Every Meta tool needs a live connection; this throws a clear, tool-level
@@ -44,40 +45,44 @@ registerToolAliased({
 
 registerToolAliased({
   name: "list_campaigns",
-  description: "Lists campaigns in a given Meta ad account. Accepts the account ID with or without the 'act_' prefix.",
+  description: "Lists campaigns in a Meta ad account. adAccountId is optional — omit it to auto-resolve (works automatically when exactly one ad account is connected; asks for a choice, with the real account names, if there's more than one). Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
-    properties: { adAccountId: { type: "string" } },
-    required: ["adAccountId"],
+    properties: { adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." } },
+    required: [],
   },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
-    const campaigns = await meta.listCampaigns(token(context), parameters.adAccountId);
+    const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const campaigns = await meta.listCampaigns(accessToken, adAccountId);
     return { campaigns };
   },
 });
 
 registerToolAliased({
   name: "create_campaign",
-  description: "Creates a new Meta ad campaign (created PAUSED so nothing spends until manually resumed). This is the top level only — after this, use meta.create_ad_set, then meta.create_image_ad or meta.upload_ad_video + meta.create_video_ad to actually build a runnable ad with a real creative. Optionally pass contentAssetId to link a Content Studio image/copy asset to this campaign for reference — that alone does NOT upload it to Meta as a creative, it just records which generated content the campaign was conceptually built from.",
+  description: "Creates a new Meta ad campaign (created PAUSED so nothing spends until manually resumed). This is the top level only — after this, use meta.create_ad_set, then meta.create_image_ad or meta.upload_ad_video + meta.create_video_ad to actually build a runnable ad with a real creative. Optionally pass contentAssetId to link a Content Studio image/copy asset to this campaign for reference — that alone does NOT upload it to Meta as a creative, it just records which generated content the campaign was conceptually built from. adAccountId is optional — omit it to auto-resolve. Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       name: { type: "string" },
       objective: { type: "string" }, // e.g. OUTCOME_TRAFFIC, OUTCOME_ENGAGEMENT
       dailyBudget: { type: "number" }, // in the account's smallest currency unit (e.g. cents)
       contentAssetId: { type: "string", description: "Optional Content Studio asset id (image/copy) this campaign is built from" },
     },
-    required: ["adAccountId", "name", "objective"],
+    required: ["name", "objective"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creating a campaign involves a budget — always confirm first.
   async execute(parameters, context) {
-    const result = await meta.createCampaign(token(context), parameters.adAccountId, {
+    const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const result = await meta.createCampaign(accessToken, adAccountId, {
       name: parameters.name,
       objective: parameters.objective,
       dailyBudget: parameters.dailyBudget,
@@ -151,12 +156,12 @@ function buildTargeting({ countries, ageMin, ageMax, gender }) {
 
 registerTool({
   name: "meta.create_ad_set",
-  description: "Creates an ad set under an existing campaign (created PAUSED) — this is where audience targeting, budget, and optimization goal live in Meta's structure. Required before creating any ad.",
+  description: "Creates an ad set under an existing campaign (created PAUSED) — this is where audience targeting, budget, and optimization goal live in Meta's structure. Required before creating any ad. adAccountId is optional — omit it to auto-resolve. Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       campaignId: { type: "string" },
       name: { type: "string" },
       dailyBudget: { type: "number" },
@@ -167,12 +172,14 @@ registerTool({
       ageMax: { type: "number" },
       gender: { type: "string", description: "'male', 'female', or omit for all genders" },
     },
-    required: ["adAccountId", "campaignId", "name", "dailyBudget"],
+    required: ["campaignId", "name", "dailyBudget"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Sets real budget + audience — always confirm.
   async execute(parameters, context) {
-    const result = await meta.createAdSet(token(context), parameters.adAccountId, {
+    const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const result = await meta.createAdSet(accessToken, adAccountId, {
       name: parameters.name,
       campaign_id: parameters.campaignId,
       daily_budget: parameters.dailyBudget,
@@ -239,19 +246,19 @@ registerTool({
 
 registerTool({
   name: "meta.boost_post",
-  description: "Creates an ad from an EXISTING Facebook Page post or Instagram post/reel (Meta's own 'Boost Post' mechanism) instead of new creative — the ad runs the post's own content as-is. Created PAUSED. Requires an ad set already created with meta.create_ad_set. Pass exactly one of: postId (a Facebook post id from meta.list_page_posts) or instagramMediaId + pageId (an Instagram post from meta.list_instagram_posts).",
+  description: "Creates an ad from an EXISTING Facebook Page post or Instagram post/reel (Meta's own 'Boost Post' mechanism) instead of new creative — the ad runs the post's own content as-is. Created PAUSED. Requires an ad set already created with meta.create_ad_set. Pass exactly one of: postId (a Facebook post id from meta.list_page_posts) or instagramMediaId + pageId (an Instagram post from meta.list_instagram_posts). adAccountId is optional — omit it to auto-resolve. Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       adSetId: { type: "string" },
       name: { type: "string" },
       postId: { type: "string" },
       instagramMediaId: { type: "string" },
       pageId: { type: "string", description: "Only relevant with instagramMediaId — not needed for postId. Optional even then: omit it to auto-resolve. Never pass a made-up value." },
     },
-    required: ["adAccountId", "adSetId", "name"],
+    required: ["adSetId", "name"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
@@ -260,6 +267,7 @@ registerTool({
       throw new Error("Provide exactly one of: postId (a Facebook post) or instagramMediaId (an Instagram post).");
     }
     const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
     let creativeFields;
     if (parameters.postId) {
       // postId from meta.list_page_posts is already in Meta's own
@@ -272,8 +280,8 @@ registerTool({
       if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected.");
       creativeFields = { name: `${parameters.name} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId };
     }
-    const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, creativeFields);
-    const ad = await meta.createAd(accessToken, parameters.adAccountId, {
+    const creative = await meta.createAdCreative(accessToken, adAccountId, creativeFields);
+    const ad = await meta.createAd(accessToken, adAccountId, {
       name: parameters.name,
       adset_id: parameters.adSetId,
       creative: { creative_id: creative.id },
@@ -291,7 +299,7 @@ registerTool({
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       adSetId: { type: "string" },
       pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve. Never pass a made-up value." },
       name: { type: "string" },
@@ -304,7 +312,7 @@ registerTool({
       link: { type: "string" },
       callToAction: { type: "string", description: "e.g. LEARN_MORE, SHOP_NOW, SIGN_UP, DOWNLOAD" },
     },
-    required: ["adAccountId", "adSetId", "name", "primaryText", "headline", "link"],
+    required: ["adSetId", "name", "primaryText", "headline", "link"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
@@ -314,6 +322,7 @@ registerTool({
       throw new Error("Provide exactly one of: imageReferenceId (a chat-attached photo), imageUrl (a public image URL), or contentAssetId (a generate_image result).");
     }
     const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
     const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
     let base64;
     if (parameters.imageReferenceId) {
@@ -327,8 +336,8 @@ registerTool({
       if (!imgRes.ok) throw new Error(`Could not fetch image from ${parameters.imageUrl}`);
       base64 = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
     }
-    const { hash } = await meta.uploadAdImage(accessToken, parameters.adAccountId, base64);
-    const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, {
+    const { hash } = await meta.uploadAdImage(accessToken, adAccountId, base64);
+    const creative = await meta.createAdCreative(accessToken, adAccountId, {
       name: `${parameters.name} — creative`,
       object_story_spec: {
         page_id: pageId,
@@ -342,7 +351,7 @@ registerTool({
         },
       },
     });
-    const ad = await meta.createAd(accessToken, parameters.adAccountId, {
+    const ad = await meta.createAd(accessToken, adAccountId, {
       name: parameters.name,
       adset_id: parameters.adSetId,
       creative: { creative_id: creative.id },
@@ -355,33 +364,35 @@ registerTool({
 
 registerTool({
   name: "meta.upload_ad_video",
-  description: "Uploads a video (from a public URL) to Meta for use in a video ad. Returns immediately with a videoId — Meta processes the video in the background, which can take up to a minute or two, so this does NOT wait for it to finish. Follow up with meta.create_video_ad once you have the videoId; if it's not ready yet, that call will say so clearly and you can just try it again shortly.",
+  description: "Uploads a video (from a public URL) to Meta for use in a video ad. Returns immediately with a videoId — Meta processes the video in the background, which can take up to a minute or two, so this does NOT wait for it to finish. Follow up with meta.create_video_ad once you have the videoId; if it's not ready yet, that call will say so clearly and you can just try it again shortly. adAccountId is optional — omit it to auto-resolve. Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       videoUrl: { type: "string" },
       name: { type: "string" },
     },
-    required: ["adAccountId", "videoUrl", "name"],
+    required: ["videoUrl", "name"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: false, // Uploading alone doesn't create anything that spends — the ad creation step does.
   async execute(parameters, context) {
-    const result = await meta.uploadAdVideoFromUrl(token(context), parameters.adAccountId, parameters.videoUrl, parameters.name);
+    const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
+    const result = await meta.uploadAdVideoFromUrl(accessToken, adAccountId, parameters.videoUrl, parameters.name);
     return { videoId: result.videoId, status: "processing" };
   },
 });
 
 registerTool({
   name: "meta.create_video_ad",
-  description: "Creates a single-video Meta ad from a videoId returned by meta.upload_ad_video — creates the ad creative and the ad, PAUSED so nothing spends until manually resumed. Requires an ad set already created with meta.create_ad_set and a page id from meta.list_pages. If Meta hasn't finished processing the video yet, this fails with a clear message — just try again in a minute, no need to re-upload.",
+  description: "Creates a single-video Meta ad from a videoId returned by meta.upload_ad_video — creates the ad creative and the ad, PAUSED so nothing spends until manually resumed. Requires an ad set already created with meta.create_ad_set and a page id from meta.list_pages. If Meta hasn't finished processing the video yet, this fails with a clear message — just try again in a minute, no need to re-upload. adAccountId is optional — omit it to auto-resolve. Never pass a made-up or reused id — e.g. a Facebook Page id is NOT an ad account id, even though both are plain numbers.",
   category: "meta_ads",
   parameters: {
     type: "object",
     properties: {
-      adAccountId: { type: "string" },
+      adAccountId: { type: "string", description: "Optional — a real ad account id from meta.list_ad_accounts. Omit to auto-resolve." },
       adSetId: { type: "string" },
       pageId: { type: "string", description: "Optional — a real Page id from meta.list_pages. Omit to auto-resolve. Never pass a made-up value." },
       name: { type: "string" },
@@ -392,14 +403,15 @@ registerTool({
       link: { type: "string" },
       callToAction: { type: "string", description: "e.g. LEARN_MORE, SHOP_NOW, SIGN_UP, DOWNLOAD" },
     },
-    required: ["adAccountId", "adSetId", "name", "videoId", "link"],
+    required: ["adSetId", "name", "videoId", "link"],
   },
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creates a real, launchable ad — always confirm.
   async execute(parameters, context) {
     const accessToken = token(context);
+    const adAccountId = await resolveAdAccountId({ accessToken, providedAdAccountId: parameters.adAccountId });
     const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
-    const creative = await meta.createAdCreative(accessToken, parameters.adAccountId, {
+    const creative = await meta.createAdCreative(accessToken, adAccountId, {
       name: `${parameters.name} — creative`,
       object_story_spec: {
         page_id: pageId,
@@ -413,7 +425,7 @@ registerTool({
         },
       },
     });
-    const ad = await meta.createAd(accessToken, parameters.adAccountId, {
+    const ad = await meta.createAd(accessToken, adAccountId, {
       name: parameters.name,
       adset_id: parameters.adSetId,
       creative: { creative_id: creative.id },
