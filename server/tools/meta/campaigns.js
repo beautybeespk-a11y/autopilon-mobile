@@ -7,6 +7,30 @@ import { resolveChatImage } from "../shared/chatImage.js";
 import { resolveContentImageAsset } from "../shared/contentAsset.js";
 import { resolvePageId } from "../shared/metaPageId.js";
 import { resolveAdAccountId } from "../shared/metaAdAccountId.js";
+import { MAX_EXECUTABLE_DAILY_BUDGET } from "../../agents/metaExpert/policy.js";
+
+// Live testing (round 4) confirmed the Meta Expert planner's budget cap
+// (createPlan -> checkBudgetPolicy) has a real bypass: these raw meta.*
+// tools create a live (paused) campaign/ad set directly and never go
+// through createPlan() at all — a model that routes a request through
+// meta.create_campaign + meta.create_ad_set instead of the planner flow
+// hits zero budget guardrail. A runaway daily_budget is exactly as
+// dangerous regardless of which tool created it, so the SAME hard ceiling
+// (server/agents/metaExpert/policy.js's MAX_EXECUTABLE_DAILY_BUDGET,
+// configurable via META_EXPERT_MAX_EXECUTABLE_DAILY_BUDGET) is enforced
+// here unconditionally — this one check is safe to apply to every path
+// with no false-positive risk, unlike the goal/objective policy (which
+// depends on user intent this raw tool has no way to know — see the round
+// 4 completion report for why that one isn't enforced here).
+function assertBudgetWithinCap(dailyBudget) {
+  if (typeof dailyBudget === "number" && dailyBudget > MAX_EXECUTABLE_DAILY_BUDGET) {
+    const err = new Error(
+      `A daily budget of ${dailyBudget} exceeds the maximum executable daily budget (${MAX_EXECUTABLE_DAILY_BUDGET}). Propose a lower budget, or this account's approved maximum needs to be raised first (META_EXPERT_MAX_EXECUTABLE_DAILY_BUDGET).`
+    );
+    err.code = "META_BUDGET_LIMIT_EXCEEDED";
+    throw err;
+  }
+}
 
 function token(context) {
   // Every Meta tool needs a live connection; this throws a clear, tool-level
@@ -80,6 +104,7 @@ registerToolAliased({
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Creating a campaign involves a budget — always confirm first.
   async execute(parameters, context) {
+    assertBudgetWithinCap(parameters.dailyBudget);
     const accessToken = token(context);
     const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const result = await meta.createCampaign(accessToken, adAccountId, {
@@ -115,6 +140,7 @@ registerToolAliased({
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Edits a live campaign's budget/config — confirm first.
   async execute(parameters, context) {
+    assertBudgetWithinCap(parameters.dailyBudget);
     const fields = {};
     if (parameters.name) fields.name = parameters.name;
     if (parameters.dailyBudget) fields.daily_budget = parameters.dailyBudget;
@@ -177,6 +203,7 @@ registerTool({
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true, // Sets real budget + audience — always confirm.
   async execute(parameters, context) {
+    assertBudgetWithinCap(parameters.dailyBudget);
     const accessToken = token(context);
     const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
     const result = await meta.createAdSet(accessToken, adAccountId, {

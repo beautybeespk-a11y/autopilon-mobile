@@ -89,6 +89,49 @@ export function checkGoalClassificationPolicy(plan, businessSignals = {}) {
   return errors;
 }
 
+// A "completely generic" audience — nothing narrowed at all — is the exact
+// shape live testing (round 4) flagged as suspicious by default: All
+// genders, 18-65 is Meta's own widest possible range, not a considered
+// choice. Using >= / <= rather than === on the ages so an even WIDER
+// (invalid per schema, but defensive) range doesn't slip past this check.
+export function isGenericAudience(plan) {
+  return plan.gender === "ALL" && plan.age_min <= 18 && plan.age_max >= 65;
+}
+
+// businessSignals.hasStrongerAudienceEvidence: real data existed that
+// COULD have informed a narrower audience (a connected store's product/
+// category data, or this ad account's own campaign history) — independent
+// of whether the plan actually used it. Same "check the real fact, not the
+// plan's own claim" principle as clearEcommerceWithPurchaseTracking above.
+export function checkAudiencePolicy(plan, businessSignals = {}) {
+  const errors = [];
+  if (!isGenericAudience(plan)) return errors;
+
+  // A generic audience is only ever acceptable with an explicit reason —
+  // Issue 3: "require an explicit audience_basis and audience_reasoning."
+  // audience_basis is already structurally required on every plan
+  // (planSchema.js); audience_reasoning is intentionally NOT a top-level
+  // required schema field (that would reintroduce the exact
+  // "Missing required parameter" brittleness audience_basis itself just
+  // had fixed — see tools/meta/metaExpert.js) — it's required here,
+  // conditionally, only for the specific case that needs it.
+  if (typeof plan.audience_reasoning !== "string" || !plan.audience_reasoning.trim()) {
+    errors.push({
+      field: "audience_reasoning",
+      message: "A fully generic audience (all genders, 18-65) requires an explicit audience_reasoning explaining why no narrower targeting applies — e.g. a genuinely universal product, or a brand-new account with no data yet.",
+    });
+  }
+
+  if (plan.audience_basis === "HEURISTIC" && businessSignals.hasStrongerAudienceEvidence) {
+    errors.push({
+      field: "audience_basis",
+      message: "A fully generic audience with basis HEURISTIC isn't justified — real data exists that could inform this (connected store/product data or this ad account's own campaign history). Use audience_basis STORE_DATA, PRODUCT_CATEGORY, ACCOUNT_HISTORY, or META_PERFORMANCE and narrow the audience using that evidence instead.",
+    });
+  }
+
+  return errors;
+}
+
 // Backend gate for meta_expert.execute_campaign_plan (Issue 6) — checked in
 // server/orchestrator/index.js BEFORE the tool is even dispatched, so a
 // model that decides to call execute_campaign_plan as its first action

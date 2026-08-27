@@ -52,7 +52,11 @@
     "audience_basis": {
       "type": "string",
       "enum": ["ACCOUNT_HISTORY", "STORE_DATA", "PRODUCT_CATEGORY", "META_PERFORMANCE", "HEURISTIC"],
-      "description": "What this audience (age/gender/locations/targeting_strategy) was actually derived from — required so a generic 'All genders 18-65' guess can't be presented as if it were evidence-backed. HEURISTIC is a legitimate, honest choice when no real account/store data exists yet; it's not honest when real data was available and ignored."
+      "description": "What this audience (age/gender/locations/targeting_strategy) was actually derived from — required so a generic 'All genders 18-65' guess can't be presented as if it were evidence-backed. HEURISTIC is a legitimate, honest choice when no real account/store data exists yet; it's not honest when real data was available and ignored. If omitted, the backend derives a safe default (STORE_DATA when a commerce platform is connected, otherwise HEURISTIC) rather than failing the call."
+    },
+    "audience_reasoning": {
+      "type": "string",
+      "description": "Only REQUIRED when the audience is fully generic (gender ALL, age 18-65 — Meta's own widest possible range): a short, honest explanation of why no narrower targeting applies (e.g. a genuinely universal product, or a brand-new account with no data yet). Not required for any narrower audience. Omit rather than pad with a generic sentence when it isn't needed."
     },
     "locations": {
       "type": "array",

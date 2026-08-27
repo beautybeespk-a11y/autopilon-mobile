@@ -72,6 +72,14 @@ export async function gatherBusinessContext(userId) {
       sampleProducts: wooProducts.products.slice(0, MAX_PRODUCTS).map((p) => ({ name: p.name, price: p.price, category: p.categories?.[0]?.name || null })),
       categories: (wooProducts.categories || []).map((c) => c.name),
     };
+    // Live testing (round 4): "please confirm what specific geographical
+    // areas should be targeted" kept getting asked even when the store's
+    // own selling location is a real, known fact — never guessed, so a
+    // failure here just means this one field stays null, not a hard error.
+    knownFacts.commerce.country = await tryFetch(unavailable, "Store selling location (WooCommerce)", () => {
+      const { siteUrl, consumerKey, consumerSecret } = wooCreds(userId);
+      return wc.getStoreCountry(siteUrl, consumerKey, consumerSecret);
+    });
   } else {
     const shopProducts = await tryFetch(unavailable, "Shopify", async () => {
       const { shop, token } = shopifyCreds(userId);
@@ -84,6 +92,10 @@ export async function gatherBusinessContext(userId) {
         sampleProducts: shopProducts.slice(0, MAX_PRODUCTS).map((p) => ({ name: p.title, price: p.variants?.[0]?.price || null, category: p.product_type || null })),
         categories: [...new Set(shopProducts.map((p) => p.product_type).filter(Boolean))],
       };
+      knownFacts.commerce.country = await tryFetch(unavailable, "Store selling location (Shopify)", () => {
+        const { shop, token } = shopifyCreds(userId);
+        return shopify.getStoreCountry(shop, token);
+      });
     }
   }
 

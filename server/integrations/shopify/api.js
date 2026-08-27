@@ -27,6 +27,15 @@ export async function checkStore(shopDomain, accessToken) {
   return { shopName: data.shop?.name, domain: data.shop?.domain, currency: data.shop?.currency, plan: data.shop?.plan_name };
 }
 
+// Live testing (round 4): same reasoning as WooCommerce's getStoreCountry —
+// Shopify's own /shop.json already carries a real country_code for the
+// shop, which the planner can use instead of asking the user which
+// cities/countries to target.
+export async function getStoreCountry(shopDomain, accessToken) {
+  const data = await shopifyFetch(shopDomain, accessToken, "/shop.json");
+  return data.shop?.country_code || null;
+}
+
 // ---- Products ----
 export const listProducts = (shop, token, params = {}) =>
   shopifyFetch(shop, token, `/products.json?${new URLSearchParams(params)}`).then((d) => d.products || []);

@@ -36,6 +36,21 @@ export async function checkStore(siteUrl, consumerKey, consumerSecret) {
   return { environment: data.environment?.site_url, wcVersion: data.environment?.version };
 }
 
+// Live testing (round 4): the agent kept asking the user which cities to
+// target even when the store's own delivery geography is a known,
+// available fact — WooCommerce → Settings → General already has a real
+// "Selling location(s)" / default country configured. woocommerce_default_
+// country's value is a plain 2-letter country code, or "PK:PB"-shaped
+// (country:state/region) for stores using state-level settings — only the
+// country part is real Meta country-targeting can use.
+export async function getStoreCountry(siteUrl, consumerKey, consumerSecret) {
+  const settings = await wcFetch(siteUrl, consumerKey, consumerSecret, "/settings/general");
+  const countrySetting = settings.find?.((s) => s.id === "woocommerce_default_country");
+  const raw = countrySetting?.value;
+  if (!raw || typeof raw !== "string") return null;
+  return raw.split(":")[0] || null;
+}
+
 export const listProducts = (site, k, s, params = {}) => wcFetch(site, k, s, `/products?${new URLSearchParams(params)}`);
 export const getProduct = (site, k, s, id) => wcFetch(site, k, s, `/products/${id}`);
 export const createProduct = (site, k, s, fields) => wcFetch(site, k, s, "/products", { method: "POST", body: fields });

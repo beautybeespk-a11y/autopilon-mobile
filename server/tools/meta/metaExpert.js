@@ -103,7 +103,11 @@ registerTool({
       audience_basis: {
         type: "string",
         enum: INTERNAL_PLAN_SCHEMA.properties.audience_basis.enum,
-        description: "What this audience was actually derived from — required. HEURISTIC is honest only when no real account/store data exists; don't use it when real campaign history or store data was available.",
+        description: "What this audience was actually derived from. HEURISTIC is honest only when no real account/store data exists; don't use it when real campaign history or store data was available. Optional — if omitted, the backend fills in a safe default rather than failing the call, but supplying a real one when you have the evidence is always better.",
+      },
+      audience_reasoning: {
+        type: "string",
+        description: "Only required when the audience is fully generic (all genders, 18-65) — a short, honest reason no narrower targeting applies. Omit for any narrower audience.",
       },
       locations: { type: "array", items: { type: "string" }, description: "Human-readable place names for display, e.g. [\"Karachi\", \"Lahore\"]." },
       countries: { type: "array", items: { type: "string" }, description: "ISO 3166-1 alpha-2 country codes, e.g. [\"PK\"] — what real Meta targeting is actually built from." },
@@ -141,7 +145,19 @@ registerTool({
         description: "Optional — set this to an existing proposed plan's id when this call is a REVISION of it (e.g. the user asked to change the audience or budget), not a brand-new campaign concept. Carries the prior daily_budget forward automatically if this call doesn't set one, per 'preserve the approved budget unless the change requires otherwise.' Asset choices (ad account, Page, Pixel, catalog) already carry forward automatically for the whole conversation — you don't need to re-specify a real id you or the user already picked earlier. Omit for a genuinely new campaign.",
       },
     },
-    required: INTERNAL_PLAN_SCHEMA.required,
+    // audience_basis is deliberately excluded here even though it's in
+    // INTERNAL_PLAN_SCHEMA.required — registry.js's validateParameters()
+    // hard-fails BEFORE execute() ever runs if a top-level required field
+    // is missing, with a generic "Missing required parameter(s)" error and
+    // no chance for the backend to help. Confirmed live: the model omitted
+    // audience_basis and had to retry blind. planner.js's createPlan()
+    // (via normalizePlanDefaults()) fills in a safe default when it's
+    // missing, so it's still effectively required by the time
+    // validatePlanStructure() runs — just never as a hard, unhelpable
+    // parameter-validation failure. goal_classification stays hard-required
+    // here: unlike audience_basis, its fields require real reasoning about
+    // THIS request that the backend cannot safely default.
+    required: INTERNAL_PLAN_SCHEMA.required.filter((f) => f !== "audience_basis"),
   },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false, // Nothing external happens yet — this only validates + stores a proposal.

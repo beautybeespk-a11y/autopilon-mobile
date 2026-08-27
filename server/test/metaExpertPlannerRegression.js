@@ -30,7 +30,7 @@ const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection } = await import("../integrations/manager.js");
 const { validatePlanStructure, validatePlanAgainstContext, validatePlan } = await import("../agents/metaExpert/planSchema.js");
 const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
-const { checkGoalClassificationPolicy, checkBudgetPolicy, messageIndicatesExecutionApproval, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
+const { checkGoalClassificationPolicy, checkBudgetPolicy, checkAudiencePolicy, isGenericAudience, messageIndicatesExecutionApproval, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
 const { getConversationAssets, saveConversationAsset } = await import("../agents/metaExpert/assetSelection.js");
 const { gatherBusinessContext } = await import("../agents/metaExpert/research.js");
 const { getTool } = await import("../tools/registry.js");
@@ -54,6 +54,31 @@ function makeUser(email) {
   const id = cryptoRandom();
   db.prepare("INSERT INTO users (id, email, password, name, createdAt) VALUES (?, ?, ?, ?, ?)").run(id, email, "hash", "Test User", new Date().toISOString());
   return id;
+}
+
+// Round 4: the "meta_ads" skill (unlike "meta_expert") is never seeded by
+// db.js's own bootstrap — nothing in this codebase actually inserts it as
+// a row today, only assumes it exists via agentLibrary.js's static
+// template list. Needed here so a real agent can have the raw meta.* tools
+// (category "meta_ads") enabled, the same way a real installed agent
+// would, for tests that go through the actual executor.runTool() dispatch
+// path rather than calling tool.execute() directly.
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("meta_ads", "Meta Ads", "Manage Facebook and Instagram ad campaigns directly.", "marketing");
+
+// Creates a real agent row with the given skills enabled — for tests that
+// exercise the actual production tool-dispatch path (executor.runTool(),
+// which checks toolAvailableToAgent() against a real agent+skill
+// assignment) rather than calling a tool's execute() directly, which skips
+// registry.js's parameter validation and permission/skill checks entirely.
+function makeAgentWithSkills(userId, skillIds) {
+  const agentId = cryptoRandom();
+  const now = new Date().toISOString();
+  db.prepare("INSERT INTO agents (id, userId, name, status, createdAt, updatedAt) VALUES (?, ?, ?, 'active', ?, ?)").run(agentId, userId, "Test Meta Ads Agent", now, now);
+  for (const skillId of skillIds) {
+    db.prepare("INSERT OR IGNORE INTO agent_skills (agentId, skillId) VALUES (?, ?)").run(agentId, skillId);
+  }
+  return agentId;
 }
 
 const originalFetch = global.fetch;
@@ -418,6 +443,35 @@ async function run() {
       assert.ok(context.unavailable.some((u) => u.includes("commerce platform")));
       assert.ok(context.unavailable.some((u) => u.includes("Pixel")));
       assert.ok(Array.isArray(context.knownFacts.meta.adAccounts) && context.knownFacts.meta.adAccounts.length === 1);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Round 4 (Issue 4): the store's own selling-location setting should be
+  // a real, known fact the agent can use instead of asking the user which
+  // cities to target. Combined Meta + WooCommerce fetch mock since
+  // gatherBusinessContext hits both.
+  await check("research_business_context surfaces the store's real selling-location country (WooCommerce) as a known fact", async () => {
+    const userId = makeUser(`store-country-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const metaHandler = metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] });
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) {
+        if (u.pathname.endsWith("/settings/general")) {
+          return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
+        }
+        if (u.pathname.endsWith("/products")) return jsonResponse([]);
+        if (u.pathname.endsWith("/products/categories")) return jsonResponse([]);
+        return jsonResponse([]);
+      }
+      return metaHandler(url, options);
+    });
+    try {
+      const context = await gatherBusinessContext(userId);
+      assert.equal(context.knownFacts.commerce.country, "PK");
     } finally {
       restoreFetch();
     }
@@ -809,11 +863,134 @@ async function run() {
     }
   });
 
+  // Round 4: the test above accidentally masked the real live bug by
+  // setting plan.pixel explicitly — a real Traffic/LINK_CLICKS plan has no
+  // reason to reference a pixel at all, which is EXACTLY the shape that
+  // let resolved.pixelId stay null and the whole e-commerce signal read as
+  // false even with a real Pixel connected (see planner.js's businessSignals
+  // comment). This reproduces the actual live request shape: no pixel
+  // reference anywhere on the plan.
+  await check("createPlan end-to-end: a Traffic/LINK_CLICKS plan with NO pixel reference at all is still rejected for a connected e-commerce business with a real (but plan-unreferenced) Pixel — the exact live bug shape, unmasked", async () => {
+    const userId = makeUser(`traffic-ecommerce-no-pixel-ref-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "px1", name: "Store Pixel" }],
+    }));
+    try {
+      const plan = basePlan({
+        goal: "I want more traffic to my website",
+        objective: "OUTCOME_TRAFFIC",
+        optimization_event: "LINK_CLICKS",
+        pixel: null, // the real live shape — a Traffic plan has no reason to reference a pixel
+        goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: false },
+      });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false, "a Traffic plan for a real e-commerce business with a real (unreferenced) Pixel must still be rejected");
+      assert.ok(result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("missing goal_classification entirely fails structural validation", () => {
     const { goal_classification, ...planWithout } = basePlan();
     const result = validatePlanStructure(planWithout);
     assert.equal(result.valid, false);
     assert.ok(result.errors.some((e) => e.field === "goal_classification"));
+  });
+
+  // --- Round 4, Issue 2: audience_basis must never hard-fail a first
+  //    attempt — the backend derives a safe default instead.
+  await check("create_campaign_plan tool no longer lists audience_basis as a hard-required parameter (registry.js pre-check must not block on it)", () => {
+    const tool = getTool("meta_expert.create_campaign_plan");
+    assert.ok(!tool.parameters.required.includes("audience_basis"), "audience_basis must not be in the tool's structural required array");
+    assert.ok(tool.parameters.required.includes("goal_classification"), "goal_classification should remain hard-required — its fields can't be safely defaulted");
+  });
+
+  await check("createPlan derives a safe audience_basis (STORE_DATA) when omitted and a commerce platform is connected", async () => {
+    const userId = makeUser(`audience-basis-default-store-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) return jsonResponse([]);
+      return metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] })(url, options);
+    });
+    try {
+      const { audience_basis, ...planWithoutBasis } = basePlan({ optimization_event: "LINK_CLICKS", pixel: null });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan: planWithoutBasis });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.plan.audience_basis, "STORE_DATA");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("createPlan derives a safe audience_basis (HEURISTIC) when omitted and no commerce platform is connected", async () => {
+    const userId = makeUser(`audience-basis-default-heuristic-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const { audience_basis, ...planWithoutBasis } = basePlan({ optimization_event: "LINK_CLICKS", pixel: null });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan: planWithoutBasis });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.plan.audience_basis, "HEURISTIC");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 4, Issue 3: generic-audience policy.
+  await check("isGenericAudience: true only for the maximally generic shape (ALL genders, 18-65)", () => {
+    assert.equal(isGenericAudience(basePlan({ gender: "ALL", age_min: 18, age_max: 65 })), true);
+    assert.equal(isGenericAudience(basePlan({ gender: "ALL", age_min: 21, age_max: 44 })), false);
+    assert.equal(isGenericAudience(basePlan({ gender: "FEMALE", age_min: 18, age_max: 65 })), false);
+  });
+
+  await check("audience policy: a fully generic audience with no audience_reasoning is rejected", () => {
+    const plan = basePlan({ gender: "ALL", age_min: 18, age_max: 65, audience_basis: "HEURISTIC" });
+    const errors = checkAudiencePolicy(plan, { hasStrongerAudienceEvidence: false });
+    assert.ok(errors.some((e) => e.field === "audience_reasoning"), JSON.stringify(errors));
+  });
+
+  await check("audience policy: a fully generic audience WITH audience_reasoning, no stronger evidence available -> passes", () => {
+    const plan = basePlan({ gender: "ALL", age_min: 18, age_max: 65, audience_basis: "HEURISTIC", audience_reasoning: "Brand-new ad account with no campaign history or store data yet — a universal starting audience is the honest choice." });
+    const errors = checkAudiencePolicy(plan, { hasStrongerAudienceEvidence: false });
+    assert.deepEqual(errors, []);
+  });
+
+  await check("audience policy: a fully generic + HEURISTIC audience is rejected when stronger real evidence exists (store data or campaign history)", () => {
+    const plan = basePlan({ gender: "ALL", age_min: 18, age_max: 65, audience_basis: "HEURISTIC", audience_reasoning: "No particular reason." });
+    const errors = checkAudiencePolicy(plan, { hasStrongerAudienceEvidence: true });
+    assert.ok(errors.some((e) => e.field === "audience_basis"), JSON.stringify(errors));
+  });
+
+  await check("audience policy: a non-generic audience is never flagged, regardless of basis or evidence", () => {
+    const plan = basePlan({ gender: "FEMALE", age_min: 21, age_max: 44, audience_basis: "HEURISTIC" });
+    const errors = checkAudiencePolicy(plan, { hasStrongerAudienceEvidence: true });
+    assert.deepEqual(errors, []);
+  });
+
+  await check("createPlan end-to-end: a fully generic audience with basis HEURISTIC is rejected for a business with connected store data — the exact live bug shape", async () => {
+    const userId = makeUser(`generic-audience-store-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) return jsonResponse([]);
+      return metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] })(url, options);
+    });
+    try {
+      const plan = basePlan({ optimization_event: "LINK_CLICKS", pixel: null, gender: "ALL", age_min: 18, age_max: 65, audience_basis: "HEURISTIC", audience_reasoning: "No particular reason." });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false);
+      assert.ok(result.errors.some((e) => e.field === "audience_basis"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
   });
 
   // --- 15. Deterministic budget policy (Issue 3): the exact live bug was
@@ -831,6 +1008,20 @@ async function run() {
   await check(`budget policy: NO budget may exceed the hard executable maximum (${MAX_EXECUTABLE_DAILY_BUDGET}), even USER_PROVIDED`, () => {
     const errors = checkBudgetPolicy(basePlan({ daily_budget: MAX_EXECUTABLE_DAILY_BUDGET + 1, budget_basis: "USER_PROVIDED" }));
     assert.ok(errors.some((e) => e.field === "daily_budget"), JSON.stringify(errors));
+  });
+
+  await check("formatRecommendation() explains the budget's basis in plain language, not just a bare number — Issue 6", async () => {
+    const userId = makeUser(`budget-basis-explanation-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const plan = basePlan({ optimization_event: "LINK_CLICKS", pixel: null, daily_budget: 2000, budget_basis: "HEURISTIC_STARTING_TEST" });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.match(result.recommendationText, /2000\/day \(as a conservative starting test budget\)/);
+    } finally {
+      restoreFetch();
+    }
   });
 
   await check("daily_budget set without budget_basis fails structural validation", () => {
@@ -934,6 +1125,110 @@ async function run() {
   await check("messageIndicatesExecutionApproval: does not false-positive on ordinary planning/adjustment language", () => {
     for (const text of ["Create the best campaign you recommend for my business.", "I want more website sales.", "Change the audience and make it more conservative.", "What campaign should I run?"]) {
       assert.equal(messageIndicatesExecutionApproval(text), false, `expected "${text}" NOT to read as approval`);
+    }
+  });
+
+  // --- Round 4: tests through the REAL production tool-dispatch path
+  //    (executor.runTool()/resumeAfterConfirmation()), not just direct
+  //    planner unit calls or tool.execute() calls. This is the exact layer
+  //    a live request actually goes through — registry.js's structural
+  //    parameter pre-check runs HERE and nowhere else, which is exactly
+  //    what let the audience_basis hard-fail slip past every direct-call
+  //    unit test in round 3 despite them all passing. A real agent row
+  //    with real agent_skills is required for this path (toolAvailableToAgent).
+  await check("[dispatch path] omitting audience_basis does NOT hard-fail through the real runTool() path — registry.js's structural pre-check must not block it", async () => {
+    const userId = makeUser(`dispatch-audience-basis-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const { audience_basis, ...planWithoutBasis } = basePlan({ optimization_event: "LINK_CLICKS", pixel: null });
+      const outcome = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: planWithoutBasis, userId, agentId, conversationId });
+      assert.equal(outcome.status, "completed", JSON.stringify(outcome));
+      assert.equal(outcome.result.valid, true, JSON.stringify(outcome.result));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[dispatch path] a Traffic/LINK_CLICKS plan for a connected e-commerce business is rejected as a clean 'failed' tool outcome, not an uncaught exception, through the real runTool() path", async () => {
+    const userId = makeUser(`dispatch-traffic-policy-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) return jsonResponse([]);
+      return metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Store Pixel" }] })(url, options);
+    });
+    try {
+      const plan = basePlan({
+        goal: "I want more traffic to my website",
+        objective: "OUTCOME_TRAFFIC",
+        optimization_event: "LINK_CLICKS",
+        pixel: null,
+        goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: false },
+      });
+      const outcome = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: plan, userId, agentId, conversationId });
+      assert.equal(outcome.status, "completed", "create_campaign_plan itself always 'completes' — validation failure is reported IN the result, not as a tool failure");
+      assert.equal(outcome.result.valid, false);
+      assert.ok(outcome.result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(outcome.result));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[dispatch path] a Page chosen explicitly persists across TWO separate real runTool() calls in the same conversation — the exact live wrong-Page bug, through the real dispatch path", async () => {
+    const userId = makeUser(`dispatch-page-memory-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "555555555555555", name: "Careonabudget.pk" }],
+    }));
+    try {
+      const first = await runTool({
+        toolName: "meta_expert.create_campaign_plan",
+        parameters: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }),
+        userId, agentId, conversationId,
+      });
+      assert.equal(first.status, "completed", JSON.stringify(first));
+      assert.equal(first.result.valid, true, JSON.stringify(first.result));
+
+      const second = await runTool({
+        toolName: "meta_expert.create_campaign_plan",
+        parameters: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "default_facebook_page" } }),
+        userId, agentId, conversationId,
+      });
+      assert.equal(second.status, "completed", JSON.stringify(second));
+      assert.equal(second.result.valid, true, JSON.stringify(second.result));
+      assert.match(second.result.recommendationText, /Beautybeespk/);
+      assert.doesNotMatch(second.result.recommendationText, /Careonabudget/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[dispatch path] the raw meta.create_ad_set bypass tool is capped at the SAME budget ceiling as the planner — full runTool() -> awaiting_confirmation -> resumeAfterConfirmation round trip", async () => {
+    const userId = makeUser(`dispatch-raw-budget-cap-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_ads"]);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }] }));
+    try {
+      const outcome = await runTool({
+        toolName: "meta.create_ad_set",
+        parameters: { campaignId: "123", name: "Big Budget Ad Set", dailyBudget: MAX_EXECUTABLE_DAILY_BUDGET + 5000 },
+        userId, agentId,
+      });
+      assert.equal(outcome.status, "awaiting_confirmation", "create_ad_set requires confirmation before executing — this must still be true");
+      const resumed = await resumeAfterConfirmation({ executionId: outcome.executionId, approved: true });
+      assert.equal(resumed.status, "failed", "the raw tool must refuse to execute above the cap even after confirmation, exactly like the planner does");
+      assert.match(resumed.error, /exceeds the maximum executable daily budget/);
+    } finally {
+      restoreFetch();
     }
   });
 

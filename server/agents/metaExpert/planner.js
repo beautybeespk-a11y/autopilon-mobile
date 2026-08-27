@@ -8,7 +8,7 @@ import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
 import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
-import { checkBudgetPolicy, checkGoalClassificationPolicy } from "./policy.js";
+import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience } from "./policy.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
@@ -141,7 +141,20 @@ export function formatRecommendation(plan, names) {
     OUTCOME_ENGAGEMENT: "Engagement", OUTCOME_AWARENESS: "Awareness", OUTCOME_APP_PROMOTION: "App Promotion",
   }[plan.objective] || plan.objective;
   const genderLabel = { ALL: "All genders", MALE: "Men", FEMALE: "Women" }[plan.gender] || plan.gender;
-  const budgetLine = plan.daily_budget != null ? `${plan.daily_budget}/day` : "Not yet set — needs your input";
+  // Issue 6 (live testing round 4): a bare number with no explanation reads
+  // as an arbitrary guess even when it isn't one — every budget line now
+  // says in plain language where it came from, using the SAME budget_basis
+  // value checkBudgetPolicy() already enforces server-side, not a separate
+  // unchecked claim.
+  const BUDGET_BASIS_EXPLANATION = {
+    USER_PROVIDED: "as you specified",
+    SAVED_POLICY: "based on your saved budget policy",
+    HISTORICAL_PERFORMANCE: "based on your account's historical spend",
+    HEURISTIC_STARTING_TEST: "as a conservative starting test budget",
+  };
+  const budgetLine = plan.daily_budget != null
+    ? `${plan.daily_budget}/day (${BUDGET_BASIS_EXPLANATION[plan.budget_basis] || "basis not specified"})`
+    : "Not yet set — needs your input";
   const placementsLabel = plan.placements === "ADVANTAGE_PLUS" ? "Advantage+ (automatic)" : (plan.manual_placements || []).join(", ");
 
   const lines = [
@@ -197,17 +210,39 @@ export const EXECUTABLE_STATUSES = new Set(["proposed", "approved"]);
 // is NOT re-run here; the caller (the agent, per its own instructions)
 // only calls research_business_context again if the revision genuinely
 // needs new facts, not on every revision.
+// Confirmed live (round 4): the model omitted audience_basis on its first
+// attempt, which registry.js's validateParameters() (a structural
+// required-field check that runs BEFORE execute()/createPlan() ever sees
+// the plan) hard-failed with "Missing required parameter(s): audience_basis"
+// — the model then had to retry blind. Unlike goal_classification's
+// sub-fields (literal_goal, recommended_meta_objective, etc.), which
+// genuinely require reasoning about THIS user's actual request and can't
+// be safely guessed backend-side, audience_basis has a real, mechanical,
+// safe default: STORE_DATA when a commerce platform is actually connected
+// (real product/category data genuinely exists to have informed the
+// audience), HEURISTIC otherwise. Filling this in before structural
+// validation runs means a model that forgets the field never sees a failed
+// attempt at all — tools/meta/metaExpert.js also drops audience_basis from
+// the tool's own exposed `required` array so registry.js's pre-check
+// doesn't hard-fail on it either; this is the actual backstop.
+function normalizePlanDefaults(userId, plan) {
+  if (plan.audience_basis) return plan;
+  const hasStoreData = !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify"));
+  return { ...plan, audience_basis: hasStoreData ? "STORE_DATA" : "HEURISTIC" };
+}
+
 export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
-  const structural = validatePlanStructure(plan); // structural-only pass — context-dependent checks run after resolution, below
+  const normalizedPlan = normalizePlanDefaults(userId, plan);
+  const structural = validatePlanStructure(normalizedPlan); // structural-only pass — context-dependent checks run after resolution, below
   if (!structural.valid) {
     return { ok: false, errors: structural.errors };
   }
 
-  let effectivePlan = plan;
+  let effectivePlan = normalizedPlan;
   if (revisesPlanId) {
     const prior = getStoredPlan(userId, revisesPlanId);
-    if (prior && (plan.daily_budget === undefined || plan.daily_budget === null) && prior.planData.plan.daily_budget != null) {
-      effectivePlan = { ...plan, daily_budget: prior.planData.plan.daily_budget };
+    if (prior && (normalizedPlan.daily_budget === undefined || normalizedPlan.daily_budget === null) && prior.planData.plan.daily_budget != null) {
+      effectivePlan = { ...normalizedPlan, daily_budget: prior.planData.plan.daily_budget };
     }
   }
 
@@ -224,12 +259,60 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   // the deterministic policy layer (policy.js) needs — Issue 8: "the LLM
   // can propose strategy, but the backend should reject unsafe or
   // contradictory plans." A commerce platform connection is a DB read, not
-  // a network call; resolved.pixelId already required a live Meta call
-  // above, so this adds no extra latency.
+  // a network call.
+  //
+  // CONFIRMED LIVE BUG (round 4): this used to read `!!resolved.pixelId`
+  // directly — but resolved.pixelId is ONLY populated a few lines above
+  // when the PLAN ITSELF references a pixel or uses a PURCHASE_LIKE_EVENTS
+  // optimization_event (line ~107). A Traffic plan with optimization_event
+  // LINK_CLICKS never triggers that branch, so resolved.pixelId stayed
+  // null EVEN WHEN A REAL PIXEL EXISTS on the account — meaning the whole
+  // goal-classification policy below silently never fired for exactly the
+  // "traffic requested for an e-commerce store with real tracking" case it
+  // exists to catch. This is the confirmed root cause of the live Traffic
+  // plan for Careonabudget.pk getting created unchecked. Fixed by checking
+  // whether a Pixel exists on the resolved ad account independently of
+  // whether THIS plan happens to reference one — an extra meta.listPixels
+  // call only when the plan's own resolution didn't already answer it, so
+  // this adds a network call only for the exact case that was broken, not
+  // on every plan.
+  let pixelExists = !!resolved.pixelId;
+  if (!pixelExists && resolved.adAccountId) {
+    try {
+      const { available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId });
+      pixelExists = available.length > 0;
+    } catch {
+      // Best-effort signal only — a failure here must never block plan
+      // creation; it just means this specific safety net can't confirm a
+      // Pixel exists, not that the plan itself is invalid.
+    }
+  }
+  const hasStoreData = !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify"));
+
+  // hasStrongerAudienceEvidence (Issue 3): only fetched when it could
+  // actually change the outcome — a generic, HEURISTIC-basis audience with
+  // no store data already known — so a normal plan never pays for this
+  // extra call. hasStoreData alone already counts as stronger evidence
+  // without needing this.
+  let hasCampaignHistory = false;
+  if (isGenericAudience(effectivePlan) && effectivePlan.audience_basis === "HEURISTIC" && !hasStoreData && resolved.adAccountId) {
+    try {
+      const campaigns = await meta.listCampaigns(accessToken, resolved.adAccountId);
+      hasCampaignHistory = campaigns.length > 0;
+    } catch {
+      // Best-effort signal only — never blocks plan creation on its own.
+    }
+  }
+
   const businessSignals = {
-    clearEcommerceWithPurchaseTracking: !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify")) && !!resolved.pixelId,
+    clearEcommerceWithPurchaseTracking: !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify")) && pixelExists,
+    hasStrongerAudienceEvidence: hasStoreData || hasCampaignHistory,
   };
-  const policyErrors = [...checkGoalClassificationPolicy(effectivePlan, businessSignals), ...checkBudgetPolicy(effectivePlan)];
+  const policyErrors = [
+    ...checkGoalClassificationPolicy(effectivePlan, businessSignals),
+    ...checkBudgetPolicy(effectivePlan),
+    ...checkAudiencePolicy(effectivePlan, businessSignals),
+  ];
 
   const errors = [...resolutionErrors, ...contextual.errors, ...policyErrors];
   if (errors.length) {
