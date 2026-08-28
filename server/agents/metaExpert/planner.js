@@ -8,7 +8,8 @@ import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
 import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
-import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience } from "./policy.js";
+import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
+import { trace } from "./diagnostics.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
@@ -37,18 +38,23 @@ async function resolveWithMemory({ conversationId, userId, field, explicitId, sa
     candidate = savedId;
     usingSaved = true;
   }
+  // source is purely for diagnostics (below) — never affects resolution.
+  let source = candidate ? (usingSaved ? "conversation-remembered" : "explicit-in-plan") : "none-supplied (single-available auto-use, or resolver asks)";
   let id;
   try {
     id = await resolve(candidate);
   } catch (err) {
     if (usingSaved && staleCodes.includes(err.code)) {
       clearConversationAsset(conversationId, field);
+      source = "conversation-remembered was STALE, cleared and re-resolved with none supplied";
       id = await resolve(undefined);
     } else {
+      trace(`asset resolution FAILED: ${field}`, { conversationId, explicitId: explicitId || null, savedId: savedId || null, candidateSource: source, errorCode: err.code, errorMessage: err.message });
       throw err;
     }
   }
   if (conversationId && id) saveConversationAsset(conversationId, userId, field, id);
+  trace(`asset resolution: ${field}`, { conversationId, explicitId: explicitId || null, savedId: savedId || null, candidateSource: source, resolvedId: id || null });
   return id;
 }
 
@@ -308,13 +314,63 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     clearEcommerceWithPurchaseTracking: !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify")) && pixelExists,
     hasStrongerAudienceEvidence: hasStoreData || hasCampaignHistory,
   };
-  const policyErrors = [
-    ...checkGoalClassificationPolicy(effectivePlan, businessSignals),
-    ...checkBudgetPolicy(effectivePlan),
-    ...checkAudiencePolicy(effectivePlan, businessSignals),
-  ];
+  const goalPolicyErrors = checkGoalClassificationPolicy(effectivePlan, businessSignals);
+  const budgetPolicyErrors = checkBudgetPolicy(effectivePlan);
+  const audiencePolicyErrors = checkAudiencePolicy(effectivePlan, businessSignals);
+
+  // TEMPORARY (live testing round 5) — see diagnostics.js. Every input the
+  // three policy functions actually see, and their actual return value —
+  // not a re-derivation, the literal values passed in and the literal
+  // arrays returned, so this can't itself be wrong in a way that hides a
+  // real discrepancy.
+  trace("goal policy", {
+    literalGoal: effectivePlan.goal_classification?.literal_goal ?? null,
+    proposedObjective: effectivePlan.objective,
+    proposedOptimizationEvent: effectivePlan.optimization_event,
+    requiresGoalConfirmation: effectivePlan.goal_classification?.requires_goal_confirmation ?? null,
+    recommendedMetaObjective: effectivePlan.goal_classification?.recommended_meta_objective ?? null,
+    commerceConnected: hasStoreData,
+    pixelExists,
+    isEcommerce: businessSignals.clearEcommerceWithPurchaseTracking,
+    hasPurchaseTracking: pixelExists,
+    policyResult: goalPolicyErrors.length ? "REJECTED" : "accepted",
+    policyErrors: goalPolicyErrors,
+  });
+  trace("audience policy", {
+    gender: effectivePlan.gender,
+    age_min: effectivePlan.age_min,
+    age_max: effectivePlan.age_max,
+    audience_basis: effectivePlan.audience_basis,
+    audience_reasoning: effectivePlan.audience_reasoning ?? null,
+    isGenericAudience: isGenericAudience(effectivePlan),
+    hasStrongerAudienceEvidence: businessSignals.hasStrongerAudienceEvidence,
+    hasStoreData,
+    hasCampaignHistory,
+    policyResult: audiencePolicyErrors.length ? "REJECTED" : "accepted",
+    policyErrors: audiencePolicyErrors,
+  });
+  trace("budget policy", {
+    proposedDailyBudget: effectivePlan.daily_budget,
+    budget_basis: effectivePlan.budget_basis,
+    MAX_SUGGESTED_DAILY_BUDGET,
+    MAX_EXECUTABLE_DAILY_BUDGET,
+    policyResult: budgetPolicyErrors.length ? "REJECTED" : "accepted",
+    policyErrors: budgetPolicyErrors,
+  });
+
+  const policyErrors = [...goalPolicyErrors, ...budgetPolicyErrors, ...audiencePolicyErrors];
 
   const errors = [...resolutionErrors, ...contextual.errors, ...policyErrors];
+  trace("createPlan final decision", {
+    conversationId,
+    accepted: errors.length === 0,
+    resolutionErrors,
+    contextualErrors: contextual.errors,
+    policyErrors,
+    resolvedAdAccountId: resolved.adAccountId,
+    resolvedPageId: resolved.pageId,
+    resolvedPixelId: resolved.pixelId,
+  });
   if (errors.length) {
     return { ok: false, errors };
   }
@@ -327,6 +383,7 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     pageName: pages.find((p) => p.id === resolved.pageId)?.name || null,
     instagramUsername: null, // Phase 1 doesn't fetch the IG username separately — accountId is enough to prove the resolution
   };
+  trace("final selected Page/ad account", { resolvedPageId: resolved.pageId, resolvedPageName: names.pageName, resolvedAdAccountId: resolved.adAccountId, resolvedAdAccountName: names.adAccountName });
 
   const recommendationText = formatRecommendation(effectivePlan, names);
 

@@ -2,6 +2,7 @@ import { requireValidToken, getConnection } from "../../integrations/manager.js"
 import * as meta from "../../integrations/meta/api.js";
 import * as wc from "../../integrations/woocommerce/api.js";
 import * as shopify from "../../integrations/shopify/api.js";
+import { trace } from "./diagnostics.js";
 
 // Bounds on every list this pulls in — this is context for an LLM prompt,
 // not a full export; a handful of representative items is enough for the
@@ -182,6 +183,26 @@ export async function gatherBusinessContext(userId) {
   } else {
     knownFacts.meta.recentInstagramPosts = [];
   }
+
+  // TEMPORARY (live testing round 5) — see diagnostics.js. Explicit
+  // whitelist only: ids, names, counts, booleans — never a raw connection/
+  // credential object, so there's no path for a secret to leak here even
+  // if this file changes later.
+  trace("research_business_context", {
+    userId,
+    commerceDetected: !!knownFacts.commerce,
+    commerceProvider: knownFacts.commerce?.platform || null,
+    storeCountry: knownFacts.commerce?.country ?? null,
+    storeDataRetrievalFailed: unavailable.some((u) => u.startsWith("Store selling location")),
+    productCount: knownFacts.commerce?.productCount ?? null,
+    sampleProductCategories: knownFacts.commerce?.categories ?? null,
+    metaPixelCount: knownFacts.meta.pixels?.length ?? null,
+    metaPixelIds: (knownFacts.meta.pixels || []).map((p) => p.id),
+    facebookPages: (knownFacts.meta.pages || []).map((p) => ({ id: p.id, name: p.name })),
+    adAccounts: (knownFacts.meta.adAccounts || []).map((a) => ({ id: a.id, name: a.name })),
+    existingCampaignCount: knownFacts.meta.existingCampaigns?.length ?? null,
+    unavailableReasons: unavailable,
+  });
 
   return { knownFacts, inferredFacts, unavailable };
 }

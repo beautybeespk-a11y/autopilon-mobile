@@ -1232,6 +1232,66 @@ async function run() {
     }
   });
 
+  // --- Round 5: the FULL two-step live flow, chained — real
+  //    gatherBusinessContext() (meta_expert.research_business_context)
+  //    followed by real createPlan() (meta_expert.create_campaign_plan),
+  //    using values genuinely read back OUT of the research call's own
+  //    knownFacts (country, commerce detection) rather than hand-typed
+  //    into the test. Only the HTTP layer (global.fetch) is mocked — every
+  //    other line of production code, in both files, runs for real. This
+  //    is the closest a deterministic test can get to reproducing "agent
+  //    went through research_business_context -> create_campaign_plan"
+  //    without a live LLM.
+  await check("[production-shaped flow] research_business_context -> create_campaign_plan, chained: a Traffic/LINK_CLICKS plan is still rejected using real research output (country, commerce, Pixel) as the actual input", async () => {
+    const userId = makeUser(`chained-flow-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) {
+        if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
+        if (u.pathname.endsWith("/products")) return jsonResponse([{ id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }] }]);
+        if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
+        return jsonResponse([]);
+      }
+      return metaRouter({
+        adAccounts: [{ id: "act_1", name: "A" }],
+        pages: [{ id: "111", name: "Beautybeespk" }],
+        pixels: [{ id: "px1", name: "Store Pixel" }],
+      })(url, options);
+    });
+    try {
+      // Step 1: the real research call, exactly as meta_expert.research_business_context runs it.
+      const research = await gatherBusinessContext(userId);
+      assert.equal(research.knownFacts.commerce.platform, "woocommerce", "sanity check: research must have actually detected the store");
+      assert.equal(research.knownFacts.meta.pixels.length, 1, "sanity check: research must have actually found the Pixel");
+      assert.equal(research.knownFacts.commerce.country, "PK", "sanity check: research must have actually found the store's country");
+
+      // Step 2: a plan shaped exactly like the live bug report — Traffic
+      // objective, LINK_CLICKS optimization, generic audience, no pixel
+      // reference (a real Traffic plan has no reason to reference one) —
+      // but using the REAL country string read back from step 1, not a
+      // hardcoded literal, and a goal_classification that (incorrectly,
+      // matching the live bug) claims no confirmation is needed.
+      const plan = basePlan({
+        goal: "I want more traffic to my website",
+        objective: "OUTCOME_TRAFFIC",
+        optimization_event: "LINK_CLICKS",
+        pixel: null,
+        gender: "ALL", age_min: 18, age_max: 65,
+        locations: [research.knownFacts.commerce.country === "PK" ? "Pakistan" : research.knownFacts.commerce.country],
+        countries: [research.knownFacts.commerce.country],
+        goal_classification: { literal_goal: "more traffic", inferred_business_outcome: "revenue from purchases", recommended_meta_objective: "OUTCOME_SALES", requires_goal_confirmation: false },
+      });
+      const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false, "a Traffic plan must be rejected when the PRECEDING research call actually found real commerce + Pixel data");
+      assert.ok(result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert planner checks passed.`);
   if (failed.length) {
