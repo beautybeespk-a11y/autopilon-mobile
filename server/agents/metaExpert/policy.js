@@ -195,6 +195,7 @@ const EXPECTED_CORRECTION_BY_FIELD = {
   goal_classification: "Set goal_classification.requires_goal_confirmation and recommended_meta_objective honestly, and align objective with the recommendation.",
   objective: "Set objective to match goal_classification.recommended_meta_objective while goal confirmation is pending.",
   open_questions: "Set approval_required true and add a real, specific open_questions entry raising the tradeoff.",
+  revisesPlanId: "Either omit revisesPlanId to create a fresh plan, or set it to the real id of a plan created earlier in THIS conversation that's still active (proposed/approved).",
 };
 export function buildRepairGuidance(errors, facts = {}) {
   return errors.map((e) => ({

@@ -76,7 +76,7 @@ registerTool({
 registerTool({
   name: "meta_expert.create_campaign_plan",
   description:
-    "Creates and validates an internal Meta campaign plan from the business/account context already researched (call meta_expert.research_business_context first). This does NOT create anything in Meta — it's a validated, stored proposal that gets presented to the user for approval before meta_expert.execute_campaign_plan ever runs. Reference assets SEMANTICALLY — facebook_page.ref / ad_account.ref / pixel.ref / catalog.ref should be \"default_facebook_page\" / \"default_ad_account\" / \"default_pixel\" / \"default_catalog\" unless the user already specified a particular real one (a real id already confirmed via a lookup tool this conversation — NEVER an invented id). Asset resolution is automatic and remembered per-conversation: exactly one available ad account/Page/Pixel/catalog is used without asking, and once the user (or you, on their behalf) picks one among several, that choice is reused for every later plan and revision in this conversation — never ask about the same asset twice. campaign_status must always be \"PAUSED\". If validation fails, the response is {valid:false, code:\"META_PLAN_REPAIR_REQUIRED\", errors, repairGuidance:[{field, problem, expectedCorrection, relevantFacts}, ...]} — use repairGuidance to fix the SPECIFIC field(s) named and call this again ONCE with a genuinely different, corrected plan. You get exactly one repair attempt after the first — the backend will refuse a THIRD call this turn regardless of whether it's identical or different, so make the repair count. Never resubmit an unchanged plan hoping for a different result — if you can't identify a real fix from repairGuidance, stop and tell the user plainly what's blocking it with type \"final\" instead of calling this again. Full field contract: " +
+    "Creates and validates an internal Meta campaign plan from the business/account context already researched (call meta_expert.research_business_context first). This does NOT create anything in Meta — it's a validated, stored proposal that gets presented to the user for approval before meta_expert.execute_campaign_plan ever runs. Reference assets SEMANTICALLY — facebook_page.ref / ad_account.ref / pixel.ref / catalog.ref should be \"default_facebook_page\" / \"default_ad_account\" / \"default_pixel\" / \"default_catalog\" unless the user already specified a particular real one (a real id already confirmed via a lookup tool this conversation — NEVER an invented id). Asset resolution is automatic and remembered per-conversation: exactly one available ad account/Page/Pixel/catalog is used without asking, and once the user (or you, on their behalf) picks one among several, that choice is reused for every later plan and revision in this conversation — never ask about the same asset twice. campaign_status must always be \"PAUSED\". REVISING an existing plan (set revisesPlanId): send ONLY the fields actually changing plus reasoning_summary explaining the change — never reconstruct the whole plan from memory. Every field you omit is carried forward automatically from the prior plan (objective, optimization_event, targeting_strategy, placements, bid_strategy, cta, facebook_page, ad_account, pixel, catalog, campaign_status, daily_budget if you're not changing it, etc.) — only send what's actually different (e.g. just gender/age_min/age_max/audience_basis/audience_reasoning for an audience change, or just daily_budget/budget_basis for a budget change). If validation fails, the response is {valid:false, code:\"META_PLAN_REPAIR_REQUIRED\", errors, repairGuidance:[{field, problem, expectedCorrection, relevantFacts}, ...]} — use repairGuidance to fix the SPECIFIC field(s) named and call this again ONCE with a genuinely different, corrected plan. You get exactly one repair attempt after the first — the backend will refuse a THIRD call this turn regardless of whether it's identical or different, so make the repair count. Never resubmit an unchanged plan hoping for a different result — if you can't identify a real fix from repairGuidance, stop and tell the user plainly what's blocking it with type \"final\" instead of calling this again. Full field contract for a BRAND-NEW plan (not a revision): " +
     JSON.stringify(INTERNAL_PLAN_SCHEMA.required),
   category: "meta_expert",
   parameters: {
@@ -142,22 +142,29 @@ registerTool({
       open_questions: { type: "array", items: { type: "string" } },
       revisesPlanId: {
         type: "string",
-        description: "Optional — set this to an existing proposed plan's id when this call is a REVISION of it (e.g. the user asked to change the audience or budget), not a brand-new campaign concept. Carries the prior daily_budget forward automatically if this call doesn't set one, per 'preserve the approved budget unless the change requires otherwise.' Asset choices (ad account, Page, Pixel, catalog) already carry forward automatically for the whole conversation — you don't need to re-specify a real id you or the user already picked earlier. Omit for a genuinely new campaign.",
+        description: "Optional — set this to an existing active (proposed/approved) plan's id when this call is a REVISION of it (e.g. the user asked to change the audience or budget), not a brand-new campaign concept. When set, send ONLY the fields you're actually changing — every other field (objective, optimization_event, targeting_strategy, placements, bid_strategy, cta, facebook_page, ad_account, pixel, catalog, daily_budget, etc.) is carried forward automatically from the prior plan, per 'preserve what wasn't asked to change.' Omit for a genuinely new campaign.",
       },
     },
-    // audience_basis is deliberately excluded here even though it's in
-    // INTERNAL_PLAN_SCHEMA.required — registry.js's validateParameters()
-    // hard-fails BEFORE execute() ever runs if a top-level required field
-    // is missing, with a generic "Missing required parameter(s)" error and
-    // no chance for the backend to help. Confirmed live: the model omitted
-    // audience_basis and had to retry blind. planner.js's createPlan()
-    // (via normalizePlanDefaults()) fills in a safe default when it's
-    // missing, so it's still effectively required by the time
-    // validatePlanStructure() runs — just never as a hard, unhelpable
-    // parameter-validation failure. goal_classification stays hard-required
-    // here: unlike audience_basis, its fields require real reasoning about
-    // THIS request that the backend cannot safely default.
-    required: INTERNAL_PLAN_SCHEMA.required.filter((f) => f !== "audience_basis"),
+    // No `required` array here at all (round 4 removed audience_basis for
+    // this exact reason; round 8 generalizes it to every field). registry.js's
+    // validateParameters() hard-fails BEFORE execute()/createPlan() ever
+    // runs when a top-level required field is missing, with a generic
+    // "Missing required parameter(s)" error and no chance for the backend
+    // to help — fine for a genuinely new plan (planner.js's
+    // validatePlanStructure() enforces the SAME INTERNAL_PLAN_SCHEMA.required
+    // list right after, with real repairGuidance instead of a bare string),
+    // but actively wrong for a REVISION: a call with revisesPlanId set is
+    // deliberately a PARTIAL plan — only the fields actually changing — with
+    // everything else meant to carry forward from the prior stored plan
+    // (planner.js's mergePlanForRevision(), which runs before
+    // validatePlanStructure()). CONFIRMED LIVE (round 8): a revision that
+    // only changed audience/budget was hard-rejected here with "Missing
+    // required parameter(s): bid_strategy, cta" before createPlan() ever
+    // got a chance to merge in the unchanged fields from the prior plan.
+    // Structural completeness is still fully enforced for both a new plan
+    // and a revision — just always AFTER any revision merge has happened,
+    // never as a blind pre-check against the raw (possibly partial) call.
+    required: [],
   },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false, // Nothing external happens yet — this only validates + stores a proposal.

@@ -924,12 +924,29 @@ async function run() {
     assert.ok(result.errors.some((e) => e.field === "goal_classification"));
   });
 
-  // --- Round 4, Issue 2: audience_basis must never hard-fail a first
-  //    attempt — the backend derives a safe default instead.
-  await check("create_campaign_plan tool no longer lists audience_basis as a hard-required parameter (registry.js pre-check must not block on it)", () => {
+  // --- Round 4, Issue 2 / Round 8/9: NOTHING is hard-required at the
+  //    registry.js pre-check layer for this tool anymore. Round 4 removed
+  //    audience_basis alone (a safe backend default exists for it); round 9
+  //    generalized this to every field, because that pre-check runs BEFORE
+  //    createPlan() ever sees whether this is a revision — a revision
+  //    deliberately submits a PARTIAL plan (see mergePlanForRevision() in
+  //    planner.js), and the blunt tool-level `required` array can't tell a
+  //    revision's intentional omission from a new plan's genuine mistake.
+  //    Full structural completeness (including goal_classification, whose
+  //    fields still can't be safely defaulted) is still enforced — just one
+  //    layer deeper, by validatePlanStructure() inside createPlan(), which
+  //    runs AFTER any revision merge and returns real repairGuidance
+  //    instead of a bare "Missing required parameter(s)" string.
+  await check("create_campaign_plan tool has NO hard-required parameters at the registry.js pre-check layer — enforcement lives in validatePlanStructure(), after any revision merge", () => {
     const tool = getTool("meta_expert.create_campaign_plan");
-    assert.ok(!tool.parameters.required.includes("audience_basis"), "audience_basis must not be in the tool's structural required array");
-    assert.ok(tool.parameters.required.includes("goal_classification"), "goal_classification should remain hard-required — its fields can't be safely defaulted");
+    assert.deepEqual(tool.parameters.required, [], "the registry-level pre-check must never block a partial revision submission");
+  });
+
+  await check("a genuinely NEW plan (no revisesPlanId) still gets goal_classification enforced by validatePlanStructure(), just one layer later", () => {
+    const { goal_classification, ...planWithoutGoalClassification } = basePlan();
+    const result = validatePlanStructure(planWithoutGoalClassification);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((e) => e.field === "goal_classification"));
   });
 
   await check("createPlan derives a safe audience_basis (STORE_DATA) when omitted and a commerce platform is connected", async () => {
@@ -1409,6 +1426,129 @@ async function run() {
       assert.equal(outcome.result.valid, true, `first attempt must succeed without needing a repair: ${JSON.stringify(outcome.result)}`);
       assert.match(outcome.result.recommendationText, /Approve this plan to proceed\./);
       assert.doesNotMatch(outcome.result.recommendationText, /which product|which category|product category/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 9, live testing: "Why did you choose all genders 18–65 and
+  //    PKR 10,000/day? Review my data, then improve the plan before I
+  //    approve it" — a REVISION request changing only audience/budget/
+  //    reasoning — failed live with "Missing required parameter(s):
+  //    bid_strategy, cta" even though those were UNCHANGED from the prior,
+  //    already-valid plan. Root cause was two-layered: registry.js's
+  //    tool-level `required` array hard-failed the partial submission
+  //    before createPlan() ever ran, and even past that, createPlan() only
+  //    ever carried daily_budget forward, not the rest of the plan. Both
+  //    fixed: tool schema now has required:[], and planner.js's
+  //    mergePlanForRevision() merges the WHOLE prior plan before structural
+  //    validation runs. This test goes through the real runTool() dispatch
+  //    path (exercises registry.js's pre-check for real, not just
+  //    createPlan() directly) for both the initial plan and the revision.
+  await check("[dispatch path] a REVISION that omits bid_strategy/cta carries them forward from the prior plan and validates — the exact live bug", async () => {
+    const userId = makeUser(`revision-carry-forward-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] }));
+    try {
+      // Step 1: an initial, complete, valid plan — bid_strategy and cta
+      // both real and set, exactly as the live prior plan had.
+      const initialPlan = basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_CAP", cta: "SHOP_NOW", pixel: { ref: "default_pixel" } });
+      const initial = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: initialPlan, userId, agentId, conversationId });
+      assert.equal(initial.status, "completed", JSON.stringify(initial));
+      assert.equal(initial.result.valid, true, JSON.stringify(initial.result));
+      const priorPlanId = initial.result.planId;
+
+      // Step 2: the live revision shape — ONLY the fields actually being
+      // reconsidered (audience + budget + why), bid_strategy and cta
+      // deliberately OMITTED entirely, exactly like the live failing call.
+      const revision = await runTool({
+        toolName: "meta_expert.create_campaign_plan",
+        parameters: {
+          gender: "FEMALE", age_min: 25, age_max: 45,
+          audience_basis: "PRODUCT_CATEGORY", audience_reasoning: "Skincare category historically performs best with women 25-45.",
+          daily_budget: 3000, budget_basis: "HEURISTIC_STARTING_TEST",
+          reasoning_summary: "Narrowed audience and adjusted budget based on product category and account history.",
+          revisesPlanId: priorPlanId,
+        },
+        userId, agentId, conversationId,
+      });
+      // Requirement 5: never the raw registry.js pre-check failure.
+      assert.notEqual(revision.status, "failed", JSON.stringify(revision));
+      if (revision.error) assert.doesNotMatch(revision.error, /Missing required parameter/i, revision.error);
+      // Requirement 4: the merged revision validates successfully.
+      assert.equal(revision.status, "completed", JSON.stringify(revision));
+      assert.equal(revision.result.valid, true, `revision must validate after carrying forward unchanged fields: ${JSON.stringify(revision.result)}`);
+
+      // Requirement 3: bid_strategy/cta (and other untouched fields —
+      // objective, optimization_event, placements, assets) were actually
+      // carried forward, not silently defaulted to something else. The
+      // stored plan is the real record of what was actually created.
+      const stored = getStoredPlan(userId, revision.result.planId);
+      assert.equal(stored.planData.plan.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "bid_strategy must carry forward unchanged");
+      assert.equal(stored.planData.plan.cta, "SHOP_NOW", "cta must carry forward unchanged");
+      assert.equal(stored.planData.plan.objective, initialPlan.objective, "objective must carry forward unchanged");
+      assert.equal(stored.planData.plan.optimization_event, initialPlan.optimization_event, "optimization_event must carry forward unchanged");
+      assert.equal(stored.planData.plan.placements, initialPlan.placements, "placements must carry forward unchanged");
+      // And the fields that WERE meant to change actually did change.
+      assert.equal(stored.planData.plan.gender, "FEMALE");
+      assert.equal(stored.planData.plan.daily_budget, 3000);
+      assert.equal(stored.planData.plan.budget_basis, "HEURISTIC_STARTING_TEST");
+
+      // Requirement 6: the old plan is superseded — and this happened only
+      // because the revision above actually validated (see the next test
+      // for the inverse: a revision that STILL fails must leave the old
+      // plan untouched).
+      const priorRow = db.prepare("SELECT status FROM meta_campaign_plans WHERE id = ?").get(priorPlanId);
+      assert.equal(priorRow.status, "superseded");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a revision that still fails validation after the merge does NOT supersede the prior plan (requirement 6, inverse case)", async () => {
+    const userId = makeUser(`revision-fail-no-supersede-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] }));
+    try {
+      const initial = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_CAP", cta: "SHOP_NOW", pixel: { ref: "default_pixel" } }),
+      });
+      assert.equal(initial.ok, true, JSON.stringify(initial));
+
+      // A revision that tries to push the budget WAY over the hard
+      // executable cap — carries everything else forward correctly, but
+      // MUST still fail policy validation on the new budget value.
+      const revision = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: { daily_budget: MAX_EXECUTABLE_DAILY_BUDGET + 50000, budget_basis: "USER_PROVIDED" },
+        revisesPlanId: initial.planId,
+      });
+      assert.equal(revision.ok, false, "an over-cap budget revision must still be rejected even though the merge itself succeeded");
+
+      const priorRow = db.prepare("SELECT status FROM meta_campaign_plans WHERE id = ?").get(initial.planId);
+      assert.equal(priorRow.status, "proposed", "the prior plan must remain 'proposed' — never superseded by a revision that didn't actually validate");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("revisesPlanId pointing at a plan that doesn't exist is rejected with a clear, actionable error (never silently treated as a fresh incomplete plan)", async () => {
+    const userId = makeUser(`revision-not-found-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const result = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: { daily_budget: 3000, budget_basis: "USER_PROVIDED" },
+        revisesPlanId: "does-not-exist",
+      });
+      assert.equal(result.ok, false);
+      assert.ok(result.errors.some((e) => e.field === "revisesPlanId"), JSON.stringify(result.errors));
     } finally {
       restoreFetch();
     }

@@ -245,12 +245,41 @@ export const EXECUTABLE_STATUSES = new Set(["proposed", "approved"]);
 // later be confused between.
 //
 // revisesPlanId (Scenario E — "change the audience, make it more
-// conservative"): when set, the prior plan's daily_budget carries forward
-// automatically if this new plan doesn't specify one — "preserve the
-// user-approved budget unless the change requires otherwise." Research
-// is NOT re-run here; the caller (the agent, per its own instructions)
-// only calls research_business_context again if the revision genuinely
-// needs new facts, not on every revision.
+// conservative"): when set, EVERY field the new call doesn't specify is
+// carried forward from the prior plan automatically — "preserve what
+// wasn't asked to change." Research is NOT re-run here; the caller (the
+// agent, per its own instructions) only calls research_business_context
+// again if the revision genuinely needs new facts, not on every revision.
+//
+// CONFIRMED LIVE BUG (round 8): a revision request ("review my data and
+// improve the plan" — only audience/budget/reasoning actually changing)
+// failed with "Missing required parameter(s): bid_strategy, cta" even
+// though those fields were unchanged from the prior, already-valid plan.
+// Root cause: this carry-forward previously only applied to daily_budget
+// (this comment used to say so) — everything else genuinely required a
+// complete resubmission, AND registry.js's tool-level `required` array
+// (tools/meta/metaExpert.js) hard-failed a partial submission before this
+// function ever ran, before there was any chance to merge. Fixed in two
+// places: registry.js's pre-check no longer requires anything for this
+// tool (see the `required: []` note in metaExpert.js — the exact same
+// "move enforcement past the merge" lesson already applied to
+// audience_basis in round 4, now generalized to every field), and the
+// merge below (mergePlanForRevision) now applies to the WHOLE plan object,
+// not just daily_budget, before normalizePlanDefaults/validatePlanStructure
+// ever run — so structural validation always sees a COMPLETE plan (prior
+// fields + this call's changes layered on top), never a partial one.
+function mergePlanForRevision(prior, plan) {
+  // Shallow, field-by-field: any key present in `plan` (INCLUDING an
+  // explicit null, e.g. "no pixel needed now") overrides the prior plan's
+  // value for that key; any key plan doesn't mention at all is inherited
+  // whole from the prior plan — correct for both scalar fields (bid_
+  // strategy, cta, objective...) and object-valued ones (facebook_page,
+  // ad_account, pixel, catalog, goal_classification, creative_strategy)
+  // since those are always set/omitted as a whole, never partially, by
+  // either the model or this merge.
+  return { ...prior.planData.plan, ...plan };
+}
+
 // Confirmed live (round 4): the model omitted audience_basis on its first
 // attempt, which registry.js's validateParameters() (a structural
 // required-field check that runs BEFORE execute()/createPlan() ever sees
@@ -274,7 +303,32 @@ function normalizePlanDefaults(userId, plan) {
 
 export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
   const attemptNumber = nextAttemptNumberForConversation(conversationId);
-  const normalizedPlan = normalizePlanDefaults(userId, plan);
+
+  let planInput = plan;
+  if (revisesPlanId) {
+    const prior = getStoredPlan(userId, revisesPlanId);
+    if (!prior) {
+      const errors = [{
+        field: "revisesPlanId",
+        message: `revisesPlanId "${revisesPlanId}" does not match any plan you own — it may be from a different conversation or user, or simply doesn't exist. Omit revisesPlanId to create a fresh plan, or use the real id of a plan created earlier in THIS conversation.`,
+      }];
+      const repairGuidance = buildRepairGuidance(errors, {});
+      trace("createPlan rejection", { conversationId, attemptNumber, stage: "revision_not_found", revisesPlanId, accepted: false, repairGuidance });
+      return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
+    }
+    if (!EXECUTABLE_STATUSES.has(prior.status)) {
+      const errors = [{
+        field: "revisesPlanId",
+        message: `The plan "${revisesPlanId}" is no longer active (status: ${prior.status}) and can't be revised. Omit revisesPlanId to create a fresh plan, or revise the CURRENT active plan for this conversation instead.`,
+      }];
+      const repairGuidance = buildRepairGuidance(errors, {});
+      trace("createPlan rejection", { conversationId, attemptNumber, stage: "revision_not_active", revisesPlanId, priorStatus: prior.status, accepted: false, repairGuidance });
+      return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
+    }
+    planInput = mergePlanForRevision(prior, plan);
+  }
+
+  const normalizedPlan = normalizePlanDefaults(userId, planInput);
   const structural = validatePlanStructure(normalizedPlan); // structural-only pass — context-dependent checks run after resolution, below
   if (!structural.valid) {
     // Issue 2 (live testing round 5): every rejection returns a structured
@@ -302,13 +356,10 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors: structural.errors, repairGuidance };
   }
 
-  let effectivePlan = normalizedPlan;
-  if (revisesPlanId) {
-    const prior = getStoredPlan(userId, revisesPlanId);
-    if (prior && (normalizedPlan.daily_budget === undefined || normalizedPlan.daily_budget === null) && prior.planData.plan.daily_budget != null) {
-      effectivePlan = { ...normalizedPlan, daily_budget: prior.planData.plan.daily_budget };
-    }
-  }
+  // The revision merge above already folded every carried-forward field
+  // (daily_budget included) into normalizedPlan — effectivePlan is just an
+  // alias kept because the rest of this function already reads that name.
+  const effectivePlan = normalizedPlan;
 
   const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, { userId, accessToken, conversationId });
   const contextual = validatePlanAgainstContext(effectivePlan, {
