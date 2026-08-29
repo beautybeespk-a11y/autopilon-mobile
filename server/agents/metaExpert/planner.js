@@ -211,10 +211,20 @@ export function formatRecommendation(plan, names) {
     lines.push(`Assumptions made:`);
     for (const a of plan.assumptions) lines.push(`- ${a}`);
   }
-  if (plan.approval_required && plan.open_questions?.length) {
+  // Round 7 (live testing): approval_required is true for essentially every
+  // plan (nothing spends without the user's go-ahead) — that's NOT the same
+  // thing as having a genuine unresolved blocker. Branch purely on whether
+  // real open_questions exist: if they do, show ONLY those genuine
+  // blockers; if the plan is fully resolved, show ONLY a plain approval
+  // CTA — never both, and never invent a question just to have something to
+  // show here.
+  if (plan.open_questions?.length) {
     lines.push(``);
     lines.push(`Before I can build this, I need you to confirm:`);
     for (const q of plan.open_questions) lines.push(`- ${q}`);
+  } else {
+    lines.push(``);
+    lines.push(`Approve this plan to proceed.`);
   }
   return lines.join("\n");
 }

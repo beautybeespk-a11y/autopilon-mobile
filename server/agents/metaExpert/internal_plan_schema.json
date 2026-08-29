@@ -161,12 +161,12 @@
     "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
     "approval_required": {
       "type": "boolean",
-      "description": "true whenever any field materially affecting spend/risk (budget, sensitive category, ambiguous asset choice, etc.) couldn't be safely inferred and needs explicit user input before execution."
+      "description": "true for essentially every plan — nothing executes/spends until the user explicitly approves it. This is separate from open_questions: a plan can be fully resolved (approval_required=true, open_questions=[]) and still require approval before execution, purely because execution always requires it."
     },
     "open_questions": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Only present when approval_required is true — the specific things the user still needs to decide/confirm (Step 4's \"ask only when necessary\")."
+      "description": "The specific GENUINE unresolved blockers the user still needs to decide/confirm before this can be safely planned or executed (e.g. an ambiguous asset choice with no default, a pending objective-confirmation, missing budget with no permitted default) — Step 4's \"ask only when necessary.\" Empty (or omitted) for a fully-resolved plan; never invent an entry just because approval_required is true."
     }
   }
 }

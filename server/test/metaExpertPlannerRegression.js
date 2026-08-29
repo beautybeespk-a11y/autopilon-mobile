@@ -202,8 +202,30 @@ async function run() {
     assert.ok(result.errors.some((e) => e.field === "campaign_status"));
   });
 
-  await check("approval_required=true without open_questions is rejected", () => {
+  // Round 7 (live testing): the previous rule here — reject
+  // approval_required=true with an empty open_questions array — was the
+  // CONFIRMED root cause of a production create_campaign_plan retry loop
+  // ("I want more sales to my website"). approval_required means "the user
+  // must approve before this spends" (true for essentially every plan);
+  // open_questions means "there's a genuine unresolved blocker" — a fully
+  // resolved plan can legitimately have the former true and the latter
+  // empty, and the model should never be forced to invent a fake question
+  // just to satisfy validation.
+  await check("approval_required=true with an EMPTY open_questions array is VALID — a fully resolved plan still needs approval before it spends, without needing an invented clarifying question", () => {
     const result = validatePlanStructure(basePlan({ approval_required: true, open_questions: [] }));
+    assert.equal(result.valid, true, JSON.stringify(result.errors));
+  });
+
+  await check("approval_required=true with a REAL open question (genuine unresolved blocker) is VALID", () => {
+    const result = validatePlanStructure(basePlan({
+      approval_required: true,
+      open_questions: ["Two ad accounts are connected with no default set — which one should this campaign run under?"],
+    }));
+    assert.equal(result.valid, true, JSON.stringify(result.errors));
+  });
+
+  await check("open_questions containing a blank/placeholder entry is still rejected — emptiness is fine, garbage is not", () => {
+    const result = validatePlanStructure(basePlan({ approval_required: true, open_questions: ["   "] }));
     assert.equal(result.valid, false);
     assert.ok(result.errors.some((e) => e.field === "open_questions"));
   });
@@ -1287,6 +1309,106 @@ async function run() {
       const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
       assert.equal(result.ok, false, "a Traffic plan must be rejected when the PRECEDING research call actually found real commerce + Pixel data");
       assert.ok(result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 7/8, live testing: the CONFIRMED production root cause of the
+  //    create_campaign_plan retry loop — a fully-resolved e-commerce Sales
+  //    plan (real store, real Pixel, correct objective — nothing actually
+  //    ambiguous) was structurally rejected because approval_required=true
+  //    with an empty open_questions array used to be forbidden, forcing the
+  //    model to either invent a fake question or submit exactly what it
+  //    submitted: approval_required=true, open_questions=[], REJECTED.
+  //    Chained the same way as the test above (real research -> real
+  //    createPlan()) so this proves the fix against the actual live shape,
+  //    not a hand-typed approximation of it.
+  await check("[production-shaped flow] a complete e-commerce Sales plan (approval_required=true, open_questions=[]) is ACCEPTED — the confirmed root cause of the live create_campaign_plan retry loop", async () => {
+    const userId = makeUser(`complete-sales-plan-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) {
+        if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
+        if (u.pathname.endsWith("/products")) return jsonResponse([{ id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }] }]);
+        if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
+        return jsonResponse([]);
+      }
+      return metaRouter({
+        adAccounts: [{ id: "act_1", name: "A" }],
+        pages: [{ id: "111", name: "Beautybeespk" }],
+        pixels: [{ id: "px1", name: "Store Pixel" }],
+      })(url, options);
+    });
+    try {
+      const research = await gatherBusinessContext(userId);
+      assert.equal(research.knownFacts.commerce.platform, "woocommerce");
+      assert.equal(research.knownFacts.meta.pixels.length, 1);
+
+      // The correct plan for this business — Sales/Purchase, matching what
+      // the research actually found — with NOTHING left ambiguous: no
+      // invented product/audience/location question, just a normal
+      // approval requirement (every plan needs one before it spends).
+      const plan = basePlan({
+        goal: "I want more sales to my website",
+        objective: "OUTCOME_SALES",
+        optimization_event: "PURCHASE",
+        pixel: { ref: "default_pixel" },
+        locations: ["Pakistan"],
+        countries: [research.knownFacts.commerce.country],
+        approval_required: true,
+        open_questions: [],
+      });
+      const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, true, `a fully-resolved e-commerce Sales plan must not be rejected: ${JSON.stringify(result.errors)}`);
+      assert.match(result.recommendationText, /Approve this plan to proceed\./, "a fully-resolved plan must show the plain approval CTA");
+      assert.doesNotMatch(result.recommendationText, /Before I can build this, I need you to confirm/i, "must never show a clarification prompt when nothing is actually ambiguous");
+      // The specific categories of question this plan must NOT invent —
+      // product/category, audience, and location were all resolvable from
+      // real research data, so none of them belong in the output at all.
+      assert.doesNotMatch(result.recommendationText, /which product|which category|what age|what audience|what location|what city|what cities/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[acceptance] 'I want more sales on my website' produces a recommendation + approval request without inventing a product-category clarification", async () => {
+    const userId = makeUser(`accept-open-questions-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) {
+        if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
+        if (u.pathname.endsWith("/products")) return jsonResponse([{ id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }] }]);
+        if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
+        return jsonResponse([]);
+      }
+      return metaRouter({
+        adAccounts: [{ id: "act_1", name: "A" }],
+        pages: [{ id: "111", name: "Beautybeespk" }],
+        pixels: [{ id: "px1", name: "Store Pixel" }],
+      })(url, options);
+    });
+    try {
+      await gatherBusinessContext(userId); // exactly as meta_expert.research_business_context runs it
+      const plan = basePlan({
+        goal: "I want more sales on my website",
+        objective: "OUTCOME_SALES",
+        optimization_event: "PURCHASE",
+        pixel: { ref: "default_pixel" },
+        approval_required: true,
+        open_questions: [],
+      });
+      const outcome = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: plan, userId, agentId: makeAgentWithSkills(userId, ["meta_expert"]), conversationId });
+      assert.equal(outcome.status, "completed");
+      assert.equal(outcome.result.valid, true, `first attempt must succeed without needing a repair: ${JSON.stringify(outcome.result)}`);
+      assert.match(outcome.result.recommendationText, /Approve this plan to proceed\./);
+      assert.doesNotMatch(outcome.result.recommendationText, /which product|which category|product category/i);
     } finally {
       restoreFetch();
     }

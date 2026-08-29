@@ -115,8 +115,26 @@ export function validatePlanStructure(plan) {
   if (!Array.isArray(plan.assumptions)) fail("assumptions", "assumptions must be an array (can be empty).");
 
   if (typeof plan.approval_required !== "boolean") fail("approval_required", "approval_required must be a boolean.");
-  if (plan.approval_required === true && (!Array.isArray(plan.open_questions) || plan.open_questions.length === 0)) {
-    fail("open_questions", "open_questions must list at least one real, specific thing when approval_required is true — don't set approval_required without saying what's actually being asked.");
+  // Round 7 (live testing): this used to hard-fail approval_required=true
+  // with an empty open_questions array — the CONFIRMED root cause of the
+  // production create_campaign_plan retry loop ("I want more sales to my
+  // website"). That rule conflated two different things: approval_required
+  // means "the user must approve before this spends money," which is true
+  // for essentially every plan; open_questions means "there's a genuine
+  // unresolved blocker the model can't safely guess past." A fully-resolved
+  // Sales plan for a connected e-commerce store legitimately has
+  // approval_required=true (nothing executes without approval) AND
+  // open_questions=[] (nothing is actually ambiguous) — the model was being
+  // forced to invent a fake clarifying question just to pass validation.
+  // open_questions is still type-checked below (an array of real,
+  // non-empty strings when present) — only the "must be non-empty" rule is
+  // gone. A GENUINE unresolved blocker (ambiguous asset choice, pending
+  // goal-objective confirmation, etc.) still requires a real open_questions
+  // entry, but that's enforced where the actual ambiguity is detected
+  // (policy.js's checkGoalClassificationPolicy, asset resolution errors),
+  // not as a blanket structural rule here.
+  if (plan.open_questions !== undefined && (!Array.isArray(plan.open_questions) || plan.open_questions.some((q) => typeof q !== "string" || !q.trim()))) {
+    fail("open_questions", "open_questions, when present, must be an array of real, specific, non-empty strings — each one a genuine unresolved blocker, never a placeholder or invented question. An empty array (or omitting the field) is valid and expected for a fully-resolved plan.");
   }
 
   return { valid: errors.length === 0, errors };
