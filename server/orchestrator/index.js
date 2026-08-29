@@ -9,7 +9,7 @@ import { enforceSpendLimit } from "./costControls.js";
 import { recordAiTextUsage } from "./costEngine.js";
 import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
-import { messageIndicatesExecutionApproval } from "../agents/metaExpert/policy.js";
+import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -120,6 +120,52 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
     return 'The user has not explicitly approved the current plan in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
   }
   return null;
+}
+
+// Issue 5 (live testing round 5): "I want more sales to my website" put
+// the model into an unbounded loop calling meta_expert.create_campaign_plan
+// six times, each presumably rejected, until MAX_STEPS was hit and the
+// user saw a raw "Reached step limit" trace line — an internal
+// orchestration failure with no customer-safe framing at all. Two
+// deterministic gates, checked per-turn (state lives in orchestrate()'s
+// own closure, reset every call — matches every other nudge counter in
+// this file):
+//
+//   1. Duplicate: the new attempt's plan.js fingerprintPlan() matches the
+//      PREVIOUS attempt's, and that previous attempt was rejected — the
+//      model resubmitted an unchanged plan hoping for a different
+//      result. Blocked immediately with META_PLAN_DUPLICATE_RETRY,
+//      without spending a real createPlan() call/DB write on it.
+//   2. Limit: attempts >= 2 (one initial + one automatic repair) — the
+//      model is not even given the chance to try a third time. Returns a
+//      customer-safe "final" reply directly, ending the turn, rather than
+//      feeding the rejection back and letting the loop continue toward
+//      MAX_STEPS.
+//
+// Returns { blocked: "duplicate" | "limit" | null, message }.
+// The limit check runs BEFORE the duplicate check: `attempts` counts every
+// create_campaign_plan call this turn, whether it was a real attempt or a
+// blocked duplicate (both branches below increment it, in orchestrate()) —
+// so once the cap is reached, a THIRD call is always hard-stopped here,
+// never allowed through as "just another duplicate check." This is what
+// bounds "no more than 2 total create_campaign_plan attempts per user turn"
+// regardless of whether the model keeps resubmitting the same plan or
+// starts inventing new ones.
+function checkCreatePlanRetryGate({ parameters, attempts, lastFingerprint, wasLastRejected, maxAttempts }) {
+  if (attempts >= maxAttempts) {
+    return {
+      blocked: "limit",
+      message: `Already attempted ${attempts} times this turn (1 initial + 1 automatic repair) — no further attempts are allowed. Respond with type "final" and tell the user plainly what's blocking it.`,
+    };
+  }
+  if (wasLastRejected && lastFingerprint && fingerprintPlan(parameters) === lastFingerprint) {
+    return {
+      blocked: "duplicate",
+      message:
+        'META_PLAN_DUPLICATE_RETRY: This plan is identical (in every strategic field) to the one just rejected — resubmitting it will fail the same way. Fix the SPECIFIC field(s) named in the last rejection\'s repairGuidance, or if it genuinely can\'t be resolved, respond with type "final" and tell the user plainly what\'s blocking it instead of calling this again.',
+    };
+  }
+  return { blocked: null, message: null };
 }
 
 function createPlan({ userId, conversationId, goal }) {
@@ -336,6 +382,10 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let malformedNudges = 0;
   let leakNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
+  let createPlanAttempts = 0;
+  let lastCreatePlanFingerprint = null;
+  let lastCreatePlanWasRejected = false;
+  const MAX_CREATE_PLAN_ATTEMPTS = 2;
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -450,6 +500,29 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       if (call.toolName === "meta_expert.execute_campaign_plan") {
         const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
         if (gateError) outcome = { status: "failed", error: gateError };
+      } else if (call.toolName === "meta_expert.create_campaign_plan") {
+        const gate = checkCreatePlanRetryGate({
+          parameters: call.parameters || {},
+          attempts: createPlanAttempts,
+          lastFingerprint: lastCreatePlanFingerprint,
+          wasLastRejected: lastCreatePlanWasRejected,
+          maxAttempts: MAX_CREATE_PLAN_ATTEMPTS,
+        });
+        if (gate.blocked === "duplicate") {
+          outcome = { status: "failed", error: gate.message };
+          createPlanAttempts += 1;
+        } else if (gate.blocked === "limit") {
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", "Campaign plan could not be finalized after one automatic repair attempt.", "done"));
+          if (planId) setPlanStatus(planId, "failed");
+          return {
+            reply:
+              "I couldn't finalize the campaign recommendation automatically because one required business setting is still unresolved. Could you check your Meta Ads integration settings (ad account, Facebook Page, or budget), or tell me more about what you'd like for this campaign?",
+            trace,
+            toolResults,
+            usage: usageTotals,
+          };
+        }
       }
       if (!outcome) {
         outcome = await runTool({
@@ -460,6 +533,11 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           conversationId,
           planId,
         });
+        if (call.toolName === "meta_expert.create_campaign_plan") {
+          createPlanAttempts += 1;
+          lastCreatePlanWasRejected = outcome.status === "completed" && outcome.result && outcome.result.valid === false;
+          lastCreatePlanFingerprint = fingerprintPlan(call.parameters || {});
+        }
       }
 
       if (outcome.status === "awaiting_confirmation") {
@@ -507,11 +585,16 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   }
 
   if (planId) setPlanStatus(planId, toolResults.some((r) => !r.error) ? "completed" : "failed");
-  trace.push(traceStep("completed", "Reached step limit.", "done"));
+  // Internal orchestration detail — this loop hit MAX_STEPS without the
+  // model producing a "final" response. Never surface the words "step
+  // limit" to the user (round 6 requirement): both the trace label and the
+  // reply below are worded as an ordinary stopping point, not an internal
+  // failure.
+  trace.push(traceStep("completed", "Finished processing this request.", "done"));
   const anySuccess = toolResults.some((r) => !r.error);
   return {
     reply: anySuccess
-      ? "I completed several steps but ran up against the step limit before finishing everything. Here's what I found so far — let me know if you'd like me to continue."
+      ? "I completed several steps but wasn't able to finish everything in this pass. Here's what I found so far — let me know if you'd like me to continue."
       : "I wasn't able to complete this — every step I tried failed. Let me know if you'd like me to try a different approach.",
     trace,
     toolResults,

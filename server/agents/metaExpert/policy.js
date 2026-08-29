@@ -9,6 +9,7 @@
 // place — createPlan() (planner.js) is the only caller for plan-creation
 // checks; execute_campaign_plan (tools/meta/metaExpert.js) reuses the
 // budget cap as defense-in-depth right before spending anything real.
+import crypto from "node:crypto";
 
 // Configurable via env — deploy-time policy, not yet a per-org UI setting
 // (that's a reasonable v2; documented as a known limitation in the round 3
@@ -143,4 +144,63 @@ const EXECUTION_APPROVAL_PATTERN = /\b(approve|approved|proceed|run it|launch it
 
 export function messageIndicatesExecutionApproval(text) {
   return typeof text === "string" && EXECUTION_APPROVAL_PATTERN.test(text);
+}
+
+// Live testing round 5: "I want more sales to my website" looped the
+// orchestrator on meta_expert.create_campaign_plan six times until
+// MAX_STEPS was hit — nothing detected the model resubmitting an
+// unchanged (or trivially reworded) plan after a rejection. This is a
+// stable fingerprint over the STRATEGIC fields only — not free-text
+// fields like reasoning_summary or assumptions, which the model could
+// vary trivially between attempts without actually fixing anything, which
+// would make a naive whole-object comparison useless. server/orchestrator/
+// index.js uses this to detect and immediately block a genuinely identical
+// resubmission (META_PLAN_DUPLICATE_RETRY) rather than spending another
+// full model round-trip discovering the same rejection again.
+const STRATEGIC_SCALAR_FIELDS = [
+  "objective", "optimization_event", "targeting_strategy", "age_min", "age_max",
+  "gender", "placements", "budget_strategy", "daily_budget", "budget_basis", "cta", "conversion_location",
+];
+export function fingerprintPlan(plan = {}) {
+  const normalized = {};
+  for (const field of STRATEGIC_SCALAR_FIELDS) normalized[field] = plan[field] ?? null;
+  normalized.locations = [...(plan.locations || [])].sort();
+  normalized.countries = [...(plan.countries || [])].sort();
+  normalized.ad_account_ref = plan.ad_account?.ref ?? null;
+  normalized.facebook_page_ref = plan.facebook_page?.ref ?? null;
+  normalized.pixel_ref = plan.pixel?.ref ?? null;
+  normalized.catalog_ref = plan.catalog?.ref ?? null;
+  normalized.recommended_meta_objective = plan.goal_classification?.recommended_meta_objective ?? null;
+  normalized.requires_goal_confirmation = plan.goal_classification?.requires_goal_confirmation ?? null;
+  normalized.audience_basis = plan.audience_basis ?? null;
+  return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 16);
+}
+
+// Turns raw validation/policy errors (field + message) into a repair
+// payload a model can act on deterministically — Issue 2's explicit ask:
+// "field, problem, expected correction, non-secret research facts needed
+// to repair it." `facts` is whatever non-secret, already-computed context
+// the caller has on hand (businessSignals, the two budget caps, etc.) —
+// never re-derived here, just passed through, so this never becomes a
+// second source of truth for what those values actually are.
+const EXPECTED_CORRECTION_BY_FIELD = {
+  ad_account: "Set ad_account.ref to one of the real, connected ad account ids named in the problem above — or set a Default Ad Account in Integrations to stop needing this every time.",
+  facebook_page: "Set facebook_page.ref to one of the real, connected Page ids named in the problem above — or set a Default Facebook Page in Integrations to stop needing this every time.",
+  pixel: "Either set pixel.ref to a real, connected Pixel id, or change optimization_event to one that doesn't require a Pixel.",
+  catalog: "Either set catalog.ref to a real, connected catalog id, or remove the catalog reference if this isn't a catalog/dynamic-ad campaign.",
+  daily_budget: "Lower daily_budget to within the stated limit, or only use budget_basis USER_PROVIDED/SAVED_POLICY if that is genuinely true.",
+  budget_basis: "Set budget_basis honestly to reflect where this number actually came from.",
+  audience_reasoning: "Add a real, specific audience_reasoning explaining why no narrower targeting applies.",
+  audience_basis: "Use a real evidence-based audience_basis instead of HEURISTIC when real account/store data exists.",
+  goal_classification: "Set goal_classification.requires_goal_confirmation and recommended_meta_objective honestly, and align objective with the recommendation.",
+  objective: "Set objective to match goal_classification.recommended_meta_objective while goal confirmation is pending.",
+  open_questions: "Set approval_required true and add a real, specific open_questions entry raising the tradeoff.",
+};
+export function buildRepairGuidance(errors, facts = {}) {
+  return errors.map((e) => ({
+    field: e.field || null,
+    problem: e.message,
+    expectedCorrection: EXPECTED_CORRECTION_BY_FIELD[e.field] || "Fix this field per the problem description above.",
+    relevantFacts: facts,
+  }));
 }

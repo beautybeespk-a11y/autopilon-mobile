@@ -8,7 +8,7 @@ import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
 import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
-import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
+import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience, buildRepairGuidance, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
 import { trace } from "./diagnostics.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
@@ -241,7 +241,12 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   const normalizedPlan = normalizePlanDefaults(userId, plan);
   const structural = validatePlanStructure(normalizedPlan); // structural-only pass — context-dependent checks run after resolution, below
   if (!structural.valid) {
-    return { ok: false, errors: structural.errors };
+    // Issue 2 (live testing round 5): every rejection returns a structured
+    // repair payload (field/problem/expectedCorrection), not just a bare
+    // errors array — server/orchestrator/index.js's retry-limit gate is
+    // what actually bounds how many times the model can act on this, but
+    // whichever attempt it is, the guidance should be equally actionable.
+    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors: structural.errors, repairGuidance: buildRepairGuidance(structural.errors, {}) };
   }
 
   let effectivePlan = normalizedPlan;
@@ -372,7 +377,14 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     resolvedPixelId: resolved.pixelId,
   });
   if (errors.length) {
-    return { ok: false, errors };
+    const facts = {
+      businessSignals,
+      budgetCaps: { suggested: MAX_SUGGESTED_DAILY_BUDGET, executable: MAX_EXECUTABLE_DAILY_BUDGET },
+      resolvedAdAccountId: resolved.adAccountId,
+      resolvedPageId: resolved.pageId,
+      resolvedPixelId: resolved.pixelId,
+    };
+    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance: buildRepairGuidance(errors, facts) };
   }
 
   // Resolve human-readable names for the recommendation text — the
