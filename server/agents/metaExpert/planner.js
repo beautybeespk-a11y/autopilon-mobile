@@ -6,7 +6,7 @@ import { resolvePageId } from "../../tools/shared/metaPageId.js";
 import { resolveAdAccountId } from "../../tools/shared/metaAdAccountId.js";
 import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
-import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
+import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS, normalizePlanEnumAliases, isValidEnumValue } from "./planSchema.js";
 import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
 import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience, buildRepairGuidance, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -301,12 +301,61 @@ function normalizePlanDefaults(userId, plan) {
   return { ...plan, audience_basis: hasStoreData ? "STORE_DATA" : "HEURISTIC" };
 }
 
+// Round 10, requirement 2 (live testing): a cta is a mechanical, safely-
+// inferable choice for the common objectives — a model shouldn't have to
+// either invent a guess or burn a repair attempt asking about it when a
+// clear default exists. Only applies when cta is genuinely missing after
+// the revision merge (a revision normally already carries the prior cta
+// forward untouched — this only fires for a brand-new plan, or the rare
+// case where even the prior plan never had one). Objectives with no safe
+// single default (none currently) fall through unchanged — validation then
+// asks for it normally, which is the correct behavior "only ask when it
+// genuinely cannot be inferred."
+const CTA_DEFAULT_BY_OBJECTIVE = {
+  OUTCOME_SALES: "SHOP_NOW",
+  OUTCOME_LEADS: "SIGN_UP",
+  OUTCOME_TRAFFIC: "LEARN_MORE",
+  OUTCOME_ENGAGEMENT: "LEARN_MORE",
+  OUTCOME_AWARENESS: "LEARN_MORE",
+  OUTCOME_APP_PROMOTION: "DOWNLOAD",
+};
+function deriveCtaIfMissing(plan) {
+  if (plan.cta) return plan;
+  const derived = CTA_DEFAULT_BY_OBJECTIVE[plan.objective];
+  return derived ? { ...plan, cta: derived } : plan;
+}
+
+// Round 10, requirement 3 (live testing): "the user asked to improve
+// audience/budget reasoning, not bidding strategy" — a revision's incoming
+// payload restating a field it wasn't actually trying to change (the model
+// re-sent bid_strategy verbatim, just spelled wrong) shouldn't sabotage an
+// otherwise-correct revision once alias normalization has already had its
+// shot. Deliberately narrow: only the mechanical/structural enum fields
+// below (never objective, optimization_event, or anything that reflects an
+// actual strategy decision the model might be genuinely trying to change)
+// — for those, an invalid value should still surface as a real, correctable
+// error rather than being silently papered over with the old value.
+const PROTECTED_ENUM_FIELDS_ON_REVISION = new Set(["bid_strategy", "placements"]);
+function protectValidPriorEnumFieldsOnRevision(prior, plan) {
+  let result = plan;
+  for (const field of PROTECTED_ENUM_FIELDS_ON_REVISION) {
+    const value = result[field];
+    if (value === undefined || value === null || isValidEnumValue(field, value)) continue;
+    const priorValue = prior.planData.plan[field];
+    if (priorValue !== undefined && isValidEnumValue(field, priorValue)) {
+      result = { ...result, [field]: priorValue };
+    }
+  }
+  return result;
+}
+
 export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
   const attemptNumber = nextAttemptNumberForConversation(conversationId);
 
   let planInput = plan;
+  let prior = null;
   if (revisesPlanId) {
-    const prior = getStoredPlan(userId, revisesPlanId);
+    prior = getStoredPlan(userId, revisesPlanId);
     if (!prior) {
       const errors = [{
         field: "revisesPlanId",
@@ -326,6 +375,22 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
       return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
     }
     planInput = mergePlanForRevision(prior, plan);
+  }
+
+  // Round 10 (live testing), requirement 4's exact order: merge (above) ->
+  // normalize canonical values/defaults (below) -> fingerprint (upstream,
+  // in orchestrator/index.js, which applies the SAME normalizePlanEnumAliases
+  // to the raw call before hashing) -> structural validation -> policy
+  // validation. Alias normalization first (fixes the confirmed
+  // LOWEST_COST_WITHOUT_BID_CAP case outright), THEN protect a revision's
+  // unrelated valid prior fields from a value normalization couldn't
+  // resolve, THEN derive a missing cta — each step only touches what the
+  // previous one left unresolved.
+  const { plan: aliasNormalized, appliedAliases } = normalizePlanEnumAliases(planInput);
+  const priorProtected = revisesPlanId && prior ? protectValidPriorEnumFieldsOnRevision(prior, aliasNormalized) : aliasNormalized;
+  planInput = deriveCtaIfMissing(priorProtected);
+  if (traceEnabled && appliedAliases.length) {
+    trace("createPlan enum normalization", { conversationId, attemptNumber, appliedAliases });
   }
 
   const normalizedPlan = normalizePlanDefaults(userId, planInput);

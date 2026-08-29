@@ -23,6 +23,87 @@ const ENUM_FIELDS = {
 const GOAL_CLASSIFICATION_OBJECTIVE_ENUM = INTERNAL_PLAN_SCHEMA.properties.goal_classification.properties.recommended_meta_objective.enum;
 export const BUDGET_BASIS_VALUES = INTERNAL_PLAN_SCHEMA.properties.budget_basis.enum;
 
+export function isValidEnumValue(field, value) {
+  const allowed = ENUM_FIELDS[field];
+  return Array.isArray(allowed) && allowed.includes(value);
+}
+
+// Round 10 (live testing, CONFIRMED): a real production revision was
+// rejected twice — burning the one automatic repair attempt — over
+// bid_strategy: "LOWEST_COST_WITHOUT_BID_CAP", which the model kept
+// producing on both attempts. The schema's canonical value is
+// LOWEST_COST_WITHOUT_CAP; "without bid cap" is a completely reasonable,
+// harmless paraphrase of "without a cap on the bid" — the kind of naming
+// drift a model reasoning in plain English will produce regardless of how
+// the prompt is worded, so this is handled deterministically here rather
+// than through another prompt instruction. The rest of this map is NOT
+// speculative guessing — each entry reflects real, documented Meta Ads
+// platform terminology this schema's canonical values supersede: the
+// pre-ODAX (Outcome-Driven Ad Experiences) legacy objective names Meta
+// used before campaigns were reorganized around OUTCOME_* objectives, and
+// "Automatic Placements" being renamed to "Advantage+ placements." Kept
+// deliberately small — only entries with a real, confident basis — rather
+// than an exhaustive guess at every possible phrasing.
+const ENUM_ALIASES = {
+  bid_strategy: {
+    LOWEST_COST_WITHOUT_BID_CAP: "LOWEST_COST_WITHOUT_CAP",
+    LOWEST_COST_AUTOMATIC: "LOWEST_COST_WITHOUT_CAP",
+    AUTOMATIC_BIDDING: "LOWEST_COST_WITHOUT_CAP",
+    LOWEST_COST_WITH_CAP: "LOWEST_COST_WITH_BID_CAP",
+    MANUAL_BID_CAP: "LOWEST_COST_WITH_BID_CAP",
+    COST_CAP_BID: "COST_CAP",
+  },
+  objective: {
+    CONVERSIONS: "OUTCOME_SALES",
+    PRODUCT_CATALOG_SALES: "OUTCOME_SALES",
+    TRAFFIC: "OUTCOME_TRAFFIC",
+    LEAD_GENERATION: "OUTCOME_LEADS",
+    LEADS: "OUTCOME_LEADS",
+    POST_ENGAGEMENT: "OUTCOME_ENGAGEMENT",
+    ENGAGEMENT: "OUTCOME_ENGAGEMENT",
+    BRAND_AWARENESS: "OUTCOME_AWARENESS",
+    AWARENESS: "OUTCOME_AWARENESS",
+    APP_INSTALLS: "OUTCOME_APP_PROMOTION",
+  },
+  placements: {
+    AUTOMATIC: "ADVANTAGE_PLUS",
+    AUTOMATIC_PLACEMENTS: "ADVANTAGE_PLUS",
+    ADVANTAGE_PLACEMENTS: "ADVANTAGE_PLUS",
+  },
+  optimization_event: {
+    LINK_CLICK: "LINK_CLICKS",
+    LANDING_PAGE_VIEW: "LANDING_PAGE_VIEWS",
+    COMPLETE_REGISTRATIONS: "COMPLETE_REGISTRATION",
+  },
+  cta: {
+    SHOP: "SHOP_NOW",
+    BUY_NOW: "SHOP_NOW",
+    SIGNUP: "SIGN_UP",
+    CONTACT: "CONTACT_US",
+    GET_A_QUOTE: "GET_QUOTE",
+  },
+};
+
+// Pure and stateless — no DB/network access, so it's safe to call from
+// BOTH planner.js (on the merged plan, before structural validation) and
+// the orchestrator's plan-attempt fingerprint (on the raw, possibly
+// partial submission) — the exact "apply normalization before
+// fingerprinting" ordering requested, so two submissions that only differ
+// by a harmless alias spelling still fingerprint identically instead of
+// looking like a genuinely different repair.
+export function normalizePlanEnumAliases(plan) {
+  const appliedAliases = [];
+  const normalized = { ...plan };
+  for (const [field, aliasMap] of Object.entries(ENUM_ALIASES)) {
+    const value = normalized[field];
+    if (typeof value === "string" && Object.prototype.hasOwnProperty.call(aliasMap, value)) {
+      normalized[field] = aliasMap[value];
+      appliedAliases.push({ field, from: value, to: aliasMap[value] });
+    }
+  }
+  return { plan: normalized, appliedAliases };
+}
+
 // No JSON Schema library is a dependency of this project today (confirmed:
 // no ajv in package.json) — rather than add one for a single schema, this
 // directly implements internal_plan_schema.json's own rules. The two files

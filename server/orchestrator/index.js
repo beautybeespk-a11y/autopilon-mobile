@@ -10,6 +10,7 @@ import { recordAiTextUsage } from "./costEngine.js";
 import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
+import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -151,6 +152,18 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
 // bounds "no more than 2 total create_campaign_plan attempts per user turn"
 // regardless of whether the model keeps resubmitting the same plan or
 // starts inventing new ones.
+// Round 10 (live testing), requirement 4: apply the SAME deterministic
+// enum-alias normalization planner.js applies before structural validation
+// (normalizePlanEnumAliases, planSchema.js) BEFORE fingerprinting too — a
+// resubmission that only differs from the one just rejected by a harmless
+// alias spelling (e.g. LOWEST_COST_WITHOUT_BID_CAP vs. the canonical
+// LOWEST_COST_WITHOUT_CAP) must fingerprint identically, not look like a
+// genuinely different repair. Pure/stateless, so it's safe to call here on
+// the raw (possibly partial, pre-merge) tool call parameters directly.
+function fingerprintPlanNormalized(parameters) {
+  return fingerprintPlan(normalizePlanEnumAliases(parameters).plan);
+}
+
 function checkCreatePlanRetryGate({ parameters, attempts, lastFingerprint, wasLastRejected, maxAttempts }) {
   if (attempts >= maxAttempts) {
     return {
@@ -158,7 +171,7 @@ function checkCreatePlanRetryGate({ parameters, attempts, lastFingerprint, wasLa
       message: `Already attempted ${attempts} times this turn (1 initial + 1 automatic repair) — no further attempts are allowed. Respond with type "final" and tell the user plainly what's blocking it.`,
     };
   }
-  if (wasLastRejected && lastFingerprint && fingerprintPlan(parameters) === lastFingerprint) {
+  if (wasLastRejected && lastFingerprint && fingerprintPlanNormalized(parameters) === lastFingerprint) {
     return {
       blocked: "duplicate",
       message:
@@ -536,7 +549,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         if (call.toolName === "meta_expert.create_campaign_plan") {
           createPlanAttempts += 1;
           lastCreatePlanWasRejected = outcome.status === "completed" && outcome.result && outcome.result.valid === false;
-          lastCreatePlanFingerprint = fingerprintPlan(call.parameters || {});
+          lastCreatePlanFingerprint = fingerprintPlanNormalized(call.parameters || {});
         }
       }
 

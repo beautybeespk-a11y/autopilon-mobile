@@ -29,9 +29,9 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { resolvePageId } = await import("../tools/shared/metaPageId.js");
-const { validatePlanStructure, validatePlanAgainstContext, validatePlan } = await import("../agents/metaExpert/planSchema.js");
+const { validatePlanStructure, validatePlanAgainstContext, validatePlan, normalizePlanEnumAliases } = await import("../agents/metaExpert/planSchema.js");
 const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
-const { checkGoalClassificationPolicy, checkBudgetPolicy, checkAudiencePolicy, isGenericAudience, messageIndicatesExecutionApproval, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
+const { checkGoalClassificationPolicy, checkBudgetPolicy, checkAudiencePolicy, isGenericAudience, messageIndicatesExecutionApproval, fingerprintPlan, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
 const { getConversationAssets, saveConversationAsset } = await import("../agents/metaExpert/assetSelection.js");
 const { gatherBusinessContext } = await import("../agents/metaExpert/research.js");
 const { getTool } = await import("../tools/registry.js");
@@ -1549,6 +1549,131 @@ async function run() {
       });
       assert.equal(result.ok, false);
       assert.ok(result.errors.some((e) => e.field === "revisesPlanId"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 10, live testing: the ACTUAL production rejection for the
+  //    revision above turned out to be "cta missing" + an INVALID
+  //    bid_strategy value the model kept producing across both attempts —
+  //    burning the one automatic repair on a harmless enum naming
+  //    difference (LOWEST_COST_WITHOUT_BID_CAP vs. the schema's canonical
+  //    LOWEST_COST_WITHOUT_CAP) the backend can resolve deterministically.
+  await check("normalizePlanEnumAliases() converts the confirmed live alias (LOWEST_COST_WITHOUT_BID_CAP) to the canonical schema value", () => {
+    const { plan, appliedAliases } = normalizePlanEnumAliases({ bid_strategy: "LOWEST_COST_WITHOUT_BID_CAP", objective: "OUTCOME_SALES" });
+    assert.equal(plan.bid_strategy, "LOWEST_COST_WITHOUT_CAP");
+    assert.equal(plan.objective, "OUTCOME_SALES", "an already-canonical field must pass through unchanged");
+    assert.deepEqual(appliedAliases, [{ field: "bid_strategy", from: "LOWEST_COST_WITHOUT_BID_CAP", to: "LOWEST_COST_WITHOUT_CAP" }]);
+  });
+
+  await check("normalizePlanEnumAliases() leaves a plan with no aliasable values completely untouched", () => {
+    const original = basePlan();
+    const { plan, appliedAliases } = normalizePlanEnumAliases(original);
+    assert.deepEqual(plan, original);
+    assert.deepEqual(appliedAliases, []);
+  });
+
+  await check("requirement 4: fingerprintPlan() on an aliased bid_strategy matches the fingerprint of the same plan using the canonical value — aliases must not look like a genuinely different repair", () => {
+    const aliased = basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_BID_CAP" });
+    const canonical = basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_CAP" });
+    const fpAliased = fingerprintPlan(normalizePlanEnumAliases(aliased).plan);
+    const fpCanonical = fingerprintPlan(normalizePlanEnumAliases(canonical).plan);
+    assert.equal(fpAliased, fpCanonical);
+  });
+
+  await check("a brand-new plan omitting cta gets a safely-derived default for its objective (Sales -> SHOP_NOW) and validates without asking", async () => {
+    const userId = makeUser(`derive-cta-sales-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const { cta, ...planWithoutCta } = basePlan({ objective: "OUTCOME_SALES", optimization_event: "LINK_CLICKS", pixel: null });
+      const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan: planWithoutCta });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      const stored = getStoredPlan(userId, result.planId);
+      assert.equal(stored.planData.plan.cta, "SHOP_NOW");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("requirement 3: a revision with an invalid, non-aliasable bid_strategy falls back to the prior plan's valid value instead of failing — 'the user asked to improve audience/budget, not bidding strategy'", async () => {
+    const userId = makeUser(`protect-prior-bid-strategy-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] }));
+    try {
+      const initial = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_CAP", pixel: { ref: "default_pixel" } }),
+      });
+      assert.equal(initial.ok, true, JSON.stringify(initial));
+
+      // Not a known alias, not the canonical value, not even close — a
+      // genuinely garbage value with no mapping, submitted on a field the
+      // revision was never about.
+      const revision = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: { gender: "MALE", bid_strategy: "SOME_MADE_UP_VALUE" },
+        revisesPlanId: initial.planId,
+      });
+      assert.equal(revision.ok, true, `an unrelated garbage bid_strategy must fall back to the prior valid value, not fail the revision: ${JSON.stringify(revision.errors)}`);
+      const stored = getStoredPlan(userId, revision.planId);
+      assert.equal(stored.planData.plan.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "must retain the prior valid value");
+      assert.equal(stored.planData.plan.gender, "MALE", "the field actually being revised must still change");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[acceptance] revision omitting cta and emitting the LOWEST_COST_WITHOUT_BID_CAP alias validates on the FIRST attempt through the real runTool() dispatch path — no repair attempt consumed for either field", async () => {
+    const userId = makeUser(`accept-normalize-revision-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) return jsonResponse([]);
+      return metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] })(url, options);
+    });
+    try {
+      // Starting point: a valid, already-approved-shaped Sales plan —
+      // real cta, real bid_strategy, exactly like the live prior plan.
+      const initialPlan = basePlan({ bid_strategy: "LOWEST_COST_WITHOUT_CAP", cta: "SHOP_NOW", pixel: { ref: "default_pixel" } });
+      const initial = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: initialPlan, userId, agentId, conversationId });
+      assert.equal(initial.status, "completed", JSON.stringify(initial));
+      assert.equal(initial.result.valid, true, JSON.stringify(initial.result));
+
+      // "Review my WooCommerce products, Meta history, and audience data,
+      // then improve the audience and budget before I approve it" — cta
+      // omitted entirely (should be preserved from the prior plan), and
+      // the model emits the confirmed live alias for bid_strategy instead
+      // of leaving it untouched.
+      const revision = await runTool({
+        toolName: "meta_expert.create_campaign_plan",
+        parameters: {
+          gender: "FEMALE", age_min: 25, age_max: 45,
+          audience_basis: "PRODUCT_CATEGORY", audience_reasoning: "Reviewed WooCommerce products and Meta account history — this category performs best with women 25-45.",
+          daily_budget: 3500, budget_basis: "HEURISTIC_STARTING_TEST",
+          reasoning_summary: "Improved audience targeting and budget based on store and account history.",
+          bid_strategy: "LOWEST_COST_WITHOUT_BID_CAP", // the confirmed live alias
+          revisesPlanId: initial.result.planId,
+        },
+        userId, agentId, conversationId,
+      });
+      // The whole point: this succeeds on the FIRST call — no repair, no
+      // duplicate block, no second attempt of any kind.
+      assert.equal(revision.status, "completed", JSON.stringify(revision));
+      assert.equal(revision.result.valid, true, `must validate on the first attempt — normalization must resolve both fields before validation runs: ${JSON.stringify(revision.result)}`);
+
+      const stored = getStoredPlan(userId, revision.result.planId);
+      assert.equal(stored.planData.plan.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "bid_strategy must be normalized to the canonical value");
+      assert.equal(stored.planData.plan.cta, "SHOP_NOW", "cta must be preserved from the prior plan, never re-asked or invented");
+      assert.equal(stored.planData.plan.gender, "FEMALE");
+      assert.equal(stored.planData.plan.daily_budget, 3500);
+      assert.match(revision.result.recommendationText, /Approve this plan to proceed\./, "a fully resolved revision must return a normal recommendation, not a clarification request");
     } finally {
       restoreFetch();
     }
