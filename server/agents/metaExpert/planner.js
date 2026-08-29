@@ -85,7 +85,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
     const explicitId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
     resolved.pageId = await resolveWithMemory({
       conversationId, userId, field: "facebookPage", explicitId, savedId: saved.selectedFacebookPageId,
-      resolve: (id) => resolvePageId({ accessToken, providedPageId: id }),
+      resolve: (id) => resolvePageId({ accessToken, providedPageId: id, userId }),
       staleCodes: ["META_PAGE_NOT_FOUND"],
     });
   } catch (err) {

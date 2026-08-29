@@ -5,6 +5,7 @@ import { buildAuthorizationUrl, exchangeCodeForToken, metaOAuthStatus, revokeTok
 import { saveConnection, disconnectIntegration, connectionHealth, getConnection, requireValidToken, updateConnectionMeta } from "../integrations/manager.js";
 import * as meta from "../integrations/meta/api.js";
 import { isPlausibleAdAccountId } from "../tools/shared/metaAdAccountId.js";
+import { isPlausibleMetaId } from "../tools/shared/metaPageId.js";
 
 const router = Router();
 
@@ -120,6 +121,58 @@ router.post("/default-ad-account", requireAuth, async (req, res) => {
     setDefault(match.id);
     logActivity(db, req.session.userId, "integration_updated", `Set Default Ad Account for Meta Ads: ${match.name} (${match.id})`);
     res.json({ defaultAdAccountId: match.id });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Same pattern as /ad-accounts above, for Facebook Pages — confirmed live
+// (round 5): with no way to set a default Page at all, every fresh
+// conversation forced the Meta Ads Expert planner to re-guess among
+// multiple real Pages, and it guessed the wrong one at least once. This
+// closes the gap the /ad-accounts route comment already anticipated
+// ("a future defaultPageId").
+router.get("/pages", requireAuth, async (req, res) => {
+  try {
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const pages = await meta.listPages(accessToken);
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const savedDefault = JSON.parse(conn?.meta || "{}").defaults?.pageId || null;
+    const defaultPageId = savedDefault && pages.some((p) => p.id === savedDefault) ? savedDefault : null;
+    res.json({ pages, defaultPageId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Sets (or clears, with pageId: null) the Default Facebook Page. Always
+// re-verifies the id against a fresh meta.listPages() call before saving —
+// same "never trust shape alone" principle as /default-ad-account.
+router.post("/default-page", requireAuth, async (req, res) => {
+  const { pageId } = req.body || {};
+  const setDefault = (value) => {
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    return updateConnectionMeta(req.session.userId, "meta_ads", { defaults: { ...currentDefaults, pageId: value } });
+  };
+  try {
+    if (pageId === null || pageId === undefined) {
+      const updated = setDefault(null);
+      if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
+      return res.json({ defaultPageId: null });
+    }
+    if (!isPlausibleMetaId(pageId)) {
+      return res.status(400).json({ error: `"${pageId}" is not a valid Facebook Page id.` });
+    }
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const pages = await meta.listPages(accessToken);
+    const match = pages.find((p) => p.id === pageId);
+    if (!match) {
+      return res.status(404).json({ error: `"${pageId}" is not one of this account's connected Facebook Pages.`, pages });
+    }
+    setDefault(match.id);
+    logActivity(db, req.session.userId, "integration_updated", `Set Default Facebook Page for Meta Ads: ${match.name} (${match.id})`);
+    res.json({ defaultPageId: match.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

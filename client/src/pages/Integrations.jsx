@@ -151,6 +151,64 @@ function MetaAdAccountSelector() {
   );
 }
 
+// Same pattern as MetaAdAccountSelector, for Facebook Pages — confirmed
+// live (round 5): with no way to set a default Page, the Meta Ads Expert
+// planner re-guessed among multiple real Pages on every fresh conversation
+// and guessed wrong at least once.
+function MetaPageSelector() {
+  const [pages, setPages] = useState([]);
+  const [defaultId, setDefaultId] = useState("");
+  const [loaded, setLoaded] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const load = () => {
+    api.get("/integrations/meta/pages")
+      .then((data) => {
+        setPages(data.pages || []);
+        setDefaultId(data.defaultPageId || "");
+        setLoaded(true);
+      })
+      .catch((err) => { setError(err.message); setLoaded(true); });
+  };
+
+  useEffect(load, []);
+
+  const setDefault = async (id) => {
+    setSaving(true); setError("");
+    const previous = defaultId;
+    setDefaultId(id); // optimistic — reverted below on failure
+    try {
+      await api.post("/integrations/meta/default-page", { pageId: id || null });
+    } catch (err) {
+      setDefaultId(previous);
+      setError(err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!loaded || pages.length === 0) return null;
+
+  return (
+    <div className="mt-3 rounded-xl border border-line bg-elevated p-3">
+      <span className="mb-1.5 block text-xs font-medium text-muted">Default Facebook Page</span>
+      <select
+        value={defaultId}
+        onChange={(e) => setDefault(e.target.value)}
+        disabled={saving}
+        className="w-full rounded-lg border border-line bg-surface px-2.5 py-2 text-sm"
+      >
+        <option value="">{pages.length === 1 ? "Auto (only one connected)" : "None — ask which one each time"}</option>
+        {pages.map((p) => (
+          <option key={p.id} value={p.id}>{p.name} ({p.id})</option>
+        ))}
+      </select>
+      {error && <p className="mt-1.5 text-xs text-red-500">{error}</p>}
+    </div>
+  );
+}
+
 export default function Integrations() {
   const [items, setItems] = useState([]);
   const [notice, setNotice] = useState(null);
@@ -245,6 +303,7 @@ export default function Integrations() {
               )}
 
               {connected && it.provider === "meta_ads" && <MetaAdAccountSelector />}
+              {connected && it.provider === "meta_ads" && <MetaPageSelector />}
             </Card>
           );
         })}

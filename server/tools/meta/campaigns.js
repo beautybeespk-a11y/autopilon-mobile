@@ -230,7 +230,7 @@ registerTool({
   requiresConfirmation: false,
   async execute(parameters, context) {
     const accessToken = token(context);
-    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
     const posts = await meta.listPagePosts(accessToken, pageId);
     return {
       posts: posts.map((p) => ({
@@ -250,7 +250,7 @@ registerTool({
   requiresConfirmation: false,
   async execute(parameters, context) {
     const accessToken = token(context);
-    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
     const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
     if (!igAccountId) return { posts: [], instagramConnected: false };
     // Reading Page metadata (above) and reading actual Instagram content
@@ -302,7 +302,7 @@ registerTool({
       // exactly that, no reconstruction needed.
       creativeFields = { name: `${parameters.name} — creative`, object_story_id: parameters.postId };
     } else {
-      const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+      const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
       const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
       if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected.");
       creativeFields = { name: `${parameters.name} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId };
@@ -350,7 +350,7 @@ registerTool({
     }
     const accessToken = token(context);
     const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
-    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
     let base64;
     if (parameters.imageReferenceId) {
       const { buffer } = resolveChatImage(context.userId, parameters.imageReferenceId);
@@ -437,7 +437,7 @@ registerTool({
   async execute(parameters, context) {
     const accessToken = token(context);
     const adAccountId = await resolveAdAccountId({ userId: context.userId, accessToken, providedAdAccountId: parameters.adAccountId });
-    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId });
+    const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
     const creative = await meta.createAdCreative(accessToken, adAccountId, {
       name: `${parameters.name} — creative`,
       object_story_spec: {

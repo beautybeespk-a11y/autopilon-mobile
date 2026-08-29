@@ -27,7 +27,8 @@ process.env.META_EXPERT_MAX_EXECUTABLE_DAILY_BUDGET = "10000";
 
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
-const { saveConnection } = await import("../integrations/manager.js");
+const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
+const { resolvePageId } = await import("../tools/shared/metaPageId.js");
 const { validatePlanStructure, validatePlanAgainstContext, validatePlan } = await import("../agents/metaExpert/planSchema.js");
 const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
 const { checkGoalClassificationPolicy, checkBudgetPolicy, checkAudiencePolicy, isGenericAudience, messageIndicatesExecutionApproval, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
@@ -781,7 +782,6 @@ async function run() {
     connectMeta(userId);
     mockFetch(metaRouter({ pages: [{ id: "717559728109412", name: "Beautybeespk" }] }));
     try {
-      const { resolvePageId } = await import("../tools/shared/metaPageId.js");
       await assert.rejects(
         () => resolvePageId({ accessToken: `fake-meta-token-${userId}`, providedPageId: "111111111111111" }),
         (err) => err.code === "META_PAGE_NOT_FOUND"
@@ -1287,6 +1287,88 @@ async function run() {
       const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
       assert.equal(result.ok, false, "a Traffic plan must be rejected when the PRECEDING research call actually found real commerce + Pixel data");
       assert.ok(result.errors.some((e) => e.field === "goal_classification"), JSON.stringify(result.errors));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 5, Issue 5 confirmed live root cause: no Default Facebook
+  //    Page mechanism existed at all, so every fresh conversation (no
+  //    conversation-scoped memory yet, since none exists until a plan is
+  //    proposed in THAT conversation) forced a re-guess among real Pages —
+  //    resolvePageId now supports a saved Default Page, mirroring
+  //    resolveAdAccountId exactly.
+  await check("resolvePageId uses the saved Default Facebook Page when multiple Pages are connected", async () => {
+    const userId = makeUser(`default-page-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pageId: "717559728109412" } });
+    mockFetch(metaRouter({ pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "790544870819230", name: "Careonabudget.pk" }] }));
+    try {
+      const pageId = await resolvePageId({ accessToken: `fake-meta-token-${userId}`, userId });
+      assert.equal(pageId, "717559728109412", "must use the saved default, never ask, never guess the other one");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("resolvePageId self-heals: a saved Default Facebook Page that's no longer connected is cleared and falls through to asking", async () => {
+    const userId = makeUser(`default-page-stale-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pageId: "999999999999999" } }); // not in the connected list below
+    mockFetch(metaRouter({ pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "790544870819230", name: "Careonabudget.pk" }] }));
+    try {
+      await assert.rejects(
+        () => resolvePageId({ accessToken: `fake-meta-token-${userId}`, userId }),
+        (err) => err.code === "META_PAGE_ID_REQUIRED" && /Beautybeespk/.test(err.message) && /Careonabudget/.test(err.message)
+      );
+      const conn = getConnection(userId, "meta_ads");
+      assert.equal(JSON.parse(conn.meta || "{}").defaults?.pageId, null, "the stale default must be cleared, not retried forever");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("resolvePageId: an explicit real id still overrides the saved Default Facebook Page", async () => {
+    const userId = makeUser(`default-page-override-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pageId: "717559728109412" } });
+    mockFetch(metaRouter({ pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "790544870819230", name: "Careonabudget.pk" }] }));
+    try {
+      const pageId = await resolvePageId({ accessToken: `fake-meta-token-${userId}`, userId, providedPageId: "790544870819230" });
+      assert.equal(pageId, "790544870819230", "an explicit choice this call always wins over the standing default");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("createPlan end-to-end: with a Default Facebook Page set, TWO SEPARATE conversations both land on the SAME Page — the exact live wrong-Page bug, closed at the account level (not just conversation memory)", async () => {
+    const userId = makeUser(`default-page-createplan-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pageId: "717559728109412" } });
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "790544870819230", name: "Careonabudget.pk" }],
+    }));
+    try {
+      const firstConversation = `conv-${cryptoRandom()}`;
+      const first = await createPlan({
+        userId, conversationId: firstConversation, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "default_facebook_page" } }),
+      });
+      assert.equal(first.ok, true, JSON.stringify(first.errors));
+      assert.match(first.recommendationText, /Beautybeespk/);
+
+      // A genuinely SEPARATE conversation — conversation-scoped memory
+      // (Issue 1/4, round 3) has nothing to remember here; only the
+      // account-level Default Page can make this land correctly.
+      const secondConversation = `conv-${cryptoRandom()}`;
+      const second = await createPlan({
+        userId, conversationId: secondConversation, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "default_facebook_page" } }),
+      });
+      assert.equal(second.ok, true, JSON.stringify(second.errors));
+      assert.match(second.recommendationText, /Beautybeespk/);
+      assert.doesNotMatch(second.recommendationText, /Careonabudget/);
     } finally {
       restoreFetch();
     }

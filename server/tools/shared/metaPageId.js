@@ -1,4 +1,5 @@
 import * as meta from "../../integrations/meta/api.js";
+import { getConnection, updateConnectionMeta } from "../../integrations/manager.js";
 
 // Facebook Page ids are always purely numeric strings — never letters,
 // underscores, or punctuation. That single fact is enough to catch every
@@ -10,6 +11,16 @@ const PAGE_ID_PATTERN = /^\d+$/;
 
 export function isPlausibleMetaId(value) {
   return typeof value === "string" && PAGE_ID_PATTERN.test(value);
+}
+
+// Same shape as metaAdAccountId.js's readSavedDefaultAdAccountId — a
+// Default Facebook Page, saved under the SAME integrations.meta.defaults
+// blob (routes/metaAuth.js's setDefault() already spreads the existing
+// `defaults` object rather than replacing it, specifically so adAccountId
+// and pageId can coexist there without either overwriting the other).
+function readSavedDefaultPageId(conn) {
+  const meta = JSON.parse(conn?.meta || "{}");
+  return meta.defaults?.pageId || null;
 }
 
 // Resolves a real Facebook Page id for a Meta tool call — never lets an
@@ -41,14 +52,25 @@ export function isPlausibleMetaId(value) {
 //   connected Pages is rejected with META_PAGE_NOT_FOUND — a distinct code,
 //   because the failure mode is different: not "missing", but "verified and
 //   rejected" (mirrors resolveAdAccountId's META_AD_ACCOUNT_NOT_FOUND).
-// - No id supplied at all is not an error by itself: falls back to the
-//   user's own connected Pages (meta.listPages) exactly like meta.list_pages
-//   itself would return. Exactly one connected Page → use it, no need to
-//   ask. Zero or more than one → fail with a clear, real-data-driven
-//   message (the actual Page names+ids, when there's more than one) so the
-//   agent can relay real options instead of guessing — never invents a
-//   choice on the caller's behalf.
-export async function resolvePageId({ accessToken, providedPageId }) {
+// - No id supplied at all is not an error by itself. Resolution order
+//   (mirrors resolveAdAccountId exactly — confirmed live, round 5: with no
+//   default set, every fresh conversation forced the model to re-guess
+//   among multiple real Pages, and it guessed wrong at least once,
+//   producing the exact "used Careonabudget.pk instead of Beautybeespk"
+//   live bug):
+//     1. An explicit, valid, verified providedPageId — always wins.
+//     2. A saved Default Facebook Page (userId's integrations.meta.
+//        defaults.pageId), but ONLY after confirming it's still in
+//        meta.listPages() — self-heals (clears) the same way a stale
+//        Default Ad Account does if it's gone.
+//     3. Exactly one connected Page → used automatically.
+//     4. Zero, or more than one with no usable default → fails with
+//        META_PAGE_ID_REQUIRED, listing the real Pages when there's a
+//        choice to make.
+// `userId` is optional — omitted, this behaves exactly as before (no
+// default lookup), so every existing caller that doesn't pass it keeps
+// working unchanged.
+export async function resolvePageId({ accessToken, providedPageId, userId }) {
   const pages = await meta.listPages(accessToken);
 
   if (providedPageId) {
@@ -70,6 +92,20 @@ export async function resolvePageId({ accessToken, providedPageId }) {
     throw err;
   }
 
+  if (userId) {
+    const conn = getConnection(userId, "meta_ads");
+    const savedDefault = readSavedDefaultPageId(conn);
+    if (savedDefault) {
+      const stillValid = pages.find((p) => p.id === savedDefault);
+      if (stillValid) return stillValid.id;
+      try {
+        updateConnectionMeta(userId, "meta_ads", { defaults: { ...JSON.parse(conn.meta || "{}").defaults, pageId: null } });
+      } catch {
+        // Non-fatal — resolution continues below regardless.
+      }
+    }
+  }
+
   if (pages.length === 1) return pages[0].id;
   if (pages.length === 0) {
     const err = new Error("No connected Facebook Pages were found for this account.");
@@ -77,7 +113,9 @@ export async function resolvePageId({ accessToken, providedPageId }) {
     throw err;
   }
   const err = new Error(
-    `Multiple Facebook Pages are connected — a specific one must be chosen: ${pages.map((p) => `${p.name} (${p.id})`).join(", ")}.`
+    `Multiple Facebook Pages are connected and no Default Page is set — a specific one must be chosen: ${pages
+      .map((p) => `${p.name} (${p.id})`)
+      .join(", ")}. A default can be set in Integrations → Meta Ads to skip this next time.`
   );
   err.code = "META_PAGE_ID_REQUIRED";
   throw err;
