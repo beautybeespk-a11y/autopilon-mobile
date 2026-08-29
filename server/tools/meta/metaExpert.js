@@ -147,7 +147,7 @@ registerTool({
       changingAssets: {
         type: "array",
         items: { type: "string", enum: ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"] },
-        description: "Only meaningful alongside revisesPlanId. List an asset field here ONLY when the user's OWN words THIS TURN explicitly asked to change that specific asset (e.g. 'use my other ad account', 'switch to Careonabudget', 'use a different Pixel') — never just because you happen to be restating that field's value. Any asset field NOT listed here is preserved from the prior plan's ALREADY-RESOLVED real id automatically, even if you also set a value for it in this call — the backend deliberately ignores an asset field's value on a revision unless it's declared here, so an audience/budget-only revision can never accidentally reassign the ad account, Page, Pixel, catalog, or Instagram identity. Omit entirely (or leave empty) for a revision that isn't touching assets at all — the normal, common case.",
+        description: "Relevant on EVERY call, not just revisions. List an asset field here ONLY when the user's OWN words THIS TURN explicitly asked to use/change that specific real asset (e.g. 'use my other ad account', 'switch to Careonabudget', 'use a different Pixel', or answering 'which Page?' after create_campaign_plan's own error named real options) — never just because you happen to be setting a real id there. A REAL id (as opposed to a semantic ref like \"default_ad_account\") in facebook_page/ad_account/pixel/catalog/instagram_identity is ONLY honored as an explicit choice when its field is listed here — otherwise the backend ignores that value entirely and resolves normally instead (saved Default Ad Account/Page, single connected asset, or the prior plan's already-resolved asset on a revision), even if the value you set is a real, validly-connected id. This is deliberate: the saved default/prior resolved asset must never be silently outranked just because you emitted a different valid id. Leave this empty (the normal, common case) whenever you're using semantic refs or not touching assets at all.",
       },
     },
     // No `required` array here at all (round 4 removed audience_basis for
@@ -176,7 +176,7 @@ registerTool({
   async execute(parameters, context) {
     const accessToken = token(context);
     const { revisesPlanId, changingAssets, ...plan } = parameters;
-    const result = await createPlan({ userId: context.userId, conversationId: context.conversationId, accessToken, plan, revisesPlanId, changingAssets });
+    const result = await createPlan({ userId: context.userId, conversationId: context.conversationId, accessToken, plan, revisesPlanId, changingAssets, userMessage: context.userMessage });
     if (!result.ok) {
       return { valid: false, code: result.code || "META_PLAN_REPAIR_REQUIRED", errors: result.errors, repairGuidance: result.repairGuidance };
     }

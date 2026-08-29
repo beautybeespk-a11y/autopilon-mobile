@@ -54,7 +54,7 @@ export function createConfirmationRequest({ executionId, userId, toolName, reaso
  * Confirmation-gated tools stop at "awaiting_confirmation" and return
  * without executing; execution resumes later via resumeAfterConfirmation().
  */
-export async function runTool({ toolName, parameters, userId, agentId, conversationId, planId, automationRunId }) {
+export async function runTool({ toolName, parameters, userId, agentId, conversationId, planId, automationRunId, userMessage }) {
   const executionId = createExecutionRow({ planId, userId, agentId, conversationId, toolName, parameters });
   setExecutionStatus(executionId, "planning");
 
@@ -83,13 +83,13 @@ export async function runTool({ toolName, parameters, userId, agentId, conversat
     return { executionId, status: "awaiting_confirmation", confirmationId, reason };
   }
 
-  return executeNow({ executionId, tool, parameters, userId, agentId, conversationId });
+  return executeNow({ executionId, tool, parameters, userId, agentId, conversationId, userMessage });
 }
 
-async function executeNow({ executionId, tool, parameters, userId, agentId, conversationId }) {
+async function executeNow({ executionId, tool, parameters, userId, agentId, conversationId, userMessage }) {
   setExecutionStatus(executionId, "running", { startedAt: now() });
   try {
-    const result = await tool.execute(parameters, { userId, agentId, conversationId });
+    const result = await tool.execute(parameters, { userId, agentId, conversationId, userMessage });
     setExecutionStatus(executionId, "completed", { result, completedAt: now() });
     return { executionId, status: "completed", result };
   } catch (err) {

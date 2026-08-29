@@ -108,6 +108,29 @@ async function resolveWithMemory({ conversationId, userId, field, explicitId, sa
 // app's Meta tools use (server/tools/shared/*), never trusted from the
 // plan directly.
 //
+// CONFIRMED LIVE BUG (round 12): a real, valid connected id in
+// plan.ad_account.ref/facebook_page.ref/etc. was treated as an
+// authoritative "the user explicitly picked this" signal purely because it
+// happened to be a REAL id rather than a semantic ref like
+// "default_ad_account" — nothing distinguished a genuine user-driven
+// choice from the model simply emitting a real id on its own (confusion,
+// stale memory of a different context, an outright guess). That let a
+// model-generated id silently outrank the user's saved Default Ad
+// Account/Facebook Page, even on a brand-new plan — round 11 already fixed
+// this exact class of bug for REVISIONS via changingAssets; this
+// generalizes the same rule to a new plan too: a real id in an asset ref is
+// only ever treated as explicit when that field is ALSO declared in
+// changingAssets. Conversation-remembered selections (the `saved.*` values
+// resolveWithMemory falls back to below) are unaffected — those already
+// trace back to a genuine earlier explicit choice (the user answered a
+// disambiguation question) and don't need to be redeclared on every
+// subsequent call.
+function explicitAssetRef(refObj, field, changingAssets) {
+  const ref = refObj?.ref;
+  if (!ref || SEMANTIC_REFS.has(ref)) return undefined;
+  return changingAssets.has(field) ? ref : undefined;
+}
+
 // priorResolved/changingAssets (round 11): only present on a revision.
 // changingAssets is the set of asset fields the caller has explicitly
 // declared the user asked to change this turn — everything NOT in that set
@@ -125,7 +148,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
     adAccountReused = true;
   } else {
     try {
-      const explicitId = SEMANTIC_REFS.has(plan.ad_account?.ref) ? undefined : plan.ad_account?.ref;
+      const explicitId = explicitAssetRef(plan.ad_account, "ad_account", changingAssets);
       resolved.adAccountId = await resolveWithMemory({
         conversationId, userId, field: "adAccount", explicitId, savedId: saved.selectedAdAccountId,
         resolve: (id) => resolveAdAccountId({ userId, accessToken, providedAdAccountId: id }),
@@ -142,7 +165,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
     pageReused = true;
   } else {
     try {
-      const explicitId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
+      const explicitId = explicitAssetRef(plan.facebook_page, "facebook_page", changingAssets);
       resolved.pageId = await resolveWithMemory({
         conversationId, userId, field: "facebookPage", explicitId, savedId: saved.selectedFacebookPageId,
         resolve: (id) => resolvePageId({ accessToken, providedPageId: id, userId }),
@@ -180,7 +203,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
       resolved.pixelId = priorResolved.pixelId;
     } else {
       try {
-        const explicitId = !plan.pixel || SEMANTIC_REFS.has(plan.pixel.ref) ? undefined : plan.pixel.ref;
+        const explicitId = explicitAssetRef(plan.pixel, "pixel", changingAssets);
         resolved.pixelId = await resolveWithMemory({
           conversationId, userId, field: "pixel", explicitId, savedId: saved.selectedPixelId,
           resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id }).then((r) => r.pixelId),
@@ -197,7 +220,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
       resolved.catalogId = priorResolved.catalogId;
     } else {
       try {
-        const explicitId = SEMANTIC_REFS.has(plan.catalog.ref) ? undefined : plan.catalog.ref;
+        const explicitId = explicitAssetRef(plan.catalog, "catalog", changingAssets);
         resolved.catalogId = await resolveWithMemory({
           conversationId, userId, field: "catalog", explicitId, savedId: saved.selectedCatalogId,
           resolve: (id) => resolveCatalogId({ accessToken, adAccountId: resolved.adAccountId, providedCatalogId: id }).then((r) => r.catalogId),
@@ -418,7 +441,44 @@ function protectValidPriorEnumFieldsOnRevision(prior, plan) {
   return result;
 }
 
-export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId, changingAssets: changingAssetsInput }) {
+// Round 12 (live testing): a real, non-negotiable literal check — does the
+// user's own message text actually contain the claimed number, in any
+// reasonable formatting (with/without thousands separators or a currency
+// symbol beside it)? Deliberately NOT semantic/NLP: the whole point is a
+// mechanical fact-check ("is this digit sequence anywhere in what they
+// actually typed"), not an interpretation of intent.
+function userMessageContainsAmount(userMessage, amount) {
+  if (!userMessage || typeof amount !== "number" || !Number.isFinite(amount)) return false;
+  const normalized = userMessage.replace(/[,\s]/g, "");
+  return normalized.includes(String(Math.trunc(amount)));
+}
+
+// CONFIRMED LIVE BUG (round 12): a production trace showed
+// budget_basis: "USER_PROVIDED" for a PKR 10,000 daily budget the user
+// never actually stated anywhere in the conversation. USER_PROVIDED is a
+// TRUST-BYPASSING claim — policy.js's checkBudgetPolicy() lets it through
+// at any size, uncapped, specifically because it's supposed to mean "the
+// user said this exact number," unlike HEURISTIC_STARTING_TEST/
+// HISTORICAL_PERFORMANCE (both capped at MAX_SUGGESTED_DAILY_BUDGET). The
+// model's own claim that a number came from the user can't be trusted any
+// more than any other self-reported field this codebase has already had
+// to independently verify (pixel existence, commerce connection, asset
+// resolution...) — same principle, applied to budget provenance.
+//
+// Only fires when THIS call is the one actually asserting USER_PROVIDED —
+// checked against the RAW, pre-merge `rawPlan` (the exact object the model
+// submitted this turn), not the merged/normalized one: a revision that
+// silently carries a prior, ALREADY-verified USER_PROVIDED budget forward
+// unchanged (the model didn't even mention budget this turn) must not be
+// re-flagged just because this turn's message doesn't happen to repeat a
+// number it already established validly in an earlier turn.
+function verifyUserProvidedBudget(rawPlan, planInput, userMessage) {
+  if (rawPlan.budget_basis !== "USER_PROVIDED") return planInput;
+  if (userMessageContainsAmount(userMessage, planInput.daily_budget)) return planInput;
+  return { ...planInput, budget_basis: "HEURISTIC_STARTING_TEST" };
+}
+
+export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId, changingAssets: changingAssetsInput, userMessage }) {
   const attemptNumber = nextAttemptNumberForConversation(conversationId);
   // Round 11: an explicit, backend-enforced declaration of which asset
   // fields the user actually asked to change this turn — never inferred
@@ -449,6 +509,23 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
       return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
     }
     planInput = mergePlanForRevision(prior, plan, changingAssets);
+  }
+
+  // Round 12 (live testing): verify a fresh USER_PROVIDED budget claim
+  // against the user's actual message BEFORE anything downstream (policy
+  // checks, the recommendation text) ever trusts it — see
+  // verifyUserProvidedBudget()'s own comment for why `plan` (raw,
+  // pre-merge) rather than `planInput` is what decides whether this call
+  // is asserting it fresh.
+  const preBudgetVerification = planInput;
+  planInput = verifyUserProvidedBudget(plan, planInput, userMessage);
+  if (traceEnabled && preBudgetVerification.budget_basis !== planInput.budget_basis) {
+    trace("createPlan budget provenance downgrade", {
+      conversationId, attemptNumber,
+      claimedBasis: "USER_PROVIDED", claimedAmount: planInput.daily_budget,
+      downgradedTo: planInput.budget_basis,
+      userMessagePresent: Boolean(userMessage),
+    });
   }
 
   // Round 10 (live testing), requirement 4's exact order: merge (above) ->

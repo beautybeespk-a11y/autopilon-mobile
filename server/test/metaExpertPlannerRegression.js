@@ -359,7 +359,13 @@ async function run() {
     mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "Real Account" }], pages: [{ id: "111", name: "Real Page" }], writes }));
     try {
       const plan = basePlan({ ad_account: { ref: "your_ad_account_id" } });
-      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      // changingAssets declared, simulating the model CLAIMING an explicit
+      // override — round 12: without this, an undeclared placeholder value
+      // is now correctly IGNORED (not rejected) and resolution falls
+      // through to the single connected account — this test specifically
+      // covers the case where the model claims an override and it's
+      // garbage, which must still be caught, not silently trusted.
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan, changingAssets: ["ad_account"] });
       assert.equal(result.ok, false);
       assert.ok(result.errors.some((e) => e.field === "ad_account"));
       assert.equal(writes.length, 0, "no write/mutation call should ever have been made");
@@ -374,7 +380,7 @@ async function run() {
     mockFetch(metaRouter({ adAccounts: [{ id: "act_237956315579168", name: "Real Account" }], pages: [{ id: "717559728109412", name: "Real Page" }] }));
     try {
       const plan = basePlan({ ad_account: { ref: "act_717559728109412" } }); // the Page's own id, shaped exactly like a valid ad account id
-      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan, changingAssets: ["ad_account"] }); // claiming an explicit override
       assert.equal(result.ok, false);
       assert.ok(result.errors.some((e) => e.field === "ad_account"));
     } finally {
@@ -678,6 +684,7 @@ async function run() {
       const first = await createPlan({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
         plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }), // the user's real, explicit choice
+        changingAssets: ["facebook_page"], // round 12: a real id only counts as explicit when declared
       });
       assert.equal(first.ok, true, JSON.stringify(first.errors));
       assert.equal(first.resolved.pageId, "717559728109412");
@@ -712,6 +719,7 @@ async function run() {
       const original = await createPlan({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
         plan: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }),
+        changingAssets: ["facebook_page"], // round 12: a real id only counts as explicit when declared
       });
       assert.equal(original.ok, true, JSON.stringify(original.errors));
 
@@ -757,6 +765,7 @@ async function run() {
       const first = await createPlan({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
         plan: basePlan({ pixel: { ref: "111111111" } }),
+        changingAssets: ["pixel"], // round 12: a real id only counts as explicit when declared
       });
       assert.equal(first.ok, true, JSON.stringify(first.errors));
       assert.equal(first.resolved.pixelId, "111111111");
@@ -1231,7 +1240,7 @@ async function run() {
     try {
       const first = await runTool({
         toolName: "meta_expert.create_campaign_plan",
-        parameters: basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }),
+        parameters: { ...basePlan({ optimization_event: "LINK_CLICKS", pixel: null, facebook_page: { ref: "717559728109412" } }), changingAssets: ["facebook_page"] },
         userId, agentId, conversationId,
       });
       assert.equal(first.status, "completed", JSON.stringify(first));
@@ -1554,6 +1563,171 @@ async function run() {
     }
   });
 
+  // --- Round 12, live testing: the production trace showed
+  //    resolvedAdAccountId/resolvedPageId landing on completely DIFFERENT
+  //    real, connected assets than the ones actually saved as defaults in
+  //    Integrations -> Meta Ads (act_237956315579168 / 717559728109412 saved,
+  //    act_769398062628867 / 790544870819230 resolved instead). Root cause:
+  //    resolveAdAccountId/resolvePageId always treated ANY real, valid id in
+  //    the plan's ad_account.ref/facebook_page.ref as an authoritative
+  //    "explicit user choice" that outranks the saved default — with no way
+  //    to tell a genuine user selection from the model simply emitting a
+  //    different (still real, still connected) id on its own. Fixed by
+  //    requiring changingAssets to declare a real id as explicit — this
+  //    test proves a saved default now wins even when the plan itself
+  //    contains a DIFFERENT, validly-connected id with no changingAssets
+  //    declaration (the exact live shape) — a brand-new (non-revision) plan.
+  await check("[acceptance, exact live case] saved Default Ad Account/Facebook Page win over other connected assets, even when the plan contains a different valid connected id with no changingAssets declared", async () => {
+    const userId = makeUser(`accept-saved-defaults-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { adAccountId: "act_237956315579168", pageId: "717559728109412" } });
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      // Pixel discovery must be scoped per ad account — the live bug's
+      // second half only manifested because the WRONG account has no
+      // Pixel; a mock that returned the same pixel list for every account
+      // couldn't prove this. Only the SAVED DEFAULT account has one.
+      if (path.endsWith("/adspixels")) {
+        return path.startsWith("/act_237956315579168/")
+          ? jsonResponse({ data: [{ id: "px_default_account", name: "Default Account Pixel" }] })
+          : jsonResponse({ data: [] });
+      }
+      return metaRouter({
+        adAccounts: [{ id: "act_237956315579168", name: "BJ" }, { id: "act_769398062628867", name: "Moazzam Dhanani" }],
+        pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "790544870819230", name: "Careonabudget.pk" }],
+      })(url, options);
+    });
+    try {
+      // The model submits semantic refs — "no explicit user-requested
+      // asset change" — this is the normal, correct shape per
+      // agentLibrary.js's own instructions (always use semantic refs
+      // unless the user actually asked for something specific).
+      const plan = basePlan({
+        ad_account: { ref: "default_ad_account" },
+        facebook_page: { ref: "default_facebook_page" },
+        pixel: { ref: "default_pixel" },
+      });
+      const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.resolved.adAccountId, "act_237956315579168", "the saved Default Ad Account must win — the alternative connected account must NEVER be resolved instead");
+      assert.equal(result.resolved.pageId, "717559728109412", "the saved Default Facebook Page must win — the alternative connected Page must NEVER be resolved instead");
+      // Pixel behavior: discovery ran against the CORRECT (default)
+      // account, which has a real Pixel — Purchase optimization must not
+      // be silently downgraded just because the WRONG account (which has
+      // none) could have been picked instead.
+      assert.equal(result.resolved.pixelId, "px_default_account", "Pixel discovery must run against the correctly-selected default account and find its real Pixel");
+
+      // Requested trace fields, reported back verbatim:
+      console.log("  [round 12 trace] savedDefaultAdAccount=act_237956315579168 savedDefaultPage=717559728109412(Beautybeespk)" +
+        ` resolvedAdAccountId=${result.resolved.adAccountId} resolvedPageId=${result.resolved.pageId} resolvedPixelId=${result.resolved.pixelId}` +
+        ` budget_basis=${result.plan.budget_basis} proposedBudget=${result.plan.daily_budget}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("requirement: an undeclared real ad_account/facebook_page id (model-emitted, not user-requested) is ignored even without a saved default — falls through to the single/only genuinely-ambiguous path instead of silently winning", async () => {
+    const userId = makeUser(`accept-undeclared-explicit-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "px1", name: "Pixel" }],
+    }));
+    try {
+      // No saved default, exactly one connected ad account/Page — the
+      // model emits a DIFFERENT (non-existent) id with no changingAssets
+      // declaration; since it's ignored, resolution must fall through to
+      // the single connected asset rather than trying (and failing) to
+      // honor the undeclared value.
+      const plan = basePlan({ ad_account: { ref: "act_999999999999999" }, facebook_page: { ref: "222222222222222" }, pixel: { ref: "default_pixel" } });
+      const result = await createPlan({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.resolved.adAccountId, "act_1");
+      assert.equal(result.resolved.pageId, "111");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 12, live testing: budget provenance. The same production
+  //    trace showed budget_basis USER_PROVIDED for a PKR 10,000 daily
+  //    budget the user never actually stated anywhere in the conversation
+  //    — USER_PROVIDED is a trust-bypassing claim (uncapped by
+  //    checkBudgetPolicy), so it must be independently verified against
+  //    the user's own message text, not accepted on the model's word alone.
+  await check("an unverified USER_PROVIDED budget claim (no matching amount in the user's message) is downgraded to HEURISTIC_STARTING_TEST and capped — the exact live bug", async () => {
+    const userId = makeUser(`accept-budget-provenance-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
+    try {
+      const plan = basePlan({
+        daily_budget: 10000, // above MAX_SUGGESTED_DAILY_BUDGET (5000 in this suite's config)
+        budget_basis: "USER_PROVIDED",
+      });
+      // The user's actual message never mentioned this number at all.
+      const result = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan,
+        userMessage: "Review my WooCommerce products, Meta history, and audience data, then improve the audience and budget before I approve it.",
+      });
+      assert.equal(result.ok, false, "an unverified USER_PROVIDED claim must be downgraded to a CAPPED basis, not accepted uncapped");
+      assert.ok(result.errors.some((e) => e.field === "daily_budget"), `expected the budget to be rejected under the suggested cap once downgraded: ${JSON.stringify(result.errors)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a genuinely user-stated budget (the exact number appears in the user's message) keeps USER_PROVIDED and is allowed above the suggested cap", async () => {
+    const userId = makeUser(`accept-budget-verified-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] }));
+    try {
+      const plan = basePlan({ daily_budget: 10000, budget_basis: "USER_PROVIDED", pixel: { ref: "default_pixel" } });
+      const result = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan,
+        userMessage: "I want to spend PKR 10,000 per day on this campaign.",
+      });
+      assert.equal(result.ok, true, `a genuinely user-stated amount must be trusted and allowed above the suggested cap: ${JSON.stringify(result.errors)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("a revision that doesn't touch budget at all keeps the prior plan's already-verified USER_PROVIDED basis, without needing to re-mention the number this turn", async () => {
+    const userId = makeUser(`accept-budget-inherited-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] }));
+    try {
+      const initial = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: basePlan({ daily_budget: 3500, budget_basis: "USER_PROVIDED", pixel: { ref: "default_pixel" } }),
+        userMessage: "I want to spend PKR 3,500 per day.",
+      });
+      assert.equal(initial.ok, true, JSON.stringify(initial.errors));
+
+      // A revision that only changes gender — no budget mentioned this
+      // turn at all, no daily_budget/budget_basis in the payload.
+      const revision = await createPlan({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        plan: { gender: "MALE" },
+        revisesPlanId: initial.planId,
+        userMessage: "Target men instead.",
+      });
+      assert.equal(revision.ok, true, JSON.stringify(revision.errors));
+      const stored = getStoredPlan(userId, revision.planId);
+      assert.equal(stored.planData.plan.budget_basis, "USER_PROVIDED", "an inherited, already-verified basis must not be re-flagged just because this turn's message doesn't repeat the number");
+      assert.equal(stored.planData.plan.daily_budget, 3500);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Round 10, live testing: the ACTUAL production rejection for the
   //    revision above turned out to be "cta missing" + an INVALID
   //    bid_strategy value the model kept producing across both attempts —
@@ -1729,6 +1903,7 @@ async function run() {
         confidence: "HIGH",
         approval_required: true,
         open_questions: [],
+        changingAssets: ["ad_account", "facebook_page"], // round 12: real ids only count as explicit when declared
       });
       const initial = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: initialPlan, userId, agentId, conversationId });
       assert.equal(initial.status, "completed", JSON.stringify(initial));

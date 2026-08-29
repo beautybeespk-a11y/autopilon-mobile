@@ -545,6 +545,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           agentId,
           conversationId,
           planId,
+          userMessage,
         });
         if (call.toolName === "meta_expert.create_campaign_plan") {
           createPlanAttempts += 1;

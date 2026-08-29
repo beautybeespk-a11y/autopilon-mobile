@@ -136,10 +136,33 @@ export function saveConnection(userId, provider, { accessToken, refreshToken, ex
 // default ad account id) WITHOUT touching accessToken/refreshToken/scopes
 // — deliberately separate from saveConnection() so a per-user preference
 // like this can never accidentally re-encrypt, clobber, or otherwise
-// disturb the OAuth token itself. No-ops (does not create a row) if the
-// user has no connection for this provider — there is nothing meaningful
-// to attach a preference to yet.
+// disturb the OAuth token itself. No-ops (does not create a row) if there's
+// no connection to attach a preference to.
+//
+// CONFIRMED LIVE BUG (round 12): this used to ALWAYS write to the
+// user's PERSONAL row (`orgId IS NULL`), while getConnection() above
+// (Phase 9, Shared Integrations) reads the ORG's connection instead
+// whenever the user is currently "in" an org with its own connected
+// integration for this provider. For exactly that user, a saved Default
+// Ad Account / Default Facebook Page set via routes/metaAuth.js's
+// /default-ad-account /default-page (both: verify against getConnection(),
+// then write via THIS function) landed on the personal row while every
+// later resolveAdAccountId()/resolvePageId() call read the meta.defaults
+// off the ORG row — the write and the read never touched the same row, so
+// the "saved" default silently never took effect, with no error anywhere
+// in the chain. Fixed by mirroring getConnection()'s exact resolution
+// order: write to the SAME row it would read back.
 export function updateConnectionMeta(userId, provider, patch) {
+  const user = db.prepare("SELECT activeOrgId FROM users WHERE id = ?").get(userId);
+  if (user?.activeOrgId) {
+    const orgConn = db.prepare("SELECT * FROM integrations WHERE orgId = ? AND provider = ? AND status = 'connected'").get(user.activeOrgId, provider);
+    if (orgConn && hasPermission(user.activeOrgId, userId, "integrations")) {
+      const currentMeta = JSON.parse(orgConn.meta || "{}");
+      const nextMeta = { ...currentMeta, ...patch };
+      db.prepare("UPDATE integrations SET meta = ?, updatedAt = ? WHERE id = ?").run(JSON.stringify(nextMeta), now(), orgConn.id);
+      return nextMeta;
+    }
+  }
   const existing = db.prepare("SELECT meta FROM integrations WHERE userId = ? AND provider = ? AND orgId IS NULL").get(userId, provider);
   if (!existing) return null;
   const currentMeta = JSON.parse(existing.meta || "{}");

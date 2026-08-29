@@ -118,7 +118,8 @@ router.post("/default-ad-account", requireAuth, async (req, res) => {
     if (!match) {
       return res.status(404).json({ error: `"${adAccountId}" is not one of this account's connected Meta ad accounts.`, accounts });
     }
-    setDefault(match.id);
+    const updated = setDefault(match.id);
+    if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
     logActivity(db, req.session.userId, "integration_updated", `Set Default Ad Account for Meta Ads: ${match.name} (${match.id})`);
     res.json({ defaultAdAccountId: match.id });
   } catch (err) {
@@ -170,7 +171,8 @@ router.post("/default-page", requireAuth, async (req, res) => {
     if (!match) {
       return res.status(404).json({ error: `"${pageId}" is not one of this account's connected Facebook Pages.`, pages });
     }
-    setDefault(match.id);
+    const updated = setDefault(match.id);
+    if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
     logActivity(db, req.session.userId, "integration_updated", `Set Default Facebook Page for Meta Ads: ${match.name} (${match.id})`);
     res.json({ defaultPageId: match.id });
   } catch (err) {
