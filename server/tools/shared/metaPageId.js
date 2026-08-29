@@ -23,6 +23,25 @@ function readSavedDefaultPageId(conn) {
   return meta.defaults?.pageId || null;
 }
 
+// Round 11 (live testing): a real production revision supplied a Page NAME
+// ("careonabudget.pk") where an id was expected. That's still never sent to
+// Meta as an id (the numeric-only check below still rejects it before it
+// reaches the id branch) — but rather than a bare rejection, try matching
+// it against this account's real, connected Pages by name first, so a
+// genuinely-named real Page (not a placeholder) resolves deterministically
+// instead of failing. Exact name match wins outright; an unambiguous
+// partial match (exactly one Page's name contains the given text) is
+// accepted too — anything ambiguous or unmatched falls through to the
+// existing rejection.
+function findPageByName(pages, name) {
+  const needle = typeof name === "string" ? name.trim().toLowerCase() : "";
+  if (!needle) return null;
+  const exact = pages.find((p) => p.name?.trim().toLowerCase() === needle);
+  if (exact) return exact;
+  const partial = pages.filter((p) => p.name?.trim().toLowerCase().includes(needle));
+  return partial.length === 1 ? partial[0] : null;
+}
+
 // Resolves a real Facebook Page id for a Meta tool call — never lets an
 // LLM-invented value reach the Graph API, and never requires the caller to
 // already know a real id.
@@ -75,8 +94,12 @@ export async function resolvePageId({ accessToken, providedPageId, userId }) {
 
   if (providedPageId) {
     if (!isPlausibleMetaId(providedPageId)) {
+      const byName = findPageByName(pages, providedPageId);
+      if (byName) return byName.id;
       const err = new Error(
-        `"${providedPageId}" is not a real Facebook Page id (Meta Page ids are always numeric) — it looks like a placeholder rather than a resolved id. Call meta.list_pages to get the real id, don't invent one.`
+        `"${providedPageId}" is not a real Facebook Page id (Meta Page ids are always numeric) and doesn't match any connected Page by name either — it looks like a placeholder or a misremembered name rather than a resolved id. Call meta.list_pages to get the real id, don't invent one. Connected Pages: ${
+          pages.map((p) => `${p.name} (${p.id})`).join(", ") || "(none)"
+        }.`
       );
       err.code = "META_PAGE_ID_REQUIRED";
       throw err;

@@ -83,6 +83,23 @@ async function resolveWithMemory({ conversationId, userId, field, explicitId, sa
   return id;
 }
 
+// Round 11 (live testing), requirements 2/5/6: on a revision, an asset
+// field the model didn't declare via `changingAssets` is never even
+// offered to the resolver — it's reused DIRECTLY from the prior plan's
+// already-resolved id, no network call, no re-derivation. This is
+// deliberately stronger than "re-resolve the same ref and hope it lands on
+// the same answer": it's the literal prior resolved value, so it can never
+// silently drift even if the connected-asset list changes underneath.
+// pixel/catalog reuse additionally requires the ad account itself was ALSO
+// reused (never re-resolved) — both are scoped to a specific ad account,
+// so reusing one without the other could pair a stale Pixel with a
+// different account (requirement 6: "preserve that same ad-account/Pixel
+// PAIR", never independently). instagram reuse likewise requires the Page
+// was reused, since it's derived from the Page. A prior resolved value
+// that's missing/falsy is never reused (the lightweight "validate
+// preserved assets still exist" the requirements ask for, without an extra
+// network round-trip) — resolution falls through to normal handling below.
+
 // Turns a plan's SEMANTIC asset references ("default_ad_account", or a
 // real id the model already confirmed earlier this conversation) into
 // real, verified Meta ids — Step 5: the LLM must never invent
@@ -90,36 +107,59 @@ async function resolveWithMemory({ conversationId, userId, field, explicitId, sa
 // these goes through the same deterministic resolvers the rest of this
 // app's Meta tools use (server/tools/shared/*), never trusted from the
 // plan directly.
-export async function resolvePlanAssets(plan, { userId, accessToken, conversationId }) {
+//
+// priorResolved/changingAssets (round 11): only present on a revision.
+// changingAssets is the set of asset fields the caller has explicitly
+// declared the user asked to change this turn — everything NOT in that set
+// reuses the prior plan's resolved id directly instead of resolving at
+// all. See canReusePrior() above for the ad-account/Pixel/catalog and
+// Page/Instagram pairing rules.
+export async function resolvePlanAssets(plan, { userId, accessToken, conversationId, priorResolved = null, changingAssets = new Set() }) {
   const resolved = { adAccountId: null, pageId: null, instagramId: null, pixelId: null, catalogId: null };
   const resolutionErrors = [];
   const saved = getConversationAssets(conversationId);
 
-  try {
-    const explicitId = SEMANTIC_REFS.has(plan.ad_account?.ref) ? undefined : plan.ad_account?.ref;
-    resolved.adAccountId = await resolveWithMemory({
-      conversationId, userId, field: "adAccount", explicitId, savedId: saved.selectedAdAccountId,
-      resolve: (id) => resolveAdAccountId({ userId, accessToken, providedAdAccountId: id }),
-      staleCodes: ["META_AD_ACCOUNT_NOT_FOUND"],
-    });
-  } catch (err) {
-    resolutionErrors.push({ field: "ad_account", message: err.message, code: err.code });
+  let adAccountReused = false;
+  if (priorResolved?.adAccountId && !changingAssets.has("ad_account")) {
+    resolved.adAccountId = priorResolved.adAccountId;
+    adAccountReused = true;
+  } else {
+    try {
+      const explicitId = SEMANTIC_REFS.has(plan.ad_account?.ref) ? undefined : plan.ad_account?.ref;
+      resolved.adAccountId = await resolveWithMemory({
+        conversationId, userId, field: "adAccount", explicitId, savedId: saved.selectedAdAccountId,
+        resolve: (id) => resolveAdAccountId({ userId, accessToken, providedAdAccountId: id }),
+        staleCodes: ["META_AD_ACCOUNT_NOT_FOUND"],
+      });
+    } catch (err) {
+      resolutionErrors.push({ field: "ad_account", message: err.message, code: err.code });
+    }
   }
 
-  try {
-    const explicitId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
-    resolved.pageId = await resolveWithMemory({
-      conversationId, userId, field: "facebookPage", explicitId, savedId: saved.selectedFacebookPageId,
-      resolve: (id) => resolvePageId({ accessToken, providedPageId: id, userId }),
-      staleCodes: ["META_PAGE_NOT_FOUND"],
-    });
-  } catch (err) {
-    resolutionErrors.push({ field: "facebook_page", message: err.message, code: err.code });
+  let pageReused = false;
+  if (priorResolved?.pageId && !changingAssets.has("facebook_page")) {
+    resolved.pageId = priorResolved.pageId;
+    pageReused = true;
+  } else {
+    try {
+      const explicitId = SEMANTIC_REFS.has(plan.facebook_page?.ref) ? undefined : plan.facebook_page?.ref;
+      resolved.pageId = await resolveWithMemory({
+        conversationId, userId, field: "facebookPage", explicitId, savedId: saved.selectedFacebookPageId,
+        resolve: (id) => resolvePageId({ accessToken, providedPageId: id, userId }),
+        staleCodes: ["META_PAGE_NOT_FOUND"],
+      });
+    } catch (err) {
+      resolutionErrors.push({ field: "facebook_page", message: err.message, code: err.code });
+    }
   }
 
   if (plan.instagram_identity && resolved.pageId) {
-    resolved.instagramId = await meta.getInstagramAccountId(accessToken, resolved.pageId).catch(() => null);
-    if (conversationId && resolved.instagramId) saveConversationAsset(conversationId, userId, "instagram", resolved.instagramId);
+    if (priorResolved?.instagramId && pageReused && !changingAssets.has("instagram_identity")) {
+      resolved.instagramId = priorResolved.instagramId;
+    } else {
+      resolved.instagramId = await meta.getInstagramAccountId(accessToken, resolved.pageId).catch(() => null);
+      if (conversationId && resolved.instagramId) saveConversationAsset(conversationId, userId, "instagram", resolved.instagramId);
+    }
   }
 
   // Attempted whenever the plan references a pixel OR the optimization
@@ -136,28 +176,36 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
   // Pixel exists) didn't carry forward, which resolveWithMemory now fixes
   // the same way it does for the ad account and Page.
   if ((plan.pixel || PURCHASE_LIKE_EVENTS.has(plan.optimization_event)) && resolved.adAccountId) {
-    try {
-      const explicitId = !plan.pixel || SEMANTIC_REFS.has(plan.pixel.ref) ? undefined : plan.pixel.ref;
-      resolved.pixelId = await resolveWithMemory({
-        conversationId, userId, field: "pixel", explicitId, savedId: saved.selectedPixelId,
-        resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id }).then((r) => r.pixelId),
-        staleCodes: ["META_PIXEL_NOT_FOUND"],
-      });
-    } catch (err) {
-      resolutionErrors.push({ field: "pixel", message: err.message, code: err.code });
+    if (priorResolved?.pixelId && adAccountReused && !changingAssets.has("pixel")) {
+      resolved.pixelId = priorResolved.pixelId;
+    } else {
+      try {
+        const explicitId = !plan.pixel || SEMANTIC_REFS.has(plan.pixel.ref) ? undefined : plan.pixel.ref;
+        resolved.pixelId = await resolveWithMemory({
+          conversationId, userId, field: "pixel", explicitId, savedId: saved.selectedPixelId,
+          resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id }).then((r) => r.pixelId),
+          staleCodes: ["META_PIXEL_NOT_FOUND"],
+        });
+      } catch (err) {
+        resolutionErrors.push({ field: "pixel", message: err.message, code: err.code });
+      }
     }
   }
 
   if (plan.catalog && resolved.adAccountId) {
-    try {
-      const explicitId = SEMANTIC_REFS.has(plan.catalog.ref) ? undefined : plan.catalog.ref;
-      resolved.catalogId = await resolveWithMemory({
-        conversationId, userId, field: "catalog", explicitId, savedId: saved.selectedCatalogId,
-        resolve: (id) => resolveCatalogId({ accessToken, adAccountId: resolved.adAccountId, providedCatalogId: id }).then((r) => r.catalogId),
-        staleCodes: ["META_CATALOG_NOT_FOUND"],
-      });
-    } catch (err) {
-      resolutionErrors.push({ field: "catalog", message: err.message, code: err.code });
+    if (priorResolved?.catalogId && adAccountReused && !changingAssets.has("catalog")) {
+      resolved.catalogId = priorResolved.catalogId;
+    } else {
+      try {
+        const explicitId = SEMANTIC_REFS.has(plan.catalog.ref) ? undefined : plan.catalog.ref;
+        resolved.catalogId = await resolveWithMemory({
+          conversationId, userId, field: "catalog", explicitId, savedId: saved.selectedCatalogId,
+          resolve: (id) => resolveCatalogId({ accessToken, adAccountId: resolved.adAccountId, providedCatalogId: id }).then((r) => r.catalogId),
+          staleCodes: ["META_CATALOG_NOT_FOUND"],
+        });
+      } catch (err) {
+        resolutionErrors.push({ field: "catalog", message: err.message, code: err.code });
+      }
     }
   }
 
@@ -268,16 +316,37 @@ export const EXECUTABLE_STATUSES = new Set(["proposed", "approved"]);
 // not just daily_budget, before normalizePlanDefaults/validatePlanStructure
 // ever run — so structural validation always sees a COMPLETE plan (prior
 // fields + this call's changes layered on top), never a partial one.
-function mergePlanForRevision(prior, plan) {
-  // Shallow, field-by-field: any key present in `plan` (INCLUDING an
-  // explicit null, e.g. "no pixel needed now") overrides the prior plan's
-  // value for that key; any key plan doesn't mention at all is inherited
-  // whole from the prior plan — correct for both scalar fields (bid_
-  // strategy, cta, objective...) and object-valued ones (facebook_page,
-  // ad_account, pixel, catalog, goal_classification, creative_strategy)
-  // since those are always set/omitted as a whole, never partially, by
-  // either the model or this merge.
-  return { ...prior.planData.plan, ...plan };
+// The plan-level asset reference fields — semantic refs or real ids the
+// model puts directly on the plan object. Kept as one list because both
+// the merge below and resolvePlanAssets() (which owns the RESOLVED id
+// side of the same fields) need to agree on exactly what counts as an
+// "asset field."
+const ASSET_PLAN_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"];
+
+// CONFIRMED LIVE BUG (round 11): a revision meant to change only audience/
+// budget instead switched the ad account (act_237956315579168 ->
+// act_769398062628867) and the Facebook Page (Beautybeespk ->
+// "careonabudget.pk", sent as a raw NAME instead of a real numeric id) —
+// neither asked for by the user. Root cause: round 8/9's plain "any key
+// present in `plan` overrides prior" merge treats ANY value the model
+// happens to include for an asset field as an intentional change, even
+// when the model only restated it as a side effect of fixing an unrelated
+// structural error (e.g. being told "ad_account missing" and then
+// inventing a value instead of leaving it out so the merge could carry the
+// real one forward). Requirement 3: "previous resolved asset > new
+// model-generated asset suggestion" — asset fields need a higher bar than
+// "the model happened to include this key," so they're merged separately
+// and deliberately: any key in ASSET_PLAN_FIELDS that plan sets is
+// DISCARDED unless the caller explicitly declared that field is changing
+// this turn (changingAssets — see tools/meta/metaExpert.js's dedicated
+// parameter for how that gets declared). Every other field keeps the
+// original "any key present overrides" behavior from round 9.
+function mergePlanForRevision(prior, plan, changingAssets) {
+  const merged = { ...prior.planData.plan, ...plan };
+  for (const field of ASSET_PLAN_FIELDS) {
+    if (!changingAssets.has(field)) merged[field] = prior.planData.plan[field];
+  }
+  return merged;
 }
 
 // Confirmed live (round 4): the model omitted audience_basis on its first
@@ -349,8 +418,13 @@ function protectValidPriorEnumFieldsOnRevision(prior, plan) {
   return result;
 }
 
-export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
+export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId, changingAssets: changingAssetsInput }) {
   const attemptNumber = nextAttemptNumberForConversation(conversationId);
+  // Round 11: an explicit, backend-enforced declaration of which asset
+  // fields the user actually asked to change this turn — never inferred
+  // from "the model happened to include this field." See
+  // ASSET_PLAN_FIELDS/mergePlanForRevision above for how this is used.
+  const changingAssets = new Set(Array.isArray(changingAssetsInput) ? changingAssetsInput.filter((f) => ASSET_PLAN_FIELDS.includes(f)) : []);
 
   let planInput = plan;
   let prior = null;
@@ -374,7 +448,7 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
       trace("createPlan rejection", { conversationId, attemptNumber, stage: "revision_not_active", revisesPlanId, priorStatus: prior.status, accepted: false, repairGuidance });
       return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
     }
-    planInput = mergePlanForRevision(prior, plan);
+    planInput = mergePlanForRevision(prior, plan, changingAssets);
   }
 
   // Round 10 (live testing), requirement 4's exact order: merge (above) ->
@@ -426,7 +500,11 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   // alias kept because the rest of this function already reads that name.
   const effectivePlan = normalizedPlan;
 
-  const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, { userId, accessToken, conversationId });
+  const { resolved, resolutionErrors } = await resolvePlanAssets(effectivePlan, {
+    userId, accessToken, conversationId,
+    priorResolved: prior?.planData?.resolved || null,
+    changingAssets,
+  });
   const contextual = validatePlanAgainstContext(effectivePlan, {
     resolvedAdAccountId: resolved.adAccountId,
     resolvedPageId: resolved.pageId,
@@ -588,11 +666,24 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   }
 
   // Resolve human-readable names for the recommendation text — the
-  // customer sees "BeautyBeesBackup", never "act_237956315579168".
-  const [adAccounts, pages] = await Promise.all([meta.listAdAccounts(accessToken), meta.listPages(accessToken)]);
+  // customer sees "BeautyBeesBackup", never "act_237956315579168". Round
+  // 11: when an asset was REUSED from the prior plan rather than
+  // re-resolved, its name is reused from the prior plan's own stored
+  // `names` too, instead of an unconditional fresh meta.listAdAccounts()/
+  // listPages() call — part of "no meta.list_pages call is required" for a
+  // revision that isn't touching Pages/ad accounts at all.
+  const adAccountNameReusable = revisesPlanId && prior && !changingAssets.has("ad_account") && resolved.adAccountId === prior.planData.resolved?.adAccountId;
+  const pageNameReusable = revisesPlanId && prior && !changingAssets.has("facebook_page") && resolved.pageId === prior.planData.resolved?.pageId;
+  const [adAccountName, pageName] = await Promise.all([
+    adAccountNameReusable && prior.planData.names
+      ? prior.planData.names.adAccountName
+      : meta.listAdAccounts(accessToken).then((accounts) => accounts.find((a) => a.id === resolved.adAccountId)?.name || null),
+    pageNameReusable && prior.planData.names
+      ? prior.planData.names.pageName
+      : meta.listPages(accessToken).then((pages) => pages.find((p) => p.id === resolved.pageId)?.name || null),
+  ]);
   const names = {
-    adAccountName: adAccounts.find((a) => a.id === resolved.adAccountId)?.name || null,
-    pageName: pages.find((p) => p.id === resolved.pageId)?.name || null,
+    adAccountName, pageName,
     instagramUsername: null, // Phase 1 doesn't fetch the IG username separately — accountId is enough to prove the resolution
   };
   trace("final selected Page/ad account", { resolvedPageId: resolved.pageId, resolvedPageName: names.pageName, resolvedAdAccountId: resolved.adAccountId, resolvedAdAccountName: names.adAccountName });

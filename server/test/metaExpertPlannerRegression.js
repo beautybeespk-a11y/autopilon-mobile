@@ -1679,6 +1679,116 @@ async function run() {
     }
   });
 
+  // --- Round 11, live testing: the EXACT next production failure after
+  //    round 10's fix — a revision meant to change only audience/budget
+  //    instead lost required state (ad_account/confidence/approval_required
+  //    missing on attempt #1) and, on the repair attempt, switched assets
+  //    nobody asked to change: ad_account act_237956315579168 ->
+  //    act_769398062628867, and facebook_page sent as the raw NAME
+  //    "careonabudget.pk" instead of Beautybeespk's real numeric id — Meta
+  //    correctly rejected the name with META_PAGE_ID_REQUIRED, and Purchase
+  //    optimization then failed because the NEW ad account had no Pixel.
+  //    Two connected ad accounts, two connected Pages, and a Pixel that
+  //    exists on only ONE of the ad accounts — mirrors the live asset
+  //    ambiguity exactly, so this test can only pass if asset state is
+  //    genuinely preserved, not merely "happens to land on the same answer."
+  await check("[acceptance, exact live case] a revision that only asks to improve audience/budget preserves every prior resolved asset and required state field, ignoring the model's accidental Page-name/ad-account mutation", async () => {
+    const userId = makeUser(`accept-preserve-assets-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    let pageListCalls = 0;
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname.startsWith("/wp-json/wc/v3/")) return jsonResponse([]);
+      if (u.pathname.endsWith("/me/accounts")) pageListCalls += 1;
+      return metaRouter({
+        adAccounts: [
+          { id: "act_237956315579168", name: "BJ" },
+          { id: "act_769398062628867", name: "Moazzam Dhanani" },
+        ],
+        pages: [
+          { id: "717559728109412", name: "Beautybeespk" },
+          { id: "790544870819230", name: "Careonabudget.pk" },
+        ],
+        // The Pixel exists ONLY on the FIRST ad account — exactly why the
+        // live bug's accidental account switch broke Purchase optimization.
+        pixels: [{ id: "px1", name: "Store Pixel" }],
+      })(url, options);
+    });
+    try {
+      // Starting point: a valid, fully-resolved Sales plan explicitly on
+      // Beautybeespk / the first (default) ad account / its Pixel.
+      const initialPlan = basePlan({
+        ad_account: { ref: "act_237956315579168" },
+        facebook_page: { ref: "717559728109412" },
+        pixel: { ref: "default_pixel" },
+        bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+        cta: "SHOP_NOW",
+        confidence: "HIGH",
+        approval_required: true,
+        open_questions: [],
+      });
+      const initial = await runTool({ toolName: "meta_expert.create_campaign_plan", parameters: initialPlan, userId, agentId, conversationId });
+      assert.equal(initial.status, "completed", JSON.stringify(initial));
+      assert.equal(initial.result.valid, true, JSON.stringify(initial.result));
+      const initialStored = getStoredPlan(userId, initial.result.planId);
+      assert.equal(initialStored.planData.resolved.adAccountId, "act_237956315579168", "sanity check on the starting state");
+      assert.equal(initialStored.planData.resolved.pageId, "717559728109412", "sanity check on the starting state");
+      assert.ok(initialStored.planData.resolved.pixelId, "sanity check: the starting plan must have a real resolved Pixel");
+
+      const pageListCallsBeforeRevision = pageListCalls;
+
+      // "Review my WooCommerce products, Meta history, and audience data,
+      // then improve the audience and budget before I approve it" — the
+      // model's partial revision, shaped exactly like the live failure:
+      // audience/budget genuinely changing, ad_account/confidence/
+      // approval_required simply omitted (not restated), and an accidental
+      // facebook_page NAME mutation nobody asked for — critically, WITHOUT
+      // declaring facebook_page in changingAssets, since the user never
+      // asked to switch Pages.
+      const revision = await runTool({
+        toolName: "meta_expert.create_campaign_plan",
+        parameters: {
+          gender: "FEMALE", age_min: 25, age_max: 45,
+          audience_basis: "PRODUCT_CATEGORY", audience_reasoning: "Reviewed WooCommerce products and Meta account history — this category performs best with women 25-45.",
+          daily_budget: 4000, budget_basis: "HEURISTIC_STARTING_TEST",
+          reasoning_summary: "Improved audience targeting and budget based on store and account history.",
+          facebook_page: "careonabudget.pk", // accidental — never declared as changing
+          revisesPlanId: initial.result.planId,
+          // changingAssets deliberately omitted — nothing was asked to change.
+        },
+        userId, agentId, conversationId,
+      });
+
+      assert.equal(revision.status, "completed", JSON.stringify(revision));
+      assert.equal(revision.result.valid, true, `must validate on the first attempt with every prior asset/state field preserved: ${JSON.stringify(revision.result)}`);
+
+      const revisedStored = getStoredPlan(userId, revision.result.planId);
+      // Prior resolved assets preserved exactly — not merely re-resolved to
+      // the same answer, the literal prior resolved ids.
+      assert.equal(revisedStored.planData.resolved.adAccountId, "act_237956315579168", "the ad account must NEVER switch during an audience/budget-only revision");
+      assert.equal(revisedStored.planData.resolved.pageId, "717559728109412", "the accidental 'careonabudget.pk' Page-name mutation must be ignored entirely — Beautybeespk's real id must be preserved");
+      assert.equal(revisedStored.planData.resolved.pixelId, initialStored.planData.resolved.pixelId, "the Pixel must stay paired with the SAME ad account — no Pixel-resolution failure");
+      // Required state fields preserved without the model restating them.
+      assert.equal(revisedStored.planData.plan.confidence, "HIGH");
+      assert.equal(revisedStored.planData.plan.approval_required, true);
+      assert.equal(revisedStored.planData.plan.bid_strategy, "LOWEST_COST_WITHOUT_CAP");
+      assert.equal(revisedStored.planData.plan.cta, "SHOP_NOW");
+      // The fields actually being revised did change.
+      assert.equal(revisedStored.planData.plan.gender, "FEMALE");
+      assert.equal(revisedStored.planData.plan.daily_budget, 4000);
+      // No fresh meta.list_pages call was needed to preserve the Page —
+      // the prior RESOLVED id was reused directly, not re-derived.
+      assert.equal(pageListCalls, pageListCallsBeforeRevision, "no meta.list_pages call should happen for an asset that isn't changing");
+      assert.match(revision.result.recommendationText, /Beautybeespk/, "the recommendation must reflect the PRESERVED Page");
+      assert.doesNotMatch(revision.result.recommendationText, /Careonabudget/i, "the accidental Page mutation must never reach the customer-facing recommendation");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Round 5, Issue 5 confirmed live root cause: no Default Facebook
   //    Page mechanism existed at all, so every fresh conversation (no
   //    conversation-scoped memory yet, since none exists until a plan is
