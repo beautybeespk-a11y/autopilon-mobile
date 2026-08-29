@@ -123,6 +123,106 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
   return null;
 }
 
+// CONFIRMED LIVE BUG (round 13): "Why did you choose all genders 18-65 and
+// PKR 10,000/day? Review my WooCommerce products, Meta history, and
+// audience data, then improve the plan before I approve it" was answered
+// directly from conversational memory — the Agent Trace showed only
+// Planning -> Completed, no tool ever called. The reply repeated stale
+// claims almost verbatim from earlier turns, including "your account
+// lacks a connected Meta Pixel" — directly contradicted by that SAME
+// conversation's own earlier research_business_context result
+// (metaPixelCount: 2) — and asked the user to design demographics/budget
+// themselves, exactly the intake-form behavior this agent is supposed to
+// never exhibit. Nothing backend-enforced ever required the model to
+// actually call a tool for this kind of request; every other gate in this
+// file (checkExecutionApprovalGate, checkCreatePlanRetryGate) only engages
+// AFTER the model has already decided to call a specific tool.
+//
+// Two deterministic triggers, checked ONLY when stepsRun === 0 (no tool
+// has been called yet THIS turn — once one has, the model is answering
+// from fresh data, not memory, so neither trigger applies past that
+// point):
+//
+//   1. Plan review/revision intent while an active plan exists: "review,"
+//      "improve," "optimize," "reconsider," "why did you choose," etc.
+//      aimed at the plan/audience/budget/targeting. This must always go
+//      through the real revision path (research first if data was asked
+//      for, then create_campaign_plan with revisesPlanId) — never a
+//      conversational answer built from what the assistant said earlier.
+//   2. A direct question about CURRENT connected integration state (a
+//      Pixel, Page, ad account, WooCommerce/Shopify connection) — these
+//      facts can only be known by actually checking, and change over time
+//      (a Pixel can be added after an earlier turn correctly said there
+//      wasn't one) — a "final" answer to one of these with no tool call
+//      this turn is answering from potentially-stale memory, not fact.
+//
+// Deliberately loose/non-exhaustive regexes — same trade-off
+// NARRATION_WITHOUT_ACTION above already documents: an occasional
+// unnecessary nudge (one extra model turn, capped by
+// MAX_STALE_ANSWER_NUDGES) is far cheaper than a real live bug like this
+// one going uncaught.
+const PLAN_REVIEW_INTENT_PATTERNS = new RegExp(
+  [
+    /\breview\b.{0,60}\b(plan|campaign|audience|budget|woocommerce|shopify|meta (history|data)|account data)\b/i,
+    /\b(improve|optimi[sz]e|reconsider|refine|re-?evaluate|revise)\b.{0,40}\b(plan|campaign|audience|budget|targeting)\b/i,
+    /\bwhy did you (choose|pick|select|recommend|set)\b/i,
+    /\bwhy (was|is) (that|this|the)\b.{0,40}\b(audience|budget|amount|targeting|chosen|choice)\b/i,
+    /\bchange the audience\b/i,
+    /\buse my (account|store|woocommerce|shopify|meta) (data|history)\b.{0,40}\b(refine|improve|revise|campaign|plan)\b/i,
+    /\brefresh (my|the) (data|research)\b/i,
+  ]
+    .map((r) => r.source)
+    .join("|"),
+  "i"
+);
+const INTEGRATION_STATE_NOUN_PATTERN = /\b(pixel|meta pixel|facebook page|ad account|woocommerce|shopify)\b/i;
+const INTEGRATION_STATE_QUESTION_PATTERNS = new RegExp(
+  [
+    // Verb before the noun ("do I have a Pixel", "is WooCommerce connected").
+    /\b(does|do|is|are|has|have)\b.{0,30}\b(pixel|meta pixel|facebook page|ad account|woocommerce|shopify)\b/i,
+    // Noun before the verb ("my Pixel — is it connected?").
+    /\b(pixel|meta pixel|facebook page|ad account|woocommerce|shopify)\b.{0,30}\b(connect|exist|set ?up|selected|active)\b/i,
+    /\bwhat('| i)?s? my (default )?(ad account|facebook page|pixel)\b/i,
+  ]
+    .map((r) => r.source)
+    .join("|"),
+  "i"
+);
+// A short follow-up ("are you sure? check again.") carries no
+// integration-state keywords of its own — it only makes sense read against
+// what was just said. If the immediately preceding assistant turn asserted
+// an integration-state fact (e.g. "no Pixel connected") and the user is
+// now pressing on it, that assertion must be re-verified with a real tool
+// call, not repeated from memory a second time.
+const STALE_CLAIM_FOLLOWUP_PATTERNS = /\b(are you sure|sure\?|check again|double[- ]check|confirm that|verify that|really\?|are you certain)\b/i;
+const MAX_STALE_ANSWER_NUDGES = 1;
+
+// Returns a nudge message when the model's "final" decision should be
+// blocked because it's answering a plan-review/revision request or an
+// integration-state question without ever calling a tool this turn — or
+// null when neither trigger applies. `hasMetaExpertTools` guards against
+// nudging an agent that doesn't even have the Meta Expert skill enabled.
+// `lastAssistantMessage` (the most recent assistant turn in history, if
+// any) lets a content-free follow-up ("are you sure? check again.") be
+// matched against the integration-state claim it's actually challenging.
+function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpertTools, lastAssistantMessage }) {
+  if (!hasMetaExpertTools || typeof userMessage !== "string") return null;
+  if (hasActivePlan && PLAN_REVIEW_INTENT_PATTERNS.test(userMessage)) {
+    return 'This looks like a request to review or revise the ACTIVE campaign plan (e.g. "review my data," "why did you choose this audience/budget," "improve/reconsider the plan") — that must go through the real revision path, never a conversational answer from memory. If the user asked you to review WooCommerce products, Meta account history, or audience data, call meta_expert.research_business_context first to get CURRENT data — a Pixel or connection status can change between turns, never state it from what an earlier turn said. Then call meta_expert.create_campaign_plan with revisesPlanId set to the active plan\'s id, changing only what the current evidence actually supports, before presenting anything to the user.';
+  }
+  if (INTEGRATION_STATE_QUESTION_PATTERNS.test(userMessage)) {
+    return "This asks about CURRENT connected integration state (a Pixel, Page, ad account, or store connection) — these can change between turns and must never be answered from what an earlier message said. Call the real lookup tool (meta_expert.research_business_context, meta.list_pages, meta.list_ad_accounts, etc. as appropriate) to get the CURRENT answer before replying.";
+  }
+  if (
+    STALE_CLAIM_FOLLOWUP_PATTERNS.test(userMessage) &&
+    typeof lastAssistantMessage === "string" &&
+    INTEGRATION_STATE_NOUN_PATTERN.test(lastAssistantMessage)
+  ) {
+    return "The user is pressing on an integration-state claim (a Pixel, Page, ad account, or store connection) made in the previous turn. That claim can go stale between turns and must be re-verified with a real tool call now, not simply repeated from memory. Call the real lookup tool (meta_expert.research_business_context, meta.list_pages, meta.list_ad_accounts, etc. as appropriate) to get the CURRENT answer before replying.";
+  }
+  return null;
+}
+
 // Issue 5 (live testing round 5): "I want more sales to my website" put
 // the model into an unbounded loop calling meta_expert.create_campaign_plan
 // six times, each presumably rejected, until MAX_STEPS was hit and the
@@ -394,7 +494,9 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let narrationNudges = 0;
   let malformedNudges = 0;
   let leakNudges = 0;
+  let staleAnswerNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
+  const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert."));
   let createPlanAttempts = 0;
   let lastCreatePlanFingerprint = null;
   let lastCreatePlanWasRejected = false;
@@ -474,6 +576,27 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           },
         ];
         continue;
+      }
+      // Round 13 (live testing): only fires on the FIRST model decision of
+      // this turn — once stepsRun > 0, a tool HAS already been called this
+      // turn, so the model is answering from fresh data, not memory.
+      if (stepsRun === 0 && staleAnswerNudges < MAX_STALE_ANSWER_NUDGES) {
+        const lastAssistantMessage = [...history].reverse().find((m) => m?.role === "assistant")?.content;
+        const staleGateMessage = checkStaleFactualAnswerGate({
+          userMessage,
+          hasActivePlan: Boolean(getActivePlanForConversation(userId, conversationId)),
+          hasMetaExpertTools,
+          lastAssistantMessage,
+        });
+        if (staleGateMessage) {
+          staleAnswerNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            { role: "user", content: staleGateMessage },
+          ];
+          continue;
+        }
       }
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));

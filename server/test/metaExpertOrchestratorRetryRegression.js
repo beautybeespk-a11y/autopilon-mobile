@@ -27,6 +27,7 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection } = await import("../integrations/manager.js");
 const { orchestrate } = await import("../orchestrator/index.js");
+const { getActivePlanForConversation, getStoredPlan } = await import("../agents/metaExpert/planner.js");
 await import("../tools/index.js"); // registers meta_expert.* tools
 
 const results = [];
@@ -337,6 +338,266 @@ async function run() {
       assert.equal(planCalls[0].result?.valid, false);
       assert.equal(planCalls[1].result?.valid, false);
       assert.match(result.reply, /couldn't finalize the campaign recommendation automatically/i, `expected the customer-safe fallback message, got: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 13, live testing: "Why did you choose all genders 18-65 and
+  //    PKR 10,000/day? Review my WooCommerce products, Meta history, and
+  //    audience data, then improve the plan before I approve it" was
+  //    answered directly from conversational memory — Agent Trace showed
+  //    only Planning -> Completed, no tool ever called, and the reply
+  //    repeated a stale claim ("no Meta Pixel connected") the SAME
+  //    conversation's own earlier research had already contradicted. These
+  //    tests drive the REAL two-turn conversation: turn 1 creates a real
+  //    active plan through orchestrate() itself (not faked), turn 2 sends
+  //    the review/revision-shaped message with the model's SCRIPTED first
+  //    response being the exact bad shape (a confident "final" answer, no
+  //    tool call) — proving the new gate intercepts it and forces a real
+  //    tool call before any reply reaches the user.
+  await check("[round 13] active plan + 'Review my WooCommerce products and improve the audience' forces the revision tool to be invoked, not a memory-only answer", async () => {
+    const userId = makeUser(`route-review-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+
+    // Turn 1: establish a REAL active plan the normal way.
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture,
+      chatResponses: [researchCall, planCall(basePlan()), finalText("Recommended: Sales objective, Purchase optimization, PKR 2,000/day. Approve to proceed?")],
+    });
+    const turn1Message = "I want more sales to my website";
+    let turn1;
+    try {
+      turn1 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn1Message,
+        history: [{ role: "user", content: turn1Message }],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+    } finally {
+      restoreFetch();
+    }
+    const activePlan = getActivePlanForConversation(userId, conversationId);
+    assert.ok(activePlan, "turn 1 must have created a real active plan");
+
+    // Turn 2: the review request. The model's FIRST scripted response is
+    // the exact live-bug shape — a confident, tool-less "final" answer
+    // with a stale Pixel claim — proving the gate catches it before it
+    // ever reaches the user.
+    const staleBadAnswer = "All genders 18-65 is a reasonable choice, and PKR 10,000/day is a reasonable budget. Also, your account lacks a connected Meta Pixel. Please choose your preferred demographics and budget.";
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture,
+      chatResponses: [
+        finalText(staleBadAnswer), // the live bug — must be intercepted
+        researchCall,
+        planCall({ audience_reasoning: "Reviewed WooCommerce products and Meta history.", revisesPlanId: activePlan.id }),
+        finalText("Reviewed your store and account data — recommend keeping the current audience and budget, both are well-supported. Approve to proceed?"),
+      ],
+    });
+    const turn2Message = "Why did you choose all genders 18-65 and PKR 10,000/day? Review my WooCommerce products, Meta history, and audience data, then improve the plan before I approve it.";
+    try {
+      const turn2 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn2Message,
+        history: [
+          { role: "user", content: turn1Message },
+          { role: "assistant", content: turn1.reply },
+          { role: "user", content: turn2Message },
+        ],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+      assert.notEqual(turn2.reply, staleBadAnswer, "the stale, tool-less answer must never reach the user");
+      const toolNames = turn2.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert.research_business_context"), `research_business_context must be called when the user explicitly asked to review WooCommerce/Meta data: ${JSON.stringify(toolNames)}`);
+      assert.ok(toolNames.includes("meta_expert.create_campaign_plan"), `the revision tool must be invoked, not a memory-only answer: ${JSON.stringify(toolNames)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 13] active plan + 'Why did you choose PKR 10,000/day? Reconsider it.' forces the revision path, not a chat-only answer", async () => {
+    const userId = makeUser(`route-reconsider-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture,
+      chatResponses: [researchCall, planCall(basePlan()), finalText("Recommended: Sales objective, Purchase optimization, PKR 2,000/day. Approve to proceed?")],
+    });
+    const turn1Message = "I want more sales to my website";
+    let turn1;
+    try {
+      turn1 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn1Message,
+        history: [{ role: "user", content: turn1Message }],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+    } finally {
+      restoreFetch();
+    }
+    const activePlan = getActivePlanForConversation(userId, conversationId);
+    assert.ok(activePlan);
+
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture,
+      chatResponses: [
+        finalText("PKR 2,000/day is a reasonable starting budget based on typical costs in this category."), // no tool call — must be intercepted
+        planCall({ daily_budget: 3000, budget_basis: "HEURISTIC_STARTING_TEST", reasoning_summary: "Reconsidered the budget upward slightly for better initial reach.", revisesPlanId: activePlan.id }),
+        finalText("Reconsidered — recommend PKR 3,000/day for better initial reach. Approve to proceed?"),
+      ],
+    });
+    const turn2Message = "Why did you choose PKR 10,000/day? Reconsider it.";
+    try {
+      const turn2 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn2Message,
+        history: [
+          { role: "user", content: turn1Message },
+          { role: "assistant", content: turn1.reply },
+          { role: "user", content: turn2Message },
+        ],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+      const toolNames = turn2.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert.create_campaign_plan"), `the revision path must run, not a chat-only answer: ${JSON.stringify(toolNames)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 13] 'Does my Meta account have a Pixel?' forces a real tool call — a stale conversational claim is never returned directly", async () => {
+    const userId = makeUser(`route-pixel-question-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture, // metaFixture has exactly one real, connected Pixel
+      chatResponses: [
+        finalText("No, your Meta account does not have a Pixel connected."), // must be intercepted — no tool called
+        researchCall,
+        finalText("Yes — your account has a connected Pixel (Store Pixel)."),
+      ],
+    });
+    const userMessage = "Does my Meta account have a Pixel?";
+    try {
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [{ role: "user", content: userMessage }],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert.research_business_context"), `a real tool must be called to answer an integration-state question, not memory: ${JSON.stringify(toolNames)}`);
+      assert.match(result.reply, /has a connected pixel/i, "the final reply must reflect the real, current tool result");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 13] a stale 'no Pixel' claim earlier in the conversation history does not exempt the current turn from checking current tool data", async () => {
+    const userId = makeUser(`route-pixel-stale-history-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+
+    global.fetch = scriptedFetch({
+      metaOpts: metaFixture, // a real Pixel IS connected now, despite the stale history claim below
+      chatResponses: [
+        finalText("As I mentioned, your account has no Meta Pixel connected."), // repeating the stale claim — must be intercepted
+        researchCall,
+        finalText("Checked again — your account now has a connected Pixel (Store Pixel)."),
+      ],
+    });
+    const priorUserMessage = "Does my account have a Pixel?";
+    const priorStaleAssistantReply = "No, your account does not have a Meta Pixel connected.";
+    const userMessage = "Are you sure? Check again.";
+    try {
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [
+          { role: "user", content: priorUserMessage },
+          { role: "assistant", content: priorStaleAssistantReply },
+          { role: "user", content: userMessage },
+        ],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+      const researchResult = result.toolResults.find((r) => r.toolName === "meta_expert.research_business_context");
+      assert.ok(researchResult, "current tool data must be fetched rather than trusting the stale history claim");
+      assert.ok(researchResult.result?.knownFacts?.meta?.pixels?.length > 0, `the CURRENT tool result must show the real, currently-connected Pixel: ${JSON.stringify(researchResult.result?.knownFacts?.meta)}`);
+      assert.match(result.reply, /has a connected pixel|does have a connected pixel|now has a connected pixel/i, "the current tool result must win over the stale history claim");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 13] a review/revision request preserves the prior resolved Page/ad account/Pixel unless explicitly changed", async () => {
+    const userId = makeUser(`route-preserve-assets-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const twoPageFixture = {
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "555555555555555", name: "Careonabudget.pk" }],
+      pixels: [{ id: "px1", name: "Store Pixel" }],
+    };
+
+    // Turn 1: explicitly select Beautybeespk (declared via changingAssets,
+    // per round 12's requirement for a real id to count as intentional).
+    global.fetch = scriptedFetch({
+      metaOpts: twoPageFixture,
+      chatResponses: [
+        researchCall,
+        planCall({ ...basePlan(), facebook_page: { ref: "717559728109412" }, pixel: { ref: "default_pixel" }, changingAssets: ["facebook_page"] }),
+        finalText("Recommended plan using Beautybeespk. Approve to proceed?"),
+      ],
+    });
+    const turn1Message = "I want more sales to my website, use my Beautybeespk page";
+    let turn1;
+    try {
+      turn1 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn1Message,
+        history: [{ role: "user", content: turn1Message }],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+    } finally {
+      restoreFetch();
+    }
+    const activePlan = getActivePlanForConversation(userId, conversationId);
+    assert.ok(activePlan);
+    assert.equal(activePlan.planData.resolved.pageId, "717559728109412", "sanity check on the starting state");
+
+    // Turn 2: review/improve the audience — NOT asking to change the Page —
+    // the model's revision call omits facebook_page/changingAssets
+    // entirely, exactly as agentLibrary.js instructs for an unrelated
+    // revision.
+    global.fetch = scriptedFetch({
+      metaOpts: twoPageFixture,
+      chatResponses: [
+        finalText("All genders 18-65 is reasonable."), // stale answer — must be intercepted
+        researchCall,
+        planCall({ gender: "FEMALE", audience_reasoning: "Reviewed store data — this category performs best with women.", revisesPlanId: activePlan.id }),
+        finalText("Reviewed and narrowed the audience to women. Approve to proceed?"),
+      ],
+    });
+    const turn2Message = "Review my data and improve the audience.";
+    try {
+      const turn2 = await orchestrate({
+        userId, agentId, conversationId, userMessage: turn2Message,
+        history: [
+          { role: "user", content: turn1Message },
+          { role: "assistant", content: turn1.reply },
+          { role: "user", content: turn2Message },
+        ],
+        agentSystemPrompt: "You are the Meta Ads Expert.",
+      });
+      const revisionCall = turn2.toolResults.find((r) => r.toolName === "meta_expert.create_campaign_plan");
+      assert.ok(revisionCall?.result?.valid, `the revision must validate: ${JSON.stringify(revisionCall)}`);
+      const revisedStored = getStoredPlan(userId, revisionCall.result.planId);
+      assert.equal(revisedStored.planData.resolved.pageId, "717559728109412", "the Page must be preserved — the review request never asked to change it");
+      assert.equal(revisedStored.planData.plan.gender, "FEMALE", "the field actually being revised must still change");
     } finally {
       restoreFetch();
     }
