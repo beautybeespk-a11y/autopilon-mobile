@@ -206,7 +206,7 @@ export async function resolvePlanAssets(plan, { userId, accessToken, conversatio
         const explicitId = explicitAssetRef(plan.pixel, "pixel", changingAssets);
         resolved.pixelId = await resolveWithMemory({
           conversationId, userId, field: "pixel", explicitId, savedId: saved.selectedPixelId,
-          resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id }).then((r) => r.pixelId),
+          resolve: (id) => resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: id, userId }).then((r) => r.pixelId),
           staleCodes: ["META_PIXEL_NOT_FOUND"],
         });
       } catch (err) {
@@ -417,6 +417,22 @@ function deriveCtaIfMissing(plan) {
   return derived ? { ...plan, cta: derived } : plan;
 }
 
+// Round 14 (live production trace), requirement 5: a HEURISTIC_STARTING_TEST
+// daily_budget above MAX_SUGGESTED_DAILY_BUDGET is a MECHANICAL, fully
+// deterministic correction — checkBudgetPolicy() (policy.js) would reject it
+// for exactly this reason every time, with only one possible fix (clamp to
+// the same cap). That's not worth spending one of the model's limited repair
+// attempts on, same reasoning as normalizePlanEnumAliases/deriveCtaIfMissing
+// above. Applied here, before structural/policy validation ever sees the
+// plan. budget_basis is deliberately left as HEURISTIC_STARTING_TEST (not
+// relabeled) — formatRecommendation()'s "as a conservative starting test
+// budget" explanation still applies correctly to the capped number.
+function capHeuristicBudget(plan) {
+  if (plan.budget_basis !== "HEURISTIC_STARTING_TEST") return plan;
+  if (typeof plan.daily_budget !== "number" || plan.daily_budget <= MAX_SUGGESTED_DAILY_BUDGET) return plan;
+  return { ...plan, daily_budget: MAX_SUGGESTED_DAILY_BUDGET };
+}
+
 // Round 10, requirement 3 (live testing): "the user asked to improve
 // audience/budget reasoning, not bidding strategy" — a revision's incoming
 // payload restating a field it wasn't actually trying to change (the model
@@ -535,13 +551,21 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   // validation. Alias normalization first (fixes the confirmed
   // LOWEST_COST_WITHOUT_BID_CAP case outright), THEN protect a revision's
   // unrelated valid prior fields from a value normalization couldn't
-  // resolve, THEN derive a missing cta — each step only touches what the
-  // previous one left unresolved.
+  // resolve, THEN derive a missing cta, THEN clamp an over-cap heuristic
+  // budget (round 14) — each step only touches what the previous one left
+  // unresolved.
   const { plan: aliasNormalized, appliedAliases } = normalizePlanEnumAliases(planInput);
   const priorProtected = revisesPlanId && prior ? protectValidPriorEnumFieldsOnRevision(prior, aliasNormalized) : aliasNormalized;
-  planInput = deriveCtaIfMissing(priorProtected);
+  const ctaResolved = deriveCtaIfMissing(priorProtected);
+  planInput = capHeuristicBudget(ctaResolved);
   if (traceEnabled && appliedAliases.length) {
     trace("createPlan enum normalization", { conversationId, attemptNumber, appliedAliases });
+  }
+  if (traceEnabled && planInput.daily_budget !== ctaResolved.daily_budget) {
+    trace("createPlan heuristic budget cap", {
+      conversationId, attemptNumber,
+      original: ctaResolved.daily_budget, capped: planInput.daily_budget, cap: MAX_SUGGESTED_DAILY_BUDGET,
+    });
   }
 
   const normalizedPlan = normalizePlanDefaults(userId, planInput);
@@ -582,13 +606,6 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     priorResolved: prior?.planData?.resolved || null,
     changingAssets,
   });
-  const contextual = validatePlanAgainstContext(effectivePlan, {
-    resolvedAdAccountId: resolved.adAccountId,
-    resolvedPageId: resolved.pageId,
-    resolvedPixelId: resolved.pixelId,
-    resolvedInstagramId: resolved.instagramId,
-    resolvedCatalogId: resolved.catalogId,
-  });
 
   // Real, independently-checkable facts (not the model's own claims) that
   // the deterministic policy layer (policy.js) needs — Issue 8: "the LLM
@@ -604,25 +621,70 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   // null EVEN WHEN A REAL PIXEL EXISTS on the account — meaning the whole
   // goal-classification policy below silently never fired for exactly the
   // "traffic requested for an e-commerce store with real tracking" case it
-  // exists to catch. This is the confirmed root cause of the live Traffic
-  // plan for Careonabudget.pk getting created unchecked. Fixed by checking
-  // whether a Pixel exists on the resolved ad account independently of
-  // whether THIS plan happens to reference one — an extra meta.listPixels
-  // call only when the plan's own resolution didn't already answer it, so
-  // this adds a network call only for the exact case that was broken, not
-  // on every plan.
-  let pixelExists = !!resolved.pixelId;
-  if (!pixelExists && resolved.adAccountId) {
+  // exists to catch. Fixed by checking whether a Pixel exists on the
+  // resolved ad account independently of whether THIS plan happens to
+  // reference one — an extra meta.listPixels call only when the plan's own
+  // resolution didn't already answer it.
+  //
+  // CONFIRMED LIVE BUG (round 14): a production trace showed
+  // pixelExists=true, hasPurchaseTracking=true (from this exact block) at
+  // the SAME TIME as resolved.pixelId=null — not a contradiction, but two
+  // genuinely different facts that nothing downstream distinguished:
+  // anyPixelExists only means "at least one Pixel is attached to this ad
+  // account"; it says nothing about whether ONE SPECIFIC Pixel could be
+  // deterministically chosen (2+ Pixels, no saved default, no explicit
+  // choice — resolvePixelId returns null ON PURPOSE rather than guessing,
+  // see tools/shared/metaPixelId.js). The model's only visible signal was
+  // "Pixel required but missing" (planSchema.js's structural rejection),
+  // which it wrongly resolved by abandoning Sales/Purchase for Traffic —
+  // exactly the objective-switching repair requirement 4 forbids. Split
+  // into explicit named signals so each caller uses the one it actually
+  // needs, and to make a pixelAmbiguous plan (2+ available, none resolved)
+  // an open_questions ask rather than a hard rejection, below.
+  let availablePixelsForAdAccount = [];
+  if (resolved.adAccountId) {
     try {
-      const { available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId });
-      pixelExists = available.length > 0;
+      ({ available: availablePixelsForAdAccount } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, userId }));
     } catch {
       // Best-effort signal only — a failure here must never block plan
       // creation; it just means this specific safety net can't confirm a
       // Pixel exists, not that the plan itself is invalid.
     }
   }
+  const anyPixelExists = !!resolved.pixelId || availablePixelsForAdAccount.length > 0;
+  const usablePixelForSelectedAdAccount = !!resolved.pixelId;
   const hasStoreData = !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify"));
+  const purchaseTrackingUsable = hasStoreData && usablePixelForSelectedAdAccount;
+
+  // Requirement 3/4 (round 14, live production trace): a PURCHASE-optimized
+  // plan whose Pixel is genuinely AMBIGUOUS (2+ usable Pixels on this ad
+  // account, none saved as default, none explicit) gets a real, safe path
+  // forward — ask once which Pixel to use — instead of being treated
+  // identically to "no Pixel exists at all" (a genuine tracking blocker).
+  // Deterministic and backend-driven (never left to the model to invent):
+  // "1 available" already auto-resolves inside resolvePixelId itself
+  // (unchanged); "0 available" still hard-fails in validatePlanAgainstContext
+  // below. This branch injects the open_questions entry and sets
+  // approval_required BEFORE validatePlanAgainstContext runs, and tells it
+  // (via pixelAmbiguous) to treat this as already-handled rather than a
+  // rejection — objective/optimization_event are left completely untouched.
+  let pixelAmbiguous = false;
+  if (PURCHASE_LIKE_EVENTS.has(effectivePlan.optimization_event) && !resolved.pixelId && availablePixelsForAdAccount.length > 1) {
+    pixelAmbiguous = true;
+    const choices = availablePixelsForAdAccount.map((p) => `${p.name} (${p.id})`).join(", ");
+    const question = `This ad account has ${availablePixelsForAdAccount.length} Meta Pixels connected (${choices}) and none is set as the default — which one should track purchases for this campaign?`;
+    effectivePlan.open_questions = [...new Set([...(effectivePlan.open_questions || []), question])];
+    effectivePlan.approval_required = true;
+  }
+
+  const contextual = validatePlanAgainstContext(effectivePlan, {
+    resolvedAdAccountId: resolved.adAccountId,
+    resolvedPageId: resolved.pageId,
+    resolvedPixelId: resolved.pixelId,
+    resolvedInstagramId: resolved.instagramId,
+    resolvedCatalogId: resolved.catalogId,
+    pixelAmbiguous,
+  });
 
   // hasStrongerAudienceEvidence (Issue 3): only fetched when it could
   // actually change the outcome — a generic, HEURISTIC-basis audience with
@@ -639,8 +701,17 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     }
   }
 
+  // clearEcommerceWithPurchaseTracking deliberately stays keyed on
+  // anyPixelExists (not usablePixelForSelectedAdAccount) — requirement 4:
+  // pixel-resolution AMBIGUITY must never be a reason to stop forcing
+  // Sales/Purchase for a real e-commerce business. Whether a SPECIFIC Pixel
+  // could be resolved this attempt is an execution-readiness question
+  // (purchaseTrackingUsable, resolvedPixelId), not a goal-classification one.
   const businessSignals = {
-    clearEcommerceWithPurchaseTracking: !!(getConnection(userId, "woocommerce") || getConnection(userId, "shopify")) && pixelExists,
+    anyPixelExists,
+    usablePixelForSelectedAdAccount,
+    purchaseTrackingUsable,
+    clearEcommerceWithPurchaseTracking: hasStoreData && anyPixelExists,
     hasStrongerAudienceEvidence: hasStoreData || hasCampaignHistory,
   };
   const goalPolicyErrors = checkGoalClassificationPolicy(effectivePlan, businessSignals);
@@ -664,9 +735,11 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
       requiresGoalConfirmation: effectivePlan.goal_classification?.requires_goal_confirmation ?? null,
       recommendedMetaObjective: effectivePlan.goal_classification?.recommended_meta_objective ?? null,
       commerceConnected: hasStoreData,
-      pixelExists,
+      anyPixelExists,
+      usablePixelForSelectedAdAccount,
+      pixelAmbiguous,
       isEcommerce: businessSignals.clearEcommerceWithPurchaseTracking,
-      hasPurchaseTracking: pixelExists,
+      hasPurchaseTracking: businessSignals.purchaseTrackingUsable,
     },
     result: goalPolicyErrors.length ? "REJECTED" : "accepted",
     errors: goalPolicyErrors,
@@ -703,6 +776,10 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   const policyErrors = [...goalPolicyErrors, ...budgetPolicyErrors, ...audiencePolicyErrors];
 
   const errors = [...resolutionErrors, ...contextual.errors, ...policyErrors];
+  // Round 14 (live production trace) requirement 6's exact acceptance-test
+  // field list — one trace line carrying every field the production trace
+  // needs to confirm Pixel resolution end-to-end without cross-referencing
+  // the separate goal-policy/asset-resolution lines above.
   trace("createPlan final decision", {
     conversationId,
     accepted: errors.length === 0,
@@ -711,7 +788,14 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     policyErrors,
     resolvedAdAccountId: resolved.adAccountId,
     resolvedPageId: resolved.pageId,
+    anyPixelExists,
+    usablePixelForSelectedAdAccount,
     resolvedPixelId: resolved.pixelId,
+    pixelAmbiguous,
+    objective: effectivePlan.objective,
+    optimization_event: effectivePlan.optimization_event,
+    daily_budget: effectivePlan.daily_budget,
+    budget_basis: effectivePlan.budget_basis,
   });
   if (errors.length) {
     const facts = {

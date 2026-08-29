@@ -29,6 +29,7 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { resolvePageId } = await import("../tools/shared/metaPageId.js");
+const { resolvePixelId } = await import("../tools/shared/metaPixelId.js");
 const { validatePlanStructure, validatePlanAgainstContext, validatePlan, normalizePlanEnumAliases } = await import("../agents/metaExpert/planSchema.js");
 const { createPlan, resolvePlanAssets, getStoredPlan, getActivePlanForConversation } = await import("../agents/metaExpert/planner.js");
 const { checkGoalClassificationPolicy, checkBudgetPolicy, checkAudiencePolicy, isGenericAudience, messageIndicatesExecutionApproval, fingerprintPlan, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } = await import("../agents/metaExpert/policy.js");
@@ -1080,15 +1081,25 @@ async function run() {
     assert.ok(result.errors.some((e) => e.field === "budget_basis"));
   });
 
-  await check("createPlan end-to-end: an 80,000/day heuristic budget is rejected — the exact live bug, through the real function", async () => {
+  // Round 14 (live production trace), requirement 5: an over-cap HEURISTIC_
+  // STARTING_TEST budget is now a deterministic, mechanical NORMALIZATION
+  // (clamped to MAX_SUGGESTED_DAILY_BUDGET before validation ever runs) —
+  // not a rejection consuming one of the model's limited repair attempts.
+  // This replaces the old "must be rejected" expectation for this exact
+  // scenario (the underlying live bug — an unevidenced 80,000/day guess —
+  // is still fully addressed, just via silent correction instead of an
+  // error round trip).
+  await check("createPlan end-to-end: an 80,000/day heuristic budget is silently capped to the safe maximum and ACCEPTED on the first attempt — no repair attempt consumed", async () => {
     const userId = makeUser(`budget-80k-${stamp}@example.com`);
     connectMeta(userId);
     mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
     try {
       const plan = basePlan({ optimization_event: "LINK_CLICKS", pixel: null, daily_budget: 80000, budget_basis: "HEURISTIC_STARTING_TEST" });
       const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
-      assert.equal(result.ok, false);
-      assert.ok(result.errors.some((e) => e.field === "daily_budget"), JSON.stringify(result.errors));
+      assert.equal(result.ok, true, JSON.stringify(result.errors));
+      assert.equal(result.plan.daily_budget, MAX_SUGGESTED_DAILY_BUDGET, "80,000 must be capped down to the safe suggested maximum, not accepted as-is");
+      assert.equal(result.plan.budget_basis, "HEURISTIC_STARTING_TEST", "the basis is preserved — only the number is clamped");
+      assert.match(result.recommendationText, /5000\/day/, "the customer-facing recommendation must reflect the CAPPED number");
     } finally {
       restoreFetch();
     }
@@ -1528,15 +1539,26 @@ async function run() {
       });
       assert.equal(initial.ok, true, JSON.stringify(initial));
 
-      // A revision that tries to push the budget WAY over the hard
+      // A revision that tries to push the budget WAY over the HARD
       // executable cap — carries everything else forward correctly, but
-      // MUST still fail policy validation on the new budget value.
+      // MUST still fail policy validation on the new budget value. Uses a
+      // genuinely VERIFIED USER_PROVIDED claim (the number appears in
+      // userMessage) rather than an unverified one — round 14's automatic
+      // HEURISTIC_STARTING_TEST cap (requirement 5) means an unverified/
+      // downgraded claim now gets silently clamped to the safe suggested
+      // maximum instead of rejected, so that shape no longer tests this
+      // path; the absolute hard cap (MAX_EXECUTABLE_DAILY_BUDGET) is never
+      // bypassed by ANY basis, including a real user instruction, which is
+      // what this test actually verifies.
+      const overCapAmount = MAX_EXECUTABLE_DAILY_BUDGET + 50000;
       const revision = await createPlan({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        plan: { daily_budget: MAX_EXECUTABLE_DAILY_BUDGET + 50000, budget_basis: "USER_PROVIDED" },
+        plan: { daily_budget: overCapAmount, budget_basis: "USER_PROVIDED" },
         revisesPlanId: initial.planId,
+        userMessage: `Please set the daily budget to ${overCapAmount}.`,
       });
       assert.equal(revision.ok, false, "an over-cap budget revision must still be rejected even though the merge itself succeeded");
+      assert.ok(revision.errors.some((e) => e.field === "daily_budget"), JSON.stringify(revision.errors));
 
       const priorRow = db.prepare("SELECT status FROM meta_campaign_plans WHERE id = ?").get(initial.planId);
       assert.equal(priorRow.status, "proposed", "the prior plan must remain 'proposed' — never superseded by a revision that didn't actually validate");
@@ -1659,13 +1681,22 @@ async function run() {
   //    — USER_PROVIDED is a trust-bypassing claim (uncapped by
   //    checkBudgetPolicy), so it must be independently verified against
   //    the user's own message text, not accepted on the model's word alone.
-  await check("an unverified USER_PROVIDED budget claim (no matching amount in the user's message) is downgraded to HEURISTIC_STARTING_TEST and capped — the exact live bug", async () => {
+  // Round 14 (live production trace), requirement 5: once downgraded to
+  // HEURISTIC_STARTING_TEST, an over-cap budget is now silently CLAMPED to
+  // MAX_SUGGESTED_DAILY_BUDGET (a mechanical normalization, not a repair-
+  // consuming rejection) — this replaces the old "must be rejected"
+  // expectation. The live bug this test guards against — an untrustworthy
+  // USER_PROVIDED claim reaching checkBudgetPolicy's uncapped path — is
+  // still fully closed: the basis is still downgraded (never left uncapped
+  // as USER_PROVIDED), it's just capped instead of bounced back for repair.
+  await check("an unverified USER_PROVIDED budget claim (no matching amount in the user's message) is downgraded to HEURISTIC_STARTING_TEST and silently capped, not rejected — the exact live bug", async () => {
     const userId = makeUser(`accept-budget-provenance-${stamp}@example.com`);
     connectMeta(userId);
     const conversationId = `conv-${cryptoRandom()}`;
     mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] }));
     try {
       const plan = basePlan({
+        optimization_event: "LINK_CLICKS", pixel: null, // unrelated to this test — avoid the mock needing a Pixel at all
         daily_budget: 10000, // above MAX_SUGGESTED_DAILY_BUDGET (5000 in this suite's config)
         budget_basis: "USER_PROVIDED",
       });
@@ -1674,8 +1705,9 @@ async function run() {
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, plan,
         userMessage: "Review my WooCommerce products, Meta history, and audience data, then improve the audience and budget before I approve it.",
       });
-      assert.equal(result.ok, false, "an unverified USER_PROVIDED claim must be downgraded to a CAPPED basis, not accepted uncapped");
-      assert.ok(result.errors.some((e) => e.field === "daily_budget"), `expected the budget to be rejected under the suggested cap once downgraded: ${JSON.stringify(result.errors)}`);
+      assert.equal(result.ok, true, `an unverified claim must be downgraded and CAPPED, not bounced back as a rejection: ${JSON.stringify(result.errors)}`);
+      assert.equal(result.plan.budget_basis, "HEURISTIC_STARTING_TEST", "the unverified USER_PROVIDED claim must still be downgraded — never trusted uncapped");
+      assert.equal(result.plan.daily_budget, MAX_SUGGESTED_DAILY_BUDGET, "the downgraded budget must be capped to the safe suggested maximum");
     } finally {
       restoreFetch();
     }
@@ -2041,6 +2073,143 @@ async function run() {
       assert.equal(second.ok, true, JSON.stringify(second.errors));
       assert.match(second.recommendationText, /Beautybeespk/);
       assert.doesNotMatch(second.recommendationText, /Careonabudget/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 14, live production trace: pixelExists=true/hasPurchaseTracking
+  //    =true at the SAME TIME as resolvedPixelId=null — a genuinely
+  //    ambiguous ad account (2+ Pixels, no saved default) had no
+  //    deterministic way to resolve one, so the structural "Pixel required"
+  //    rejection cornered the model into silently abandoning Sales/Purchase
+  //    for Traffic/Link Clicks (goal policy then correctly rejected THAT).
+  //    resolvePixelId() now supports a saved Default Pixel, mirroring
+  //    resolveAdAccountId/resolvePageId exactly (requirement 3).
+  await check("resolvePixelId uses the saved Default Pixel when multiple Pixels are connected", async () => {
+    const userId = makeUser(`default-pixel-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pixelId: "900000000000001" } });
+    mockFetch(metaRouter({ pixels: [{ id: "900000000000001", name: "Store Pixel" }, { id: "900000000000002", name: "Other Pixel" }] }));
+    try {
+      const { pixelId } = await resolvePixelId({ accessToken: `fake-meta-token-${userId}`, adAccountId: "act_1", userId });
+      assert.equal(pixelId, "900000000000001", "must use the saved default, never ask, never guess the other one");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("resolvePixelId self-heals: a saved Default Pixel that's no longer connected is cleared and falls through to ambiguous (null, not thrown)", async () => {
+    const userId = makeUser(`default-pixel-stale-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pixelId: "900000000000009" } }); // not in the connected list below
+    mockFetch(metaRouter({ pixels: [{ id: "900000000000001", name: "Store Pixel" }, { id: "900000000000002", name: "Other Pixel" }] }));
+    try {
+      const { pixelId } = await resolvePixelId({ accessToken: `fake-meta-token-${userId}`, adAccountId: "act_1", userId });
+      assert.equal(pixelId, null, "genuinely ambiguous with no VALID default — must ask (return null), never guess, never throw (Pixel is optional)");
+      const conn = getConnection(userId, "meta_ads");
+      assert.equal(JSON.parse(conn.meta || "{}").defaults?.pixelId, null, "the stale default must be cleared, not retried forever");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("resolvePixelId: an explicit real id still overrides the saved Default Pixel", async () => {
+    const userId = makeUser(`default-pixel-override-${stamp}@example.com`);
+    connectMeta(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { pixelId: "900000000000001" } });
+    mockFetch(metaRouter({ pixels: [{ id: "900000000000001", name: "Store Pixel" }, { id: "900000000000002", name: "Other Pixel" }] }));
+    try {
+      const { pixelId } = await resolvePixelId({ accessToken: `fake-meta-token-${userId}`, adAccountId: "act_1", userId, providedPixelId: "900000000000002" });
+      assert.equal(pixelId, "900000000000002", "an explicit choice this call always wins over the standing default");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // The core production fix: a genuinely ambiguous Pixel (2+ available, no
+  // default, no explicit choice) on a Purchase-optimized plan must become a
+  // real open_questions ask — NEVER a hard rejection, and NEVER a silent
+  // objective downgrade to Traffic (requirement 4's explicit prohibition).
+  await check("createPlan: a Purchase plan with 2 ambiguous Pixels and no default ASKS ONCE via open_questions — keeps Sales/Purchase, never rejects, never downgrades to Traffic", async () => {
+    const userId = makeUser(`pixel-ambiguous-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "900000000000001", name: "Store Pixel" }, { id: "900000000000002", name: "Other Pixel" }],
+    }));
+    try {
+      const plan = basePlan(); // objective OUTCOME_SALES, optimization_event PURCHASE, pixel null — the exact live shape
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, true, `an ambiguous Pixel must never hard-reject the plan: ${JSON.stringify(result.errors)}`);
+      assert.equal(result.plan.objective, "OUTCOME_SALES", "the objective must NEVER be silently downgraded away from Sales because of Pixel ambiguity");
+      assert.equal(result.plan.optimization_event, "PURCHASE", "optimization_event must NEVER be silently downgraded to LINK_CLICKS/Traffic");
+      assert.equal(result.resolved.pixelId, null, "genuinely ambiguous — no Pixel is invented or guessed");
+      assert.equal(result.plan.approval_required, true, "an ambiguous Pixel must force an explicit approval/question, not a silent guess");
+      assert.ok(result.plan.open_questions?.some((q) => /pixel/i.test(q) && /900000000000001|900000000000002/.test(q)), `expected a real, specific Pixel-choice question naming both real Pixels: ${JSON.stringify(result.plan.open_questions)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // The genuine-blocker case (0 Pixels at all) must still hard-reject — but
+  // the rejection/repair guidance itself must forbid the objective-switching
+  // "fix" that caused the live bug (requirement 4).
+  await check("createPlan: a Purchase plan with ZERO Pixels still hard-rejects as a real tracking blocker — and the repair guidance explicitly forbids switching to Traffic", async () => {
+    const userId = makeUser(`pixel-none-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [] }));
+    try {
+      const plan = basePlan();
+      const result = await createPlan({ userId, accessToken: `fake-meta-token-${userId}`, plan });
+      assert.equal(result.ok, false, "zero Pixels is a genuine tracking-setup blocker and must still reject");
+      const pixelError = result.errors.find((e) => e.field === "pixel");
+      assert.ok(pixelError, JSON.stringify(result.errors));
+      assert.doesNotMatch(pixelError.message, /choose a different optimization_event/i, "the rejection itself must never invite an objective-switching workaround");
+      const repairEntry = result.repairGuidance.find((r) => r.field === "pixel");
+      assert.ok(repairEntry, JSON.stringify(result.repairGuidance));
+      assert.match(repairEntry.expectedCorrection, /do not change optimization_event\/objective/i, "repair guidance must explicitly forbid the Traffic/Link Clicks workaround that caused the live bug");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Requirement 6's exact acceptance test: fresh conversation, "I want more
+  // sales on my website", saved Default Ad Account + Default Facebook Page
+  // + a SINGLE usable Pixel (auto-resolves deterministically), a heuristic
+  // budget over the cap (auto-normalized, not rejected) — full recommendation
+  // on the FIRST attempt, no repair attempts consumed for mechanical fixes.
+  await check("[acceptance, requirement 6] fresh conversation 'I want more sales on my website': default assets honored, Sales/Purchase retained, single usable Pixel auto-resolved, heuristic budget auto-capped, no Traffic downgrade, no repair attempts consumed", async () => {
+    const userId = makeUser(`acceptance-round14-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { adAccountId: "act_237956315579168", pageId: "717559728109412" } });
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_237956315579168", name: "Beautybeespk Ads" }, { id: "act_other", name: "Other Ads" }],
+      pages: [{ id: "717559728109412", name: "Beautybeespk" }, { id: "999999999999999", name: "Careonabudget.pk" }],
+      pixels: [{ id: "900000000000001", name: "Store Pixel" }],
+    }));
+    try {
+      const plan = basePlan({
+        daily_budget: 10000, budget_basis: "HEURISTIC_STARTING_TEST", // the exact live over-cap shape
+        ad_account: { ref: "default_ad_account" }, facebook_page: { ref: "default_facebook_page" }, pixel: null,
+      });
+      const result = await createPlan({
+        userId, accessToken: `fake-meta-token-${userId}`, plan,
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(result.ok, true, `the full recommendation must be produced on the FIRST attempt, no repair round trip: ${JSON.stringify(result.errors)}`);
+      assert.equal(result.resolved.adAccountId, "act_237956315579168");
+      assert.equal(result.resolved.pageId, "717559728109412");
+      assert.equal(result.resolved.pixelId, "900000000000001", "the single usable Pixel on this ad account must auto-resolve — no invented id, no ask needed");
+      assert.equal(result.plan.objective, "OUTCOME_SALES");
+      assert.equal(result.plan.optimization_event, "PURCHASE", "must never be silently downgraded to LINK_CLICKS/Traffic");
+      assert.equal(result.plan.daily_budget, MAX_SUGGESTED_DAILY_BUDGET, "the over-cap heuristic budget must be auto-normalized to the safe maximum");
+      assert.equal(result.plan.budget_basis, "HEURISTIC_STARTING_TEST");
+      assert.match(result.recommendationText, /Beautybeespk/, "the customer-facing recommendation must reflect the resolved Page");
+      assert.match(result.recommendationText, new RegExp(`${MAX_SUGGESTED_DAILY_BUDGET}/day`), "the customer-facing recommendation must reflect the CAPPED budget");
     } finally {
       restoreFetch();
     }

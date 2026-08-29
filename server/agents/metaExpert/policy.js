@@ -186,7 +186,15 @@ export function fingerprintPlan(plan = {}) {
 const EXPECTED_CORRECTION_BY_FIELD = {
   ad_account: "Set ad_account.ref to one of the real, connected ad account ids named in the problem above — or set a Default Ad Account in Integrations to stop needing this every time.",
   facebook_page: "Set facebook_page.ref to one of the real, connected Page ids named in the problem above — or set a Default Facebook Page in Integrations to stop needing this every time.",
-  pixel: "Either set pixel.ref to a real, connected Pixel id, or change optimization_event to one that doesn't require a Pixel.",
+  // Round 14 (live production trace): the old wording ("...or change
+  // optimization_event to one that doesn't require a Pixel") is exactly
+  // what led the model to silently abandon Sales/Purchase for Traffic/Link
+  // Clicks when it hit this rejection — a missing Pixel is a tracking-setup
+  // gap, never a reason to change what the campaign is FOR. This only fires
+  // for the genuine "zero Pixels at all" case (createPlan() now resolves
+  // the "2+ Pixels, ambiguous" case into an open_questions entry instead of
+  // a rejection at all — see planSchema.js's pixelAmbiguous parameter).
+  pixel: "Do not change optimization_event/objective to route around this — a missing Pixel is a tracking-setup gap, not a reason to abandon Sales/Purchase. Reference a real, connected Pixel id if one exists; otherwise keep the plan's objective/optimization_event as proposed, explain the tracking blocker in open_questions, and offer Traffic only as an explicit, separate alternative — never a silent replacement.",
   catalog: "Either set catalog.ref to a real, connected catalog id, or remove the catalog reference if this isn't a catalog/dynamic-ad campaign.",
   daily_budget: "Lower daily_budget to within the stated limit, or only use budget_basis USER_PROVIDED/SAVED_POLICY if that is genuinely true.",
   budget_basis: "Set budget_basis honestly to reflect where this number actually came from.",

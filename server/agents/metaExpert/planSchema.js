@@ -247,7 +247,7 @@ export const PURCHASE_LIKE_EVENTS = new Set(["PURCHASE", "ADD_TO_CART"]);
 // (server/tools/shared/*), not just the plan's semantic references, so
 // this is separate from validatePlanStructure() and only runs once
 // resolution has happened.
-export function validatePlanAgainstContext(plan, { resolvedAdAccountId, resolvedPageId, resolvedPixelId, resolvedInstagramId, resolvedCatalogId } = {}) {
+export function validatePlanAgainstContext(plan, { resolvedAdAccountId, resolvedPageId, resolvedPixelId, resolvedInstagramId, resolvedCatalogId, pixelAmbiguous = false } = {}) {
   const errors = [];
   const fail = (field, message) => errors.push({ field, message });
 
@@ -262,8 +262,16 @@ export function validatePlanAgainstContext(plan, { resolvedAdAccountId, resolved
     fail("instagram_identity", "The plan references an Instagram identity, but none could be resolved (Instagram may not be connected).");
   }
 
-  if (PURCHASE_LIKE_EVENTS.has(plan.optimization_event) && !resolvedPixelId) {
-    fail("pixel", `optimization_event "${plan.optimization_event}" requires a Meta Pixel to measure it, but no Pixel is available on this ad account. Either set one up in Events Manager first, or choose a different optimization_event this account can actually support.`);
+  // Round 14 (live production trace): pixelAmbiguous means the ad account
+  // genuinely HAS usable Pixels (2+), just none deterministically chosen
+  // yet (no saved default, none explicit) — planner.js's createPlan()
+  // already turned that into a real open_questions entry asking the user
+  // to pick one, keeping this plan's objective/optimization_event exactly
+  // as proposed. That is NOT the same failure as "this ad account has no
+  // Pixel at all", which genuinely blocks Purchase-optimized measurement
+  // and must still hard-fail below.
+  if (PURCHASE_LIKE_EVENTS.has(plan.optimization_event) && !resolvedPixelId && !pixelAmbiguous) {
+    fail("pixel", `optimization_event "${plan.optimization_event}" requires a Meta Pixel to measure it, and this ad account has no Pixel set up at all — a real tracking-setup gap, not a reason to change the objective. Do NOT silently switch objective/optimization_event to OUTCOME_TRAFFIC/LINK_CLICKS to route around this: keep Sales/Purchase, explain the tracking blocker to the user (a Pixel needs to be created in Events Manager first), and offer Traffic only as an explicit, separate alternative via open_questions if genuinely wanted.`);
   }
 
   if (plan.catalog?.ref && !resolvedCatalogId) {

@@ -6,6 +6,7 @@ import { saveConnection, disconnectIntegration, connectionHealth, getConnection,
 import * as meta from "../integrations/meta/api.js";
 import { isPlausibleAdAccountId } from "../tools/shared/metaAdAccountId.js";
 import { isPlausibleMetaId } from "../tools/shared/metaPageId.js";
+import { isPlausiblePixelId } from "../tools/shared/metaPixelId.js";
 
 const router = Router();
 
@@ -175,6 +176,76 @@ router.post("/default-page", requireAuth, async (req, res) => {
     if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
     logActivity(db, req.session.userId, "integration_updated", `Set Default Facebook Page for Meta Ads: ${match.name} (${match.id})`);
     res.json({ defaultPageId: match.id });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Same pattern as /ad-accounts and /pages above, for Meta Pixels — Round 14
+// (live production trace), requirement 3: "if multiple usable Pixels exist
+// and one is stored/default → use the default." Unlike Pages (account-wide),
+// Pixels are scoped to a SPECIFIC ad account, so this needs one to list
+// against — defaults to the saved Default Ad Account, or falls back to the
+// account's only connected ad account, when the caller doesn't supply
+// adAccountId explicitly.
+router.get("/pixels", requireAuth, async (req, res) => {
+  try {
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const defaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    let adAccountId = req.query.adAccountId || defaults.adAccountId || null;
+    if (!adAccountId) {
+      const accounts = await meta.listAdAccounts(accessToken);
+      if (accounts.length === 1) adAccountId = accounts[0].id;
+    }
+    if (!adAccountId) {
+      return res.status(400).json({ error: "No ad account specified and none could be inferred — pass ?adAccountId= or set a Default Ad Account first." });
+    }
+    const pixels = await meta.listPixels(accessToken, adAccountId);
+    const savedDefault = defaults.pixelId || null;
+    const defaultPixelId = savedDefault && pixels.some((p) => p.id === savedDefault) ? savedDefault : null;
+    res.json({ adAccountId, pixels, defaultPixelId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Sets (or clears, with pixelId: null) the Default Pixel. Always re-verifies
+// the id against a fresh meta.listPixels() call for the relevant ad account
+// before saving — same "never trust shape alone" principle as
+// /default-ad-account and /default-page.
+router.post("/default-pixel", requireAuth, async (req, res) => {
+  const { pixelId, adAccountId: bodyAdAccountId } = req.body || {};
+  const setDefault = (value) => {
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    return updateConnectionMeta(req.session.userId, "meta_ads", { defaults: { ...currentDefaults, pixelId: value } });
+  };
+  try {
+    if (pixelId === null || pixelId === undefined) {
+      const updated = setDefault(null);
+      if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
+      return res.json({ defaultPixelId: null });
+    }
+    if (!isPlausiblePixelId(pixelId)) {
+      return res.status(400).json({ error: `"${pixelId}" is not a valid Meta Pixel id.` });
+    }
+    const accessToken = requireValidToken(req.session.userId, "meta_ads");
+    const conn = getConnection(req.session.userId, "meta_ads");
+    const defaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    const adAccountId = bodyAdAccountId || defaults.adAccountId || null;
+    if (!adAccountId) {
+      return res.status(400).json({ error: "adAccountId is required (or set a Default Ad Account first)." });
+    }
+    const pixels = await meta.listPixels(accessToken, adAccountId);
+    const match = pixels.find((p) => p.id === pixelId);
+    if (!match) {
+      return res.status(404).json({ error: `"${pixelId}" is not one of ad account ${adAccountId}'s connected Pixels.`, pixels });
+    }
+    const updated = setDefault(match.id);
+    if (!updated) return res.status(400).json({ error: "Meta Ads is not connected." });
+    logActivity(db, req.session.userId, "integration_updated", `Set Default Pixel for Meta Ads: ${match.name} (${match.id})`);
+    res.json({ defaultPixelId: match.id });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
