@@ -9,7 +9,32 @@ import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { validatePlanStructure, validatePlanAgainstContext, PURCHASE_LIKE_EVENTS } from "./planSchema.js";
 import { getConversationAssets, saveConversationAsset, clearConversationAsset } from "./assetSelection.js";
 import { checkBudgetPolicy, checkGoalClassificationPolicy, checkAudiencePolicy, isGenericAudience, buildRepairGuidance, MAX_SUGGESTED_DAILY_BUDGET, MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
-import { trace } from "./diagnostics.js";
+import { trace, traceEnabled } from "./diagnostics.js";
+
+// Round 6 (live testing): the user could see a plan get rejected but had no
+// way to tell, from the logs, which attempt within the conversation it was
+// — the existing "goal policy"/"audience policy"/"budget policy" trace
+// lines below are per-createPlan-call, with nothing tying them to "this was
+// attempt 1" vs "this was the automatic repair." Counted here rather than
+// threaded down from orchestrator/index.js's own per-turn retry counter
+// (server/orchestrator/index.js's createPlanAttempts) because that would
+// mean widening runTool()/execute()'s parameters just for a diagnostic —
+// this is a simpler, self-contained counter of createPlan() ENTRIES per
+// conversation (so it also counts an attempt that fails structural
+// validation, which never reaches the retry gate's own bookkeeping since
+// that gate only sees attempts that got as far as being dispatched).
+// Deliberately gated on traceEnabled so this Map never grows at all when
+// tracing is off (the default) — a plain in-memory counter, so a
+// multi-replica deployment would see independent counts per process; fine
+// for a temporary diagnostic, not meant as a source of truth.
+const conversationAttemptCounts = new Map();
+function nextAttemptNumberForConversation(conversationId) {
+  if (!traceEnabled) return null;
+  const key = conversationId || "no-conversation";
+  const n = (conversationAttemptCounts.get(key) || 0) + 1;
+  conversationAttemptCounts.set(key, n);
+  return n;
+}
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
@@ -238,6 +263,7 @@ function normalizePlanDefaults(userId, plan) {
 }
 
 export async function createPlan({ userId, conversationId, accessToken, plan, contextSummary, revisesPlanId }) {
+  const attemptNumber = nextAttemptNumberForConversation(conversationId);
   const normalizedPlan = normalizePlanDefaults(userId, plan);
   const structural = validatePlanStructure(normalizedPlan); // structural-only pass — context-dependent checks run after resolution, below
   if (!structural.valid) {
@@ -246,7 +272,24 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
     // errors array — server/orchestrator/index.js's retry-limit gate is
     // what actually bounds how many times the model can act on this, but
     // whichever attempt it is, the guidance should be equally actionable.
-    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors: structural.errors, repairGuidance: buildRepairGuidance(structural.errors, {}) };
+    const repairGuidance = buildRepairGuidance(structural.errors, {});
+    // Round 6 (live testing): this is the ONE rejection path that used to
+    // have zero trace output at all — everything below (goal/audience/
+    // budget policy, resolution) never runs when structural validation
+    // itself fails, so a plan that's rejected here (a malformed field, not
+    // a policy judgment call) was previously invisible to
+    // META_EXPERT_TRACE. Logged with the same "createPlan rejection" label
+    // as the later rejection path below so a single grep always shows every
+    // rejection, whichever stage it happened at.
+    trace("createPlan rejection", {
+      conversationId, attemptNumber, stage: "structural",
+      goalPolicy: null, audiencePolicy: null, budgetPolicy: null,
+      resolutionErrors: null, contextualErrors: null, policyErrors: null,
+      structuralErrors: structural.errors,
+      repairGuidance,
+      accepted: false,
+    });
+    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors: structural.errors, repairGuidance };
   }
 
   let effectivePlan = normalizedPlan;
@@ -327,41 +370,54 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
   // three policy functions actually see, and their actual return value —
   // not a re-derivation, the literal values passed in and the literal
   // arrays returned, so this can't itself be wrong in a way that hides a
-  // real discrepancy.
-  trace("goal policy", {
-    literalGoal: effectivePlan.goal_classification?.literal_goal ?? null,
-    proposedObjective: effectivePlan.objective,
-    proposedOptimizationEvent: effectivePlan.optimization_event,
-    requiresGoalConfirmation: effectivePlan.goal_classification?.requires_goal_confirmation ?? null,
-    recommendedMetaObjective: effectivePlan.goal_classification?.recommended_meta_objective ?? null,
-    commerceConnected: hasStoreData,
-    pixelExists,
-    isEcommerce: businessSignals.clearEcommerceWithPurchaseTracking,
-    hasPurchaseTracking: pixelExists,
-    policyResult: goalPolicyErrors.length ? "REJECTED" : "accepted",
-    policyErrors: goalPolicyErrors,
-  });
-  trace("audience policy", {
-    gender: effectivePlan.gender,
-    age_min: effectivePlan.age_min,
-    age_max: effectivePlan.age_max,
-    audience_basis: effectivePlan.audience_basis,
-    audience_reasoning: effectivePlan.audience_reasoning ?? null,
-    isGenericAudience: isGenericAudience(effectivePlan),
-    hasStrongerAudienceEvidence: businessSignals.hasStrongerAudienceEvidence,
-    hasStoreData,
-    hasCampaignHistory,
-    policyResult: audiencePolicyErrors.length ? "REJECTED" : "accepted",
-    policyErrors: audiencePolicyErrors,
-  });
-  trace("budget policy", {
-    proposedDailyBudget: effectivePlan.daily_budget,
-    budget_basis: effectivePlan.budget_basis,
-    MAX_SUGGESTED_DAILY_BUDGET,
-    MAX_EXECUTABLE_DAILY_BUDGET,
-    policyResult: budgetPolicyErrors.length ? "REJECTED" : "accepted",
-    policyErrors: budgetPolicyErrors,
-  });
+  // real discrepancy. Built as named objects (not inlined into trace()
+  // calls) so the SAME input/result shape can also be embedded in the
+  // single consolidated "createPlan rejection" trace below (round 6) —
+  // one grep for that label shows the complete picture regardless of
+  // which policy actually rejected the plan.
+  const goalPolicyTrace = {
+    input: {
+      literalGoal: effectivePlan.goal_classification?.literal_goal ?? null,
+      proposedObjective: effectivePlan.objective,
+      proposedOptimizationEvent: effectivePlan.optimization_event,
+      requiresGoalConfirmation: effectivePlan.goal_classification?.requires_goal_confirmation ?? null,
+      recommendedMetaObjective: effectivePlan.goal_classification?.recommended_meta_objective ?? null,
+      commerceConnected: hasStoreData,
+      pixelExists,
+      isEcommerce: businessSignals.clearEcommerceWithPurchaseTracking,
+      hasPurchaseTracking: pixelExists,
+    },
+    result: goalPolicyErrors.length ? "REJECTED" : "accepted",
+    errors: goalPolicyErrors,
+  };
+  const audiencePolicyTrace = {
+    input: {
+      gender: effectivePlan.gender,
+      age_min: effectivePlan.age_min,
+      age_max: effectivePlan.age_max,
+      audience_basis: effectivePlan.audience_basis,
+      audience_reasoning: effectivePlan.audience_reasoning ?? null,
+      isGenericAudience: isGenericAudience(effectivePlan),
+      hasStrongerAudienceEvidence: businessSignals.hasStrongerAudienceEvidence,
+      hasStoreData,
+      hasCampaignHistory,
+    },
+    result: audiencePolicyErrors.length ? "REJECTED" : "accepted",
+    errors: audiencePolicyErrors,
+  };
+  const budgetPolicyTrace = {
+    input: {
+      proposedDailyBudget: effectivePlan.daily_budget,
+      budget_basis: effectivePlan.budget_basis,
+      MAX_SUGGESTED_DAILY_BUDGET,
+      MAX_EXECUTABLE_DAILY_BUDGET,
+    },
+    result: budgetPolicyErrors.length ? "REJECTED" : "accepted",
+    errors: budgetPolicyErrors,
+  };
+  trace("goal policy", { ...goalPolicyTrace.input, policyResult: goalPolicyTrace.result, policyErrors: goalPolicyTrace.errors });
+  trace("audience policy", { ...audiencePolicyTrace.input, policyResult: audiencePolicyTrace.result, policyErrors: audiencePolicyTrace.errors });
+  trace("budget policy", { ...budgetPolicyTrace.input, policyResult: budgetPolicyTrace.result, policyErrors: budgetPolicyTrace.errors });
 
   const policyErrors = [...goalPolicyErrors, ...budgetPolicyErrors, ...audiencePolicyErrors];
 
@@ -384,7 +440,25 @@ export async function createPlan({ userId, conversationId, accessToken, plan, co
       resolvedPageId: resolved.pageId,
       resolvedPixelId: resolved.pixelId,
     };
-    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance: buildRepairGuidance(errors, facts) };
+    const repairGuidance = buildRepairGuidance(errors, facts);
+    // Round 6 (live testing): one consolidated line with everything needed
+    // to diagnose a rejection without cross-referencing the separate goal/
+    // audience/budget/final-decision lines above — same "createPlan
+    // rejection" label as the structural-failure path above, so a single
+    // grep for that label always shows every rejection this conversation
+    // hit, whichever stage it happened at.
+    trace("createPlan rejection", {
+      conversationId, attemptNumber, stage: "policy_and_resolution",
+      goalPolicy: goalPolicyTrace,
+      audiencePolicy: audiencePolicyTrace,
+      budgetPolicy: budgetPolicyTrace,
+      resolutionErrors,
+      contextualErrors: contextual.errors,
+      policyErrors,
+      repairGuidance,
+      accepted: false,
+    });
+    return { ok: false, code: "META_PLAN_REPAIR_REQUIRED", errors, repairGuidance };
   }
 
   // Resolve human-readable names for the recommendation text — the
