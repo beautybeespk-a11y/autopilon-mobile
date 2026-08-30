@@ -1469,6 +1469,62 @@ async function run() {
     }
   });
 
+  // --- facebook_page/ad_account omitted (live bug, same class as approval_required) --
+  // Live screenshot: "It looks like there was an issue with building the
+  // strategy for increasing sales due to a missing required field:
+  // Facebook Page... Please ensure that your Facebook Page is integrated
+  // and connected properly." A real Page WAS connected and resolvable
+  // (confirmed via gatherBusinessSnapshot in production: defaultPage
+  // resolution "saved_default", a real id) — the model's build_strategy
+  // call had simply omitted the facebook_page field entirely, exactly the
+  // same mechanical-omission class as the approval_required bug fixed
+  // above. deriveDefaultAssetRefsIfMissing (strategySchema.js) now
+  // defaults a missing facebook_page/ad_account to the semantic
+  // "default_*" ref — the SAME ref value the model would have written
+  // itself, going through the exact same resolution path either way.
+  await check("[V2 policy] facebook_page and ad_account omitted entirely from the model's strategy are defaulted to the semantic default ref and accepted — never rejected as if the Page/account weren't connected", async () => {
+    const userId = makeUser(`v2-assetref-missing-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { facebook_page, ad_account, ...strategyWithoutAssetRefs } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyWithoutAssetRefs, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.facebook_page.ref, "default_facebook_page");
+      assert.equal(result.strategy.ad_account.ref, "default_ad_account");
+      assert.equal(result.resolved.pageId, "111", "the real connected Page must still be resolved, exactly as if the model had written the default ref itself");
+      assert.equal(result.resolved.adAccountId, "act_1");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy, orchestrator-level] facebook_page omitted from the model's FIRST build_strategy call succeeds immediately — no second call, never told the Page isn't connected when it is", async () => {
+    const userId = makeUser(`v2-assetref-missing-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { facebook_page, ...strategyWithoutFacebookPage } = baseStrategy();
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", strategyWithoutFacebookPage),
+        finalText("Here is your recommended strategy — let me know if you'd like any changes."),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales on my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      assert.equal(buildCalls.length, 1, `omitting facebook_page must never force a second attempt: ${JSON.stringify(buildCalls)}`);
+      assert.equal(buildCalls[0].result.valid, true, JSON.stringify(buildCalls[0].result));
+      assert.doesNotMatch(result.reply, /facebook page is|please ensure/i, "must never claim the Page isn't connected when it is — the model just omitted the field");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {

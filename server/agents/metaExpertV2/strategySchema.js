@@ -134,6 +134,33 @@ export function deriveApprovalRequiredIfMissing(strategy) {
   return { ...strategy, approval_required: true };
 }
 
+// Live bug (same class as approval_required above): the model occasionally
+// omits facebook_page/ad_account entirely from its build_strategy call.
+// Per this tool's own description (metaExpertV2.js) and internal_strategy_
+// schema.json's own $comment, these are semantic refs the backend ALREADY
+// resolves automatically to the saved default (or the single connected
+// one, or an ambiguity question) whenever the model hasn't explicitly
+// asked for a specific different one via explicitAssetChanges — an
+// entirely absent field is behaviorally indistinguishable from the model
+// correctly writing { ref: "default_facebook_page" } / { ref:
+// "default_ad_account" }, just a mechanical slip in how it wrote the
+// call, not a business decision. Never overwrites a ref the model DID
+// provide (including a real, already-confirmed id from an earlier turn)
+// — only fills in when the field is completely absent. Resolution itself
+// still goes through the exact same assetResolution.js path either way,
+// so this changes nothing about WHICH asset ultimately gets used, only
+// whether a trivially-omittable field crashes the whole recommendation.
+export function deriveDefaultAssetRefsIfMissing(strategy) {
+  let result = strategy;
+  if (!result.facebook_page || typeof result.facebook_page.ref !== "string" || !result.facebook_page.ref) {
+    result = { ...result, facebook_page: { ref: "default_facebook_page" } };
+  }
+  if (!result.ad_account || typeof result.ad_account.ref !== "string" || !result.ad_account.ref) {
+    result = { ...result, ad_account: { ref: "default_ad_account" } };
+  }
+  return result;
+}
+
 export function deriveCtaIfMissing(strategy) {
   if (strategy.cta) return strategy;
   const derived = CTA_DEFAULT_BY_OBJECTIVE[strategy.recommended_objective];

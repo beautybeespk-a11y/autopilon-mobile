@@ -11,7 +11,8 @@ import { gatherBusinessSnapshot } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
-  normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing, PURCHASE_LIKE_EVENTS,
+  normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
+  deriveDefaultAssetRefsIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -162,7 +163,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const { strategy: aliasNormalized, appliedAliases } = normalizeStrategyEnumAliases(merged);
   const ctaResolved = deriveCtaIfMissing(aliasNormalized);
   const approvalResolved = deriveApprovalRequiredIfMissing(ctaResolved);
-  let normalized = capHeuristicBudget(approvalResolved);
+  // For a revision, mergeForRevision() above already carries facebook_page/
+  // ad_account forward from the prior strategy unless explicitAssetChanges
+  // says otherwise, so this only ever actually fires on a fresh build_strategy
+  // call where the model itself omitted the field.
+  const assetRefsResolved = deriveDefaultAssetRefsIfMissing(approvalResolved);
+  let normalized = capHeuristicBudget(assetRefsResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -173,6 +179,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   if (traceEnabled && appliedAliases.length) trace("strategy enum normalization", { conversationId, appliedAliases });
   if (traceEnabled && typeof aliasNormalized.approval_required !== "boolean") {
     trace("strategy approval_required defaulted (missing from model output)", { conversationId, defaultedTo: true });
+  }
+  if (traceEnabled && (assetRefsResolved.facebook_page !== approvalResolved.facebook_page || assetRefsResolved.ad_account !== approvalResolved.ad_account)) {
+    trace("strategy asset ref(s) defaulted (missing from model output)", {
+      conversationId,
+      facebookPageDefaulted: assetRefsResolved.facebook_page !== approvalResolved.facebook_page,
+      adAccountDefaulted: assetRefsResolved.ad_account !== approvalResolved.ad_account,
+    });
   }
   if (traceEnabled && normalized.budget_daily !== ctaResolved.budget_daily) {
     trace("strategy heuristic budget cap", { conversationId, original: ctaResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });
