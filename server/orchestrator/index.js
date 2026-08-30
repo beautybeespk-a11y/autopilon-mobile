@@ -13,6 +13,7 @@ import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/me
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
 import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "../agents/metaExpertV2/policy.js";
+import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -288,25 +289,40 @@ const MAX_STALE_ANSWER_NUDGES = 1;
 // state. Same loose/non-exhaustive regex trade-off as every other trigger
 // in this file — an occasional unnecessary nudge is far cheaper than
 // naming a real post/product/date that was never actually looked up.
+// Kept as a labeled ARRAY (not just a combined regex) so live diagnostic
+// tracing (see checkCreativeRevisionRequiredGate's call site below) can
+// report exactly WHICH sub-pattern matched a real message, not just a
+// yes/no — that's the difference between "the gate never ran" and "the
+// gate ran but this specific phrasing doesn't match any pattern" when
+// debugging a live report.
+const CREATIVE_SELECTION_INTENT_PATTERN_LIST = [
+  { label: "choose/pick/select + quality + noun", pattern: /\b(choose|pick|select)\b.{0,60}\b(best|exact|strongest|top|right)\b.{0,50}\b(reel|post|creative|content|product|video|image)\b/i },
+  { label: "choose/pick/select + noun + purpose", pattern: /\b(choose|pick|select)\b.{0,40}\b(reel|post|creative|content|product)\b.{0,40}\b(advertise|for (this|the) (ad|campaign)|to (run|use))\b/i },
+  { label: "which noun should/for ad", pattern: /\bwhich\b.{0,40}\b(product|reel|post|creative|content)\b.{0,40}\b(should|to use|for (this|the) (ad|campaign))\b/i },
+  { label: "use my best/recent noun", pattern: /\buse my (best|recent|top|strongest)\b.{0,40}\b(reel|post|content|creative|product)\b/i },
+  { label: "compare my recent posts", pattern: /\bcompare (my )?(recent )?(posts|reels|content|creatives)\b/i },
+  { label: "which existing creative reuse", pattern: /\bwhich (existing )?(ad )?creative\b.{0,40}\breuse\b/i },
+  { label: "best/highest-performing noun", pattern: /\b(best|strongest|top|highest[- ]performing)\b.{0,30}\b(reel|post|creative|content)\b/i },
+  // "change/update/optimize the creative" — no choose/pick/select verb,
+  // no quality adjective, so none of the patterns above catch it; this
+  // is the exact live-bug follow-up shape ("optimize the campaign
+  // creative") reported after the snapshot-forcing fix above shipped.
+  { label: "change/update/optimize the creative", pattern: /\b(change|update|swap|replace|optimi[sz]e|revise)\b.{0,40}\b(the )?(ad |campaign )?creative\b/i },
+];
 const CREATIVE_SELECTION_INTENT_PATTERNS = new RegExp(
-  [
-    /\b(choose|pick|select)\b.{0,60}\b(best|exact|strongest|top|right)\b.{0,50}\b(reel|post|creative|content|product|video|image)\b/i,
-    /\b(choose|pick|select)\b.{0,40}\b(reel|post|creative|content|product)\b.{0,40}\b(advertise|for (this|the) (ad|campaign)|to (run|use))\b/i,
-    /\bwhich\b.{0,40}\b(product|reel|post|creative|content)\b.{0,40}\b(should|to use|for (this|the) (ad|campaign))\b/i,
-    /\buse my (best|recent|top|strongest)\b.{0,40}\b(reel|post|content|creative|product)\b/i,
-    /\bcompare (my )?(recent )?(posts|reels|content|creatives)\b/i,
-    /\bwhich (existing )?(ad )?creative\b.{0,40}\breuse\b/i,
-    /\b(best|strongest|top|highest[- ]performing)\b.{0,30}\b(reel|post|creative|content)\b/i,
-    // "change/update/optimize the creative" — no choose/pick/select verb,
-    // no quality adjective, so none of the patterns above catch it; this
-    // is the exact live-bug follow-up shape ("optimize the campaign
-    // creative") reported after the snapshot-forcing fix above shipped.
-    /\b(change|update|swap|replace|optimi[sz]e|revise)\b.{0,40}\b(the )?(ad |campaign )?creative\b/i,
-  ]
-    .map((r) => r.source)
-    .join("|"),
+  CREATIVE_SELECTION_INTENT_PATTERN_LIST.map((p) => p.pattern.source).join("|"),
   "i"
 );
+// Diagnostic-only helper — returns the label of the FIRST sub-pattern that
+// matches, or null. Never used for real gating logic (that still runs
+// against the combined CREATIVE_SELECTION_INTENT_PATTERNS regex above,
+// unchanged) — purely so a trace log can say exactly which phrasing rule
+// fired.
+function matchedCreativeSelectionPatternLabel(userMessage) {
+  if (typeof userMessage !== "string") return null;
+  const hit = CREATIVE_SELECTION_INTENT_PATTERN_LIST.find((p) => p.pattern.test(userMessage));
+  return hit ? hit.label : null;
+}
 
 // Returns a nudge message when the model's "final" decision should be
 // blocked because it's answering a plan-review/revision request or an
@@ -760,11 +776,36 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // strategy's creative fields.
       {
         const revisedThisTurn = (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0;
+        const activeV2Strategy = getActiveStrategyForConversation(userId, conversationId);
         const creativeRevisionMessage = checkCreativeRevisionRequiredGate({
           userMessage,
-          hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
+          hasActiveV2Strategy: Boolean(activeV2Strategy),
           hasV2Tools,
           revisedThisTurn,
+        });
+        // TEMPORARY diagnostic instrumentation (live bug: production still
+        // shows get_business_snapshot -> final with no revise_strategy call
+        // even after this gate shipped) — env-gated (META_EXPERT_V2_TRACE=1),
+        // no secrets/tokens, safe to leave deployed. Remove once the trace
+        // identifies which condition is actually false in production.
+        v2Trace("creativeRevisionGate", {
+          conversationId,
+          creativeIntentMatched: matchedCreativeSelectionPatternLabel(userMessage) !== null,
+          matchedPattern: matchedCreativeSelectionPatternLabel(userMessage),
+          activeV2StrategyFound: Boolean(activeV2Strategy),
+          activeV2StrategyId: activeV2Strategy?.id || null,
+          activeV2StrategyStatus: activeV2Strategy?.status || null,
+          activeV2StrategyConversationId: activeV2Strategy?.conversationId || null,
+          hasV2Tools,
+          reviseStrategyAlreadyCalledThisTurn: revisedThisTurn,
+          gateRan: true,
+          gateDecision: !creativeRevisionMessage
+            ? "allow"
+            : creativeRevisionNudges < MAX_CREATIVE_REVISION_NUDGES
+            ? "nudge"
+            : "hard-stop",
+          stepsRun,
+          userMessageSnippet: typeof userMessage === "string" ? userMessage.slice(0, 200) : null,
         });
         if (creativeRevisionMessage) {
           if (creativeRevisionNudges < MAX_CREATIVE_REVISION_NUDGES) {

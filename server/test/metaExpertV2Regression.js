@@ -1215,6 +1215,63 @@ async function run() {
     }
   });
 
+  // --- Exact live-reported wording, end-to-end through the real loop ------
+  // Production report (commit 1ec290c): the exact live user message below,
+  // against an active PROPOSED V2 strategy, still produced
+  // get_business_snapshot -> final with no revise_strategy call. This
+  // reproduces that scenario byte-for-byte (same wording, same active-
+  // strategy setup, same bad-then-nudged model shape) through the REAL
+  // orchestrate() loop to prove/disprove the gate logic itself is at
+  // fault. See checkCreativeRevisionRequiredGate's temporary
+  // [meta_expert_v2_trace] creativeRevisionGate instrumentation
+  // (orchestrator/index.js) for the live diagnostic fields requested
+  // alongside this test — set META_EXPERT_V2_TRACE=1 in production and
+  // reproduce this exact message to see which field is actually false.
+  await check("[Creative revision gate, exact live wording] active PROPOSED strategy + the exact reported live message: required flow is get_business_snapshot -> revise_strategy -> final", async () => {
+    const userId = makeUser(`v2-creative-live-wording-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+      const storedInitial = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(storedInitial.status, "proposed", "test setup sanity check: the active strategy must be PROPOSED, matching the live report");
+    } finally {
+      restoreFetch();
+    }
+
+    const userMessage =
+      "Choose the exact best creative for this campaign from my recent Facebook/Instagram content and WooCommerce products. " +
+      "Tell me which specific Reel/post/product you selected and why. " +
+      "Do not ask me to choose unless the data is genuinely ambiguous.";
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        // Exact live-bug shape: finalizes right after the snapshot,
+        // without ever calling revise_strategy.
+        finalText("Based on your recent content, I selected the Vitamin C Serum post (480 likes, 52 comments, 30 shares) as the best creative for this campaign because it has real, verified engagement."),
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares) — real engagement shows strong interest." } }, freshResearchRequired: false }),
+        finalText("I've updated the creative to use your Vitamin C Serum post, which has real engagement (480 likes, 52 comments, 30 shares)."),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot", "meta_expert_v2.revise_strategy"], `required flow is get_business_snapshot -> revise_strategy -> final: ${JSON.stringify(toolNames)}`);
+      const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
+      assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
+      assert.doesNotMatch(result.reply, /because it has real, verified engagement\.$/, "the premature pre-revision answer must never be the final reply");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {
