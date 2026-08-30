@@ -1,3 +1,5 @@
+import { logger } from "../../config/logger.js";
+
 const API_VERSION = process.env.META_API_VERSION || "v19.0";
 const BASE = `https://graph.facebook.com/${API_VERSION}`;
 
@@ -11,9 +13,22 @@ async function metaFetch(path, { accessToken, method = "GET", body }) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const message = data?.error?.message || `Meta API error ${res.status}`;
-    const err = new Error(message);
-    err.code = data?.error?.code;
+    const apiError = data?.error || {};
+    // Live bug: a raw "Invalid parameter" from Meta with no further
+    // context reached the customer verbatim after an execute_strategy
+    // approval — Meta's generic error.message is often unhelpful on its
+    // own, but the response also carries error_user_msg (Meta's own
+    // human-readable explanation of WHICH parameter/why) and
+    // error_subcode/fbtrace_id (needed to look the failure up with Meta
+    // support). Previously only error.message was kept — everything else
+    // was silently dropped, making every future occurrence just as
+    // undiagnosable as this one. Logged in full for operators; the thrown
+    // message includes error_user_msg when Meta provides one, since it's
+    // written by Meta to be shown to the end user.
+    logger.error("meta_api.request_failed", { path, method, status: res.status, code: apiError.code, errorSubcode: apiError.error_subcode, type: apiError.type, message: apiError.message, errorUserTitle: apiError.error_user_title, errorUserMsg: apiError.error_user_msg, fbtraceId: apiError.fbtrace_id });
+    const message = apiError.error_user_msg || apiError.message || `Meta API error ${res.status}`;
+    const err = new Error(apiError.error_subcode ? `${message} (Meta error ${apiError.code}/${apiError.error_subcode})` : message);
+    err.code = apiError.code;
     throw err;
   }
   return data;
