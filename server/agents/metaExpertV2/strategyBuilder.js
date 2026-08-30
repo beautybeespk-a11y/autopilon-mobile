@@ -17,6 +17,7 @@ import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
   checkGoalAlignmentPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
+  repairSalesReasoningSummary,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -216,10 +217,26 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   };
 
   const goalErrors = checkGoalAlignmentPolicy(normalized, businessSignals);
-  const salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
+  let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
   const audienceErrors = checkAudienceQualityPolicy(normalized, businessSignals);
   const budgetErrors = checkBudgetPolicy(normalized);
   const revisionErrors = priorStored ? checkRevisionSubstantive({ priorStrategy: priorStored.strategy, newStrategy: normalized, requestedChanges }) : [];
+
+  // Non-strategic presentation repair (live bug): when sales-consistency
+  // wording is the ONLY thing wrong — every real business decision
+  // (objective, audience, budget, assets, placements) already checked out
+  // — deterministically regenerate reasoning_summary instead of rejecting
+  // a sound strategy over prose. See repairSalesReasoningSummary in
+  // policy.js. Never a second build_strategy call, never another LLM
+  // generation — this stays inside the model's one attempt.
+  if (
+    salesConsistencyErrors.length && !resolutionErrors.length && !contextual.errors.length &&
+    !goalErrors.length && !audienceErrors.length && !budgetErrors.length && !revisionErrors.length
+  ) {
+    if (traceEnabled) trace("strategy reasoning_summary auto-repaired (sales consistency)", { conversationId, before: normalized.reasoning_summary });
+    normalized = { ...normalized, reasoning_summary: repairSalesReasoningSummary(normalized) };
+    salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
+  }
 
   const errors = [...resolutionErrors, ...contextual.errors, ...goalErrors, ...salesConsistencyErrors, ...audienceErrors, ...budgetErrors, ...revisionErrors];
 

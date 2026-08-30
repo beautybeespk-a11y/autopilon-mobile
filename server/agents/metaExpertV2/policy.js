@@ -115,6 +115,41 @@ export function checkSalesConsistencyPolicy(strategy) {
   return errors;
 }
 
+// Live bug (round after the per-turn single-call gate): a structurally
+// sound OUTCOME_SALES strategy (valid objective/audience/budget/assets/
+// placements — everything a business decision) was rejected purely
+// because reasoning_summary's WORDING didn't frame it around purchases/
+// CPA/ROAS/revenue. That's a presentation defect, not an unresolved
+// business issue — the model had already made the right call, it just
+// phrased the explanation for reach/engagement instead of sales.
+// Rejecting it burned the model's one generation attempt (Step 7) on
+// something purely mechanical, driving exactly the kind of build_strategy
+// retry the per-turn gate now caps.
+//
+// repairSalesReasoningSummary deterministically REGENERATES the summary
+// from the strategy's own already-validated fields (optimization_event,
+// evidence_used) — never another LLM call, same "mechanical fix before
+// validation" principle as normalizeStrategyEnumAliases/deriveCtaIfMissing/
+// capHeuristicBudget in strategySchema.js/policy.js. Called by
+// strategyBuilder.js ONLY when checkSalesConsistencyPolicy is the SOLE
+// failing check — every other business decision must already be sound.
+const OUTCOME_SALES_EVENT_LABEL = {
+  PURCHASE: "purchases",
+  ADD_TO_CART: "add-to-cart conversions",
+  LEAD: "lead conversions",
+  COMPLETE_REGISTRATION: "registration conversions",
+};
+export function repairSalesReasoningSummary(strategy) {
+  const evidenceClause = Array.isArray(strategy.evidence_used) && strategy.evidence_used.length
+    ? ` — using ${strategy.evidence_used.join("; ")}`
+    : "";
+  if (strategy.optimization_event === "PURCHASE") {
+    return `This strategy is optimized to drive purchases, not just reach or clicks${evidenceClause}: the goal is a strong volume of completed purchases at an efficient cost-per-acquisition (CPA) and a healthy return on ad spend (ROAS), maximizing revenue and overall conversion efficiency.`;
+  }
+  const eventLabel = OUTCOME_SALES_EVENT_LABEL[strategy.optimization_event] || "conversions";
+  return `This strategy is optimized to drive ${eventLabel}, not just reach or clicks${evidenceClause}: the goal is a strong conversion volume at an efficient cost-per-acquisition (CPA) and a healthy return on ad spend (ROAS), maximizing revenue and overall conversion efficiency.`;
+}
+
 // Step 4/5 — Audience quality. Same "generic audience needs a real reason"
 // principle: All genders 18-65 is Meta's own widest possible range, not a
 // considered choice.

@@ -809,6 +809,60 @@ async function run() {
     }
   });
 
+  // --- Non-strategic reasoning_summary repair (live bug) -------------------
+  // Live testing round: a valid OUTCOME_SALES/PURCHASE strategy (correct
+  // objective, audience, budget, assets, placements) was rejected purely
+  // because reasoning_summary's WORDING didn't frame it around purchases/
+  // CPA/ROAS/revenue — a presentation defect, not a real business issue.
+  // The backend now auto-repairs the summary deterministically instead of
+  // rejecting, so build_strategy never needs a second call for this.
+  await check("[V2 policy] a structurally valid Sales/Purchase strategy with a weak/generic reasoning_summary is auto-repaired (not rejected) — accepted on the FIRST build_strategy call", async () => {
+    const userId = makeUser(`v2-repair-reasoning-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const weakSummary = "This will get more people to see and engage with your brand and increase reach.";
+      const strategy = baseStrategy({ reasoning_summary: weakSummary });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.notEqual(result.strategy.reasoning_summary, weakSummary, "the weak/generic wording must actually be replaced, not kept");
+      assert.match(result.strategy.reasoning_summary, /\bpurchases?\b/i);
+      assert.match(result.strategy.reasoning_summary, /\bcpa\b/i);
+      assert.match(result.strategy.reasoning_summary, /\broas\b/i);
+      assert.match(result.strategy.reasoning_summary, /\brevenue\b/i);
+      assert.match(result.recommendationText, /\bpurchases?\b/i, "the repaired wording must actually reach the customer-facing recommendation text");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy, orchestrator-level] a weak/generic reasoning_summary for an otherwise-valid Sales/Purchase strategy never triggers a second build_strategy call through the real loop", async () => {
+    const userId = makeUser(`v2-repair-reasoning-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const strategy = baseStrategy({ reasoning_summary: "This will get more people to see and engage with your brand and increase reach." });
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", strategy),
+        finalText("Here is your recommended strategy."),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales on my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      assert.equal(buildCalls.length, 1, `the weak reasoning_summary must be repaired in place — no retry should ever be needed: ${JSON.stringify(buildCalls)}`);
+      assert.equal(buildCalls[0].result.valid, true, JSON.stringify(buildCalls[0].result));
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {
