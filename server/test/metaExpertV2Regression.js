@@ -1525,6 +1525,58 @@ async function run() {
     }
   });
 
+  // --- Fabricated "success" out of a rejection's own text (live bug) ------
+  // Live screenshot: build_strategy was genuinely REJECTED (no usable
+  // existing Facebook/Instagram content — the honest checkCreativeSourceAvailabilityPolicy
+  // rejection). The model then wrongly tried revise_strategy (nothing
+  // exists yet), got correctly blocked; tried build_strategy again, got
+  // correctly blocked by the per-turn gate (which quoted the rejection's
+  // own guidance text back in its nudge); and on its NEXT "final" decision
+  // dressed that guidance up as a complete, approvable strategy — "the
+  // strategy remains paused until you approve it" — even though nothing
+  // was ever saved. Every gate fired correctly; only the FINAL reply was
+  // dishonest. The new backend-enforced check overrides any such reply
+  // deterministically whenever it can prove nothing was actually saved.
+  await check("[V2 honesty guard] a rejected build_strategy call can never be dressed up as a complete, approvable strategy in the final reply — the backend overrides it with an honest message when nothing was actually saved", async () => {
+    const userId = makeUser(`v2-honesty-guard-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // No Facebook posts mocked (empty), no Instagram connected — matches
+    // the live scenario: no usable existing Meta content, so an
+    // EXISTING_PAGE_POST claim is genuinely, honestly rejected.
+    const strategyClaimingExistingPost = baseStrategy({
+      creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use your recent Facebook post about the product." },
+    });
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", strategyClaimingExistingPost), // rejected — no usable existing content
+        toolCall("meta_expert_v2.revise_strategy", {}), // wrong move — nothing exists yet to revise
+        toolCall("meta_expert_v2.build_strategy", strategyClaimingExistingPost), // 2nd real attempt — blocked by the per-turn gate
+        // Live-bug shape: fabricates a complete, approvable-sounding
+        // strategy out of the rejection's own guidance text.
+        finalText(
+          "- **Objective**: Outcome Sales\n- **Creative Strategy**: New product-led creative based on WooCommerce relevance.\n\n" +
+          "The strategy remains paused until you approve it. If you have any adjustments, please confirm."
+        ),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales on my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /remains paused until you approve/i, "the fabricated fake-success reply must never reach the customer");
+      assert.doesNotMatch(result.reply, /\*\*Objective\*\*/i, "no fabricated strategy-shaped content must reach the customer when nothing was actually saved");
+      assert.match(result.reply, /wasn't able to finalize a strategy/i);
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active, null, "no strategy must exist for this conversation — the backend override only fires when it can PROVE nothing was saved");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {

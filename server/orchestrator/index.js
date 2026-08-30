@@ -828,6 +828,43 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           };
         }
       }
+      // CONFIRMED LIVE BUG: a rejected meta_expert_v2.build_strategy call
+      // (this turn) fed its rejection guidance into the per-turn gate's
+      // nudge above (see summarizeV2ToolResult); the model then dressed
+      // that guidance up as if it were a complete, approvable strategy —
+      // "the strategy remains paused until you approve it" — even though
+      // NOTHING was ever actually saved for this conversation. A user who
+      // then said "approve it" would hit checkV2ExecutionApprovalGate's
+      // "No active strategy exists" failure, having been told the
+      // opposite. Every gate up to this point fired correctly; nothing
+      // stopped the model from fabricating a fake success out of a
+      // rejection's own leftover text once it reached "final."
+      //
+      // Backend-enforced, deterministic, and narrow: only overrides the
+      // reply when build_strategy/revise_strategy was attempted THIS TURN,
+      // its real (dispatched) outcome was a genuine rejection
+      // (valid:false), AND no active strategy exists for this conversation
+      // right now — i.e. the backend can PROVE nothing was actually saved.
+      // A genuine success, or a rejected revision of an EXISTING active
+      // strategy (which stays active, untouched, since only a successful
+      // revision ever supersedes it), never triggers this — the model's
+      // own wording is trusted in every other case.
+      if (hasV2Tools) {
+        const lastBuildOutcome = v2ToolLastOutcome.get("meta_expert_v2.build_strategy");
+        const lastReviseOutcome = v2ToolLastOutcome.get("meta_expert_v2.revise_strategy");
+        const rejectedOutcome = [lastReviseOutcome, lastBuildOutcome].find((o) => o?.status === "completed" && o.result?.valid === false);
+        if (rejectedOutcome && !getActiveStrategyForConversation(userId, conversationId)) {
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", "Strategy could not be finalized — nothing was saved this turn.", "done"));
+          if (planId) setPlanStatus(planId, "failed");
+          return {
+            reply: `I wasn't able to finalize a strategy for this request — ${rejectedOutcome.result.issue} Could you tell me more, or would you like me to try a different approach?`,
+            trace,
+            toolResults,
+            usage: usageTotals,
+          };
+        }
+      }
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));
       if (planId) setPlanStatus(planId, "completed");
