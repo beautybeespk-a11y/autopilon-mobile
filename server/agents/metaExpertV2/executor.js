@@ -185,6 +185,20 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     markStrategyExecuted(stored.id, executionResult);
     return { ...executionResult, nextStep: "Campaign and ad set are created and PAUSED — nothing will spend until you resume it." };
   } catch (err) {
+    // Live bug: Meta's real Ad Set creation rejected an approved strategy
+    // with "(#100/3858558) To avoid zero results, your budget must be at
+    // least PKR250.00" — a genuinely recoverable, budget-only problem
+    // Meta itself already quantified. markStrategyFailed below moves the
+    // strategy out of EXECUTABLE_STATUSES entirely, so
+    // getActiveStrategyForConversation would no longer find it — forcing
+    // the user back through a full build_strategy from scratch just to
+    // raise one number. For this specific, identifiable Meta rejection,
+    // keep the strategy 'proposed' instead so a plain "revise the budget
+    // to X" reaches it through the normal revise_strategy path.
+    if (err.code === 100 && err.subcode === 3858558) {
+      setStrategyStatus(stored.id, "proposed");
+      throw err;
+    }
     markStrategyFailed(stored.id, err.message);
     throw err;
   }

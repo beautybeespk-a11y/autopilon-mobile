@@ -66,14 +66,26 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [] } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [], writeError = null } = {}) {
   let nextId = 900000000000001n;
   return async (url, options = {}) => {
     const u = new URL(url);
     const path = u.pathname.replace(/^\/v[\d.]+/, "");
     const method = options.method || "GET";
     if (method !== "GET") {
-      writes.push({ path, body: options.body ? JSON.parse(options.body) : {} });
+      const writeBody = options.body ? JSON.parse(options.body) : {};
+      writes.push({ path, body: writeBody });
+      // writeError simulates a real Meta API rejection (e.g. "(#100/
+      // 3858558) budget too low") for ONE specific write path — every
+      // other write still succeeds normally, matching a real partial
+      // failure mid-execution (e.g. Campaign created fine, Ad Set
+      // rejected). An optional failWhen(body) predicate scopes it further
+      // (e.g. only when the submitted budget is actually below Meta's
+      // real minimum) so a corrected retry against the SAME mock can
+      // succeed naturally, exactly like the real API would.
+      if (writeError && path.endsWith(writeError.pathSuffix) && (!writeError.failWhen || writeError.failWhen(writeBody))) {
+        return jsonResponse({ error: writeError.error }, writeError.status || 400);
+      }
       return jsonResponse({ id: String(nextId++) });
     }
     if (path === "/me/adaccounts") return jsonResponse({ data: adAccounts });
@@ -472,6 +484,50 @@ async function run() {
       );
       const stored = getStoredStrategy(userId, built.strategyId);
       assert.equal(stored.status, "proposed", "a strategy blocked for missing budget must stay 'proposed', never falsely marked approved/executed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Meta rejects the real Ad Set for budget-too-low (live bug, round 17) --
+  // Live screenshot: after the earlier budget-missing fix, an approved
+  // strategy with a REAL (but too small) budget reached Meta's actual Ad
+  // Set creation and was rejected: "(#100/3858558) To avoid zero results,
+  // your budget must be at least PKR250.00." markStrategyFailed's normal
+  // path would move the strategy out of EXECUTABLE_STATUSES entirely,
+  // forcing the user through a full build_strategy from scratch just to
+  // raise one number. For this specific, identifiable Meta rejection, the
+  // strategy is kept 'proposed' instead so a plain "raise the budget"
+  // reaches it through the normal revise_strategy path.
+  await check("[V2 execution] Meta's real 'budget too low' rejection keeps the strategy revisable ('proposed'), not permanently 'failed' — a one-field fix shouldn't require rebuilding from scratch", async () => {
+    const userId = makeUser(`v2-meta-budget-too-low-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        writeError: { pathSuffix: "/adsets", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 3858558, error_user_msg: "To avoid zero results, your budget must be at least PKR250.00." }, failWhen: (body) => body.daily_budget < 250 },
+      },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 50 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => /at least PKR250/.test(err.message) && err.code === 100 && err.subcode === 3858558
+      );
+      const stored = getStoredStrategy(userId, built.strategyId);
+      assert.equal(stored.status, "proposed", "a budget-too-low rejection from Meta itself must leave the strategy revisable, not dead-ended as 'failed'");
+      assert.equal(getActiveStrategyForConversation(userId, conversationId)?.id, built.strategyId, "the strategy must still be findable as the active one for a follow-up revise_strategy call");
+
+      // The one-field fix actually works: revise_strategy finds it and a
+      // corrected budget executes cleanly on the very next attempt.
+      const revised = await reviseStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, requestedChanges: { budget_daily: 500 }, userMessage: "raise the budget to PKR 500/day" });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
+      assert.equal(executed.status, "PAUSED");
     } finally {
       restoreFetch();
     }

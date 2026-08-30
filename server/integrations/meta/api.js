@@ -29,6 +29,7 @@ async function metaFetch(path, { accessToken, method = "GET", body }) {
     const message = apiError.error_user_msg || apiError.message || `Meta API error ${res.status}`;
     const err = new Error(apiError.error_subcode ? `${message} (Meta error ${apiError.code}/${apiError.error_subcode})` : message);
     err.code = apiError.code;
+    err.subcode = apiError.error_subcode;
     throw err;
   }
   return data;
