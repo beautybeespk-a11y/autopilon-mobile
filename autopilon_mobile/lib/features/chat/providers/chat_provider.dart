@@ -222,5 +222,21 @@ class ChatController extends StateNotifier<ChatState> {
   }
 }
 
+// Deliberately NOT .autoDispose, unlike most other screen-level providers
+// in this app (tasks/files/agents/automations/etc., where autoDispose is
+// correct — a listing screen re-fetching fresh data on reentry has no
+// downside). Chat is different: activeConversationId/messages are
+// hard-to-recreate, in-progress client state, not just a cached list.
+// With GoRouter's plain ShellRoute (app_router.dart), navigating to any
+// other tab and back UNMOUNTS ChatScreen — with autoDispose, that tears
+// down the whole ChatController and its state the moment the last
+// listener drops, so the NEXT message sent conversationId: null,
+// silently starting a brand-new server-side conversation instead of
+// continuing the one on screen. Confirmed as the root cause of a live V2
+// bug where a strategy built in one turn couldn't be found by
+// getActiveStrategyForConversation() on a later turn — the two turns had
+// landed in two different conversations. Same category of "must survive
+// navigation" state as authControllerProvider/organizationControllerProvider
+// below, for the same underlying reason.
 final chatControllerProvider =
-    StateNotifierProvider.autoDispose<ChatController, ChatState>((ref) => ChatController(ref));
+    StateNotifierProvider<ChatController, ChatState>((ref) => ChatController(ref));
