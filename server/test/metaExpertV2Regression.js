@@ -533,6 +533,91 @@ async function run() {
     }
   });
 
+  // --- Claimed execution without ever calling the tool (live bug, round 17) --
+  // Live screenshot: execute_strategy was blocked for a missing budget,
+  // the model correctly asked the user for one, the user replied "500/
+  // day" — and the model's NEXT decision was "final" with the reply
+  // "Executing the strategy with a daily budget of 500 PKR." Agent Trace
+  // showed only Planning -> Completed, no tool ever called. Nothing was
+  // actually revised or executed.
+  await check("[V2 execution claim gate] a 'final' reply claiming the strategy is executing/updated with NO revise_strategy or execute_strategy call this turn is nudged into actually calling the tool, and finalizes honestly once it does", async () => {
+    const userId = makeUser(`v2-execution-claim-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        // Live-bug shape: claims completion with zero tool calls this turn.
+        finalText("Executing the strategy with a daily budget of 500 PKR."),
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { budget_daily: 500 } }),
+        // A REAL revise_strategy call happened this turn now — the exact
+        // same "I've updated the budget" phrasing here must NOT be
+        // blocked, since it's now an honest claim.
+        finalText("I've updated the budget to PKR 500/day — say \"approve\" when you're ready to execute."),
+      ],
+    }));
+    try {
+      const userMessage = "500/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.revise_strategy"), `the nudge must force a real revise_strategy call: ${JSON.stringify(toolNames)}`);
+      assert.doesNotMatch(result.reply, /^Executing the strategy with a daily budget of 500 PKR\.$/, "the unfulfilled claim must never be the final reply");
+      assert.match(result.reply, /updated the budget/i);
+      // revise_strategy always inserts a NEW row (never updates in place)
+      // — the active strategy for this conversation is now the revision,
+      // not initial.strategyId.
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.strategy.budget_daily, 500, "the budget must actually be revised in storage, not just narrated");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 execution claim gate] the SAME false claim repeated even after the nudge hard-stops with an honest fallback — never reaches the customer as a fabricated success", async () => {
+    const userId = makeUser(`v2-execution-claim-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Executing the strategy with a daily budget of 500 PKR."),
+        finalText("The campaign is now running with the updated budget."), // still no tool call after the nudge
+      ],
+    }));
+    try {
+      const userMessage = "500/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.toolResults.length, 0, "no V2 tool must have actually been dispatched in this scenario");
+      assert.doesNotMatch(result.reply, /is now running|executing the strategy/i, "the fabricated success claim must never reach the customer even after the nudge is exhausted");
+      const stored = getStoredStrategy(userId, initial.strategyId);
+      assert.equal(stored.strategy.budget_daily ?? null, null, "budget must remain unset — nothing was actually revised");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test G --------------------------------------------------
   await check("[Acceptance G] multiple ad accounts/Pages/Pixels — saved defaults are used deterministically, never guessed", async () => {
     const userId = makeUser(`accept-g-${stamp}@example.com`);

@@ -57,6 +57,35 @@ const NARRATION_WITHOUT_ACTION = /\b(let me(?!\s+know)|let's|i'll|i will|i'm goi
 // few lines below already has for a different failure shape.
 const MAX_NARRATION_NUDGES = 1;
 
+// CONFIRMED LIVE BUG (round 17): after execute_strategy was blocked for a
+// missing budget and the model correctly asked the user for one, the
+// user replied with a plain number ("500/day"). The model's NEXT
+// decision was "final" with the reply "Executing the strategy with a
+// daily budget of 500 PKR." — Agent Trace showed only Planning ->
+// Completed, no tool ever called. Nothing was actually revised or
+// executed; the reply asserted a real-money action was happening when it
+// wasn't. NARRATION_WITHOUT_ACTION above only catches FUTURE-tense
+// commitments ("I'll do X") — it doesn't cover a PRESENT/PAST-tense claim
+// that something is already running or done, which is arguably worse
+// since it tells the customer a real action already occurred.
+// checkStaleFactualAnswerGate (stepsRun === 0 only) and the honesty guard
+// (only fires when build/revise_strategy was actually REJECTED this
+// turn) both structurally can't catch this either — neither engages when
+// no V2 tool was attempted at all this turn. Scoped tightly to the exact
+// language a genuine execute/revise completion claim uses, and gated on
+// hasV2Tools + neither revise_strategy nor execute_strategy having
+// actually run this turn — a legitimate final reply after a REAL
+// execute_strategy call this turn (e.g. "Your campaign is now created
+// and paused") is untouched, since executeCalledThisTurn is true there.
+const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|(campaign|strategy|ad set) is now (created|running|live|executing)|proceeding to (execute|create) the (campaign|strategy))\b/i;
+const MAX_EXECUTION_CLAIM_NUDGES = 1;
+function checkExecutionClaimWithoutCallGate({ decision, hasV2Tools, executeCalledThisTurn, reviseCalledThisTurn }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  if (executeCalledThisTurn || reviseCalledThisTurn) return null;
+  if (!EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message)) return null;
+  return 'Your reply claims the strategy is being executed, revised, or updated, but neither meta_expert_v2.revise_strategy nor meta_expert_v2.execute_strategy was actually called this turn — nothing happened. If you now have what you need (e.g. a budget the user just gave you), call the real tool now with type "tool_call" instead of describing it as done. Never describe an action as executing/created/updated/running unless the matching tool call actually ran and succeeded this turn.';
+}
+
 // A hard output boundary against internal data reaching the user — not
 // just an instruction (buildSystemPrompt() below already tells the model
 // never to copy the "[Underlying tool data...]" history annotation
@@ -670,6 +699,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let leakNudges = 0;
   let staleAnswerNudges = 0;
   let creativeRevisionNudges = 0;
+  let executionClaimNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
@@ -758,6 +788,39 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           },
         ];
         continue;
+      }
+      // Round 17 (live testing) — see EXECUTION_CLAIM_WITHOUT_CALL_PATTERN
+      // above. Checked with NO stepsRun restriction (unlike the stale-
+      // factual-answer gate below): the model could have called SOME
+      // unrelated tool earlier this turn and still be about to claim an
+      // execute/revise happened when it didn't.
+      const executionClaimGateMessage = hasV2Tools
+        ? checkExecutionClaimWithoutCallGate({
+            decision, hasV2Tools,
+            executeCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) > 0,
+            reviseCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0,
+          })
+        : null;
+      if (executionClaimGateMessage && executionClaimNudges < MAX_EXECUTION_CLAIM_NUDGES) {
+        executionClaimNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: executionClaimGateMessage },
+        ];
+        continue;
+      }
+      if (executionClaimGateMessage) {
+        // Nudge already used and it STILL claimed an unexecuted action —
+        // never let this reach the customer. Fail safe with an honest,
+        // actionable message instead of a fabricated "done."
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Claimed an action that was never actually taken — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I wasn't able to actually apply that — could you repeat the budget (or whatever you'd like changed), and I'll update and execute the strategy for real this time?",
+          trace, toolResults, usage: usageTotals,
+        };
       }
       // Round 13 (live testing): only fires on the FIRST model decision of
       // this turn — once stepsRun > 0, a tool HAS already been called this
