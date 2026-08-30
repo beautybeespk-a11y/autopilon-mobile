@@ -24,6 +24,7 @@ const { saveConnection, updateConnectionMeta } = await import("../integrations/m
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
+const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
 const { checkV2ExecutionApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
@@ -432,6 +433,40 @@ async function run() {
       assert.ok(executed.adSetId);
       const stored = getStoredStrategy(userId, built.strategyId);
       assert.equal(stored.status, "executed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Bare short approval replies (live bug, round 20) --------------------
+  // Live screenshot: the model's own execute_strategy-blocked message
+  // suggests exactly 'Please confirm your approval by stating "approve"
+  // or "run it."' — the user (via a quick-reply chip or a terse natural
+  // reply) sent just "run" (no "it"), which didn't match the "run it"
+  // phrase, silently blocking a genuinely intended approval and leaving
+  // the user stuck re-presented with the same recommendation.
+  await check("[V2 policy] a bare 'run' (or 'yes'/'ok'/'okay'/'sure') as the ENTIRE message counts as approval — the model's own suggested short reply must actually work", () => {
+    for (const reply of ["run", "Run", "run.", "run!", "yes", "ok", "okay", "sure"]) {
+      assert.ok(messageIndicatesExecutionApproval(reply), `"${reply}" must be recognized as approval`);
+    }
+  });
+
+  await check("[V2 policy] 'run' or 'yes' used naturally MID-SENTENCE (not as the whole reply) is never mistaken for approval", () => {
+    for (const reply of ["how does this run", "yes it is", "yes, tell me more"]) {
+      assert.equal(messageIndicatesExecutionApproval(reply), false, `"${reply}" must NOT be treated as approval`);
+    }
+  });
+
+  await check("[V2 policy, orchestrator-level] checkV2ExecutionApprovalGate accepts a bare 'run' the same as 'run it'", async () => {
+    const userId = makeUser(`v2-bare-run-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true);
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "run" });
+      assert.equal(gate, null, "a bare 'run' reply must pass the approval gate, matching the model's own suggested short phrasing");
     } finally {
       restoreFetch();
     }

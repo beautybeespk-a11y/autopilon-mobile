@@ -327,8 +327,20 @@ export function buildUnresolvedIssue(errors) {
 // own active-strategy lookup, see strategyStore.js's
 // getActiveStrategyForConversation).
 const EXECUTION_APPROVAL_PATTERN = /\b(approve|approved|proceed|run it|launch it|go ahead|do it|confirm(ed)?|create it|build it|make it live|start it)\b|\byes[,.]?\s+(create|launch|run|build|do)\s+it\b/i;
+// Live bug (round 20): the model's own execute_strategy-blocked message
+// suggests exactly "Please confirm your approval by stating 'approve' or
+// 'run it.'" — but a natural short reply of just "run" (no "it") doesn't
+// match "run it" above, so a genuinely intended approval was silently
+// blocked, leaving the user stuck re-presenting the same recommendation.
+// Whole-message-only (never mid-sentence) so a real word like "run" or
+// "yes" used naturally elsewhere in a longer message ("how does this
+// run?") is never mistaken for approval — only when it's the ENTIRE
+// reply, exactly the shape a quick-reply chip or a terse human answer
+// takes.
+const BARE_APPROVAL_WORD_PATTERN = /^\s*(run|yes|ok|okay|sure)[.!]?\s*$/i;
 export function messageIndicatesExecutionApproval(text) {
-  return typeof text === "string" && EXECUTION_APPROVAL_PATTERN.test(text);
+  if (typeof text !== "string") return false;
+  return EXECUTION_APPROVAL_PATTERN.test(text) || BARE_APPROVAL_WORD_PATTERN.test(text);
 }
 
 export function fingerprintStrategy(strategy = {}) {
