@@ -652,7 +652,11 @@ async function run() {
       chatResponses: [],
       metaOpts: {
         adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
-        writeError: { pathSuffix: "/adsets", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 3858558, error_user_msg: "To avoid zero results, your budget must be at least PKR250.00." }, failWhen: (body) => body.daily_budget < 250 },
+        // daily_budget arrives in Meta's real minor-unit convention now
+        // (round 20 currency fix) — PKR250.00 is 25000 minor units (×100,
+        // the default multiplier for a 2-decimal currency / no currency
+        // on the mocked ad account).
+        writeError: { pathSuffix: "/adsets", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 3858558, error_user_msg: "To avoid zero results, your budget must be at least PKR250.00." }, failWhen: (body) => body.daily_budget < 25000 },
       },
     }));
     try {
@@ -673,6 +677,57 @@ async function run() {
       assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
       assert.equal(executed.status, "PAUSED");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Currency minor-unit conversion (live bug, round 20) ----------------
+  // Live screenshot: a PKR account, budget_daily 500 (the user's own
+  // words, "500/day" — 500 whole Rupees), and Meta's real Ad Set creation
+  // STILL rejected it as too low: "(#100/3858558) ... your budget must be
+  // at least PKR250.00" — 500 > 250, which made no sense until traced to
+  // the real cause: Meta's API requires daily_budget in the account's
+  // currency's SMALLEST unit (100 = 1.00 for a standard 2-decimal
+  // currency), and nothing in this codebase ever did that conversion —
+  // the raw "500" was sent as 500 minor units (5.00 PKR), nowhere near a
+  // real minimum. budget_daily is set/compared everywhere else in MAJOR
+  // units (matching the user's own wording and the MAX_*_DAILY_BUDGET
+  // config defaults) — the conversion happens ONLY at the literal Meta
+  // API call, in executeCampaignMode.
+  await check("[V2 execution] budget_daily (major units, e.g. 500 whole Rupees) is converted to Meta's real minor-unit convention (50000) for a standard 2-decimal currency before the actual Ad Set creation call", async () => {
+    const userId = makeUser(`v2-currency-minor-units-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(campaignWrite?.body?.daily_budget, 50000, "the real Meta campaign write must carry the minor-unit value (500 PKR x 100), never the raw major-unit number");
+      assert.equal(adSetWrite?.body?.daily_budget, 50000, JSON.stringify(adSetWrite?.body));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 execution] a zero-decimal currency (e.g. JPY) is sent UNCHANGED — no x100 conversion for a currency with no minor unit", async () => {
+    const userId = makeUser(`v2-currency-zero-decimal-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "JPY" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 3000 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.daily_budget, 3000, "a zero-decimal currency (no minor unit) must be sent as-is, not multiplied");
     } finally {
       restoreFetch();
     }

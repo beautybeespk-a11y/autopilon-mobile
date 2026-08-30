@@ -22,6 +22,41 @@ import { MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
 import { getStoredStrategy, getActiveStrategyForConversation, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 
+// Live bug (round 20): a PKR ad account, "budget_daily: 500" (the user's
+// own words, "500/day", meaning 500 whole Rupees), and Meta's real Ad Set
+// creation STILL rejected it as too low: "(#100/3858558) To avoid zero
+// results, your budget must be at least PKR250.00" — 500 > 250, so this
+// made no sense until traced to the actual root cause: Meta's Marketing
+// API requires daily_budget in the ad account's currency's SMALLEST unit
+// (100 = $1.00 for USD, 100 = PKR 1.00 for PKR — same 2-decimal
+// convention), which the internal schema's own field description already
+// says ("In the ad account's currency's smallest unit") — but nothing in
+// this codebase ever actually did that conversion. budget_daily is set
+// and compared everywhere else (MAX_SUGGESTED_DAILY_BUDGET/
+// MAX_EXECUTABLE_DAILY_BUDGET, the user's own "500/day" wording, every
+// policy check) in ordinary MAJOR units (whole Rupees/Dollars) — the only
+// place minor units actually matter is the literal Meta API call, so the
+// conversion happens ONLY here, right before that call, never touching
+// the stored/displayed/compared value anywhere else. A small number of
+// real currencies (JPY, KRW, VND, and others Meta treats the same way as
+// Stripe's documented zero-decimal set) have no minor unit at all — their
+// multiplier is 1, everything else defaults to 100. Three-decimal
+// currencies (e.g. BHD/KWD/OMR) are deliberately NOT special-cased here —
+// too small an edge case to guess Meta's exact behavior for without a
+// live account to verify against; PKR/USD/EUR/GBP and the vast majority
+// of real currencies are unaffected by that omission.
+const META_ZERO_DECIMAL_CURRENCIES = new Set([
+  "BIF", "CLP", "DJF", "GNF", "JPY", "KMF", "KRW", "MGA", "PYG", "RWF", "UGX", "VND", "VUV", "XAF", "XOF", "XPF",
+]);
+function currencyMinorUnitMultiplier(currencyCode) {
+  if (typeof currencyCode !== "string" || !currencyCode) return 100;
+  return META_ZERO_DECIMAL_CURRENCIES.has(currencyCode.toUpperCase()) ? 1 : 100;
+}
+function toMetaBudgetMinorUnits(majorAmount, currencyCode) {
+  if (typeof majorAmount !== "number" || !Number.isFinite(majorAmount)) return majorAmount;
+  return Math.round(majorAmount * currencyMinorUnitMultiplier(currencyCode));
+}
+
 // Meta's real Ad Set optimization_goal enum doesn't include "PURCHASE" (or
 // this strategy's other custom-event-style optimization_event values) —
 // conversion events are optimized via optimization_goal: "OFFSITE_
@@ -55,18 +90,19 @@ function loadExecutable(userId, conversationId, strategyId) {
   return stored;
 }
 
-async function executeCampaignMode(stored, accessToken, userId) {
+async function executeCampaignMode(stored, accessToken, userId, currency) {
   const { strategy, resolvedAssets } = stored;
+  const minorUnitBudget = toMetaBudgetMinorUnits(strategy.budget_daily, currency);
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, {
     name: `${strategy.business_goal} — ${strategy.recommended_objective}`,
     objective: strategy.recommended_objective,
-    dailyBudget: strategy.budget_daily,
+    dailyBudget: minorUnitBudget,
     status: "PAUSED",
   });
   const adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, {
     name: `${strategy.business_goal} — ad set`,
     campaign_id: campaign.id,
-    daily_budget: strategy.budget_daily,
+    daily_budget: minorUnitBudget,
     billing_event: "IMPRESSIONS",
     ...buildOptimizationFields(strategy, resolvedAssets.pixelId),
     bid_strategy: strategy.bid_strategy,
@@ -84,6 +120,17 @@ async function executeCampaignMode(stored, accessToken, userId) {
 // Campaign + Ad Set first (Meta's structure requires it), then attaches
 // the actual creative via the SAME internal tools the explicit-action
 // chat flow already uses — called directly, never through LLM dispatch.
+// NOT converted to minor units like executeCampaignMode below — this path
+// creates its campaign directly via api.js (safe to convert) but the ad
+// set goes through the SHARED meta.create_ad_set tool (campaigns.js),
+// which V1 also dispatches directly and which enforces its own
+// assertBudgetWithinCap against MAX_EXECUTABLE_DAILY_BUDGET in MAJOR
+// units — feeding it an already-converted minor-unit number would trip
+// that cap falsely (e.g. 50000 minor units > a 10000-major-unit cap) or
+// require changing campaigns.js itself, which is shared V1 code this
+// rebuild must never touch. Left as a known, separately-flagged gap
+// rather than a half-fix that trades one currency bug for a new false
+// rejection.
 async function executeExplicitAction(stored, accessToken, userId, conversationId) {
   const { strategy, resolvedAssets } = stored;
   const objective = strategy.recommended_objective || "OUTCOME_ENGAGEMENT";
@@ -171,7 +218,8 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     // anything real — time may have passed since the strategy was
     // proposed, access can be revoked in between (Step 8, requirement 2).
     const [adAccounts, pages] = await Promise.all([meta.listAdAccounts(accessToken), meta.listPages(accessToken)]);
-    if (!adAccounts.some((a) => a.id === stored.resolvedAssets.adAccountId)) {
+    const adAccount = adAccounts.find((a) => a.id === stored.resolvedAssets.adAccountId);
+    if (!adAccount) {
       throw new Error(`The ad account this strategy was built for (${stored.resolvedAssets.adAccountId}) is no longer connected — build a new strategy.`);
     }
     if (!pages.some((p) => p.id === stored.resolvedAssets.pageId)) {
@@ -180,7 +228,7 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
 
     const executionResult = stored.mode === "explicit_action"
       ? await executeExplicitAction(stored, accessToken, userId, conversationId)
-      : await executeCampaignMode(stored, accessToken, userId);
+      : await executeCampaignMode(stored, accessToken, userId, adAccount.currency);
 
     markStrategyExecuted(stored.id, executionResult);
     return { ...executionResult, nextStep: "Campaign and ad set are created and PAUSED — nothing will spend until you resume it." };
