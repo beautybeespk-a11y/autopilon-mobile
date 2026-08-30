@@ -708,6 +708,42 @@ async function run() {
     }
   });
 
+  // --- Stale pre-fix stored strategy with the broken bid_strategy value (live bug, round 23) --
+  // Live screenshot: the SAME "bid amount required" rejection recurred
+  // even after the round-22 fix was deployed. Root cause: build/revise-
+  // time normalization (above) only touches a strategy at the moment
+  // it's built or revised — a strategy that was already sitting in
+  // 'proposed' from BEFORE the fix shipped (a real scenario: the same
+  // conversation gets reused across many testing rounds) keeps its stale
+  // LOWEST_COST_WITH_BID_CAP value forever, since nothing re-touches an
+  // already-stored row until its NEXT build/revise call. Simulated here
+  // by inserting a strategy the way a pre-fix build_strategy call would
+  // have (bypassing normalizeStrategyEnumAliases entirely, via a direct
+  // DB write) and confirming executeStrategy() corrects it anyway.
+  await check("[V2 execution] a stale strategy stored BEFORE the bid-strategy fix (raw DB row, normalization never applied) is still corrected at the actual execution call — defense in depth for rows that predate a fix", async () => {
+    const userId = makeUser(`v2-stale-bid-strategy-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // Simulate a pre-fix stored row: overwrite the strategyJson directly,
+      // the same shape normalizeStrategyEnumAliases would have produced
+      // BEFORE round 22 — never going through the fixed normalization path.
+      const staleStrategy = { ...built.strategy, bid_strategy: "LOWEST_COST_WITH_BID_CAP" };
+      db.prepare("UPDATE meta_v2_strategies SET strategyJson = ? WHERE id = ?").run(JSON.stringify(staleStrategy), built.strategyId);
+
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "a stale stored value must be corrected at the actual Meta write, not just at build/revise time");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Missing "countries" derivable from locations (live bug, round 22) --
   // Live screenshot: a build_strategy/revise_strategy call was hard-
   // rejected with "Missing required field \"countries\"" even though

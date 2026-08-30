@@ -93,6 +93,18 @@ function loadExecutable(userId, conversationId, strategyId) {
 async function executeCampaignMode(stored, accessToken, userId, currency) {
   const { strategy, resolvedAssets } = stored;
   const minorUnitBudget = toMetaBudgetMinorUnits(strategy.budget_daily, currency);
+  // Defense in depth — deriveXIfMissing/normalizeStrategyEnumAliases
+  // (strategySchema.js) only run at build/revise TIME. A strategy that
+  // was built/revised BEFORE this bid-strategy fix shipped and has sat
+  // in 'proposed' since (a real live scenario — the same conversation
+  // gets reused across many testing rounds) carries its stale
+  // LOWEST_COST_WITH_BID_CAP/COST_CAP value forever, since nothing
+  // re-touches an already-stored row until its NEXT build/revise call.
+  // The schema now only allows LOWEST_COST_WITHOUT_CAP at all, so any
+  // other stored value is unconditionally stale — safe to correct right
+  // here, at the one place that actually spends real API calls, rather
+  // than let an old row's zombie enum value reach Meta's real API again.
+  const safeBidStrategy = strategy.bid_strategy === "LOWEST_COST_WITHOUT_CAP" ? strategy.bid_strategy : "LOWEST_COST_WITHOUT_CAP";
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, {
     name: `${strategy.business_goal} — ${strategy.recommended_objective}`,
     objective: strategy.recommended_objective,
@@ -105,7 +117,7 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
     daily_budget: minorUnitBudget,
     billing_event: "IMPRESSIONS",
     ...buildOptimizationFields(strategy, resolvedAssets.pixelId),
-    bid_strategy: strategy.bid_strategy,
+    bid_strategy: safeBidStrategy,
     targeting: buildTargeting({ countries: strategy.countries, ageMin: strategy.age_min, ageMax: strategy.age_max, gender: strategy.gender === "ALL" ? undefined : strategy.gender?.toLowerCase() }),
     status: "PAUSED",
   });
