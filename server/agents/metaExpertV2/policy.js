@@ -203,6 +203,46 @@ export function repairCreativeReasoningForMissingEvidence(strategy) {
   return `Based on content relevance and format${evidenceClause}, this is the most suitable existing creative to use right now. No real engagement or performance data is currently available in the account to rank content by results, so this selection is based on recency, relevance, and format suitability rather than proven performance.`;
 }
 
+// Live bug (creative-selection follow-up): a live test's snapshot had
+// Facebook post fetching FAIL and no usable Instagram content — yet the
+// strategy still claimed to select "an existing Facebook/Instagram
+// creative," effectively presenting a WooCommerce product as if it were
+// real, fetched Meta content. checkCreativeGroundingPolicy above only
+// guards PERFORMANCE claims ("high engagement"); this guards the
+// EXISTENCE claim itself — creative_strategy.source can only claim
+// EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST when that platform's content
+// actually came back usable in the snapshot. Deliberately NOT
+// auto-repaired like the two checks above: which specific product to
+// recommend instead is a real business decision (which one is actually
+// relevant), not a mechanical wording fix — so this returns a genuine
+// rejection whose message tells the model exactly what to do instead
+// (PRODUCT_IMAGE, grounded in a real product), matching the same
+// "genuine business decision -> real unresolved issue" principle as an
+// ambiguous Pixel.
+function hasUsableContent(section) {
+  return section?.status === "exists" && Array.isArray(section.items) && section.items.length > 0;
+}
+export function checkCreativeSourceAvailabilityPolicy(strategy, snapshot) {
+  const errors = [];
+  const source = strategy.creative_strategy?.source;
+  if (!source) return errors;
+  const fbUsable = hasUsableContent(snapshot?.recentContent?.facebookPosts);
+  const igUsable = hasUsableContent(snapshot?.recentContent?.instagramPosts);
+  if (source === "EXISTING_PAGE_POST" && !fbUsable) {
+    errors.push({
+      field: "creative_strategy",
+      message: `creative_strategy claims an existing Facebook post as the creative, but no usable Facebook post content exists in the current snapshot (status: ${snapshot?.recentContent?.facebookPosts?.status || "unknown"}) — never present a WooCommerce/Shopify product, or anything else, as if it were an existing Facebook creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance."`,
+    });
+  }
+  if (source === "EXISTING_INSTAGRAM_POST" && !igUsable) {
+    errors.push({
+      field: "creative_strategy",
+      message: `creative_strategy claims an existing Instagram post/Reel as the creative, but no usable Instagram content exists in the current snapshot (status: ${snapshot?.recentContent?.instagramPosts?.status || "unknown"}) — never present a WooCommerce/Shopify product, or anything else, as if it were an existing Instagram creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance."`,
+    });
+  }
+  return errors;
+}
+
 // Step 4/5 — Audience quality. Same "generic audience needs a real reason"
 // principle: All genders 18-65 is Meta's own widest possible range, not a
 // considered choice.

@@ -297,6 +297,11 @@ const CREATIVE_SELECTION_INTENT_PATTERNS = new RegExp(
     /\bcompare (my )?(recent )?(posts|reels|content|creatives)\b/i,
     /\bwhich (existing )?(ad )?creative\b.{0,40}\breuse\b/i,
     /\b(best|strongest|top|highest[- ]performing)\b.{0,30}\b(reel|post|creative|content)\b/i,
+    // "change/update/optimize the creative" — no choose/pick/select verb,
+    // no quality adjective, so none of the patterns above catch it; this
+    // is the exact live-bug follow-up shape ("optimize the campaign
+    // creative") reported after the snapshot-forcing fix above shipped.
+    /\b(change|update|swap|replace|optimi[sz]e|revise)\b.{0,40}\b(the )?(ad |campaign )?creative\b/i,
   ]
     .map((r) => r.source)
     .join("|"),
@@ -334,6 +339,33 @@ function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpert
     return "The user is pressing on an integration-state claim (a Pixel, Page, ad account, or store connection) made in the previous turn. That claim can go stale between turns and must be re-verified with a real tool call now, not simply repeated from memory. Call the real lookup tool (meta_expert.research_business_context, meta.list_pages, meta.list_ad_accounts, etc. as appropriate) to get the CURRENT answer before replying.";
   }
   return null;
+}
+
+// CONFIRMED LIVE BUG (V2 live testing, follow-up): the creative-selection
+// gate above successfully forced a real meta_expert_v2.get_business_snapshot
+// call and the model correctly avoided inventing engagement data — but
+// with an ACTIVE strategy already in place, the model then finished
+// (type: "final") right after the snapshot, never calling
+// meta_expert_v2.revise_strategy at all. checkStaleFactualAnswerGate above
+// only runs when stepsRun === 0 (no tool called yet THIS turn) — once the
+// snapshot call happens, stepsRun becomes 1 and that gate no longer
+// applies, so nothing backend-enforced ever required the SECOND step
+// (the actual revision) to happen too.
+//
+// Checked on EVERY "final" decision this turn (no stepsRun restriction —
+// that's the whole point, this fires AFTER a tool has already been
+// called), with its own nudge budget (MAX_CREATIVE_REVISION_NUDGES) so it
+// doesn't interfere with the snapshot-forcing gate's own one-nudge budget
+// above. `revisedThisTurn` is read from the SAME v2ToolCallCounts map the
+// V2 single-call gate already maintains — a call counts as satisfying
+// this requirement whether it succeeded or was rejected (a genuine
+// rejection is a real, honest attempt; the single-call gate already
+// prevents that from becoming a retry loop).
+const MAX_CREATIVE_REVISION_NUDGES = 1;
+function checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy, hasV2Tools, revisedThisTurn }) {
+  if (!hasV2Tools || !hasActiveV2Strategy || revisedThisTurn) return null;
+  if (typeof userMessage !== "string" || !CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) return null;
+  return 'An active strategy already exists for this conversation and this is a creative-selection/change request. You must call meta_expert_v2.revise_strategy — updating ONLY the creative fields (creative_strategy / content_selector) with what the business snapshot actually supports — before finalizing. Preserve the existing objective, audience, budget, Page, ad account, and Pixel exactly as they are; never rebuild the campaign from scratch. The required flow is: get_business_snapshot -> revise_strategy -> final.';
 }
 
 // Issue 5 (live testing round 5): "I want more sales to my website" put
@@ -608,6 +640,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let malformedNudges = 0;
   let leakNudges = 0;
   let staleAnswerNudges = 0;
+  let creativeRevisionNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
@@ -717,6 +750,41 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             { role: "user", content: staleGateMessage },
           ];
           continue;
+        }
+      }
+      // Mandatory revise_strategy step (live bug follow-up) — see
+      // checkCreativeRevisionRequiredGate above. Deliberately checked with
+      // NO stepsRun restriction: this fires specifically AFTER the model
+      // has already called get_business_snapshot (satisfying the gate
+      // above) but is trying to finalize without also revising the active
+      // strategy's creative fields.
+      {
+        const revisedThisTurn = (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0;
+        const creativeRevisionMessage = checkCreativeRevisionRequiredGate({
+          userMessage,
+          hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
+          hasV2Tools,
+          revisedThisTurn,
+        });
+        if (creativeRevisionMessage) {
+          if (creativeRevisionNudges < MAX_CREATIVE_REVISION_NUDGES) {
+            creativeRevisionNudges += 1;
+            conversationForModel = [
+              ...conversationForModel,
+              { role: "assistant", content: JSON.stringify(decision) },
+              { role: "user", content: creativeRevisionMessage },
+            ];
+            continue;
+          }
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", "Creative update could not be finalized through the required revision step.", "done"));
+          if (planId) setPlanStatus(planId, "failed");
+          return {
+            reply: "I wasn't able to complete that creative update through the proper revision process — could you try again, or tell me more about what you'd like changed?",
+            trace,
+            toolResults,
+            usage: usageTotals,
+          };
         }
       }
       trace[trace.length - 1].state = "done";

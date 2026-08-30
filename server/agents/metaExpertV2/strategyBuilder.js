@@ -18,6 +18,7 @@ import {
   checkGoalAlignmentPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
+  checkCreativeSourceAvailabilityPolicy,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -219,6 +220,10 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const goalErrors = checkGoalAlignmentPolicy(normalized, businessSignals);
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
   let creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
+  // NOT eligible for the text-only auto-repair below — which specific
+  // product to recommend instead is a real business decision, not a
+  // wording fix (see checkCreativeSourceAvailabilityPolicy in policy.js).
+  const creativeSourceErrors = checkCreativeSourceAvailabilityPolicy(normalized, snapshot);
   const audienceErrors = checkAudienceQualityPolicy(normalized, businessSignals);
   const budgetErrors = checkBudgetPolicy(normalized);
   const revisionErrors = priorStored ? checkRevisionSubstantive({ priorStrategy: priorStored.strategy, newStrategy: normalized, requestedChanges }) : [];
@@ -239,7 +244,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // BOTH simultaneously is returned as a real (double) rejection instead —
   // that reasoning_summary needs actual attention, not a mechanical patch.
   const baseChecksClean = !resolutionErrors.length && !contextual.errors.length &&
-    !goalErrors.length && !audienceErrors.length && !budgetErrors.length && !revisionErrors.length;
+    !goalErrors.length && !audienceErrors.length && !budgetErrors.length && !revisionErrors.length && !creativeSourceErrors.length;
   if (baseChecksClean && salesConsistencyErrors.length && !creativeGroundingErrors.length) {
     if (traceEnabled) trace("strategy reasoning_summary auto-repaired (sales consistency)", { conversationId, before: normalized.reasoning_summary });
     normalized = { ...normalized, reasoning_summary: repairSalesReasoningSummary(normalized) };
@@ -250,7 +255,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   }
 
-  const errors = [...resolutionErrors, ...contextual.errors, ...goalErrors, ...salesConsistencyErrors, ...creativeGroundingErrors, ...audienceErrors, ...budgetErrors, ...revisionErrors];
+  const errors = [...resolutionErrors, ...contextual.errors, ...goalErrors, ...salesConsistencyErrors, ...creativeGroundingErrors, ...creativeSourceErrors, ...audienceErrors, ...budgetErrors, ...revisionErrors];
 
   trace("strategy final decision", {
     conversationId, accepted: errors.length === 0,

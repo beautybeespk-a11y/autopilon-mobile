@@ -73,7 +73,12 @@ registerTool({
       targeting_approach: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.targeting_approach.enum },
       placements: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.placements.enum },
       manual_placements: { type: "array", items: { type: "string" } },
-      creative_strategy: { type: "object", description: "The backend rejects a description that calls content \"high performing\"/\"proven effective\" unless the selected content's real engagement data (from get_business_snapshot) actually supports it — use \"Based on content relevance and format...\" framing when no such data exists.", properties: { source: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.creative_strategy.properties.source.enum }, description: { type: "string" } } },
+      creative_strategy: {
+        type: "object",
+        description:
+          "The backend rejects a description that calls content \"high performing\"/\"proven effective\" unless the selected content's real engagement data (from get_business_snapshot) actually supports it — use \"Based on content relevance and format...\" framing when no such data exists. Separately, source EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST is REJECTED unless that platform's recentContent in the snapshot is actually usable (status 'exists' with real items) — if Facebook post fetching failed and/or no usable Instagram content exists, do NOT claim an existing Meta creative (and never describe a WooCommerce/Shopify product as if it were one). Use source PRODUCT_IMAGE instead and say plainly: \"I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance.\"",
+        properties: { source: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.creative_strategy.properties.source.enum }, description: { type: "string" } },
+      },
       budget_daily: { type: "number", description: "Omit if a budget policy/user input is still needed — never invent a number." },
       budget_basis: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.budget_basis.enum, description: "USER_PROVIDED must be genuinely stated by the user this conversation — the backend independently verifies it against their actual message text and downgrades the claim if it can't." },
       bid_strategy: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.bid_strategy.enum },

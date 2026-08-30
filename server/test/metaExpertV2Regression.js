@@ -65,7 +65,7 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], writes = [] } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [] } = {}) {
   let nextId = 900000000000001n;
   return async (url, options = {}) => {
     const u = new URL(url);
@@ -87,7 +87,11 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     if (path.endsWith("/product_catalogs")) return jsonResponse({ data: catalogs });
     if (path.endsWith("/campaigns")) return jsonResponse({ data: campaigns });
     if (path.endsWith("/insights")) return jsonResponse({ data: [{ impressions: "1000", clicks: "40", spend: "120", ctr: "4", cpc: "3", cpm: "12", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "8" }], cost_per_action_type: [{ action_type: "purchase", value: "15" }], purchase_roas: [{ action_type: "omni_purchase", value: "2.4" }] }] });
-    if (path.endsWith("/posts")) return jsonResponse({ data: posts });
+    // postsError simulates a real Meta API failure (e.g. a transient error
+    // or a revoked permission) for the Page-posts fetch specifically —
+    // distinct from "not_connected"/empty, matching businessSnapshot.js's
+    // real fetch_failed status (attempt() catches the thrown error).
+    if (path.endsWith("/posts")) return postsError ? jsonResponse({ error: { message: "Simulated Facebook posts fetch failure" } }, 500) : jsonResponse({ data: posts });
     if (path.endsWith("/media")) return jsonResponse({ data: [] });
     return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
   };
@@ -143,7 +147,13 @@ function baseStrategy(overrides = {}) {
     countries: ["PK"],
     targeting_approach: "BROAD_WITH_TEST",
     placements: "ADVANTAGE_PLUS",
-    creative_strategy: { source: "EXISTING_PAGE_POST", description: "Best recent product Reel" },
+    // PRODUCT_IMAGE rather than EXISTING_PAGE_POST — grounded regardless of
+    // whether a given test happens to mock any Facebook/Instagram posts
+    // (most don't, since post content isn't what they're testing); an
+    // EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST claim is now backend-
+    // enforced against real snapshot content (checkCreativeSourceAvailabilityPolicy)
+    // and would be rejected against an empty mocked post list.
+    creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" },
     budget_daily: 3000,
     budget_basis: "HEURISTIC_STARTING_TEST",
     bid_strategy: "LOWEST_COST_WITHOUT_CAP",
@@ -1054,6 +1064,152 @@ async function run() {
       const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost this specific post" });
       assert.equal(result.ok, false, "a post id that doesn't exist in the current snapshot must never be accepted");
       assert.match(result.unresolved.issue, /not one of the recent posts/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Mandatory revise_strategy after snapshot (live bug follow-up) ------
+  // Live testing round: the snapshot-forcing gate worked — the model
+  // called meta_expert_v2.get_business_snapshot and correctly avoided
+  // inventing engagement data — but with an active strategy, it then
+  // finished right after the snapshot, never calling revise_strategy at
+  // all. checkCreativeRevisionRequiredGate (orchestrator/index.js) now
+  // forces get_business_snapshot -> revise_strategy -> final.
+  await check("[Creative revision gate] active strategy + creative-selection request: finalizing right after get_business_snapshot (skipping revise_strategy) is blocked and forces the real revision call", async () => {
+    const userId = makeUser(`v2-creative-revision-gate-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        // Live-bug shape: finalizes right after the snapshot, without ever
+        // calling revise_strategy — must be intercepted.
+        finalText("I recommend using the Vitamin C Serum post (480 likes, 52 comments, 30 shares) as your creative."),
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares) — real engagement shows strong interest." } }, freshResearchRequired: false }),
+        finalText("I've updated the creative to use your Vitamin C Serum post, which has real engagement (480 likes, 52 comments, 30 shares)."),
+      ],
+    }));
+    try {
+      const userMessage = "Choose the exact best creative for this campaign.";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `snapshot must be called: ${JSON.stringify(toolNames)}`);
+      assert.ok(toolNames.includes("meta_expert_v2.revise_strategy"), `revise_strategy must be called before finalizing when an active strategy exists: ${JSON.stringify(toolNames)}`);
+      const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
+      assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
+      assert.doesNotMatch(result.reply, /I recommend using the Vitamin C Serum post \(480 likes, 52 comments, 30 shares\) as your creative\.$/, "the premature pre-revision answer must never be the final reply");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Facebook fetch failure + Instagram unavailable (exact requested test) --
+  // Live testing round: with an active strategy, an exact creative-
+  // selection request, and a snapshot where Facebook post fetching FAILED
+  // and Instagram has no usable content, the required flow is
+  // get_business_snapshot -> revise_strategy -> final, and the resulting
+  // creative strategy must NEVER present a WooCommerce product as if it
+  // were an existing Facebook/Instagram creative — it must be honestly
+  // labeled as a new, product-led recommendation instead.
+  await check("[Creative revision, Facebook fetch failure] active strategy + exact creative-selection request + Facebook fetch failure + Instagram unavailable: revise_strategy is still called, the creative is updated, and no WooCommerce product is presented as an existing Meta creative", async () => {
+    const userId = makeUser(`v2-creative-fbfail-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // Initial strategy built while Facebook/Instagram content was fine.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    // Now the creative-selection turn: Facebook posts fetch FAILS
+    // (postsError), and no Instagram account is connected at all — both
+    // platforms are unusable for existing content.
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], postsError: true },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        // Correctly-behaved model: does NOT claim an existing Facebook/
+        // Instagram post — recommends a new product-led creative instead,
+        // using the exact required honesty framing.
+        toolCall("meta_expert_v2.revise_strategy", {
+          requestedChanges: {
+            creative_strategy: {
+              source: "PRODUCT_IMAGE",
+              description: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around the Vitamin C Serum based on WooCommerce relevance.",
+            },
+          },
+          freshResearchRequired: false,
+        }),
+        finalText("I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around the Vitamin C Serum based on WooCommerce relevance."),
+      ],
+    }));
+    try {
+      const snapshotCheck = await gatherBusinessSnapshot(userId);
+      assert.notEqual(snapshotCheck.recentContent.facebookPosts.status, "exists", "test setup sanity check: Facebook posts must be unusable");
+      assert.notEqual(snapshotCheck.recentContent.instagramPosts.status, "exists", "test setup sanity check: Instagram must be unusable");
+
+      const userMessage = "Choose the exact best creative for this campaign from my recent content.";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `snapshot must be called: ${JSON.stringify(toolNames)}`);
+      assert.ok(toolNames.includes("meta_expert_v2.revise_strategy"), `revise_strategy must still be called: ${JSON.stringify(toolNames)}`);
+      const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
+      assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
+
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.notEqual(updated.strategy.creative_strategy.source, "EXISTING_PAGE_POST", "must never claim an existing Facebook post when Facebook fetch failed");
+      assert.notEqual(updated.strategy.creative_strategy.source, "EXISTING_INSTAGRAM_POST", "must never claim an existing Instagram post when Instagram is unavailable");
+      assert.match(updated.strategy.creative_strategy.description, /new product-led creative/i);
+      assert.match(result.reply, /couldn't verify a usable existing reel\/post/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative source grounding] a revision that FALSELY claims an existing Facebook post as the creative while Facebook fetch failed and Instagram is unavailable is REJECTED", async () => {
+    const userId = makeUser(`v2-creative-fbfail-rejected-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], postsError: true } }));
+    try {
+      // Misbehaving model: falsely claims an existing Facebook post despite
+      // the fetch failure — this must never be silently accepted.
+      const revision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId,
+        requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Your recent Facebook post about the Vitamin C Serum." } },
+        userMessage: "Choose the exact best creative for this campaign.",
+      });
+      assert.equal(revision.ok, false, "an existing-post claim must be rejected when that platform's content is actually unusable");
+      assert.match(revision.unresolved.issue, /never present a WooCommerce\/Shopify product.*as if it were an existing Facebook creative/i);
     } finally {
       restoreFetch();
     }
