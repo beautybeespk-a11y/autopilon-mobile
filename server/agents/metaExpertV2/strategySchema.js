@@ -9,6 +9,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { isGenericAudience } from "./policy.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const INTERNAL_STRATEGY_SCHEMA = JSON.parse(fs.readFileSync(path.join(__dirname, "internal_strategy_schema.json"), "utf8"));
@@ -159,6 +160,34 @@ export function deriveDefaultAssetRefsIfMissing(strategy) {
     result = { ...result, ad_account: { ref: "default_ad_account" } };
   }
   return result;
+}
+
+// Live bug (round 15): even after strengthening this field's tool
+// description, the model still routinely leaves a fully generic audience
+// (ALL, 18-65) with NO audience_reasoning when NO real store/account data
+// exists to narrow by — build_strategy is a single-attempt tool (Step 7),
+// so a missed free-text field here has no retry chance and hard-rejects
+// an otherwise-sound strategy. This is ONLY safe to auto-fill in the
+// specific case where `businessSignals.hasStrongerAudienceEvidence` is
+// false: at that point "no narrower targeting applies" isn't the model's
+// judgment call, it's an objective fact the backend already verified from
+// the snapshot (same class of fix as deriveApprovalRequiredIfMissing/
+// deriveDefaultAssetRefsIfMissing above — the correct value is forced
+// regardless of business context). When hasStrongerAudienceEvidence IS
+// true, this deliberately does NOT fire — leaving a generic audience
+// unexplained while real store/campaign data exists is a genuine
+// analysis failure the model must actually address (still hard-rejected,
+// same as checkAudienceQualityPolicy's separate audience_strategy check
+// for that case).
+export function deriveAudienceReasoningIfMissing(strategy, businessSignals = {}) {
+  if (strategy.mode === "explicit_action") return strategy;
+  if (!isGenericAudience(strategy)) return strategy;
+  if (typeof strategy.audience_reasoning === "string" && strategy.audience_reasoning.trim()) return strategy;
+  if (businessSignals.hasStrongerAudienceEvidence) return strategy;
+  return {
+    ...strategy,
+    audience_reasoning: "No connected store data or Meta ad account history exists yet to narrow this audience further, so Meta's full available range (all genders, 18-65) is used.",
+  };
 }
 
 export function deriveCtaIfMissing(strategy) {

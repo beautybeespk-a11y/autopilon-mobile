@@ -371,6 +371,26 @@ function computeVersion(business, metaAssets, metaHistory) {
   return crypto.createHash("sha256").update(JSON.stringify(stable)).digest("hex").slice(0, 16);
 }
 
+// Live bug (round 15): build_strategy's own field description already
+// warns that a generic (ALL, 18-65) audience needs audience_reasoning,
+// but that text sits buried among ~30 other tool-schema fields the model
+// only sees once, before it has this turn's actual data in front of it —
+// and it kept getting missed even after that description was strengthened.
+// Surfacing the SAME warning here instead, computed from the exact facts
+// this snapshot just gathered (hasStoreData/hasCampaignHistory — the same
+// signal strategyBuilder.js turns into businessSignals.
+// hasStrongerAudienceEvidence right before validating), puts it in the
+// freshest, most salient place: the tool result the model is reading
+// immediately before it decides what to send to build_strategy. Purely
+// informational — never auto-narrows anything itself, that stays the
+// model's own business judgment when real data exists.
+function computeAudienceEvidenceHint(hasStoreData, hasCampaignHistory) {
+  if (hasStoreData || hasCampaignHistory) {
+    return "Real store and/or Meta account history data exists in this snapshot — build_strategy REJECTS a generic (ALL genders, 18-65) audience left unexplained here. Use it: narrow gender/age_min/age_max from real product categories, pricing, store country, or past campaign performance, and set audience_strategy to STORE_DATA/PRODUCT_CATEGORY/ACCOUNT_HISTORY/META_PERFORMANCE accordingly. Only keep a fully generic audience if you have written a specific, defensible audience_reasoning for why this real data still doesn't justify narrowing.";
+  }
+  return "No connected store data or Meta campaign history exists yet — a generic (ALL genders, 18-65) audience is honest here, and build_strategy will accept it as-is even with no audience_reasoning written.";
+}
+
 // The single entry point — Step 1's "one canonical trusted snapshot from
 // live connected data." Never partially cached, never backed by chat
 // memory (Step 13); every call re-fetches from real APIs.
@@ -394,6 +414,7 @@ export async function gatherBusinessSnapshot(userId) {
       recentContent: { facebookPosts: { status: "not_connected", items: [] }, instagramPosts: { status: "not_connected", items: [] } },
       metaConnected: false,
       metaConnectionError: err.message,
+      audienceEvidenceHint: computeAudienceEvidenceHint(business.commerceConnected && business.commerceDataStatus === "exists", false),
     };
     trace("gatherBusinessSnapshot (Meta not connected)", { userId, commerceConnected: business.commerceConnected, metaError: err.message });
     return snapshot;
@@ -412,6 +433,10 @@ export async function gatherBusinessSnapshot(userId) {
     recentContent,
     metaConnected: true,
     metaConnectionError: null,
+    audienceEvidenceHint: computeAudienceEvidenceHint(
+      business.commerceConnected && business.commerceDataStatus === "exists",
+      (metaHistory.campaignCount || 0) > 0
+    ),
   };
 
   trace("gatherBusinessSnapshot", {

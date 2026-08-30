@@ -1525,6 +1525,86 @@ async function run() {
     }
   });
 
+  // --- audience_reasoning omitted with NO real evidence to narrow by (live bug, round 15) --
+  // Live screenshot sequence: build_strategy rejected repeatedly with "A
+  // fully generic audience (all genders, 18-65) requires an explicit
+  // audience_reasoning..." — even after strengthening the tool's field
+  // description (an earlier fix this round) and an explicit user
+  // instruction to use WooCommerce data. Root cause: build_strategy is a
+  // single-attempt tool (Step 7) and the per-turn gate never lets a
+  // corrected retry actually re-validate (see V2_SINGLE_CALL_TOOLS in
+  // orchestrator/index.js) — a missed free-text field here has no second
+  // chance. deriveAudienceReasoningIfMissing (strategySchema.js) closes
+  // the ONE slice of this that's genuinely mechanical: when NO real store
+  // or Meta account history data exists (businessSignals.
+  // hasStrongerAudienceEvidence is false), "no narrower targeting
+  // applies" isn't a business judgment call, it's an objective fact the
+  // backend already verified — so it's safe to default, exactly like
+  // approval_required/facebook_page/ad_account above.
+  await check("[V2 policy] a fully generic audience (ALL, 18-65) with no audience_reasoning and NO real store/account data is auto-explained with an honest default and accepted — the model's one attempt is never spent on an unfixable-by-retry rejection", async () => {
+    const userId = makeUser(`v2-audience-reasoning-noevidence-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const genericStrategy = baseStrategy({ gender: "ALL", age_min: 18, age_max: 65, audience_strategy: "HEURISTIC" });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: genericStrategy, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.ok(result.strategy.audience_reasoning && result.strategy.audience_reasoning.trim(), "a missing audience_reasoning must be defaulted, not left empty, when no evidence exists to narrow by");
+      assert.match(result.strategy.audience_reasoning, /no connected store data|no.*(store|account).*(data|history)/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Regression guard for the OTHER half of the same live sequence: this
+  // user's WooCommerce store WAS connected (12 real products) — a genuine
+  // audience_strategy=HEURISTIC/no-reasoning rejection with real store
+  // data available must NOT be silently auto-filled; narrowing using that
+  // real data is a genuine analysis step the model must still do.
+  await check("[V2 policy] a fully generic audience (ALL, 18-65) with no audience_reasoning is still REJECTED when real store data exists to narrow it — never auto-filled away", async () => {
+    const userId = makeUser(`v2-audience-reasoning-hasevidence-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const genericStrategy = baseStrategy({ gender: "ALL", age_min: 18, age_max: 65, audience_strategy: "HEURISTIC" });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: genericStrategy, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, false, "a generic audience left unexplained must still be rejected when real store data exists to narrow it");
+      assert.match(result.unresolved.issue, /audience/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // The same "no real evidence exists yet" fact must be surfaced directly
+  // in get_business_snapshot's own result — the freshest, most salient
+  // place for the model to read it, since the build_strategy tool
+  // description alone already proved insufficient (see above).
+  await check("[V2 policy] get_business_snapshot's audienceEvidenceHint reflects real store/account data when present, and the honest 'none yet' case when absent", async () => {
+    const userIdNoEvidence = makeUser(`v2-hint-noevidence-${stamp}@example.com`);
+    connectMeta(userIdNoEvidence);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userIdNoEvidence);
+      assert.match(snapshot.audienceEvidenceHint, /no connected store data or meta campaign history/i);
+    } finally {
+      restoreFetch();
+    }
+
+    const userIdWithEvidence = makeUser(`v2-hint-hasevidence-${stamp}@example.com`);
+    connectMeta(userIdWithEvidence);
+    connectWooCommerce(userIdWithEvidence);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userIdWithEvidence);
+      assert.match(snapshot.audienceEvidenceHint, /real store and\/or meta account history data exists/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Fabricated "success" out of a rejection's own text (live bug) ------
   // Live screenshot: build_strategy was genuinely REJECTED (no usable
   // existing Facebook/Instagram content — the honest checkCreativeSourceAvailabilityPolicy

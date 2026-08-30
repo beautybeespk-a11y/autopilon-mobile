@@ -12,7 +12,7 @@ import { resolveStrategyAssets } from "./assetResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
-  deriveDefaultAssetRefsIfMissing, PURCHASE_LIKE_EVENTS,
+  deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -233,6 +233,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     clearEcommerceWithPurchaseTracking: hasStoreData && anyPixelExists,
     hasStrongerAudienceEvidence: hasStoreData || hasCampaignHistory,
   };
+
+  const audienceReasoningResolved = deriveAudienceReasoningIfMissing(normalized, businessSignals);
+  if (traceEnabled && audienceReasoningResolved.audience_reasoning !== normalized.audience_reasoning) {
+    trace("strategy audience_reasoning defaulted (no stronger evidence exists)", { conversationId });
+  }
+  normalized = audienceReasoningResolved;
 
   const goalErrors = checkGoalAlignmentPolicy(normalized, businessSignals);
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
