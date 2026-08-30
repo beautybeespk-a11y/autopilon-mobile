@@ -143,6 +143,19 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   if (!messageIndicatesExecutionApprovalV2(userMessage)) {
     return 'The user has not explicitly approved the current strategy in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
   }
+  // Live bug: budget_daily is deliberately nullable at build time (the
+  // schema explicitly allows it — "Null if a budget policy/user input is
+  // still needed, never invent a number"), so a strategy can be validly
+  // SAVED with no budget set. Nothing here checked for that before letting
+  // an "approve" reach execute_strategy — the call went through to the
+  // real Meta Ad Set creation, which requires a real budget, and Meta's
+  // own API rejected it with a raw "(#100) Invalid parameter" the
+  // customer saw verbatim after clicking Approve. Same principle as the
+  // rest of this gate: catch it before the tool is ever dispatched, not
+  // after a doomed real API call.
+  if (typeof active.strategy.budget_daily !== "number" || active.strategy.budget_daily <= 0) {
+    return "This strategy still has no daily budget set — Meta requires a real budget to create the Ad Set and this call would fail. Ask the user what daily budget they'd like (or call meta_expert_v2.revise_strategy with a budget_daily once they answer) before calling execute_strategy again.";
+  }
   return null;
 }
 

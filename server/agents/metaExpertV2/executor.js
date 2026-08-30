@@ -138,11 +138,25 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   assertV2RuntimeEnabled(userId);
   const stored = loadExecutable(userId, conversationId, strategyId);
 
+  // Defense in depth — checkV2ExecutionApprovalGate in orchestrator/
+  // index.js already blocks this before the tool is even dispatched, but
+  // budget_daily is legitimately nullable at build time (schema allows it
+  // — "Null if a budget policy/user input is still needed") and this
+  // function is also reachable directly (see the kill-switch comment
+  // above). Meta's real Ad Set creation has no such flexibility — a null
+  // budget reaches Meta's API and comes back as a raw "(#100) Invalid
+  // parameter" the customer would otherwise see verbatim.
+  const dailyBudgetAtExecution = stored.strategy.budget_daily;
+  if (typeof dailyBudgetAtExecution !== "number" || dailyBudgetAtExecution <= 0) {
+    const err = new Error("This strategy has no daily budget set — a real budget is required before it can be executed. Build a revised strategy with a budget_daily set.");
+    err.code = "META_V2_BUDGET_MISSING";
+    throw err;
+  }
+
   // Defense in depth — budget policy is already checked at build time, but
   // a strategy can sit in 'proposed' for a while and the configured
   // maximum could be lowered in between.
-  const dailyBudgetAtExecution = stored.strategy.budget_daily;
-  if (typeof dailyBudgetAtExecution === "number" && dailyBudgetAtExecution > MAX_EXECUTABLE_DAILY_BUDGET) {
+  if (dailyBudgetAtExecution > MAX_EXECUTABLE_DAILY_BUDGET) {
     const err = new Error(`This strategy's daily budget (${dailyBudgetAtExecution}) exceeds the current maximum executable daily budget (${MAX_EXECUTABLE_DAILY_BUDGET}) — it cannot be executed as-is. Build a revised strategy with a lower budget.`);
     err.code = "META_V2_BUDGET_LIMIT_EXCEEDED";
     throw err;

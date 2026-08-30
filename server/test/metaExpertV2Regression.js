@@ -425,6 +425,58 @@ async function run() {
     }
   });
 
+  // --- No-budget execution (live bug, round 16) ---------------------------
+  // Live screenshot: the model presented a full recommendation with
+  // "Budget: Not yet set — needs your input" (a legitimate state —
+  // budget_daily is explicitly nullable at build time, "Null if a budget
+  // policy/user input is still needed, never invent a number"). The user
+  // then said "approved". checkV2ExecutionApprovalGate only checked for an
+  // active strategy + approval language, so the call reached
+  // executeStrategy() and then Meta's real Ad Set creation — which
+  // requires an actual budget — and came back with a raw "(#100) Invalid
+  // parameter" the user saw verbatim as "(Could not resolve: Invalid
+  // parameter)". Fixed at both layers: the gate now blocks BEFORE the
+  // tool is ever dispatched (same principle as every other check in this
+  // gate), and executeStrategy() itself refuses defense-in-depth for any
+  // other caller that might reach it directly.
+  await check("[V2 budget gate] checkV2ExecutionApprovalGate blocks execute_strategy when the active strategy has no budget_daily set, even with explicit approval language", async () => {
+    const userId = makeUser(`v2-budget-missing-gate-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy.budget_daily ?? null, null, "budget_daily must genuinely be unset for this test to be testing the real scenario");
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approved" });
+      assert.ok(gate, "must be blocked when the active strategy has no budget set, even with genuine approval language");
+      assert.match(gate, /budget/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 budget gate] executeStrategy() itself refuses to run (defense in depth) when budget_daily is missing, even if some other caller bypasses the orchestrator gate", async () => {
+    const userId = makeUser(`v2-budget-missing-direct-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_V2_BUDGET_MISSING"
+      );
+      const stored = getStoredStrategy(userId, built.strategyId);
+      assert.equal(stored.status, "proposed", "a strategy blocked for missing budget must stay 'proposed', never falsely marked approved/executed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test G --------------------------------------------------
   await check("[Acceptance G] multiple ad accounts/Pages/Pixels — saved defaults are used deterministically, never guessed", async () => {
     const userId = makeUser(`accept-g-${stamp}@example.com`);
