@@ -12,7 +12,8 @@ import { resolveStrategyAssets } from "./assetResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
-  deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, deriveBudgetFromUserMessageIfMissing, PURCHASE_LIKE_EVENTS,
+  deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, deriveBudgetFromUserMessageIfMissing,
+  deriveCountriesFromLocationsIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -176,7 +177,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // straight from the user's own current message (see
   // deriveBudgetFromUserMessageIfMissing's comment) — never invented.
   const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage);
-  let normalized = capHeuristicBudget(budgetFromMessageResolved);
+  // Live bug (round 22): "Missing required field 'countries'" hard-
+  // rejected an otherwise-complete strategy — locations (e.g. "Pakistan")
+  // was present, countries (the real ISO codes) was not. Only fires when
+  // every location name maps unambiguously to a known country.
+  const countriesResolved = deriveCountriesFromLocationsIfMissing(budgetFromMessageResolved);
+  let normalized = capHeuristicBudget(countriesResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -197,6 +203,9 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   }
   if (traceEnabled && budgetFromMessageResolved.budget_daily !== assetRefsResolved.budget_daily) {
     trace("strategy budget derived from user message (missing from model output)", { conversationId, derivedBudget: budgetFromMessageResolved.budget_daily });
+  }
+  if (traceEnabled && countriesResolved.countries !== budgetFromMessageResolved.countries) {
+    trace("strategy countries derived from locations (missing from model output)", { conversationId, derivedCountries: countriesResolved.countries });
   }
   if (traceEnabled && normalized.budget_daily !== budgetFromMessageResolved.budget_daily) {
     trace("strategy heuristic budget cap", { conversationId, original: budgetFromMessageResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });

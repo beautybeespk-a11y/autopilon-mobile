@@ -46,13 +46,27 @@ export function isValidEnumValue(field, value) {
 // as a real validation failure (Step 7 — V2 gets exactly one generation
 // attempt, so a repair-worthy failure must be a REAL one).
 const ENUM_ALIASES = {
+  // Live bug (round 22): a strategy with bid_strategy LOWEST_COST_WITH_
+  // BID_CAP (or COST_CAP) reached real execution and Meta rejected the Ad
+  // Set creation outright: "(#100/1815857) Bid amount required: you must
+  // provide a bid cap or target cost in bid_amount field." Nothing in
+  // this schema, the executor, or Meta's real API call anywhere has ever
+  // had a bid_amount field to populate — these two bid strategies are
+  // GUARANTEED to fail at execution 100% of the time in this system, not
+  // a legitimate choice being taken away. Every variant/synonym is
+  // normalized straight to the one bid strategy that actually works
+  // (never requires a companion field) — see internal_strategy_schema.json,
+  // whose own enum was narrowed to match.
   bid_strategy: {
     LOWEST_COST_WITHOUT_BID_CAP: "LOWEST_COST_WITHOUT_CAP",
     LOWEST_COST_AUTOMATIC: "LOWEST_COST_WITHOUT_CAP",
     AUTOMATIC_BIDDING: "LOWEST_COST_WITHOUT_CAP",
-    LOWEST_COST_WITH_CAP: "LOWEST_COST_WITH_BID_CAP",
-    MANUAL_BID_CAP: "LOWEST_COST_WITH_BID_CAP",
-    COST_CAP_BID: "COST_CAP",
+    LOWEST_COST_WITH_CAP: "LOWEST_COST_WITHOUT_CAP",
+    LOWEST_COST_WITH_BID_CAP: "LOWEST_COST_WITHOUT_CAP",
+    MANUAL_BID_CAP: "LOWEST_COST_WITHOUT_CAP",
+    COST_CAP_BID: "LOWEST_COST_WITHOUT_CAP",
+    COST_CAP: "LOWEST_COST_WITHOUT_CAP",
+    TARGET_COST: "LOWEST_COST_WITHOUT_CAP",
   },
   recommended_objective: {
     CONVERSIONS: "OUTCOME_SALES",
@@ -160,6 +174,39 @@ export function deriveDefaultAssetRefsIfMissing(strategy) {
     result = { ...result, ad_account: { ref: "default_ad_account" } };
   }
   return result;
+}
+
+// Live bug (round 22): a build_strategy/revise_strategy call was rejected
+// outright for "Missing required field \"countries\"" — locations
+// (human-readable place names, e.g. "Pakistan") is a separate field the
+// model reliably fills in, but countries (the real ISO 3166-1 alpha-2
+// codes Meta targeting actually needs) was sometimes left off entirely,
+// especially right after a wrong-tool recovery (revise_strategy ->
+// build_strategy) where the model appears to lose track of a field it
+// had already stated in plain English one line above. Only ever fires
+// when EVERY location name maps unambiguously to a real ISO code via
+// this lookup — a name that doesn't match (a city, an unusual spelling)
+// leaves countries untouched and the honest structural rejection stands,
+// same "never guess wrong, only fill in what's already objectively
+// known" principle as the other derive*IfMissing functions. Deliberately
+// not exhaustive — covers the countries this platform's real customers
+// actually target, not all ~195 countries on Earth.
+const COMMON_COUNTRY_NAME_TO_ISO = {
+  pakistan: "PK", "united states": "US", usa: "US", "united states of america": "US", us: "US",
+  "united kingdom": "GB", uk: "GB", "great britain": "GB", england: "GB",
+  india: "IN", canada: "CA", australia: "AU",
+  "united arab emirates": "AE", uae: "AE", "saudi arabia": "SA", qatar: "QA", kuwait: "KW", bahrain: "BH", oman: "OM",
+  germany: "DE", france: "FR", italy: "IT", spain: "ES", netherlands: "NL", "the netherlands": "NL",
+  bangladesh: "BD", nigeria: "NG", "south africa": "ZA", egypt: "EG", turkey: "TR", kenya: "KE",
+  indonesia: "ID", malaysia: "MY", philippines: "PH", singapore: "SG", "sri lanka": "LK", nepal: "NP", vietnam: "VN", thailand: "TH",
+  brazil: "BR", mexico: "MX", argentina: "AR", ireland: "IE", "new zealand": "NZ", japan: "JP", "south korea": "KR", china: "CN",
+};
+export function deriveCountriesFromLocationsIfMissing(strategy) {
+  if (Array.isArray(strategy.countries) && strategy.countries.length) return strategy;
+  if (!Array.isArray(strategy.locations) || !strategy.locations.length) return strategy;
+  const mapped = strategy.locations.map((loc) => (typeof loc === "string" ? COMMON_COUNTRY_NAME_TO_ISO[loc.trim().toLowerCase()] : undefined));
+  if (mapped.some((code) => !code)) return strategy; // an unrecognized location — never guess, leave the honest rejection in place
+  return { ...strategy, countries: [...new Set(mapped)] };
 }
 
 // Live bug (round 18): after execute_strategy was correctly blocked for a

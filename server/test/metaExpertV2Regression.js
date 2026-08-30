@@ -682,6 +682,71 @@ async function run() {
     }
   });
 
+  // --- Broken bid strategies (live bug, round 22) --------------------------
+  // Live screenshot: an approved strategy reached real execution and Meta
+  // rejected the Ad Set creation outright: "(#100/1815857) Bid amount
+  // required: you must provide a bid cap or target cost in bid_amount
+  // field." Nothing in this schema/executor has ever had a bid_amount
+  // field to populate — LOWEST_COST_WITH_BID_CAP and COST_CAP are
+  // GUARANTEED to fail at execution 100% of the time, not a legitimate
+  // choice. Every variant now normalizes to the one bid strategy that
+  // actually works, and the schema's own enum no longer offers the
+  // broken options to begin with.
+  await check("[V2 policy] bid_strategy LOWEST_COST_WITH_BID_CAP/COST_CAP (guaranteed to fail — no bid_amount field exists anywhere) is always normalized to LOWEST_COST_WITHOUT_CAP", async () => {
+    const userId = makeUser(`v2-bid-strategy-broken-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      for (const brokenValue of ["LOWEST_COST_WITH_BID_CAP", "COST_CAP", "TARGET_COST"]) {
+        const conversationId = `conv-${cryptoRandom()}`;
+        const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ bid_strategy: brokenValue }), userMessage: "I want more sales on my website" });
+        assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+        assert.equal(result.strategy.bid_strategy, "LOWEST_COST_WITHOUT_CAP", `"${brokenValue}" must be normalized to the only working bid strategy`);
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Missing "countries" derivable from locations (live bug, round 22) --
+  // Live screenshot: a build_strategy/revise_strategy call was hard-
+  // rejected with "Missing required field \"countries\"" even though
+  // locations (e.g. "Pakistan") was present — countries (the real ISO
+  // codes Meta targeting needs) was sometimes left off, especially right
+  // after a wrong-tool recovery. Only fires when every location name maps
+  // unambiguously to a known country — an unrecognized name (a city, an
+  // unusual spelling) leaves the field alone and the honest rejection
+  // stands, never a guess.
+  await check("[V2 policy] countries omitted but locations present with a recognizable country name is derived automatically, never hard-rejected", async () => {
+    const userId = makeUser(`v2-countries-from-locations-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["Pakistan"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["PK"], "the real ISO code must be derived from the recognizable location name");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] countries omitted with an UNRECOGNIZED location name is left unset — never guesses, the honest rejection stands", async () => {
+    const userId = makeUser(`v2-countries-unrecognized-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["Karachi"] }); // a city, not a country
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, false, "an unrecognized location name must never be silently mapped to a guessed country code");
+      assert.match(result.unresolved.issue, /countries/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Currency minor-unit conversion (live bug, round 20) ----------------
   // Live screenshot: a PKR account, budget_daily 500 (the user's own
   // words, "500/day" — 500 whole Rupees), and Meta's real Ad Set creation

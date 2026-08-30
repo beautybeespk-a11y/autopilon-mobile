@@ -56,7 +56,7 @@
     },
     "budget_daily": { "type": ["number", "null"], "description": "In the ad account's currency's smallest unit. Null if a budget policy/user input is still needed — never invent a number." },
     "budget_basis": { "type": "string", "enum": ["USER_PROVIDED", "SAVED_POLICY", "HISTORICAL_PERFORMANCE", "HEURISTIC_STARTING_TEST"] },
-    "bid_strategy": { "type": "string", "enum": ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"] },
+    "bid_strategy": { "type": "string", "enum": ["LOWEST_COST_WITHOUT_CAP"], "description": "The only bid strategy this system can execute — LOWEST_COST_WITH_BID_CAP/COST_CAP both require a bid_amount Meta's real API demands and nothing here ever supports; always normalized to this value." },
     "cta": {
       "type": "string",
       "enum": ["SHOP_NOW", "LEARN_MORE", "SIGN_UP", "DOWNLOAD", "CONTACT_US", "GET_QUOTE", "SUBSCRIBE", "BOOK_TRAVEL", "APPLY_NOW"]
