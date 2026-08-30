@@ -489,6 +489,116 @@ async function run() {
     }
   });
 
+  // --- Budget still omitted, but the user JUST gave it (live bug, round 18) --
+  // Live screenshots: after execute_strategy was correctly blocked for a
+  // missing budget and the user was asked for one, the model's build_strategy/
+  // revise_strategy call STILL omitted budget_daily even on the turn right
+  // after the user replied "500/day" — over and over, re-asking the same
+  // question the user had already answered. deriveBudgetFromUserMessageIfMissing
+  // (strategySchema.js) now fills it in when the exact amount is extractable
+  // from the user's own current message — never an invented number.
+  await check("[V2 policy] budget_daily omitted from the model's call, but the user's CURRENT message contains a clear amount ('500/day') — filled in as USER_PROVIDED, never re-asked", async () => {
+    const userId = makeUser(`v2-budget-from-message-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "500/day" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.budget_daily, 500, "the budget the user just typed must be used, not re-requested");
+      assert.equal(result.strategy.budget_basis, "USER_PROVIDED");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] budget_daily omitted with NO extractable amount in the user's message ('approved') is left unset — never guesses a number", async () => {
+    const userId = makeUser(`v2-budget-from-message-none-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "approved" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.budget_daily ?? null, null, "no number was ever given, so nothing must be invented");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy, orchestrator-level] the full live loop: blocked for missing budget -> user replies '500/day' -> the model's next revise_strategy call STILL omits budget_daily -> filled in automatically -> the user is never re-asked, and the resulting strategy actually executes", async () => {
+    const userId = makeUser(`v2-budget-from-message-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { budget_daily, ...strategyNoBudget } = baseStrategy();
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        // First turn: builds a strategy with no budget set, exactly the
+        // legitimate "budget policy/user input still needed" case, and
+        // correctly asks the user for one instead of inventing a number.
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", strategyNoBudget),
+        finalText("Please provide a daily budget amount for the campaign so we can proceed with execution."),
+      ],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+    }));
+    try {
+      const firstMessage = "I want more sales on my website";
+      await orchestrate({ userId, agentId, conversationId, userMessage: firstMessage, history: [{ role: "user", content: firstMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        // Live-bug shape: STILL omits budget_daily even though the user's
+        // current message plainly states it — an empty requestedChanges
+        // means the prior strategy's own (unset) budget_daily is simply
+        // carried forward by mergeForRevision, reproducing the omission.
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: {} }),
+        // A REAL revise_strategy call happened this turn, so this honest
+        // "I've set the budget" claim is legitimate (see the round-17
+        // execution-claim gate, which only blocks this phrasing when NO
+        // matching tool call actually ran).
+        finalText("I've set the daily budget to PKR 500/day — say \"approve\" when you'd like me to execute it."),
+      ],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+    }));
+    let result;
+    try {
+      const userMessage = "500/day";
+      result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [{ role: "user", content: "I want more sales on my website" }, { role: "assistant", content: "Please provide a daily budget amount for the campaign so we can proceed with execution." }, { role: "user", content: userMessage }],
+        agentSystemPrompt: "You are the Meta Ads Manager V2.",
+      });
+    } finally {
+      restoreFetch();
+    }
+    const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
+    assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
+    assert.doesNotMatch(result.reply, /provide a daily budget|budget you'd like/i, "must never re-ask for a budget the user already gave");
+    assert.match(result.reply, /500/);
+
+    // Prove it end to end: the derived budget must actually be usable for
+    // a real execution, not just accepted by build/revise in isolation
+    // (execute_strategy always requires a separate UI confirmation click
+    // — requiresConfirmation: true — so it's exercised directly here,
+    // same pattern as the round-17 budget-too-low recovery test).
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.strategy.budget_daily, 500);
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id });
+      assert.equal(executed.status, "PAUSED");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Meta rejects the real Ad Set for budget-too-low (live bug, round 17) --
   // Live screenshot: after the earlier budget-missing fix, an approved
   // strategy with a REAL (but too small) budget reached Meta's actual Ad

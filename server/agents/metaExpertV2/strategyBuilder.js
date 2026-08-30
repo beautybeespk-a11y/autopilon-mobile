@@ -12,7 +12,7 @@ import { resolveStrategyAssets } from "./assetResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
-  deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, PURCHASE_LIKE_EVENTS,
+  deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, deriveBudgetFromUserMessageIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -168,7 +168,15 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // says otherwise, so this only ever actually fires on a fresh build_strategy
   // call where the model itself omitted the field.
   const assetRefsResolved = deriveDefaultAssetRefsIfMissing(approvalResolved);
-  let normalized = capHeuristicBudget(assetRefsResolved);
+  // Live bug (round 18): the model kept omitting budget_daily from its
+  // build_strategy/revise_strategy call even on the turn RIGHT AFTER the
+  // user had just typed a number ("500/day") in direct response to being
+  // asked for one — re-asking the same question the user had already
+  // answered, in a loop. Safe to fill in ONLY because the number comes
+  // straight from the user's own current message (see
+  // deriveBudgetFromUserMessageIfMissing's comment) — never invented.
+  const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage);
+  let normalized = capHeuristicBudget(budgetFromMessageResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -187,8 +195,11 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       adAccountDefaulted: assetRefsResolved.ad_account !== approvalResolved.ad_account,
     });
   }
-  if (traceEnabled && normalized.budget_daily !== ctaResolved.budget_daily) {
-    trace("strategy heuristic budget cap", { conversationId, original: ctaResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });
+  if (traceEnabled && budgetFromMessageResolved.budget_daily !== assetRefsResolved.budget_daily) {
+    trace("strategy budget derived from user message (missing from model output)", { conversationId, derivedBudget: budgetFromMessageResolved.budget_daily });
+  }
+  if (traceEnabled && normalized.budget_daily !== budgetFromMessageResolved.budget_daily) {
+    trace("strategy heuristic budget cap", { conversationId, original: budgetFromMessageResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });
   }
 
   const structural = validateStrategyStructure(normalized);

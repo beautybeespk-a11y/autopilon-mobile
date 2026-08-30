@@ -162,6 +162,34 @@ export function deriveDefaultAssetRefsIfMissing(strategy) {
   return result;
 }
 
+// Live bug (round 18): after execute_strategy was correctly blocked for a
+// missing budget and the user was asked for one, they answered with a
+// plain number ("500/day") — and the model's NEXT build_strategy/
+// revise_strategy call STILL omitted budget_daily, over and over across
+// many turns, even though the number the user had JUST typed was sitting
+// right there in userMessage. Each cycle re-asked for the same number the
+// user had already given, an infinite loop from the customer's side.
+// Unlike audience_reasoning (a free-text business justification) or a
+// truly invented number, this is safe to fill in ONLY when the exact
+// amount is extractable from the USER'S OWN CURRENT MESSAGE — the same
+// standard verifyUserProvidedBudget (policy.js) already uses to validate
+// a USER_PROVIDED claim, just applied the other direction: deriving the
+// missing value FROM the message instead of only checking a claimed one
+// against it. Deliberately narrow (currency-prefixed, "/day"-suffixed, or
+// the ENTIRE message is just a bare number — never a stray digit
+// mid-sentence) and capped at 6 digits so it can never mistake a long
+// Pixel/ad-account id pasted into the chat for a budget.
+const USER_MESSAGE_BUDGET_PATTERN = /(?:\b(?:pkr|rs\.?|usd)\s*|\$\s*)([\d][\d,]{0,5})\b|\b([\d][\d,]{0,5})\s*(?:\/|per\s+)\s*day\b|^\s*([\d][\d,]{0,5})\s*(?:\/day)?\s*$/i;
+export function deriveBudgetFromUserMessageIfMissing(strategy, userMessage) {
+  if (strategy.budget_daily !== null && strategy.budget_daily !== undefined) return strategy;
+  if (typeof userMessage !== "string") return strategy;
+  const match = USER_MESSAGE_BUDGET_PATTERN.exec(userMessage);
+  if (!match) return strategy;
+  const amount = Number((match[1] || match[2] || match[3]).replace(/,/g, ""));
+  if (!Number.isFinite(amount) || amount <= 0) return strategy;
+  return { ...strategy, budget_daily: amount, budget_basis: "USER_PROVIDED" };
+}
+
 // Live bug (round 15): even after strengthening this field's tool
 // description, the model still routinely leaves a fully generic audience
 // (ALL, 18-65) with NO audience_reasoning when NO real store/account data
