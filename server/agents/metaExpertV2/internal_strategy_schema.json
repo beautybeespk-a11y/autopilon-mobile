@@ -1,0 +1,98 @@
+{
+  "$comment": "Meta Ads Expert V2 — clean strategy contract. This describes BUSINESS DECISIONS the LLM makes (goal, objective, audience, budget, creative direction) — never raw Meta ids and never Meta's own low-level API shapes. Asset fields (ad_account/facebook_page/pixel/catalog/instagram_identity) are SEMANTIC references only (e.g. \"default_ad_account\", or a real id the user already explicitly confirmed this conversation) — resolving them to trusted raw ids is strategyBuilder.js/assetResolution.js's job, never the LLM's. See strategySchema.js for the code that enforces this.",
+  "type": "object",
+  "required": [
+    "business_goal", "recommended_objective", "optimization_event", "conversion_location",
+    "audience_strategy", "gender", "age_min", "age_max", "locations", "countries",
+    "targeting_approach", "placements", "creative_strategy", "budget_basis", "bid_strategy",
+    "cta", "campaign_status", "reasoning_summary", "evidence_used", "assumptions",
+    "approval_required", "facebook_page", "ad_account"
+  ],
+  "properties": {
+    "mode": { "type": "string", "enum": ["campaign", "explicit_action"], "default": "campaign" },
+    "business_goal": { "type": "string", "description": "The user's own stated goal, in their words." },
+    "goal_alignment": {
+      "type": "object",
+      "description": "Deterministic pre-strategy reasoning, required whenever the literal request and the likely real business outcome could differ (Step 4's traffic-vs-sales case). Optional when there's no real tension (e.g. the user already said 'sales').",
+      "properties": {
+        "literal_request": { "type": "string" },
+        "likely_business_outcome": { "type": "string" },
+        "recommendation_differs_from_literal_request": { "type": "boolean" }
+      }
+    },
+    "recommended_objective": {
+      "type": "string",
+      "enum": ["OUTCOME_SALES", "OUTCOME_TRAFFIC", "OUTCOME_LEADS", "OUTCOME_ENGAGEMENT", "OUTCOME_AWARENESS", "OUTCOME_APP_PROMOTION"]
+    },
+    "optimization_event": {
+      "type": "string",
+      "enum": ["PURCHASE", "ADD_TO_CART", "LEAD", "COMPLETE_REGISTRATION", "LINK_CLICKS", "LANDING_PAGE_VIEWS", "REACH", "IMPRESSIONS", "THRUPLAY", "APP_INSTALLS"]
+    },
+    "conversion_location": { "type": "string", "enum": ["WEBSITE", "APP", "MESSENGER", "INSTAGRAM_DIRECT", "CALLS"] },
+    "audience_strategy": {
+      "type": "string",
+      "enum": ["STORE_DATA", "PRODUCT_CATEGORY", "ACCOUNT_HISTORY", "META_PERFORMANCE", "HEURISTIC"],
+      "description": "What the proposed audience was actually derived from — the evidence basis, not the targeting mechanism (see targeting_approach for that). HEURISTIC is only honest when no real store/account data exists."
+    },
+    "gender": { "type": "string", "enum": ["ALL", "MALE", "FEMALE"] },
+    "age_min": { "type": "integer", "minimum": 13, "maximum": 65 },
+    "age_max": { "type": "integer", "minimum": 13, "maximum": 65 },
+    "audience_reasoning": { "type": "string", "description": "Required only when the audience is fully generic (ALL genders, 18-65) — a short, honest reason no narrower targeting applies." },
+    "locations": { "type": "array", "items": { "type": "string" }, "description": "Human-readable place names for display." },
+    "countries": { "type": "array", "items": { "type": "string" }, "description": "ISO 3166-1 alpha-2 country codes — what real Meta targeting is actually built from." },
+    "targeting_approach": {
+      "type": "string",
+      "enum": ["BROAD_WITH_TEST", "INTEREST_BASED", "LOOKALIKE_AUDIENCE", "RETARGETING", "ADVANTAGE_PLUS_AUDIENCE"]
+    },
+    "placements": { "type": "string", "enum": ["ADVANTAGE_PLUS", "MANUAL"] },
+    "manual_placements": { "type": "array", "items": { "type": "string" } },
+    "creative_strategy": {
+      "type": "object",
+      "required": ["source", "description"],
+      "properties": {
+        "source": { "type": "string", "enum": ["EXISTING_PAGE_POST", "EXISTING_INSTAGRAM_POST", "PRODUCT_IMAGE", "GENERATED_IMAGE", "GENERATED_VIDEO", "USER_ATTACHED_MEDIA"] },
+        "description": { "type": "string" }
+      }
+    },
+    "budget_daily": { "type": ["number", "null"], "description": "In the ad account's currency's smallest unit. Null if a budget policy/user input is still needed — never invent a number." },
+    "budget_basis": { "type": "string", "enum": ["USER_PROVIDED", "SAVED_POLICY", "HISTORICAL_PERFORMANCE", "HEURISTIC_STARTING_TEST"] },
+    "bid_strategy": { "type": "string", "enum": ["LOWEST_COST_WITHOUT_CAP", "LOWEST_COST_WITH_BID_CAP", "COST_CAP"] },
+    "cta": {
+      "type": "string",
+      "enum": ["SHOP_NOW", "LEARN_MORE", "SIGN_UP", "DOWNLOAD", "CONTACT_US", "GET_QUOTE", "SUBSCRIBE", "BOOK_TRAVEL", "APPLY_NOW"]
+    },
+    "campaign_status": { "type": "string", "enum": ["PAUSED"] },
+    "reasoning_summary": { "type": "string" },
+    "evidence_used": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Concrete, specific facts actually pulled from the business snapshot that this strategy is based on (e.g. \"WooCommerce: 42 products in Skincare, avg price PKR 1,800\", \"Meta history: 3 campaigns, avg ROAS 2.1\") — never a vague restatement. Evidence Rule (Step 12): only cite what get_business_snapshot actually returned."
+    },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "unresolved_questions": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Genuine unresolved BUSINESS decisions only — never a technical/asset question (those are resolved automatically by the backend). Empty (or omitted) for a fully-resolved strategy."
+    },
+    "approval_required": { "type": "boolean" },
+    "facebook_page": { "type": "object", "properties": { "ref": { "type": "string" } } },
+    "instagram_identity": { "type": ["object", "null"], "properties": { "ref": { "type": "string" } } },
+    "ad_account": { "type": "object", "properties": { "ref": { "type": "string" } } },
+    "pixel": { "type": ["object", "null"], "properties": { "ref": { "type": "string" } } },
+    "catalog": { "type": ["object", "null"], "properties": { "ref": { "type": "string" } } },
+    "action_type": {
+      "type": "string",
+      "enum": ["BOOST_FACEBOOK_POST", "BOOST_INSTAGRAM_POST", "USE_ATTACHED_IMAGE", "USE_ATTACHED_VIDEO"],
+      "description": "Only relevant when mode is \"explicit_action\" — which fixed, lightweight action the user asked for (e.g. 'boost my latest reel')."
+    },
+    "content_selector": {
+      "type": "object",
+      "description": "Only relevant when mode is \"explicit_action\". Refers to content ORDINALLY (e.g. { position: 1 } = the most recent item in the snapshot's recentContent list the LLM already saw) or by a real id ONLY if it was already confirmed via get_business_snapshot this conversation — never invented. Never a raw id the LLM is guessing at.",
+      "properties": {
+        "position": { "type": "integer", "minimum": 1 },
+        "confirmedId": { "type": "string" },
+        "attachedMediaRef": { "type": "string", "description": "A chat-attached image/video reference id, when action_type is USE_ATTACHED_IMAGE/USE_ATTACHED_VIDEO." }
+      }
+    }
+  }
+}

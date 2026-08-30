@@ -7,12 +7,12 @@ const router = Router();
 router.use(requireAuth);
 
 router.get("/", (req, res) => {
-  res.json(listTemplates());
+  res.json(listTemplates(req.session.userId, req.session.currentOrgId));
 });
 
 router.post("/:templateId/install", (req, res) => {
   try {
-    const agent = installTemplate(req.session.userId, req.params.templateId, req.body?.name);
+    const agent = installTemplate(req.session.userId, req.params.templateId, req.body?.name, req.session.currentOrgId);
     logActivity(db, req.session.userId, "agent_created", `Installed "${agent.name}" from the Agent Library`);
     res.json(agent);
   } catch (err) {

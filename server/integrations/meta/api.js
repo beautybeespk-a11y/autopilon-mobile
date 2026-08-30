@@ -54,12 +54,37 @@ export async function setCampaignStatus(accessToken, campaignId, status) {
   return metaFetch(`/${campaignId}`, { accessToken, method: "POST", body: { status } });
 }
 
+// Purchases/CPA/ROAS aren't flat scalar fields in Meta's real Insights
+// API — they come back as action-type breakdowns (`actions`,
+// `cost_per_action_type`, `purchase_roas`, each an array of
+// {action_type, value}). Meta Ads Expert V2's business snapshot (server/
+// agents/metaExpertV2/businessSnapshot.js) needs these as plain numbers to
+// reason about performance, so this extracts the "purchase"/"omni_purchase"
+// action type's value into flat purchases/cpa/roas convenience fields
+// alongside the existing flat fields (impressions/clicks/spend/ctr/cpc/
+// reach) and the new cpm/frequency — purely additive; every existing
+// caller that only reads the original fields is unaffected, and the raw
+// actions/cost_per_action_type/purchase_roas arrays are still returned too
+// for anyone who wants the full breakdown.
+const PURCHASE_ACTION_TYPES = new Set(["purchase", "omni_purchase", "offsite_conversion.fb_pixel_purchase"]);
+function extractActionValue(actionsArray) {
+  if (!Array.isArray(actionsArray)) return null;
+  const match = actionsArray.find((a) => PURCHASE_ACTION_TYPES.has(a.action_type));
+  return match ? Number(match.value) : null;
+}
 export async function getCampaignInsights(accessToken, campaignId, datePreset = "last_30d") {
   const data = await metaFetch(
-    `/${campaignId}/insights?fields=impressions,clicks,spend,ctr,cpc,reach&date_preset=${datePreset}`,
+    `/${campaignId}/insights?fields=impressions,clicks,spend,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type,purchase_roas&date_preset=${datePreset}`,
     { accessToken }
   );
-  return data.data?.[0] || null;
+  const row = data.data?.[0];
+  if (!row) return null;
+  return {
+    ...row,
+    purchases: extractActionValue(row.actions),
+    cpa: extractActionValue(row.cost_per_action_type),
+    roas: Array.isArray(row.purchase_roas) && row.purchase_roas[0] ? Number(row.purchase_roas[0].value) : null,
+  };
 }
 
 // Needed to pick which Facebook Page an ad creative posts as

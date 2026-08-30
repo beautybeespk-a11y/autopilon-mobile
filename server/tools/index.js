@@ -8,6 +8,7 @@ import "./research/generateReport.js";
 import "./research/knowledge.js";
 import "./meta/campaigns.js";
 import "./meta/metaExpert.js";
+import "./meta/metaExpertV2.js";
 import "./whatsapp/messaging.js";
 import "./automation/draftWorkflow.js";
 import "./wordpress/content.js";

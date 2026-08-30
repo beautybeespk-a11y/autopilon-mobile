@@ -11,6 +11,8 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
+import { getActiveStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "../agents/metaExpertV2/policy.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -119,6 +121,26 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
   }
   if (!messageIndicatesExecutionApproval(userMessage)) {
     return 'The user has not explicitly approved the current plan in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
+  }
+  return null;
+}
+
+// Meta Ads Expert V2's own version of the gate above, kept as a SEPARATE
+// function (not a shared/modified checkExecutionApprovalGate) per the V2
+// rebuild's own instruction: build V2 beside the original planner, never
+// patch the original's internals to serve V2. Same principle — the model
+// is never even given the chance to call meta_expert_v2.execute_strategy
+// without (a) an active strategy for this conversation and (b) genuine
+// approval language in the user's own, current message — just pointed at
+// V2's own strategy store (server/agents/metaExpertV2/strategyStore.js)
+// instead of the original planner's meta_campaign_plans table.
+export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage }) {
+  const active = getActiveStrategyForConversation(userId, conversationId);
+  if (!active) {
+    return "No active strategy exists for this conversation yet. Call meta_expert_v2.build_strategy first (after meta_expert_v2.get_business_snapshot if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
+  }
+  if (!messageIndicatesExecutionApprovalV2(userMessage)) {
+    return 'The user has not explicitly approved the current strategy in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
   }
   return null;
 }
@@ -496,7 +518,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let leakNudges = 0;
   let staleAnswerNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
-  const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert."));
+  const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   let createPlanAttempts = 0;
   let lastCreatePlanFingerprint = null;
   let lastCreatePlanWasRejected = false;
@@ -584,7 +606,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         const lastAssistantMessage = [...history].reverse().find((m) => m?.role === "assistant")?.content;
         const staleGateMessage = checkStaleFactualAnswerGate({
           userMessage,
-          hasActivePlan: Boolean(getActivePlanForConversation(userId, conversationId)),
+          hasActivePlan: Boolean(getActivePlanForConversation(userId, conversationId)) || Boolean(getActiveStrategyForConversation(userId, conversationId)),
           hasMetaExpertTools,
           lastAssistantMessage,
         });
@@ -635,6 +657,14 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       let outcome;
       if (call.toolName === "meta_expert.execute_campaign_plan") {
         const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
+        if (gateError) outcome = { status: "failed", error: gateError };
+      } else if (call.toolName === "meta_expert_v2.execute_strategy") {
+        // Meta Ads Expert V2's own approval gate — see
+        // checkV2ExecutionApprovalGate above. V2 deliberately has NO
+        // retry-limit gate for build_strategy/revise_strategy (Step 7: one
+        // generation attempt, no automatic repair loop) — only execution
+        // needs a backend-enforced approval check.
+        const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage });
         if (gateError) outcome = { status: "failed", error: gateError };
       } else if (call.toolName === "meta_expert.create_campaign_plan") {
         const gate = checkCreatePlanRetryGate({

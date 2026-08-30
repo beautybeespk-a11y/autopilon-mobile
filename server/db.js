@@ -2027,4 +2027,58 @@ db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, statu
 db.prepare("UPDATE skills SET description = ?, category = ? WHERE id = ?")
   .run("Research business/account context and build a validated, approval-gated Meta campaign strategy from a stated goal, instead of guessing individual campaign settings.", "marketing", "meta_expert");
 
+// Meta Ads Expert V2 (server/agents/metaExpertV2/) — a from-scratch rebuild
+// beside the original Meta Expert planner above, not a replacement of it.
+// Same statuses as meta_campaign_plans, plus 'draft' (a strategy that
+// failed validation and was never actually stored as a real proposal —
+// V2 has no repair-retry loop, so a failed build_strategy call simply
+// never reaches 'proposed' at all; nothing is written for it).
+//   draft | proposed | approved | executing | executed | rejected |
+//   superseded | failed
+// resolvedAssetsJson is the trusted, backend-resolved real Meta ids (ad
+// account/Page/Pixel/catalog/Instagram + their display names) — the LLM
+// strategy itself only ever contains semantic refs ("default_ad_account"),
+// never raw ids; this column is the only place a raw id is authoritative.
+// snapshotVersion/snapshotJson capture WHICH business snapshot this
+// strategy was built from (a sha256 over the snapshot's own facts) purely
+// for audit/display — a revision does not blindly trust a stale snapshot,
+// it re-fetches live data whenever freshResearchRequired is set (see
+// strategyBuilder.js's reviseStrategy()).
+db.exec(`
+CREATE TABLE IF NOT EXISTS meta_v2_strategies (
+  id                  TEXT PRIMARY KEY,
+  userId              TEXT NOT NULL,
+  conversationId      TEXT,
+  status              TEXT NOT NULL DEFAULT 'proposed',
+  mode                TEXT NOT NULL DEFAULT 'campaign', -- campaign | explicit_action
+  strategyJson        TEXT NOT NULL,
+  resolvedAssetsJson  TEXT NOT NULL,
+  snapshotVersion     TEXT,
+  snapshotJson        TEXT,
+  recommendationText  TEXT,
+  executionResultJson TEXT,
+  revisionOf          TEXT,
+  createdAt           TEXT NOT NULL,
+  updatedAt           TEXT NOT NULL,
+  approvedAt          TEXT,
+  executedAt          TEXT,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_meta_v2_user ON meta_v2_strategies(userId);
+CREATE INDEX IF NOT EXISTS idx_meta_v2_conversation ON meta_v2_strategies(conversationId);
+`);
+
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("meta_expert_v2", "Meta Ads Expert V2", "Rebuilt Meta Ads AI Media Buyer — trusted business snapshot, deterministic strategy validation, and approval-gated execution. Behind the META_EXPERT_V2 feature flag; not yet enabled by default.", "marketing");
+
+// Admin/internal switch (Step 16) — off by default. The META_EXPERT_V2 env
+// var is the master kill switch (checked in agentLibrary.js before this
+// flag is even consulted); this DB flag additionally controls PER-USER/ORG
+// rollout via feature_flag_overrides once the env var is on, using the
+// same feature-flag system every other risky feature in this app already
+// uses (server/orchestrator/featureFlags.js) rather than inventing new
+// gating infrastructure.
+db.prepare("INSERT OR IGNORE INTO feature_flags (id, key, name, description, enabled, rolloutPercent, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+  .run("meta-expert-v2-flag", "meta_expert_v2", "Meta Ads Expert V2", "Gates visibility of the rebuilt Meta Ads Expert V2 agent template. Requires META_EXPERT_V2=true in the environment as well — this flag alone does not enable V2 if the env var is off.", 0, 0, new Date().toISOString(), new Date().toISOString());
+
 export default db;

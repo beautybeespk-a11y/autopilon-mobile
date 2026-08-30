@@ -1,5 +1,6 @@
 import db from "../db.js";
 import { createAgent, getTemplateSyncInfo, syncAgentFromTemplate } from "./agentManager.js";
+import { isFeatureEnabled } from "./featureFlags.js";
 
 // Static starter templates. Installing one just calls the same createAgent()
 // every hand-built agent goes through — a template is nothing more than a
@@ -125,15 +126,66 @@ export const AGENT_TEMPLATES = [
     instructions: "You help design and manage automated workflows that connect the platform's tools together, and can delegate steps to other agents when that fits better than doing it yourself.",
     skillIds: ["automations", "productivity", "collaboration"],
   },
+  {
+    id: "meta-ads-manager-v2",
+    name: "Meta Ads Manager V2",
+    description: "Rebuilt Meta Ads AI Media Buyer — trusted business snapshot, deterministic strategy validation, approval-gated execution.",
+    category: "marketing",
+    icon: "Target",
+    personality: "professional",
+    // Behind the META_EXPERT_V2 feature flag (see gateTemplate() below) —
+    // not offered to normal users until explicitly enabled. skillIds is
+    // DELIBERATELY only "meta_expert_v2" — never "meta_ads" (the raw
+    // mutation tools' category) — so this agent's model structurally
+    // cannot see meta.create_campaign/meta.boost_post/etc. at all (Step 9;
+    // server/tools/registry.js's listToolsForSkills() filters by category).
+    instructions:
+      "You are a professional Meta Ads media buyer. Never say you're about to check something without actually calling the tool in that same response. Core philosophy: infer when possible, ask only when necessary — the user should almost never be asked what age, gender, interests, placements, objective, or cities to target; you decide those from real evidence and present a finished recommendation, not a form.\n\n" +
+      "1. ALWAYS call meta_expert_v2.get_business_snapshot first when the user states a goal ('I want more sales', 'I want more traffic', 'build me a campaign') — never assume or reuse what an earlier turn said about Pixel/Page/ad account/WooCommerce connection state or campaign performance; that can change between turns, so re-check it whenever it materially affects your recommendation. General knowledge questions don't need this; anything account-specific does.\n" +
+      "2. Call meta_expert_v2.build_strategy exactly ONCE per request. It normalizes harmless issues (spelling drift, a missing CTA, an over-cap heuristic budget) automatically — if it still returns valid:false, that is a genuine unresolved business decision, not something to retry with a guessed fix: present the returned issue to the user in plain language and wait for their answer. Never call build_strategy a second time hoping for a different result.\n" +
+      "3. You decide the strategy yourself from the snapshot's real evidence — objective, optimization_event, audience, locations, placements, creative direction, bid_strategy, cta. If the connected business is clearly e-commerce (real products AND a usable Pixel) and the user's literal request doesn't match ('traffic' for a revenue business), set goal_alignment.recommendation_differs_from_literal_request=true, recommend Sales/Purchase, and explain why in reasoning_summary — offer Traffic only as an explicit alternative, never build it silently. A fully generic audience (all genders, 18-65) needs real audience_reasoning — infer a narrower one from product categories, campaign history, or business type whenever real data exists.\n" +
+      "4. Budget: if the user hasn't stated one and no saved policy exists, propose a specific conservative test number yourself with budget_basis HEURISTIC_STARTING_TEST — never leave it blank as an open question, and never invent a large number. budget_basis USER_PROVIDED requires the user to have actually said that number this conversation — the backend verifies this independently.\n" +
+      "5. Assets (ad account, Facebook Page, Pixel, catalog, Instagram) are semantic refs only ('default_ad_account', etc.) — the backend resolves them automatically. Never invent a raw Meta id.\n" +
+      "6. To change something about the CURRENT strategy ('narrower audience', 'lower the budget', 'why did you choose this?'), call meta_expert_v2.revise_strategy with requestedChanges containing ONLY the fields actually changing — the backend rejects a revision that claims to reconsider a field but leaves its value identical, so make sure the value genuinely changes (or justify keeping it with real evidence). Only set freshResearchRequired=true when the user asked you to re-check WooCommerce/Meta data.\n" +
+      "7. Only call meta_expert_v2.execute_strategy after the user has EXPLICITLY approved the current strategy in their own words this turn ('approve', 'proceed', 'run it') — presenting a recommendation is not approval. The backend blocks the call otherwise.\n" +
+      "8. For a single fixed action ('boost my latest reel', 'use this photo as an ad'), call build_strategy with mode: \"explicit_action\" — refer to content by its position in the snapshot's recentContent list (e.g. the most recent = position 1), never by inventing an id.\n" +
+      "9. Present the returned recommendationText as your own reply, in plain language — never show JSON, a strategyId, schema/field names, or any raw internal identifier.",
+    skillIds: ["meta_expert_v2"],
+  },
 ];
 
-export function listTemplates() {
-  return AGENT_TEMPLATES.map(({ id, name, description, category, icon, skillIds }) => ({ id, name, description, category, icon, skillIds }));
+// Step 16 — admin/internal switch. META_EXPERT_V2=true (env var) is the
+// master kill switch; the "meta_expert_v2" feature flag (server/
+// orchestrator/featureFlags.js, DB-backed with per-user/org overrides —
+// the same system every other risky feature in this app already uses)
+// additionally controls WHO sees it once the env var is on, so it can be
+// rolled out to test users/agents first. Both gates apply: the env var
+// alone is not enough, and the flag alone is not enough.
+function v2Enabled(userId, orgId) {
+  return process.env.META_EXPERT_V2 === "true" && isFeatureEnabled("meta_expert_v2", { userId, orgId });
 }
 
-export function installTemplate(userId, templateId, overrideName) {
+// userId/orgId are optional — omitted, every gated template (currently
+// just meta-ads-manager-v2) is filtered out, same as a user for whom the
+// flag isn't enabled. Every existing call site that doesn't pass them
+// keeps getting exactly the template list it always has, minus V2 until
+// it's explicitly turned on.
+export function listTemplates(userId, orgId) {
+  const enabled = v2Enabled(userId, orgId);
+  return AGENT_TEMPLATES
+    .filter((t) => !t.id.endsWith("-v2") || enabled)
+    .map(({ id, name, description, category, icon, skillIds }) => ({ id, name, description, category, icon, skillIds }));
+}
+
+export function installTemplate(userId, templateId, overrideName, orgId) {
   const template = AGENT_TEMPLATES.find((t) => t.id === templateId);
   if (!template) throw new Error(`No template "${templateId}" found.`);
+  // Defense in depth (Step 16) — a gated template must also be rejected
+  // here even if the caller reaches this function directly, not just
+  // filtered out of listTemplates()'s display list.
+  if (template.id.endsWith("-v2") && !v2Enabled(userId, orgId)) {
+    throw new Error(`Template "${templateId}" is not yet available.`);
+  }
   return createAgent(userId, {
     name: overrideName || template.name,
     description: template.description,
