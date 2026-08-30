@@ -145,6 +145,55 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   return null;
 }
 
+// CONFIRMED LIVE BUG (V2 live testing): "I want more sales to my website"
+// led the model to call meta_expert_v2.build_strategy repeatedly within
+// the same turn until MAX_STEPS was hit and the user saw the generic
+// step-limit fallback reply. build_strategy returning `valid:false` is a
+// normal `status:"completed"` tool result (see runTool()/executeNow() in
+// orchestrator/executor.js) — not a thrown "failed" outcome — so nothing
+// ever capped how many times the MODEL could re-invoke the tool from
+// scratch. strategyBuilder.js's "one generation attempt, no internal
+// repair loop" (Step 7) only bounds what happens INSIDE a single call;
+// it does nothing to stop the model calling the tool again a moment
+// later. Same nudge-then-hard-stop shape as every other gate in this
+// file: each of the 4 V2 tools may be REALLY dispatched at most once per
+// turn; a repeat attempt is intercepted here — before it ever reaches
+// runTool(), so a second real build/revise/snapshot/execute NEVER
+// actually happens — and answered with a nudge quoting exactly what the
+// first call returned. A second repeat (a third total call for that
+// tool) hard-stops the turn with a clean customer-safe reply instead of
+// looping toward MAX_STEPS.
+const V2_SINGLE_CALL_TOOLS = new Set([
+  "meta_expert_v2.get_business_snapshot",
+  "meta_expert_v2.build_strategy",
+  "meta_expert_v2.revise_strategy",
+  "meta_expert_v2.execute_strategy",
+]);
+const MAX_V2_TOOL_NUDGES = 1;
+
+// Human-readable digest of what a V2 tool's first (and only allowed) real
+// call this turn actually returned — quoted back to the model so "use the
+// first result" is something it can act on, not just an instruction to
+// obey blindly.
+function summarizeV2ToolResult(toolName, outcome) {
+  if (!outcome) return "no result was captured for it.";
+  if (outcome.status === "failed") return `it failed: ${outcome.error}`;
+  const result = outcome.result;
+  if (toolName === "meta_expert_v2.get_business_snapshot") {
+    return "it returned the current business snapshot, already shown to you above — use that data, don't fetch it again.";
+  }
+  if (toolName === "meta_expert_v2.build_strategy" || toolName === "meta_expert_v2.revise_strategy") {
+    if (result?.valid === false) {
+      return `it was rejected as unresolved — field "${result.field}": ${result.issue}. That's a genuine business issue, not something calling it again will fix.`;
+    }
+    return `it succeeded (strategyId: ${result?.strategyId}) — the recommendation text was already returned to you above; present it and wait for the user's explicit approval.`;
+  }
+  if (toolName === "meta_expert_v2.execute_strategy") {
+    return `it succeeded (campaignId: ${result?.campaignId}) — the campaign was already created, paused. Do not execute it again.`;
+  }
+  return `it returned: ${JSON.stringify(result)}`;
+}
+
 // CONFIRMED LIVE BUG (round 13): "Why did you choose all genders 18-65 and
 // PKR 10,000/day? Review my WooCommerce products, Meta history, and
 // audience data, then improve the plan before I approve it" was answered
@@ -523,6 +572,12 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let lastCreatePlanFingerprint = null;
   let lastCreatePlanWasRejected = false;
   const MAX_CREATE_PLAN_ATTEMPTS = 2;
+  // Per-turn state for the V2 single-call gate (see V2_SINGLE_CALL_TOOLS
+  // above) — keyed by tool name, reset every orchestrate() call same as
+  // every other nudge counter in this function.
+  const v2ToolCallCounts = new Map();
+  const v2ToolNudgeCounts = new Map();
+  const v2ToolLastOutcome = new Map();
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -654,16 +709,51 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       }
       trace.push(traceStep("tool", `Selected: ${call.toolName}`, "active"));
 
+      // V2 single-call gate — checked BEFORE any dispatch attempt, so a
+      // repeat call for a tool already really-dispatched this turn NEVER
+      // reaches runTool() a second time. See V2_SINGLE_CALL_TOOLS above.
+      if (V2_SINGLE_CALL_TOOLS.has(call.toolName) && (v2ToolCallCounts.get(call.toolName) || 0) >= 1) {
+        const priorSummary = summarizeV2ToolResult(call.toolName, v2ToolLastOutcome.get(call.toolName));
+        const nudges = v2ToolNudgeCounts.get(call.toolName) || 0;
+        if (nudges < MAX_V2_TOOL_NUDGES) {
+          v2ToolNudgeCounts.set(call.toolName, nudges + 1);
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("error", `${call.toolName} already called once this turn — reusing that result.`, "done"));
+          toolResults.push({ toolName: call.toolName, error: `Blocked duplicate call this turn — ${priorSummary}` });
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `"${call.toolName}" can only be called once per turn, and it was already called once this turn — ${priorSummary} Do not call "${call.toolName}" again. Respond now with type "final" using that result — or, only for a genuinely valid build_strategy/revise_strategy result, present it and wait for the user's explicit approval before calling meta_expert_v2.execute_strategy.`,
+            },
+          ];
+          continue;
+        }
+        // Second repeat (a third total call for this tool) — hard-stop
+        // rather than let the loop grind toward MAX_STEPS.
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", `${call.toolName} could not be finalized after one attempt this turn.`, "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I already have a result from earlier in this response and wasn't able to move past it — could you tell me more about what you'd like, or try again in a new message?",
+          trace,
+          toolResults,
+          usage: usageTotals,
+        };
+      }
+
       let outcome;
       if (call.toolName === "meta_expert.execute_campaign_plan") {
         const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
         if (gateError) outcome = { status: "failed", error: gateError };
       } else if (call.toolName === "meta_expert_v2.execute_strategy") {
         // Meta Ads Expert V2's own approval gate — see
-        // checkV2ExecutionApprovalGate above. V2 deliberately has NO
-        // retry-limit gate for build_strategy/revise_strategy (Step 7: one
-        // generation attempt, no automatic repair loop) — only execution
-        // needs a backend-enforced approval check.
+        // checkV2ExecutionApprovalGate above. This runs IN ADDITION to the
+        // V2 single-call gate above — a gate-blocked attempt here (no
+        // active strategy yet, or no approval language) doesn't consume
+        // the once-per-turn dispatch budget, only a genuine execution
+        // attempt that reaches runTool() below does.
         const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage });
         if (gateError) outcome = { status: "failed", error: gateError };
       } else if (call.toolName === "meta_expert.create_campaign_plan") {
@@ -704,6 +794,10 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           createPlanAttempts += 1;
           lastCreatePlanWasRejected = outcome.status === "completed" && outcome.result && outcome.result.valid === false;
           lastCreatePlanFingerprint = fingerprintPlanNormalized(call.parameters || {});
+        }
+        if (V2_SINGLE_CALL_TOOLS.has(call.toolName)) {
+          v2ToolCallCounts.set(call.toolName, (v2ToolCallCounts.get(call.toolName) || 0) + 1);
+          v2ToolLastOutcome.set(call.toolName, outcome);
         }
       }
 
