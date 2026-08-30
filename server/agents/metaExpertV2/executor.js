@@ -20,6 +20,7 @@ import { buildTargeting } from "../../tools/meta/campaigns.js";
 import { publishEvent } from "../../automation/triggers.js";
 import { MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
 import { getStoredStrategy, getActiveStrategyForConversation, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
+import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 
 // Meta's real Ad Set optimization_goal enum doesn't include "PURCHASE" (or
 // this strategy's other custom-event-style optimization_event values) —
@@ -129,6 +130,12 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
 }
 
 export async function executeStrategy({ userId, conversationId, accessToken, strategyId }) {
+  // Runtime kill switch, checked FIRST and again here (defense in depth —
+  // the tool wrapper in server/tools/meta/metaExpertV2.js already checks
+  // this too) — this is the one call that spends real ad budget, so
+  // "already installed" or "already approved" must never be a way around
+  // the flag being off right now.
+  assertV2RuntimeEnabled(userId);
   const stored = loadExecutable(userId, conversationId, strategyId);
 
   // Defense in depth — budget policy is already checked at build time, but

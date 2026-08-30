@@ -16,6 +16,7 @@ import { buildStrategy, reviseStrategy } from "../../agents/metaExpertV2/strateg
 import { executeStrategy, rejectStrategy } from "../../agents/metaExpertV2/executor.js";
 import { getActiveStrategyForConversation } from "../../agents/metaExpertV2/strategyStore.js";
 import { INTERNAL_STRATEGY_SCHEMA } from "../../agents/metaExpertV2/strategySchema.js";
+import { assertV2RuntimeEnabled } from "../../agents/metaExpertV2/runtimeGate.js";
 
 function token(context) {
   return requireValidToken(context.userId, "meta_ads");
@@ -30,6 +31,7 @@ registerTool({
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
     return gatherBusinessSnapshot(context.userId);
   },
 });
@@ -102,6 +104,7 @@ registerTool({
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
     const { explicitAssetChanges, ...strategy } = parameters;
     const result = await buildStrategy({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategy, userMessage: context.userMessage, explicitAssetChanges });
     if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field };
@@ -127,6 +130,7 @@ registerTool({
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
     const strategyId = parameters.strategyId || getActiveStrategyForConversation(context.userId, context.conversationId)?.id;
     if (!strategyId) {
       const err = new Error("No active strategy exists for this conversation to revise — call meta_expert_v2.build_strategy first.");
@@ -152,6 +156,12 @@ registerTool({
   requiredPermissions: ["meta.write"],
   requiresConfirmation: true,
   async execute(parameters, context) {
+    // Checked here (the tool-invocation boundary) AND again inside
+    // executeStrategy() itself (server/agents/metaExpertV2/executor.js) as
+    // defense in depth — this is the one call that actually spends real ad
+    // budget, so "the runtime flag is off" must block it from every angle,
+    // not just the one the LLM happens to go through.
+    assertV2RuntimeEnabled(context.userId);
     return executeStrategy({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategyId: parameters.strategyId });
   },
 });

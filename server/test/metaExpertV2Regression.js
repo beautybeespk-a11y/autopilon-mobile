@@ -27,7 +27,7 @@ const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { getStoredStrategy, getActiveStrategyForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
 const { checkV2ExecutionApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
-const { runTool } = await import("../orchestrator/executor.js");
+const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate } = await import("../orchestrator/agentLibrary.js");
 const { updateFlag } = await import("../orchestrator/featureFlags.js");
 await import("../tools/index.js"); // registers meta_expert_v2.* tools
@@ -65,13 +65,16 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [] } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], writes = [] } = {}) {
   let nextId = 900000000000001n;
   return async (url, options = {}) => {
     const u = new URL(url);
     const path = u.pathname.replace(/^\/v[\d.]+/, "");
     const method = options.method || "GET";
-    if (method !== "GET") return jsonResponse({ id: String(nextId++) });
+    if (method !== "GET") {
+      writes.push({ path, body: options.body ? JSON.parse(options.body) : {} });
+      return jsonResponse({ id: String(nextId++) });
+    }
     if (path === "/me/adaccounts") return jsonResponse({ data: adAccounts });
     if (path === "/me/accounts") return jsonResponse({ data: pages });
     if (path === "/me/businesses") return jsonResponse({ data: [] });
@@ -159,6 +162,17 @@ function baseStrategy(overrides = {}) {
 }
 
 const stamp = Date.now();
+
+// Round 2 (runtime kill switch): every acceptance/isolation test below
+// exercises normal V2 behavior, so the ambient state for the whole suite
+// is "runtime-enabled" (both META_EXPERT_V2=true, set at the top of this
+// file, and the DB flag on at 100% rollout) — the SAME two-gate check
+// meta_expert_v2's tool wrappers now enforce on every call (server/
+// agents/metaExpertV2/runtimeGate.js). The dedicated "[rollout]" and
+// "[kill switch]" tests further down are the ones that deliberately flip
+// this flag off mid-run — each restores it (in a try/finally) before
+// returning, so no other test ever sees a stale disabled state.
+updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
 
 async function run() {
   console.log("Meta Ads Expert V2 regression suite\n");
@@ -559,10 +573,15 @@ async function run() {
     }
   });
 
-  await check("[rollout] the V2 template is hidden from listTemplates() until the feature flag is explicitly enabled for this user", () => {
+  await check("[rollout] the V2 template is hidden from listTemplates() when the feature flag is disabled for this user", () => {
     const userId = makeUser(`rollout-hidden-${stamp}@example.com`);
-    const templates = listTemplates(userId, null);
-    assert.ok(!templates.some((t) => t.id === "meta-ads-manager-v2"), "V2 template must stay hidden by default");
+    updateFlag("meta_expert_v2", { enabled: false });
+    try {
+      const templates = listTemplates(userId, null);
+      assert.ok(!templates.some((t) => t.id === "meta-ads-manager-v2"), "V2 template must stay hidden while the flag is off");
+    } finally {
+      updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 }); // restore ambient "enabled" state for later tests
+    }
   });
 
   await check("[rollout] enabling the feature flag for a specific user makes the V2 template visible to them, and installable", () => {
@@ -572,6 +591,99 @@ async function run() {
     assert.ok(templates.some((t) => t.id === "meta-ads-manager-v2"));
     const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
     assert.deepEqual(agent.skillIds || [], ["meta_expert_v2"].filter(() => true), "installed agent's skills should be exactly meta_expert_v2");
+  });
+
+  // --- Runtime kill switch (round 2) ---------------------------------
+  // Closes the gap the pre-deployment report flagged: install-time gating
+  // (agentLibrary.js's listTemplates/installTemplate) only controls
+  // whether a NEW agent can be created from the V2 template — it says
+  // nothing about an agent installed BEFORE the flag was disabled. This
+  // proves the runtime gate (server/agents/metaExpertV2/runtimeGate.js) is
+  // checked fresh on every V2 tool call, so flipping the flag off takes
+  // effect immediately for an agent that already exists, with no
+  // dependency on when it was installed.
+  await check("[kill switch] 1-6: a V2 agent installed while ENABLED is fully blocked (snapshot/build/revise/execute, raw Meta mutations never reached) once the flag is disabled, and fully restored once it's re-enabled", async () => {
+    const userId = makeUser(`kill-switch-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes },
+    }));
+    try {
+      // 1. V2 agent installed WHILE ENABLED — through the real install
+      // path (agentLibrary.js's installTemplate), not a hand-rolled DB row.
+      updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const agentId = agent.id;
+
+      // A real, approved-shape strategy built WHILE enabled — proves even
+      // an already-built strategy can't be executed once the flag flips.
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(writes.length, 0, "building a strategy alone must never touch the Meta write API");
+
+      // 2. Feature flag later disabled.
+      updateFlag("meta_expert_v2", { enabled: false });
+
+      // 3. Snapshot/build/revise calls are blocked — through the REAL
+      // runTool() dispatch path (the same path a live agent call goes
+      // through), not just the bare function.
+      const snapshotOutcome = await runTool({ toolName: "meta_expert_v2.get_business_snapshot", parameters: {}, userId, agentId, conversationId, planId: null });
+      assert.equal(snapshotOutcome.status, "failed");
+      assert.match(snapshotOutcome.error, /not currently available/i);
+
+      const buildOutcome = await runTool({ toolName: "meta_expert_v2.build_strategy", parameters: baseStrategy(), userId, agentId, conversationId, planId: null });
+      assert.equal(buildOutcome.status, "failed");
+      assert.match(buildOutcome.error, /not currently available/i);
+
+      const reviseOutcome = await runTool({ toolName: "meta_expert_v2.revise_strategy", parameters: { strategyId: built.strategyId, requestedChanges: { gender: "MALE" } }, userId, agentId, conversationId, planId: null });
+      assert.equal(reviseOutcome.status, "failed");
+      assert.match(reviseOutcome.error, /not currently available/i);
+
+      // 4. execute_strategy is blocked — through the REAL confirm-then-
+      // resume flow (requiresConfirmation:true means runTool() only
+      // returns awaiting_confirmation; the runtime gate is enforced when
+      // the confirmation is actually resumed, exactly where the real
+      // Meta write would otherwise happen).
+      const execAttempt = await runTool({ toolName: "meta_expert_v2.execute_strategy", parameters: { strategyId: built.strategyId }, userId, agentId, conversationId, planId: null });
+      assert.equal(execAttempt.status, "awaiting_confirmation", "the approval prompt itself is still shown — the block happens at the point the real write would occur, same as every other confirm-gated Meta write tool");
+      const resumed = await resumeAfterConfirmation({ executionId: execAttempt.executionId, approved: true });
+      assert.equal(resumed.status, "failed");
+      assert.match(resumed.error, /not currently available/i);
+
+      // 4b. Direct-function defense-in-depth — executeStrategy() itself
+      // (not just its tool wrapper) refuses to run while disabled, for
+      // any future caller that might reach it another way.
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_EXPERT_V2_DISABLED"
+      );
+
+      // 5. Raw Meta mutations never reached — no campaign/ad set/ad/etc.
+      // write request ever hit the Meta API mock during any of the
+      // blocked attempts above.
+      assert.equal(writes.length, 0, "no Meta write call must ever be reached while the runtime flag is disabled");
+      const stillProposed = getStoredStrategy(userId, built.strategyId);
+      assert.equal(stillProposed.status, "proposed", "the strategy must remain unexecuted — never silently marked approved/executing/executed while blocked");
+
+      // 6. Re-enabling restores functionality — the SAME strategy, same
+      // agent, same conversation, no reinstall needed.
+      updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+      const snapshotAfter = await runTool({ toolName: "meta_expert_v2.get_business_snapshot", parameters: {}, userId, agentId, conversationId, planId: null });
+      assert.equal(snapshotAfter.status, "completed");
+
+      const executedAfter = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executedAfter.status, "PAUSED");
+      assert.ok(writes.length > 0, "re-enabled execution must actually reach the Meta write API this time");
+      const finalStored = getStoredStrategy(userId, built.strategyId);
+      assert.equal(finalStored.status, "executed");
+    } finally {
+      restoreFetch();
+      updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 }); // restore ambient "enabled" state regardless of pass/fail
+    }
   });
 
   const failed = results.filter((r) => !r.ok);
