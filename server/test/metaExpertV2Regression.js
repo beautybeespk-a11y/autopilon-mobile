@@ -1416,6 +1416,59 @@ async function run() {
     assert.ok(stillActive, "the strategy built in turn 1 must remain findable under the same conversationId after a second, unrelated turn");
   });
 
+  // --- approval_required omitted (live bug) --------------------------------
+  // Live screenshot: the model's first build_strategy call omitted
+  // approval_required (a plain required boolean, not a business decision) —
+  // validateStrategyStructure hard-rejected the WHOLE strategy over it, the
+  // per-turn single-call gate correctly blocked a second attempt, and the
+  // customer was shown a confusing final message quoting the raw internal
+  // field name back at them: "the field 'approval_required' is required.
+  // Please confirm that you approve the recommended campaign strategy..."
+  // — conflating a technical omission with the real approval flow.
+  // deriveApprovalRequiredIfMissing (strategySchema.js) now defaults a
+  // missing value to true (the conservative choice — see its comment for
+  // why this can never weaken the real execution-approval gate), same
+  // "mechanical fix before validation" principle as deriveCtaIfMissing.
+  await check("[V2 policy] approval_required omitted entirely from the model's strategy is defaulted to true and accepted — never rejected, never surfaced as a confusing field-name message", async () => {
+    const userId = makeUser(`v2-approval-required-missing-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { approval_required, ...strategyWithoutApprovalRequired } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyWithoutApprovalRequired, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.approval_required, true, "a missing approval_required must default to true, not be left undefined");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy, orchestrator-level] approval_required omitted from the model's FIRST build_strategy call succeeds immediately — no second call, no confusing field-name message reaches the user", async () => {
+    const userId = makeUser(`v2-approval-required-missing-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { approval_required, ...strategyWithoutApprovalRequired } = baseStrategy();
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", strategyWithoutApprovalRequired),
+        finalText("Here is your recommended strategy — let me know if you'd like any changes."),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales on my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      assert.equal(buildCalls.length, 1, `omitting approval_required must never force a second attempt: ${JSON.stringify(buildCalls)}`);
+      assert.equal(buildCalls[0].result.valid, true, JSON.stringify(buildCalls[0].result));
+      assert.doesNotMatch(result.reply, /approval_required/i, "the raw internal field name must never reach the customer-facing reply");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {

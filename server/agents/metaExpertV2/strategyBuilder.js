@@ -11,7 +11,7 @@ import { gatherBusinessSnapshot } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
-  normalizeStrategyEnumAliases, deriveCtaIfMissing, PURCHASE_LIKE_EVENTS,
+  normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -161,7 +161,8 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
 
   const { strategy: aliasNormalized, appliedAliases } = normalizeStrategyEnumAliases(merged);
   const ctaResolved = deriveCtaIfMissing(aliasNormalized);
-  let normalized = capHeuristicBudget(ctaResolved);
+  const approvalResolved = deriveApprovalRequiredIfMissing(ctaResolved);
+  let normalized = capHeuristicBudget(approvalResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -170,6 +171,9 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // whether the caller bothered to set it.
   if (!normalized.mode) normalized = { ...normalized, mode: "campaign" };
   if (traceEnabled && appliedAliases.length) trace("strategy enum normalization", { conversationId, appliedAliases });
+  if (traceEnabled && typeof aliasNormalized.approval_required !== "boolean") {
+    trace("strategy approval_required defaulted (missing from model output)", { conversationId, defaultedTo: true });
+  }
   if (traceEnabled && normalized.budget_daily !== ctaResolved.budget_daily) {
     trace("strategy heuristic budget cap", { conversationId, original: ctaResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });
   }

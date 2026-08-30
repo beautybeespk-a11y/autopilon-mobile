@@ -114,6 +114,26 @@ const CTA_DEFAULT_BY_OBJECTIVE = {
   OUTCOME_AWARENESS: "LEARN_MORE",
   OUTCOME_APP_PROMOTION: "DOWNLOAD",
 };
+// Live bug: the model occasionally omits approval_required entirely
+// (a plain boolean field, not a business decision) — validateStrategyStructure
+// then hard-rejects the WHOLE strategy over it, and since V2 caps
+// build_strategy at one real attempt per turn (the per-turn single-call
+// gate), the customer sees a confusing final message quoting the raw
+// internal field name back at them ("the field approval_required is
+// required... please confirm you approve...") instead of an actual
+// recommendation. Mechanical, not a business decision (Step 7: never
+// spend the model's one generation attempt on something this trivial) —
+// defaulting a MISSING value to `true` (never overwrites an explicit
+// `false`) is always the conservative choice: real execution is
+// separately, unconditionally gated by checkV2ExecutionApprovalGate in
+// orchestrator/index.js regardless of this field, and the one other place
+// this field is read (validateStrategyAgainstContext's budget_daily
+// check) only ever gets MORE lenient when it's true, never less safe.
+export function deriveApprovalRequiredIfMissing(strategy) {
+  if (typeof strategy.approval_required === "boolean") return strategy;
+  return { ...strategy, approval_required: true };
+}
+
 export function deriveCtaIfMissing(strategy) {
   if (strategy.cta) return strategy;
   const derived = CTA_DEFAULT_BY_OBJECTIVE[strategy.recommended_objective];
