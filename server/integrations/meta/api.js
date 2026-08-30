@@ -198,9 +198,14 @@ export async function createAd(accessToken, adAccountId, fields) {
 // that points at an existing post (object_story_id) instead of uploading new
 // creative content. Requires pages_read_engagement in addition to
 // pages_show_list (which only lists which Pages exist, not their content).
+// likes.summary(true)/comments.summary(true)/shares are real counts
+// returned directly on the post object — no extra per-post call needed —
+// used by Meta Ads Expert V2's business snapshot (businessSnapshot.js) to
+// show REAL engagement numbers instead of letting the model guess at
+// "high engagement" from nothing.
 export async function listPagePosts(accessToken, pageId) {
   const pageToken = await getPageAccessToken(accessToken, pageId);
-  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken: pageToken || accessToken });
+  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media},likes.summary(true),comments.summary(true),shares`, { accessToken: pageToken || accessToken });
   return data.data || [];
 }
 
@@ -228,8 +233,11 @@ export async function getInstagramAccountId(accessToken, pageId) {
   return null;
 }
 
+// like_count/comments_count are real counts returned directly on the
+// media object — no extra per-post call needed. Same purpose as
+// listPagePosts' engagement fields above.
 export async function listInstagramPosts(accessToken, igAccountId) {
-  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp`, { accessToken });
+  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count`, { accessToken });
   return data.data || [];
 }
 

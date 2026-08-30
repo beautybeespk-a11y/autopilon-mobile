@@ -268,6 +268,41 @@ const INTEGRATION_STATE_QUESTION_PATTERNS = new RegExp(
 const STALE_CLAIM_FOLLOWUP_PATTERNS = /\b(are you sure|sure\?|check again|double[- ]check|confirm that|verify that|really\?|are you certain)\b/i;
 const MAX_STALE_ANSWER_NUDGES = 1;
 
+// CONFIRMED LIVE BUG (V2 live testing): "Choose the exact best creative
+// for this campaign from my recent Facebook/Instagram content and
+// WooCommerce products. Tell me which specific Reel/post/product you
+// selected and why." was answered directly — Agent Trace showed only
+// Planning -> Completed, no tool ever called — yet the reply confidently
+// named a specific post/product/date and described it as high engagement/
+// proven effectiveness. None of that could have been known: it was
+// invented. Neither PLAN_REVIEW_INTENT_PATTERNS (requires an ACTIVE plan/
+// strategy, and doesn't match "choose"/"pick"/"which post/product"
+// phrasing at all) nor INTEGRATION_STATE_QUESTION_PATTERNS (Pixel/Page/ad
+// account/store connection only) covers a creative-selection request —
+// this category of ask fell through every existing gate in this file.
+//
+// Deliberately checked with NO hasActivePlan requirement (unlike
+// PLAN_REVIEW_INTENT_PATTERNS) — a creative-selection request is just as
+// invention-prone on a brand-new conversation with no strategy yet as it
+// is mid-revision; the trigger is the request TYPE, not conversation
+// state. Same loose/non-exhaustive regex trade-off as every other trigger
+// in this file — an occasional unnecessary nudge is far cheaper than
+// naming a real post/product/date that was never actually looked up.
+const CREATIVE_SELECTION_INTENT_PATTERNS = new RegExp(
+  [
+    /\b(choose|pick|select)\b.{0,60}\b(best|exact|strongest|top|right)\b.{0,50}\b(reel|post|creative|content|product|video|image)\b/i,
+    /\b(choose|pick|select)\b.{0,40}\b(reel|post|creative|content|product)\b.{0,40}\b(advertise|for (this|the) (ad|campaign)|to (run|use))\b/i,
+    /\bwhich\b.{0,40}\b(product|reel|post|creative|content)\b.{0,40}\b(should|to use|for (this|the) (ad|campaign))\b/i,
+    /\buse my (best|recent|top|strongest)\b.{0,40}\b(reel|post|content|creative|product)\b/i,
+    /\bcompare (my )?(recent )?(posts|reels|content|creatives)\b/i,
+    /\bwhich (existing )?(ad )?creative\b.{0,40}\breuse\b/i,
+    /\b(best|strongest|top|highest[- ]performing)\b.{0,30}\b(reel|post|creative|content)\b/i,
+  ]
+    .map((r) => r.source)
+    .join("|"),
+  "i"
+);
+
 // Returns a nudge message when the model's "final" decision should be
 // blocked because it's answering a plan-review/revision request or an
 // integration-state question without ever calling a tool this turn — or
@@ -276,10 +311,17 @@ const MAX_STALE_ANSWER_NUDGES = 1;
 // `lastAssistantMessage` (the most recent assistant turn in history, if
 // any) lets a content-free follow-up ("are you sure? check again.") be
 // matched against the integration-state claim it's actually challenging.
-function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpertTools, lastAssistantMessage }) {
+function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpertTools, hasV2Tools, lastAssistantMessage }) {
   if (!hasMetaExpertTools || typeof userMessage !== "string") return null;
   if (hasActivePlan && PLAN_REVIEW_INTENT_PATTERNS.test(userMessage)) {
     return 'This looks like a request to review or revise the ACTIVE campaign plan (e.g. "review my data," "why did you choose this audience/budget," "improve/reconsider the plan") — that must go through the real revision path, never a conversational answer from memory. If the user asked you to review WooCommerce products, Meta account history, or audience data, call meta_expert.research_business_context first to get CURRENT data — a Pixel or connection status can change between turns, never state it from what an earlier turn said. Then call meta_expert.create_campaign_plan with revisesPlanId set to the active plan\'s id, changing only what the current evidence actually supports, before presenting anything to the user.';
+  }
+  if (CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) {
+    const snapshotTool = hasV2Tools ? "meta_expert_v2.get_business_snapshot" : "meta_expert.research_business_context";
+    const revisionClause = hasV2Tools && hasActivePlan
+      ? " Since an active strategy already exists for this conversation, then call meta_expert_v2.revise_strategy updating ONLY the creative fields (creative_strategy / content_selector) with what the real data supports — preserve the Page, ad account, Pixel, objective, audience, and budget exactly as they are; do not rebuild the campaign."
+      : "";
+    return `This asks you to select or compare specific creative (a Reel, post, or product) for an ad. Never name a specific post, product, or date, and never describe something as "high engagement," "high performing," or "proven effectiveness," without real CURRENT data behind it. Call ${snapshotTool} first to get the actual recent content list before selecting or describing anything specific.${revisionClause} If no real engagement/performance data is available for a piece of content, say so plainly and choose based on clearly-labeled factors instead (e.g. "Based on content relevance and format...") — never claim something is your best- or highest-performing content without the numbers to back it up.`;
   }
   if (INTEGRATION_STATE_QUESTION_PATTERNS.test(userMessage)) {
     return "This asks about CURRENT connected integration state (a Pixel, Page, ad account, or store connection) — these can change between turns and must never be answered from what an earlier message said. Call the real lookup tool (meta_expert.research_business_context, meta.list_pages, meta.list_ad_accounts, etc. as appropriate) to get the CURRENT answer before replying.";
@@ -568,6 +610,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let staleAnswerNudges = 0;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
+  const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
   let createPlanAttempts = 0;
   let lastCreatePlanFingerprint = null;
   let lastCreatePlanWasRejected = false;
@@ -663,6 +706,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           userMessage,
           hasActivePlan: Boolean(getActivePlanForConversation(userId, conversationId)) || Boolean(getActiveStrategyForConversation(userId, conversationId)),
           hasMetaExpertTools,
+          hasV2Tools,
           lastAssistantMessage,
         });
         if (staleGateMessage) {

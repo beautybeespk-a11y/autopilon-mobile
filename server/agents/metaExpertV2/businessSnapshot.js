@@ -271,12 +271,83 @@ async function gatherMetaHistory(userId, accessToken, primaryAdAccountId) {
   };
 }
 
-async function gatherRecentContent(accessToken, pageId, instagram) {
+const CAPTION_EXCERPT_LENGTH = 140;
+
+// Deterministic, mechanical WooCommerce/Shopify product match — a
+// case-insensitive substring check of each product's own name against
+// the post/Reel's real caption text. Never an LLM guess: if a product's
+// exact name doesn't literally appear in the caption, this returns no
+// match rather than inferring one. Used so a creative-selection strategy
+// can honestly say "this post is about product X" only when that's
+// mechanically true, never invented.
+function matchLinkedProduct(captionText, sampleProducts) {
+  if (!captionText || !Array.isArray(sampleProducts) || !sampleProducts.length) return null;
+  const lowerCaption = captionText.toLowerCase();
+  const match = sampleProducts.find((p) => p.name && lowerCaption.includes(p.name.toLowerCase()));
+  return match ? { name: match.name, price: match.price ?? null, category: match.category ?? null } : null;
+}
+
+// A Reel is really just an Instagram VIDEO whose permalink path says so —
+// the Graph API doesn't expose a dedicated "is this a Reel" field on the
+// plain media fields this snapshot fetches, so this is read off the one
+// place that's actually reliable (the real permalink), never guessed from
+// caption wording.
+function classifyContentType(platform, mediaType, permalink) {
+  if (platform === "instagram" && typeof permalink === "string" && permalink.includes("/reel/")) return "reel";
+  const normalized = (mediaType || "").toLowerCase();
+  if (normalized.includes("video")) return "video";
+  if (normalized.includes("carousel") || normalized.includes("album")) return "carousel";
+  if (normalized.includes("photo") || normalized.includes("image")) return "image";
+  if (normalized === "share" || normalized === "link") return "link_share";
+  return "unknown";
+}
+
+// Normalizes a raw Facebook/Instagram post into the shape strategyBuilder.js
+// and the model actually need for creative selection (Step: creative-
+// selection grounding) — ONLY verified facts, with every metric the
+// model must never invent explicitly marked "unavailable" rather than
+// omitted, so a missing fact reads as "not known," never as "zero" or
+// "doesn't exist."
+function normalizeContentItem(platform, raw, sampleProducts) {
+  const permalink = raw.permalink_url || raw.permalink || null;
+  const mediaType = platform === "facebook" ? (raw.attachments?.data?.[0]?.media_type || null) : (raw.media_type || null);
+  const captionText = raw.message || raw.caption || null;
+  const likes = platform === "facebook" ? raw.likes?.summary?.total_count : raw.like_count;
+  const comments = platform === "facebook" ? raw.comments?.summary?.total_count : raw.comments_count;
+  const shares = platform === "facebook" ? raw.shares?.count : undefined;
+  const hasEngagement = [likes, comments, shares].some((v) => typeof v === "number");
+  return {
+    id: raw.id,
+    platform,
+    contentType: classifyContentType(platform, mediaType, permalink),
+    captionExcerpt: captionText ? captionText.slice(0, CAPTION_EXCERPT_LENGTH) + (captionText.length > CAPTION_EXCERPT_LENGTH ? "…" : "") : null,
+    publishedDate: raw.created_time || raw.timestamp || null,
+    permalink,
+    mediaType,
+    engagement: hasEngagement
+      ? { status: "exists", likes: typeof likes === "number" ? likes : null, comments: typeof comments === "number" ? comments : null, shares: typeof shares === "number" ? shares : null }
+      : { status: "unavailable", likes: null, comments: null, shares: null },
+    // Not fetched in this pass — Meta's per-post reach/impressions/video-view
+    // counts require a separate Insights call per post; rather than silently
+    // omit the field (which the model could mistake for "doesn't exist"),
+    // it's explicitly marked unavailable so the model can never claim a
+    // reach/impressions/view number that was never actually retrieved.
+    reachImpressions: { status: "unavailable", reach: null, impressions: null },
+    videoViews: { status: "unavailable", views: null },
+    linkedProduct: matchLinkedProduct(captionText, sampleProducts),
+    // A fetched post/Reel with a real permalink is the same object Meta's
+    // own "Boost" flow would offer — the same condition meta.boost_post
+    // already relies on (a real postId/permalink to attach as an ad).
+    eligibleForPromotion: Boolean(permalink),
+  };
+}
+
+async function gatherRecentContent(accessToken, pageId, instagram, sampleProducts) {
   const facebook = pageId
-    ? await attempt(async () => (await meta.listPagePosts(accessToken, pageId)).slice(0, MAX_RECENT_CONTENT).map((p) => ({ id: p.id, message: p.message || null, createdTime: p.created_time, mediaType: p.attachments?.data?.[0]?.media_type || null })))
+    ? await attempt(async () => (await meta.listPagePosts(accessToken, pageId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts)))
     : { status: "not_connected", value: [] };
   const instagramPosts = instagram?.accountId
-    ? await attempt(async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).slice(0, MAX_RECENT_CONTENT).map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, timestamp: p.timestamp })))
+    ? await attempt(async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts)))
     : { status: "not_connected", value: [] };
   return {
     facebookPosts: { status: facebook.status, items: facebook.value || [] },
@@ -330,7 +401,7 @@ export async function gatherBusinessSnapshot(userId) {
 
   const metaAssets = await gatherMetaAssets(userId, accessToken, conn);
   const metaHistory = await gatherMetaHistory(userId, accessToken, metaAssets.defaultAdAccount.id);
-  const recentContent = await gatherRecentContent(accessToken, metaAssets.defaultPage.id, metaAssets.instagram.account);
+  const recentContent = await gatherRecentContent(accessToken, metaAssets.defaultPage.id, metaAssets.instagram.account, business.sampleProducts);
 
   const snapshot = {
     generatedAt: new Date().toISOString(),

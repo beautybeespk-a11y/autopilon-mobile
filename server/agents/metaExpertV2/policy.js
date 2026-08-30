@@ -150,6 +150,59 @@ export function repairSalesReasoningSummary(strategy) {
   return `This strategy is optimized to drive ${eventLabel}, not just reach or clicks${evidenceClause}: the goal is a strong conversion volume at an efficient cost-per-acquisition (CPA) and a healthy return on ad spend (ROAS), maximizing revenue and overall conversion efficiency.`;
 }
 
+// Live bug: a live V2 test asked the model to choose the "exact best"
+// creative from the account's real recent content. Nothing forced a real
+// get_business_snapshot call first (see CREATIVE_SELECTION_INTENT_PATTERNS
+// in orchestrator/index.js for the chat-level fix), and separately,
+// nothing here stopped a strategy from claiming a piece of creative was
+// "high performing" or had "proven effectiveness" when the business
+// snapshot never actually returned real engagement/performance numbers
+// for it. This is the backend-enforced half of that fix: a strategy is
+// REJECTED if its reasoning/creative description makes a performance
+// claim the snapshot's own data doesn't support — the same "policy can
+// reject the model's prose regardless of how convincing it reads"
+// principle as checkSalesConsistencyPolicy above, just grounded against
+// real snapshot facts instead of a fixed keyword list.
+const PERFORMANCE_CLAIM_WORDS = /\b(high(?:est)?[- ]?(?:performing|engagement)|top[- ]?performing|best[- ]?performing|proven (effectiveness|track record)|strong engagement|great engagement|top performer)\b/i;
+export function checkCreativeGroundingPolicy(strategy, snapshot) {
+  const errors = [];
+  const texts = [strategy.reasoning_summary, strategy.creative_strategy?.description].filter((t) => typeof t === "string");
+  if (!texts.some((t) => PERFORMANCE_CLAIM_WORDS.test(t))) return errors;
+
+  const allContent = [
+    ...(snapshot?.recentContent?.facebookPosts?.items || []),
+    ...(snapshot?.recentContent?.instagramPosts?.items || []),
+  ];
+  // If a SPECIFIC piece of content was selected (explicit_action mode),
+  // the performance claim must be grounded in THAT item's own real
+  // engagement data — not just any item in the snapshot having numbers.
+  const selectedId = strategy.mode === "explicit_action" ? strategy.content_selector?.confirmedId : null;
+  const selectedItem = selectedId ? allContent.find((i) => i.id === selectedId) : null;
+  const hasRealEvidence = selectedItem ? selectedItem.engagement?.status === "exists" : allContent.some((i) => i.engagement?.status === "exists");
+
+  if (!hasRealEvidence) {
+    errors.push({
+      field: "reasoning_summary",
+      message: 'The strategy describes a piece of creative as high-performing / proven ("high engagement," "proven effectiveness," etc.), but no real engagement or performance data exists in the current business snapshot for it — that claim isn\'t supported by any actual fact. Either select content that genuinely has engagement data, or reframe the reasoning around clearly-labeled non-performance factors (e.g. "Based on content relevance and format...") instead of claiming it performs best.',
+    });
+  }
+  return errors;
+}
+
+// Deterministic, non-LLM regeneration paired with checkCreativeGroundingPolicy
+// above — same "mechanical fix before validation" principle as
+// repairSalesReasoningSummary: when the ONLY problem is an unsupported
+// performance claim, replace it with the honest, clearly-labeled heuristic
+// framing the spec requires, rather than burning the model's one
+// generation attempt on a rejection it can't actually fix with more facts
+// (the facts genuinely don't exist).
+export function repairCreativeReasoningForMissingEvidence(strategy) {
+  const evidenceClause = Array.isArray(strategy.evidence_used) && strategy.evidence_used.length
+    ? ` — using ${strategy.evidence_used.join("; ")}`
+    : "";
+  return `Based on content relevance and format${evidenceClause}, this is the most suitable existing creative to use right now. No real engagement or performance data is currently available in the account to rank content by results, so this selection is based on recency, relevance, and format suitability rather than proven performance.`;
+}
+
 // Step 4/5 — Audience quality. Same "generic audience needs a real reason"
 // principle: All genders 18-65 is Meta's own widest possible range, not a
 // considered choice.

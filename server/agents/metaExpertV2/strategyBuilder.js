@@ -17,7 +17,7 @@ import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
   checkGoalAlignmentPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
-  repairSalesReasoningSummary,
+  repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -218,27 +218,39 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
 
   const goalErrors = checkGoalAlignmentPolicy(normalized, businessSignals);
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
+  let creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   const audienceErrors = checkAudienceQualityPolicy(normalized, businessSignals);
   const budgetErrors = checkBudgetPolicy(normalized);
   const revisionErrors = priorStored ? checkRevisionSubstantive({ priorStrategy: priorStored.strategy, newStrategy: normalized, requestedChanges }) : [];
 
-  // Non-strategic presentation repair (live bug): when sales-consistency
-  // wording is the ONLY thing wrong — every real business decision
+  // Non-strategic presentation repairs (live bugs): when the ONLY thing
+  // wrong is reasoning_summary's WORDING — every real business decision
   // (objective, audience, budget, assets, placements) already checked out
-  // — deterministically regenerate reasoning_summary instead of rejecting
-  // a sound strategy over prose. See repairSalesReasoningSummary in
-  // policy.js. Never a second build_strategy call, never another LLM
-  // generation — this stays inside the model's one attempt.
-  if (
-    salesConsistencyErrors.length && !resolutionErrors.length && !contextual.errors.length &&
-    !goalErrors.length && !audienceErrors.length && !budgetErrors.length && !revisionErrors.length
-  ) {
+  // — deterministically regenerate it instead of rejecting a sound
+  // strategy over prose. See repairSalesReasoningSummary/
+  // repairCreativeReasoningForMissingEvidence in policy.js. Never a
+  // second build_strategy call, never another LLM generation — this stays
+  // inside the model's one attempt. The two repairs are mutually
+  // exclusive here (each only fires when the OTHER isn't also failing) —
+  // repairSalesReasoningSummary's text never claims content performance,
+  // and repairCreativeReasoningForMissingEvidence's text never mentions
+  // purchases/CPA/ROAS, so chaining them would let one repair's text
+  // silently undo the other's fix. The rare case where a strategy fails
+  // BOTH simultaneously is returned as a real (double) rejection instead —
+  // that reasoning_summary needs actual attention, not a mechanical patch.
+  const baseChecksClean = !resolutionErrors.length && !contextual.errors.length &&
+    !goalErrors.length && !audienceErrors.length && !budgetErrors.length && !revisionErrors.length;
+  if (baseChecksClean && salesConsistencyErrors.length && !creativeGroundingErrors.length) {
     if (traceEnabled) trace("strategy reasoning_summary auto-repaired (sales consistency)", { conversationId, before: normalized.reasoning_summary });
     normalized = { ...normalized, reasoning_summary: repairSalesReasoningSummary(normalized) };
     salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
+  } else if (baseChecksClean && creativeGroundingErrors.length && !salesConsistencyErrors.length) {
+    if (traceEnabled) trace("strategy reasoning_summary auto-repaired (creative grounding)", { conversationId, before: normalized.reasoning_summary });
+    normalized = { ...normalized, reasoning_summary: repairCreativeReasoningForMissingEvidence(normalized) };
+    creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   }
 
-  const errors = [...resolutionErrors, ...contextual.errors, ...goalErrors, ...salesConsistencyErrors, ...audienceErrors, ...budgetErrors, ...revisionErrors];
+  const errors = [...resolutionErrors, ...contextual.errors, ...goalErrors, ...salesConsistencyErrors, ...creativeGroundingErrors, ...audienceErrors, ...budgetErrors, ...revisionErrors];
 
   trace("strategy final decision", {
     conversationId, accepted: errors.length === 0,

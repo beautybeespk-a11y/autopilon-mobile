@@ -863,6 +863,202 @@ async function run() {
     }
   });
 
+  // --- Creative-selection grounding (live bug) ------------------------------
+  // Live testing round: "Choose the exact best creative for this campaign
+  // from my recent Facebook/Instagram content and WooCommerce products.
+  // Tell me which specific Reel/post/product you selected and why." was
+  // answered directly — Agent Trace showed only Planning -> Completed, no
+  // tool ever called — yet the reply confidently named a specific post/
+  // product/date and called it high engagement/proven effectiveness, none
+  // of which could have been known. Two backend fixes, tested below:
+  // (1) orchestrator/index.js's CREATIVE_SELECTION_INTENT_PATTERNS now
+  // forces a real get_business_snapshot (and revise_strategy, if an active
+  // strategy exists) before the model may finalize such a request; (2)
+  // policy.js's checkCreativeGroundingPolicy rejects/auto-repairs any
+  // strategy that describes content as high-performing/proven without real
+  // engagement data in the snapshot to back it up.
+  const CREATIVE_TEST_POST = {
+    id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-03T10:00:00+0000",
+    permalink_url: "https://facebook.com/111/posts/1", attachments: { data: [{ media_type: "video" }] },
+  };
+  const CREATIVE_TEST_POST_WITH_ENGAGEMENT = {
+    ...CREATIVE_TEST_POST,
+    likes: { summary: { total_count: 480 } }, comments: { summary: { total_count: 52 } }, shares: { count: 30 },
+  };
+
+  await check("[Creative gate 1] 'Choose my best recent Facebook Reel.' forces a real get_business_snapshot call before any creative claim is finalized", async () => {
+    const userId = makeUser(`v2-creative-gate-1-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST] },
+      chatResponses: [
+        finalText("Your Facebook Reel posted on March 3rd showing the new Vitamin C Serum has the highest engagement of all your recent content — I recommend using it."),
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("Based on content relevance and format, the Vitamin C Serum post is the most suitable option to use — no real engagement data is currently available to rank it by results."),
+      ],
+    }));
+    try {
+      const userMessage = "Choose my best recent Facebook Reel.";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `a real snapshot call must be forced before any creative claim is finalized: ${JSON.stringify(toolNames)}`);
+      assert.doesNotMatch(result.reply, /highest engagement of all your recent content/i, "the invented, ungrounded claim must never reach the user");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative gate 2] the model tries to answer a creative-selection request by reusing a claim from conversation HISTORY without calling any tool — the stale-factual gate blocks it and forces a real snapshot call", async () => {
+    const userId = makeUser(`v2-creative-gate-2-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST] },
+      chatResponses: [
+        finalText("As I mentioned earlier, your March 3rd post is your best-performing content, so I'll use that one again."),
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("Based on content relevance and format, the Vitamin C Serum post is the best fit to use for this ad."),
+      ],
+    }));
+    const priorAssistantClaim = "Your March 3rd Facebook post about the Vitamin C Serum had the highest engagement of anything you've posted recently.";
+    try {
+      const userMessage = "Use my best recent content for this ad.";
+      const history = [
+        { role: "user", content: "Which of my posts performs best?" },
+        { role: "assistant", content: priorAssistantClaim },
+        { role: "user", content: userMessage },
+      ];
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `a real snapshot call must be forced even though conversation history already contains a specific claim: ${JSON.stringify(toolNames)}`);
+      assert.doesNotMatch(result.reply, /as I mentioned earlier/i, "the reply must not simply repeat the stale historical claim");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative grounding 3] a creative selection claiming 'high performing'/'proven effectiveness' with NO real engagement data in the snapshot is auto-repaired to honest, clearly-labeled wording — never a false performance claim", async () => {
+    const userId = makeUser(`v2-creative-noeng-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const strategy = {
+        mode: "explicit_action",
+        business_goal: "boost my best post",
+        action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { confirmedId: "111_1" },
+        budget_daily: 1000,
+        budget_basis: "HEURISTIC_STARTING_TEST",
+        campaign_status: "PAUSED",
+        reasoning_summary: "This is your highest-performing post with proven effectiveness, so it's the best choice to boost.",
+        evidence_used: ["Facebook Page recent content"],
+        assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my best post" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.doesNotMatch(result.strategy.reasoning_summary, /highest-performing|proven effectiveness/i, "the unsupported performance claim must be replaced, not kept");
+      assert.match(result.strategy.reasoning_summary, /content relevance and format/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative grounding 4] a creative selection claiming strong performance WITH real engagement data in the snapshot is accepted unchanged — grounded claims are allowed through", async () => {
+    const userId = makeUser(`v2-creative-witheng-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    try {
+      const strategy = {
+        mode: "explicit_action",
+        business_goal: "boost my best post",
+        action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { confirmedId: "111_1" },
+        budget_daily: 1000,
+        budget_basis: "HEURISTIC_STARTING_TEST",
+        campaign_status: "PAUSED",
+        reasoning_summary: "This is your highest-performing post (480 likes, 52 comments, 30 shares) with proven effectiveness, so it's the best choice to boost.",
+        evidence_used: ["Facebook Page recent content: 480 likes, 52 comments, 30 shares"],
+        assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my best post" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.reasoning_summary, strategy.reasoning_summary, "a genuinely grounded performance claim must be accepted unchanged, not rewritten");
+      assert.match(result.strategy.reasoning_summary, /480 likes/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative revision 5] revising ONLY the creative selection for an active strategy preserves Page/ad account/Pixel/objective/audience/budget exactly, without rebuilding the campaign", async () => {
+    const userId = makeUser(`v2-creative-revision-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+    }));
+    try {
+      const initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+
+      const revision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId,
+        requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares) — real engagement shows strong interest." } },
+        userMessage: "Choose the exact best creative for this campaign from my recent content.",
+      });
+      assert.equal(revision.ok, true, JSON.stringify(revision.unresolved));
+      assert.match(revision.strategy.creative_strategy.description, /480 likes/);
+      // Every non-creative field must carry forward unchanged — this must
+      // be a revision, never a rebuild.
+      assert.equal(revision.strategy.recommended_objective, initial.strategy.recommended_objective);
+      assert.equal(revision.strategy.optimization_event, initial.strategy.optimization_event);
+      assert.equal(revision.strategy.gender, initial.strategy.gender);
+      assert.equal(revision.strategy.age_min, initial.strategy.age_min);
+      assert.equal(revision.strategy.age_max, initial.strategy.age_max);
+      assert.equal(revision.strategy.budget_daily, initial.strategy.budget_daily);
+      assert.equal(revision.resolved.adAccountId, initial.resolved.adAccountId);
+      assert.equal(revision.resolved.pageId, initial.resolved.pageId);
+      assert.equal(revision.resolved.pixelId, initial.resolved.pixelId);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative grounding 6] a content_selector confirmedId that doesn't exist in the CURRENT snapshot is REJECTED — a specific post/date may only appear in the final answer if it's actually there", async () => {
+    const userId = makeUser(`v2-creative-invalid-id-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const strategy = {
+        mode: "explicit_action",
+        business_goal: "boost my best post",
+        action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { confirmedId: "999_invented_id" }, // NOT present in the real snapshot
+        budget_daily: 1000,
+        budget_basis: "HEURISTIC_STARTING_TEST",
+        campaign_status: "PAUSED",
+        reasoning_summary: "Boosting a specific post for maximum relevance.",
+        evidence_used: ["Facebook Page recent content"],
+        assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost this specific post" });
+      assert.equal(result.ok, false, "a post id that doesn't exist in the current snapshot must never be accepted");
+      assert.match(result.unresolved.issue, /not one of the recent posts/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {
