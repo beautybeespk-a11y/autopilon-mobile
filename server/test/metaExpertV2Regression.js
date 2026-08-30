@@ -24,12 +24,13 @@ const { saveConnection, updateConnectionMeta } = await import("../integrations/m
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
-const { getStoredStrategy, getActiveStrategyForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
+const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
 const { checkV2ExecutionApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate } = await import("../orchestrator/agentLibrary.js");
 const { updateFlag } = await import("../orchestrator/featureFlags.js");
+const { handleIncomingMessage } = await import("../orchestrator/conversationService.js");
 await import("../tools/index.js"); // registers meta_expert_v2.* tools
 
 const results = [];
@@ -1270,6 +1271,149 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Strategy persistence / conversationId linkage, end-to-end ----------
+  // Production report: getActiveStrategyForConversation found no active
+  // strategy for the live conversation (activeV2StrategyFound: false),
+  // even though a build_strategy call had just succeeded in that same
+  // chat. This exercises the REAL production call chain — routes/chat.js's
+  // own conversation-creation step, then handleIncomingMessage()
+  // (conversationService.js, the exact function routes/chat.js calls, not
+  // orchestrate() called directly like the tests above) — end to end,
+  // numbered to match the required invariant:
+  //   1. User starts conversation X.
+  //   2. build_strategy succeeds.
+  //   3. DB row exists with conversationId X and status 'proposed'.
+  //   4. Next user turn in the SAME chat asks to change/select creative.
+  //   5. getActiveStrategyForConversation() returns that same strategy.
+  //   6. The creative revision gate forces revise_strategy.
+  await check("[Strategy persistence] end-to-end through the real chat call chain: build_strategy in conversation X persists conversationId=X/status=proposed, and the next turn in that same chat finds it", async () => {
+    const userId = makeUser(`v2-persistence-e2e-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+
+    // Step 1: "User starts conversation X" — replicate routes/chat.js's own
+    // conversation-creation step (POST /chat/message with no conversationId
+    // in the body creates one server-side) rather than inventing an id the
+    // real request path would never actually produce.
+    const conversationIdX = cryptoRandom();
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(conversationIdX, userId, agentId, "Test conversation", now, now);
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      chatResponses: [toolCall("meta_expert_v2.build_strategy", baseStrategy()), finalText("Here is your recommended strategy.")],
+    }));
+    try {
+      // Step 2: build_strategy succeeds, through the REAL chat call chain —
+      // handleIncomingMessage(), the exact function routes/chat.js calls.
+      const turn1 = await handleIncomingMessage({
+        userId, agentId, conversationId: conversationIdX, content: "I want more sales on my website",
+      });
+      assert.ok(turn1.toolResults.some((r) => r.toolName === "meta_expert_v2.build_strategy" && r.result?.valid), `build_strategy must succeed: ${JSON.stringify(turn1.toolResults)}`);
+    } finally {
+      restoreFetch();
+    }
+
+    // Step 3: DB row exists with conversationId X and status 'proposed'.
+    const stored = getActiveStrategyForConversation(userId, conversationIdX);
+    assert.ok(stored, "a strategy row must exist for conversation X immediately after build_strategy succeeds");
+    assert.equal(stored.conversationId, conversationIdX, "the stored row's conversationId must be EXACTLY X, not null/undefined/a different id");
+    assert.equal(stored.status, "proposed");
+    const recent = listRecentStrategiesForUser(userId, 10);
+    assert.equal(recent[0].id, stored.id);
+    assert.equal(recent[0].conversationId, conversationIdX);
+    assert.equal(recent[0].status, "proposed");
+
+    // Step 4: next user turn in the SAME chat (same conversationIdX, exactly
+    // as the real chat client would send when correctly echoing it back)
+    // asks to select creative.
+    const userMessage = "Choose the exact best creative for this campaign from my recent Facebook/Instagram content and WooCommerce products.";
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("I selected the Vitamin C Serum post as the creative."), // live-bug shape: no revise_strategy
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares)." } }, freshResearchRequired: false }),
+        finalText("I've updated the creative to use your Vitamin C Serum post."),
+      ],
+    }));
+    try {
+      const turn2 = await handleIncomingMessage({ userId, agentId, conversationId: conversationIdX, content: userMessage });
+      const toolNames = turn2.toolResults.map((r) => r.toolName);
+
+      // Step 5: getActiveStrategyForConversation() found and used the SAME
+      // strategy (not a different/duplicate one under a mismatched id).
+      const reviseCall = turn2.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(reviseCall, `revise_strategy must be called: ${JSON.stringify(toolNames)}`);
+      assert.equal(reviseCall.result?.valid, true, JSON.stringify(reviseCall.result));
+      // A revision always inserts a NEW row (see strategyStore.js's
+      // insertStrategy comment: the prior row is marked 'superseded', never
+      // updated in place) — so the meaningful check isn't "same id," it's
+      // that this new row's revisionOf points back to the SAME strategy
+      // found via conversationId X in step 5, and that prior row is now
+      // superseded, never left dangling as still 'proposed'.
+      const revisedStored = getStoredStrategy(userId, reviseCall.result?.strategyId);
+      assert.equal(revisedStored?.revisionOf, stored.id, "the revision must be OF the same strategy found via conversationId X, not an unrelated one");
+      assert.equal(getStoredStrategy(userId, stored.id)?.status, "superseded", "the original strategy must be marked superseded once revised, not left dangling as proposed");
+
+      // Step 6: the required flow — snapshot, then revision, before final.
+      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot", "meta_expert_v2.revise_strategy"], `required flow is get_business_snapshot -> revise_strategy -> final: ${JSON.stringify(toolNames)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Chat route conversationId reuse (not a new id per turn) ------------
+  // Directly tests the exact behavior requested: "whether the chat API is
+  // generating a new conversationId between turns while the UI still
+  // visually shows the same conversation." Two consecutive
+  // handleIncomingMessage() calls with the SAME conversationId (as
+  // routes/chat.js sends whenever the client includes conversationId in
+  // the request body — see routes/chat.js's `let convId = conversationId`)
+  // must both persist under, and both find data under, that identical id —
+  // never silently split across two different conversationIds server-side.
+  await check("[Strategy persistence] two consecutive chat turns with the SAME conversationId never get split across two different conversations server-side", async () => {
+    const userId = makeUser(`v2-persistence-sameid-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = cryptoRandom();
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(conversationId, userId, agentId, "Test conversation", now, now);
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [toolCall("meta_expert_v2.build_strategy", baseStrategy()), finalText("Here is your recommended strategy.")],
+    }));
+    try {
+      await handleIncomingMessage({ userId, agentId, conversationId, content: "I want more sales on my website" });
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [finalText("Sure, tell me more.")] }));
+    try {
+      await handleIncomingMessage({ userId, agentId, conversationId, content: "Ok, tell me more." });
+    } finally {
+      restoreFetch();
+    }
+
+    // Both turns' messages must be under the ONE conversation row — never
+    // silently duplicated into a second conversations row for the "same"
+    // chat, which is exactly what a client-side conversationId-loss bug
+    // would produce server-side.
+    const convRows = db.prepare("SELECT COUNT(*) as n FROM conversations WHERE userId = ?").get(userId);
+    assert.equal(convRows.n, 1, "exactly one conversations row must exist for this user after two turns with the same conversationId");
+    const msgRows = db.prepare("SELECT COUNT(*) as n FROM messages WHERE conversationId = ?").get(conversationId).n;
+    assert.equal(msgRows, 4, "both turns (2 messages each: user + assistant) must be stored under the SAME conversationId");
+    // The strategy built in turn 1 must still be findable by that SAME id.
+    const stillActive = getActiveStrategyForConversation(userId, conversationId);
+    assert.ok(stillActive, "the strategy built in turn 1 must remain findable under the same conversationId after a second, unrelated turn");
   });
 
   const failed = results.filter((r) => !r.ok);
