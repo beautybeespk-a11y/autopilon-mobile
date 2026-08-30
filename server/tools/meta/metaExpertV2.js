@@ -67,7 +67,7 @@ registerTool({
       gender: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.gender.enum },
       age_min: { type: "number" },
       age_max: { type: "number" },
-      audience_reasoning: { type: "string", description: "Required only when the audience is fully generic (all genders, 18-65)." },
+      audience_reasoning: { type: "string", description: "REQUIRED whenever gender is ALL and age_min<=18 and age_max>=65 (a fully generic audience) — the backend REJECTS the whole strategy without this. Never leave a generic audience unexplained: either write a real, specific reason no narrower targeting applies (e.g. \"No store/account data exists yet to narrow by\"), or — if real WooCommerce/Meta data IS available — narrow gender/age_min/age_max using it instead of defaulting to generic." },
       locations: { type: "array", items: { type: "string" } },
       countries: { type: "array", items: { type: "string" }, description: "ISO 3166-1 alpha-2 country codes, e.g. [\"PK\"]." },
       targeting_approach: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.targeting_approach.enum },
