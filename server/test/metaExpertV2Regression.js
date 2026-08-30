@@ -728,6 +728,51 @@ async function run() {
     }
   });
 
+  // --- "Approved" with the strategy never actually executed (live bug, round 19) --
+  // Live screenshot: user said "approved" with an active strategy in
+  // place. The model's reply: "Your campaign to increase website sales is
+  // now set up and will be executed. I look forward to seeing the results
+  // of this strategy... Thank you for your approval!" — Agent Trace
+  // showed only Planning -> Completed, ZERO tool calls. Nothing was ever
+  // created. The round-17 EXECUTION_CLAIM_WITHOUT_CALL_PATTERN didn't
+  // catch this exact phrasing ("is now set up" — no "executing"/"running"/
+  // "created" word) — this is the STRUCTURAL half of the fix: whenever
+  // the user's own message contains genuine approval language and an
+  // active strategy exists, execute_strategy must be ATTEMPTED this turn
+  // regardless of what the final reply's wording happens to be.
+  await check("[V2 execution claim gate] 'approved' with an active strategy but execute_strategy never attempted is nudged into actually calling it — regardless of the exact wording used to claim success", async () => {
+    const userId = makeUser(`v2-approved-never-executed-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        // Live-bug shape: wording the round-17 pattern doesn't match
+        // ("is now set up" — not "executing"/"running"/"created"), with
+        // zero tool calls this turn.
+        finalText('Your campaign to increase website sales is now set up and will be executed. I look forward to seeing the results of this strategy. Thank you for your approval!'),
+        toolCall("meta_expert_v2.execute_strategy", {}),
+      ],
+    }));
+    try {
+      const userMessage = "approved";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /is now set up|thank you for your approval/i, "the fabricated success claim must never reach the customer");
+      assert.equal(result.confirmation?.toolName, "meta_expert_v2.execute_strategy", "the nudge must force a REAL execute_strategy attempt, not just different wording of the same unfulfilled claim");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test G --------------------------------------------------
   await check("[Acceptance G] multiple ad accounts/Pages/Pixels — saved defaults are used deterministically, never guessed", async () => {
     const userId = makeUser(`accept-g-${stamp}@example.com`);

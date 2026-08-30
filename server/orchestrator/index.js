@@ -77,13 +77,34 @@ const MAX_NARRATION_NUDGES = 1;
 // actually run this turn — a legitimate final reply after a REAL
 // execute_strategy call this turn (e.g. "Your campaign is now created
 // and paused") is untouched, since executeCalledThisTurn is true there.
-const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|(campaign|strategy|ad set) is now (created|running|live|executing)|proceeding to (execute|create) the (campaign|strategy))\b/i;
+// Round 19 (live testing): the SAME class of bug recurred with wording
+// the pattern above didn't cover — "Your campaign to increase website
+// sales is now set up and will be executed... Thank you for your
+// approval!" (Agent Trace: Planning -> Completed, zero tool calls) — the
+// user had just said "approved" and an active strategy existed, but
+// execute_strategy was never even attempted. Chasing every possible
+// phrasing of "I did it" with more regex alternatives is exactly the
+// whack-a-mole this file's own NARRATION_WITHOUT_ACTION comment already
+// warns against, so this adds a STRUCTURAL trigger instead of relying on
+// wording alone: whenever the user's CURRENT message contains genuine
+// approval language and an active V2 strategy exists, execute_strategy
+// must actually be ATTEMPTED this turn — no phrasing of "final" is
+// legitimate otherwise, regardless of what it says. This doesn't replace
+// the text-pattern check (still useful for the non-approval case, e.g.
+// round 17's "500/day" with no "approve" wording), it's checked in
+// addition — either signal alone is enough to block.
+const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|(campaign|strategy|ad set) is now (created|running|live|executing|set ?up)|(campaign|strategy) (will be|has been|is being) (executed|created|set ?up)|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
-function checkExecutionClaimWithoutCallGate({ decision, hasV2Tools, executeCalledThisTurn, reviseCalledThisTurn }) {
+function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   if (executeCalledThisTurn || reviseCalledThisTurn) return null;
-  if (!EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message)) return null;
-  return 'Your reply claims the strategy is being executed, revised, or updated, but neither meta_expert_v2.revise_strategy nor meta_expert_v2.execute_strategy was actually called this turn — nothing happened. If you now have what you need (e.g. a budget the user just gave you), call the real tool now with type "tool_call" instead of describing it as done. Never describe an action as executing/created/updated/running unless the matching tool call actually ran and succeeded this turn.';
+  const claimsCompletion = EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message);
+  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage);
+  if (!claimsCompletion && !approvedButNeverAttempted) return null;
+  if (approvedButNeverAttempted && !claimsCompletion) {
+    return 'The user just approved the active strategy in their current message, but meta_expert_v2.execute_strategy was never actually called this turn. Call it now with type "tool_call" — never tell the user the campaign is set up, created, executing, or running unless that tool call actually ran (it requires a separate confirmation step, so say that plainly if it comes back awaiting confirmation, never claim it already spent or executed).';
+  }
+  return 'Your reply claims the strategy is being executed, revised, updated, or set up, but neither meta_expert_v2.revise_strategy nor meta_expert_v2.execute_strategy was actually called this turn — nothing happened. If you now have what you need (e.g. a budget the user just gave you, or explicit approval), call the real tool now with type "tool_call" instead of describing it as done. Never describe an action as executing/created/updated/running/set up unless the matching tool call actually ran and succeeded this turn.';
 }
 
 // A hard output boundary against internal data reaching the user — not
@@ -796,7 +817,8 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // execute/revise happened when it didn't.
       const executionClaimGateMessage = hasV2Tools
         ? checkExecutionClaimWithoutCallGate({
-            decision, hasV2Tools,
+            decision, userMessage, hasV2Tools,
+            hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
             executeCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) > 0,
             reviseCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0,
           })
@@ -818,7 +840,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         trace.push(traceStep("completed", "Claimed an action that was never actually taken — overridden.", "done"));
         if (planId) setPlanStatus(planId, "failed");
         return {
-          reply: "I wasn't able to actually apply that — could you repeat the budget (or whatever you'd like changed), and I'll update and execute the strategy for real this time?",
+          reply: "I wasn't able to actually apply that — could you say \"approve\" (or repeat whatever you'd like changed) one more time, and I'll update and execute the strategy for real this time?",
           trace, toolResults, usage: usageTotals,
         };
       }
