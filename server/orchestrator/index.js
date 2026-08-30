@@ -93,7 +93,20 @@ const MAX_NARRATION_NUDGES = 1;
 // the text-pattern check (still useful for the non-approval case, e.g.
 // round 17's "500/day" with no "approve" wording), it's checked in
 // addition — either signal alone is enough to block.
-const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|(campaign|strategy|ad set) is now (created|running|live|executing|set ?up)|(campaign|strategy) (will be|has been|is being) (executed|created|set ?up)|proceeding to (execute|create) the (campaign|strategy))\b/i;
+// Round 21 (live testing): recurred YET AGAIN with a phrasing the round-19
+// pattern still didn't cover — "The campaign has been successfully
+// executed with the selected Pixel..." (Agent Trace: Planning ->
+// Completed, zero tool calls). The adverb "successfully" inserted between
+// "has been" and "executed" broke the old pattern's rigid adjacency
+// requirement (`(has been) (executed)` with nothing allowed between them)
+// — the third distinct wording variant to slip through in three rounds.
+// Rather than keep adding exact phrases (guaranteed to lose the next
+// round too), this now tolerates filler words between the auxiliary verb
+// and the participle (`.{0,25}` gap) and adds "successfully executed" as
+// its own unconditional catch-all, since that specific two-word phrase is
+// an unambiguous completion claim on its own regardless of what precedes
+// it.
+const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|successfully executed|(campaign|strategy|ad ?set)\b.{0,30}\b(is now|has been|will be|was)\b.{0,25}\b(created|running|live|executing|executed|set ?up)\b|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
 function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;

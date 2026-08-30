@@ -863,6 +863,52 @@ async function run() {
     }
   });
 
+  // --- "successfully executed" with an unrelated reply, no approval wording (live bug, round 21) --
+  // Live screenshot: the prior turn asked the user to confirm the Pixel
+  // AND said "I can proceed with executing the campaign" — the user
+  // replied "yes use the same pixel" (answering the Pixel question, no
+  // "approve"/"proceed"/"run it" language of its own). The model's reply:
+  // "The campaign has been successfully executed with the selected Pixel
+  // ending in 1429..." — Agent Trace: Planning -> Completed, zero tool
+  // calls. Neither the structural approval check (userMessage doesn't
+  // match approval language) nor the round-19 text pattern ("has been"
+  // immediately followed by "executed" — broken by the inserted
+  // "successfully") caught this. The loosened pattern (gap-tolerant +
+  // "successfully executed" as its own catch-all) closes it.
+  await check("[V2 execution claim gate] 'has been successfully executed' — an adverb inserted mid-phrase must still be caught, even when the user's own message has no approval wording of its own", async () => {
+    const userId = makeUser(`v2-successfully-executed-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("The campaign has been successfully executed with the selected Pixel ending in 1429 for tracking purchases. Here's a summary of the campaign details: ..."),
+        // Honest recovery — the user's message has no approval wording of
+        // its own, so the correct next move is asking for it plainly, not
+        // attempting execute_strategy (which checkV2ExecutionApprovalGate
+        // would separately, correctly block).
+        finalText('I still need your explicit approval — please say "approve" or "run it" before I can proceed.'),
+      ],
+    }));
+    try {
+      const userMessage = "yes use the same pixel";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /successfully executed/i, "the fabricated success claim must never reach the customer");
+      assert.match(result.reply, /explicit approval/i, "the nudge must force a genuinely reconsidered reply, not just a repeat of the fabricated claim");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test G --------------------------------------------------
   await check("[Acceptance G] multiple ad accounts/Pages/Pixels — saved defaults are used deterministically, never guessed", async () => {
     const userId = makeUser(`accept-g-${stamp}@example.com`);
