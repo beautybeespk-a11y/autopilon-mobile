@@ -109,6 +109,24 @@ current_image_digest() {
   docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || echo ""
 }
 
+# The CURRENTLY-running app container's org.opencontainers.image.revision
+# label — the exact git commit build-and-push.yml built the image from
+# (baked in at build time, see .github/workflows/build-and-push.yml).
+# Empty string if the container isn't running, or if its image has no such
+# label (e.g. a locally-built fallback image, or one built before this
+# label existed). This is what lets deploy.sh tell "the pull genuinely
+# shipped new code" apart from "docker compose up -d was a silent no-op
+# because the target tag's digest hadn't actually changed" — the exact
+# live failure mode this was added for: a stale :latest that hadn't been
+# rebuilt since the last push made deploy.sh report success against a
+# 4-hour-old container.
+current_image_revision() {
+  local cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q app 2>/dev/null || true)"
+  [[ -n "$cid" ]] || { echo ""; return; }
+  docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$cid" 2>/dev/null || echo ""
+}
+
 # Short git commit hash of the checkout deploy.sh is running from, or
 # "unknown" outside a git checkout (shouldn't happen in production, but
 # state-tracking should never crash over it).

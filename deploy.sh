@@ -108,8 +108,10 @@ require_env_file # reload with the (possibly just-updated) tag
 GIT_SHA="$(current_git_commit)"
 
 log "Pulling ${IMAGE_REPO}:${IMAGE_TAG}..."
+USED_LOCAL_FALLBACK_BUILD=0
 if ! $COMPOSE pull app worker; then
   warn "Pull failed for ${IMAGE_REPO}:${IMAGE_TAG} — falling back to building on this VPS instead (same path install-production.sh uses when no pre-built image is available yet, e.g. before this branch's first build-and-push.yml run, or while the GHCR package is still private). If this tag was just pushed by build-and-push.yml, GitHub Actions may still be running — check the Actions tab. If the GHCR package is private, see install-production.sh's registry-access step / PRODUCTION_DEPLOYMENT.md for how to 'docker login ghcr.io' on this VPS instead."
+  USED_LOCAL_FALLBACK_BUILD=1
   $COMPOSE build app worker
   $COMPOSE pull redis traefik
   # A locally-built image is tagged ${IMAGE_TAG} (usually the floating
@@ -124,6 +126,43 @@ fi
 
 log "Restarting containers (named volumes are preserved — this never runs 'docker compose down -v')..."
 $COMPOSE up -d --remove-orphans
+
+# CONFIRMED LIVE BUG: `docker compose up -d` is a no-op for a service
+# whose target image digest hasn't actually changed — a real occurrence
+# was a stale :latest in GHCR that hadn't been rebuilt since the last
+# push, so the pull above silently fetched nothing new, the OLD container
+# just kept running untouched ("Running 0.0s" / an hours-old StartedAt),
+# and health checks then passed against it — this script reported success
+# at a commit that was never actually deployed. Verify what's ACTUALLY
+# running before declaring success, using org.opencontainers.image.
+# revision (baked into every image build-and-push.yml produces) — the
+# same signal a human would use `docker inspect` for by hand. Skipped
+# (with a warning, not a failure) only when there's genuinely nothing to
+# verify against: a local-build fallback (matches this checkout by
+# construction — see USED_LOCAL_FALLBACK_BUILD above) or a tag that
+# doesn't encode a commit and isn't "latest" (e.g. a plain release tag).
+EXPECTED_REVISION=""
+if [[ "$IMAGE_TAG" =~ ^sha-([0-9a-f]{40})$ ]]; then
+  EXPECTED_REVISION="${BASH_REMATCH[1]}"
+elif [[ "$IMAGE_TAG" == "latest" && -d .git ]]; then
+  EXPECTED_REVISION="$(git rev-parse HEAD)"
+fi
+if [[ "$USED_LOCAL_FALLBACK_BUILD" == "1" ]]; then
+  log "Skipping image-revision verification — this deploy built locally from the current checkout, so it matches by construction."
+elif [[ -z "$EXPECTED_REVISION" ]]; then
+  warn "Cannot determine the expected commit for tag '${IMAGE_TAG}' (not a sha-<commit> tag, and not 'latest' in a git checkout) — skipping the revision-match check. Verify manually with: docker inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' \$($COMPOSE ps -q app)"
+else
+  RUNNING_REVISION="$(current_image_revision)"
+  if [[ -z "$RUNNING_REVISION" ]]; then
+    warn "The running app image has no org.opencontainers.image.revision label — cannot verify it matches the expected commit ($EXPECTED_REVISION). This means it was built by something other than this repo's current build-and-push.yml (or an older version of it, before this label existed). Proceeding, but this deploy is unverified."
+  elif [[ "$RUNNING_REVISION" != "$EXPECTED_REVISION" ]]; then
+    err "The running app container's image was built from commit $RUNNING_REVISION, but this deploy targeted commit $EXPECTED_REVISION."
+    err "'docker compose up -d' did not actually restart anything — the pulled ${IMAGE_REPO}:${IMAGE_TAG} image's digest is unchanged from what was already running. This almost always means the :${IMAGE_TAG} tag in GHCR has not been rebuilt since $EXPECTED_REVISION was pushed."
+    die "Refusing to report success: the deployed code is stale, not the commit this deploy claims. Trigger build-and-push.yml (workflow_dispatch works on any branch) so :${IMAGE_TAG} is actually rebuilt, or deploy an explicit ./deploy.sh sha-<commit> tag once it exists, then re-run ./deploy.sh."
+  else
+    log "Verified: the running app image was built from commit $RUNNING_REVISION — matches what this deploy targeted."
+  fi
+fi
 
 log "No separate migration step needed — the new containers apply any additive schema changes automatically on boot."
 
