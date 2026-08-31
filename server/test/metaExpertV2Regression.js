@@ -1472,7 +1472,15 @@ async function run() {
   // through the REAL orchestrate() loop (server/orchestrator/index.js),
   // same mocked-chatComplete harness as Acceptance E/F above — not just a
   // unit test of the gate function in isolation.
-  await check("[V2 gate] build_strategy called twice in one turn — the second call is never really dispatched; the model is nudged with exactly what the first (rejected) call returned, and finalizes from it", async () => {
+  // Live bug (round 28): this test used to assert the second call was
+  // BLOCKED as a duplicate — that was the bug itself (see the retry-cap
+  // and self-correction tests above). Rewritten: two genuinely still-
+  // incomplete attempts must BOTH be real dispatches (never silently
+  // discarded), and the model is free to give up and ask the user
+  // directly once it decides it can't self-correct further — the backend
+  // never forces it to keep retrying past what its own retry budget
+  // allows, but never blocks a genuine retry attempt either.
+  await check("[V2 gate] build_strategy called twice in one turn, BOTH still genuinely incomplete — both are real dispatches, and the model can still finalize honestly afterward", async () => {
     const userId = makeUser(`v2-gate-build-${stamp}@example.com`);
     connectMeta(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
@@ -1481,7 +1489,7 @@ async function run() {
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
       chatResponses: [
         toolCall("meta_expert_v2.build_strategy", {}), // deliberately incomplete — guaranteed structural rejection (valid:false)
-        toolCall("meta_expert_v2.build_strategy", {}), // the live-bug repeat — must be intercepted, never really dispatched again
+        toolCall("meta_expert_v2.build_strategy", {}), // still incomplete — must be a REAL second attempt, not blocked
         finalText("I wasn't able to finalize a strategy — some required business details are still missing. Could you tell me more about your goal?"),
       ],
     }));
@@ -1489,37 +1497,103 @@ async function run() {
       const userMessage = "I want more sales to my website";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
-      assert.equal(buildCalls.length, 2, `expected exactly one real dispatch + one blocked-duplicate entry, got: ${JSON.stringify(buildCalls)}`);
-      assert.ok(buildCalls[0].result, "the first call must be a real dispatch with a result");
+      assert.equal(buildCalls.length, 2, `both attempts must be REAL dispatches — the second must never be blocked as a duplicate: ${JSON.stringify(buildCalls)}`);
       assert.equal(buildCalls[0].result.valid, false);
-      assert.ok(buildCalls[1].error && /blocked duplicate call this turn/i.test(buildCalls[1].error), "the second call must be intercepted before it ever reaches the real builder");
+      assert.equal(buildCalls[1].result.valid, false, "a second still-incomplete attempt must still be a genuine (rejected) dispatch, not intercepted");
       assert.match(result.reply, /wasn't able to finalize/i);
     } finally {
       restoreFetch();
     }
   });
 
-  await check("[V2 gate] build_strategy called a THIRD time in one turn — hard-stops with a clean customer-safe reply instead of grinding toward the step limit", async () => {
-    const userId = makeUser(`v2-gate-build-hardstop-${stamp}@example.com`);
+  // Live bug (round 28): a validation-rejected build_strategy call could
+  // never be retried this turn at all — the per-turn gate blocked EVERY
+  // repeat call regardless of whether the prior attempt succeeded or
+  // failed, so the model could never self-correct a mechanical validation
+  // slip (e.g. "locations must be a non-empty array"). Fixed: build_strategy/
+  // revise_strategy now get up to MAX_V2_BUILD_ATTEMPTS (3) real dispatches
+  // per turn as long as every attempt so far was a genuine validation
+  // rejection — only a SUCCESSFUL call reverts to strict single-call
+  // behavior (see the next test), and running out of the retry budget
+  // still hard-stops cleanly rather than grinding toward the step limit.
+  await check("[V2 gate] build_strategy REPEATEDLY FAILING validation gets real retries up to the cap, then hard-stops with a clean customer-safe reply — never grinds toward the step limit", async () => {
+    const userId = makeUser(`v2-gate-build-retrycap-${stamp}@example.com`);
     connectMeta(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
     const conversationId = `conv-${cryptoRandom()}`;
     mockFetch(scriptedFetch({
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
       chatResponses: [
-        toolCall("meta_expert_v2.build_strategy", {}),
-        toolCall("meta_expert_v2.build_strategy", {}), // 1st repeat — nudged, not dispatched
-        toolCall("meta_expert_v2.build_strategy", {}), // 2nd repeat (3rd total call) — hard-stopped before another model call is even needed
+        toolCall("meta_expert_v2.build_strategy", {}), // attempt 1/3 — real dispatch, fails (empty strategy)
+        toolCall("meta_expert_v2.build_strategy", {}), // attempt 2/3 — real RETRY, fails again
+        toolCall("meta_expert_v2.build_strategy", {}), // attempt 3/3 — real RETRY, fails again — budget now exhausted
+        toolCall("meta_expert_v2.build_strategy", {}), // 4th attempt — blocked before ever reaching runTool()
       ],
     }));
     try {
       const userMessage = "I want more sales to my website";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
-      assert.equal(buildCalls.length, 2, `only the FIRST call may ever be a real dispatch — no third real dispatch, even after the hard-stop: ${JSON.stringify(buildCalls)}`);
-      assert.ok(buildCalls[0].result);
-      assert.match(result.reply, /already have a result/i);
+      assert.equal(buildCalls.length, 3, `exactly 3 real dispatches (the retry cap) must happen, no more: ${JSON.stringify(buildCalls)}`);
+      assert.ok(buildCalls.every((c) => c.result?.valid === false), "every one of the 3 real attempts must be a genuine validation rejection");
+      assert.match(result.reply, /wasn't able to finalize a strategy/i);
       assert.doesNotMatch(result.reply, /step limit/i, "the internal orchestration detail must never be shown to the user");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 gate] a validation-rejected build_strategy call CAN be retried and succeed within the same turn — the model actually self-corrects", async () => {
+    const userId = makeUser(`v2-gate-build-selfcorrect-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { locations, countries, ...strategyMissingLocations } = baseStrategy();
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", strategyMissingLocations), // rejected: locations missing
+        toolCall("meta_expert_v2.build_strategy", baseStrategy()), // genuine retry, corrected — must succeed
+        finalText("Recommended strategy ready — want to proceed?"),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales to my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      assert.equal(buildCalls.length, 2, `both attempts must be REAL dispatches — the second must never be blocked as a duplicate: ${JSON.stringify(buildCalls)}`);
+      assert.equal(buildCalls[0].result.valid, false, "the first attempt must be a genuine rejection");
+      assert.equal(buildCalls[1].result.valid, true, `the corrected retry must succeed: ${JSON.stringify(buildCalls[1])}`);
+      assert.match(result.reply, /want to proceed/i, "the model's real final reply must be used, not a generic fallback");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 gate] build_strategy succeeds, then a repeat call in the SAME turn is still blocked (single-call-after-success behavior is unchanged)", async () => {
+    const userId = makeUser(`v2-gate-build-success-then-block-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", baseStrategy()), // succeeds
+        toolCall("meta_expert_v2.build_strategy", baseStrategy()), // repeat after success — must be blocked (nudged), not re-dispatched
+        finalText("Recommended strategy ready — want to proceed?"), // model's reply after being nudged
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales to my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      // The blocked repeat is still recorded in toolResults (as an error
+      // entry, same pattern the pre-existing single-call gate uses) — it's
+      // just never a real SECOND dispatch to the builder.
+      assert.equal(buildCalls.length, 2, `expected one real dispatch + one blocked-duplicate entry: ${JSON.stringify(buildCalls)}`);
+      assert.equal(buildCalls[0].result?.valid, true, "the first call must be the real, successful dispatch");
+      assert.ok(buildCalls[1].error && /blocked duplicate call this turn/i.test(buildCalls[1].error), "the second call must be intercepted, never re-dispatched to the real builder");
+      assert.match(result.reply, /want to proceed/i, "the model's real reply after the nudge must be used");
     } finally {
       restoreFetch();
     }
@@ -1550,7 +1624,12 @@ async function run() {
     }
   });
 
-  await check("[V2 gate] revise_strategy called twice in one turn for a rejected revision — the second call is never really dispatched; the model is nudged with the first result", async () => {
+  // Live bug (round 28), same fix as build_strategy above: this used to
+  // assert the second call was blocked as a duplicate — rewritten to
+  // reflect that a genuine retry (even one that fails again, as this one
+  // deliberately does by repeating the identical non-change) must be a
+  // REAL dispatch, not silently intercepted.
+  await check("[V2 gate] revise_strategy called twice in one turn for a rejected revision — both are real dispatches, and the model can still finalize honestly", async () => {
     const userId = makeUser(`v2-gate-revise-${stamp}@example.com`);
     connectMeta(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
@@ -1579,10 +1658,12 @@ async function run() {
       const userMessage = "Reconsider the audience gender";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       const reviseCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy");
-      assert.equal(reviseCalls.length, 2, `expected exactly one real dispatch + one blocked-duplicate entry, got: ${JSON.stringify(reviseCalls)}`);
+      assert.equal(reviseCalls.length, 2, `both attempts must be REAL dispatches — the second must never be blocked as a duplicate: ${JSON.stringify(reviseCalls)}`);
       assert.ok(reviseCalls[0].result);
       assert.equal(reviseCalls[0].result.valid, false);
-      assert.ok(reviseCalls[1].error && /blocked duplicate call this turn/i.test(reviseCalls[1].error));
+      assert.ok(reviseCalls[1].result, "the second attempt must also be a real dispatch with its own result");
+      assert.equal(reviseCalls[1].result.valid, false, "repeating the identical non-change must be rejected again for real, not intercepted");
+      assert.match(result.reply, /wasn't able to make that revision/i);
     } finally {
       restoreFetch();
     }
@@ -2309,6 +2390,13 @@ async function run() {
   // applies" isn't a business judgment call, it's an objective fact the
   // backend already verified — so it's safe to default, exactly like
   // approval_required/facebook_page/ad_account above.
+  //
+  // Round 28 follow-up: the OTHER branch this comment flags as unfixable
+  // — real evidence DOES exist, so no safe mechanical default applies —
+  // hit exactly this "no second chance" limitation live. Fixed at the
+  // root: build_strategy/revise_strategy are no longer single-attempt
+  // (see V2_RETRYABLE_BUILD_TOOLS in orchestrator/index.js) — a corrected
+  // retry can now actually re-validate within the same turn.
   await check("[V2 policy] a fully generic audience (ALL, 18-65) with no audience_reasoning and NO real store/account data is auto-explained with an honest default and accepted — the model's one attempt is never spent on an unfixable-by-retry rejection", async () => {
     const userId = makeUser(`v2-audience-reasoning-noevidence-${stamp}@example.com`);
     connectMeta(userId);

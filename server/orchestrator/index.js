@@ -240,12 +240,38 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
 // first call returned. A second repeat (a third total call for that
 // tool) hard-stops the turn with a clean customer-safe reply instead of
 // looping toward MAX_STEPS.
+// CONFIRMED LIVE BUG (round 28): a validation-rejected build_strategy call
+// ("locations must be a non-empty array...", then on a separate attempt
+// "audience_reasoning" required) could never be retried this turn — the
+// gate below blocked EVERY repeat call to a V2_SINGLE_CALL_TOOLS tool
+// regardless of whether the first real call succeeded or was rejected.
+// That's correct for get_business_snapshot (idempotent read — re-fetching
+// wastes a call, never "fixes" anything) and execute_strategy (real
+// money/API mutation — retrying it automatically risks creating a
+// duplicate real campaign, and its own pre-dispatch gate,
+// checkV2ExecutionApprovalGate, already blocks anything genuinely
+// retryable before runTool() is ever reached). It was WRONG for
+// build_strategy/revise_strategy: a structural validation slip (a missing
+// field, a malformed value) is exactly the kind of thing the model could
+// fix on a second attempt using data it already has — the backend's own
+// derive*IfMissing/normalization chain (strategyBuilder.js) already
+// mechanically fixes what it safely can before validation ever runs, so a
+// rejection that still reaches the model IS something worth letting it
+// retry, not an automatic "genuine business issue, give up and ask the
+// user" as the tool's old description used to claim.
 const V2_SINGLE_CALL_TOOLS = new Set([
   "meta_expert_v2.get_business_snapshot",
-  "meta_expert_v2.build_strategy",
-  "meta_expert_v2.revise_strategy",
   "meta_expert_v2.execute_strategy",
 ]);
+// build_strategy/revise_strategy get a bounded number of REAL retries
+// within the same turn, but only while every attempt so far has been a
+// genuine validation rejection (valid:false) — the moment a call
+// SUCCEEDS, it reverts to single-call behavior (no reason to keep calling
+// it, and revise_strategy inserts a NEW stored row per successful call —
+// unbounded successful re-calls would create duplicate stored strategies
+// for one turn).
+const V2_RETRYABLE_BUILD_TOOLS = new Set(["meta_expert_v2.build_strategy", "meta_expert_v2.revise_strategy"]);
+const MAX_V2_BUILD_ATTEMPTS = 3; // 1 initial + 2 retries
 const MAX_V2_TOOL_NUDGES = 1;
 
 // Human-readable digest of what a V2 tool's first (and only allowed) real
@@ -1055,6 +1081,57 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         };
       }
 
+      // Bounded-retry gate for build_strategy/revise_strategy — see
+      // V2_RETRYABLE_BUILD_TOOLS above. Unlike the single-call gate, a
+      // FAILED (valid:false) prior attempt does NOT block the next real
+      // call — only a prior SUCCESS does (never re-run a strategy that
+      // already worked), or running out of the retry budget.
+      if (V2_RETRYABLE_BUILD_TOOLS.has(call.toolName)) {
+        const priorCalls = v2ToolCallCounts.get(call.toolName) || 0;
+        const priorOutcome = v2ToolLastOutcome.get(call.toolName);
+        const priorWasGenuineSuccess = priorCalls >= 1 && priorOutcome?.status === "completed" && priorOutcome.result?.valid !== false;
+        if (priorWasGenuineSuccess) {
+          const priorSummary = summarizeV2ToolResult(call.toolName, priorOutcome);
+          const nudges = v2ToolNudgeCounts.get(call.toolName) || 0;
+          if (nudges < MAX_V2_TOOL_NUDGES) {
+            v2ToolNudgeCounts.set(call.toolName, nudges + 1);
+            trace[trace.length - 1].state = "done";
+            trace.push(traceStep("error", `${call.toolName} already succeeded once this turn — reusing that result.`, "done"));
+            toolResults.push({ toolName: call.toolName, error: `Blocked duplicate call this turn — ${priorSummary}` });
+            conversationForModel = [
+              ...conversationForModel,
+              { role: "assistant", content: JSON.stringify(decision) },
+              { role: "user", content: `"${call.toolName}" already succeeded once this turn — ${priorSummary} Do not call it again. Respond now with type "final" using that result, or wait for the user's explicit approval before calling meta_expert_v2.execute_strategy.` },
+            ];
+            continue;
+          }
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", `${call.toolName} could not be finalized after succeeding once this turn.`, "done"));
+          if (planId) setPlanStatus(planId, "failed");
+          return {
+            reply: "I already have a result from earlier in this response and wasn't able to move past it — could you tell me more about what you'd like, or try again in a new message?",
+            trace, toolResults, usage: usageTotals,
+          };
+        }
+        if (priorCalls >= MAX_V2_BUILD_ATTEMPTS) {
+          // Every attempt this turn was a genuine validation rejection and
+          // the retry budget is now exhausted — hard-stop rather than grind
+          // toward MAX_STEPS. Reuses the exact same honest wording the
+          // pre-existing "rejected + nothing active" guard further below
+          // already uses, so the customer sees identical phrasing either way.
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", `${call.toolName} could not be finalized after ${priorCalls} attempts this turn.`, "done"));
+          if (planId) setPlanStatus(planId, "failed");
+          const lastIssue = priorOutcome?.result?.issue || "an unresolved issue";
+          return {
+            reply: `I wasn't able to finalize a strategy for this request — ${lastIssue} Could you tell me more, or would you like me to try a different approach?`,
+            trace, toolResults, usage: usageTotals,
+          };
+        }
+        // Otherwise: first attempt this turn, or a genuine retry within
+        // budget after a validation failure — fall through to runTool().
+      }
+
       let outcome;
       if (call.toolName === "meta_expert.execute_campaign_plan") {
         const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
@@ -1107,7 +1184,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           lastCreatePlanWasRejected = outcome.status === "completed" && outcome.result && outcome.result.valid === false;
           lastCreatePlanFingerprint = fingerprintPlanNormalized(call.parameters || {});
         }
-        if (V2_SINGLE_CALL_TOOLS.has(call.toolName)) {
+        if (V2_SINGLE_CALL_TOOLS.has(call.toolName) || V2_RETRYABLE_BUILD_TOOLS.has(call.toolName)) {
           v2ToolCallCounts.set(call.toolName, (v2ToolCallCounts.get(call.toolName) || 0) + 1);
           v2ToolLastOutcome.set(call.toolName, outcome);
         }
@@ -1172,6 +1249,35 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
 
       trace[trace.length - 1].state = "done";
       toolResults.push({ toolName: call.toolName, result: outcome.result });
+
+      // A validation-rejected build_strategy/revise_strategy call gets its
+      // own, more directive feedback instead of the generic "Tool result:
+      // ..." message below — CONFIRMED LIVE BUG (round 28): the model was
+      // told, in effect, to give up and ask the user about a field it
+      // should have generated itself (e.g. audience_reasoning — that's the
+      // model's OWN analysis of the business snapshot it already fetched,
+      // never something only a human could answer). Every issue is listed
+      // (not just the first — see the metaExpertV2.js tool wrapper, which
+      // now returns allIssues) so one retry can fix everything currently
+      // wrong at once instead of discovering issues one at a time.
+      if (V2_RETRYABLE_BUILD_TOOLS.has(call.toolName) && outcome.result?.valid === false) {
+        const attemptsSoFar = v2ToolCallCounts.get(call.toolName) || 0;
+        const remaining = MAX_V2_BUILD_ATTEMPTS - attemptsSoFar;
+        const issues = Array.isArray(outcome.result.allIssues) && outcome.result.allIssues.length
+          ? outcome.result.allIssues
+          : [{ field: outcome.result.field, issue: outcome.result.issue }];
+        const issuesText = issues.map((i) => `- ${i.field ? `"${i.field}": ` : ""}${i.issue}`).join("\n");
+        const guidance = remaining > 0
+          ? `You have ${remaining} more attempt(s) this turn. Fix these yourself using the business snapshot data you already fetched — fields like audience_reasoning, reasoning_summary, locations, targeting, and creative details are YOUR OWN analysis to produce, never something to ask the user for. Only ask the user directly for a fact only they can supply (a specific budget amount, explicit approval, or a genuinely ambiguous choice between multiple real options with no safe default) — and if that's the actual blocker, respond with type "final" and ask for exactly that, nothing else, never mentioning an internal field name.`
+          : `You're out of attempts for "${call.toolName}" this turn. Respond now with type "final". If the blocker is something only the user can supply (a budget amount, explicit approval, an ambiguous choice), ask for exactly that — never mention an internal field name to the user.`;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: `"${call.toolName}" was rejected. Every currently-failing field:\n${issuesText}\n${guidance}` },
+        ];
+        continue;
+      }
+
       // Feed the tool's result back to the model so it can decide the next step
       // or produce the final summary.
       conversationForModel = [

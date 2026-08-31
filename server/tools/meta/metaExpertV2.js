@@ -48,7 +48,7 @@ registerTool({
 registerTool({
   name: "meta_expert_v2.build_strategy",
   description:
-    "Builds and validates a NEW Meta Ads strategy from the business snapshot already gathered (call meta_expert_v2.get_business_snapshot first). This does NOT create anything in Meta — it's a validated, stored recommendation presented to the user for approval before meta_expert_v2.execute_strategy ever runs. You get exactly ONE attempt: the backend automatically normalizes harmless issues (enum spelling drift, a missing CTA, an over-cap heuristic budget) before validating, so if this still returns valid:false, that's a genuine unresolved business issue (not something to retry with a guess) — present the returned issue to the user in plain language and wait for their answer instead of calling this again for the same request. Set mode to \"explicit_action\" for a single fixed action (\"boost my latest reel\", \"use this photo as an ad\") instead of a full campaign strategy — in that mode only business_goal/action_type/content_selector/budget fields matter; audience/placements/creative_strategy are not required. Asset fields (ad_account/facebook_page/pixel/catalog/instagram_identity) are semantic refs the backend resolves automatically (saved default, or the single connected one) — a REAL id is only ever honored as the user's explicit choice when its field name is also listed in explicitAssetChanges. Full field contract: " +
+    "Builds and validates a NEW Meta Ads strategy from the business snapshot already gathered (call meta_expert_v2.get_business_snapshot first). This does NOT create anything in Meta — it's a validated, stored recommendation presented to the user for approval before meta_expert_v2.execute_strategy ever runs. The backend automatically normalizes harmless issues (enum spelling drift, a missing CTA, an over-cap heuristic budget) before validating. If it still returns valid:false, you get up to 2 more real retries THIS TURN to fix it yourself — the result lists every currently-failing field (not just one) so you can fix them all at once. A rejection is almost always something YOU can fix from data you already have (audience_reasoning, reasoning_summary, locations, targeting, creative details, etc. are your own analysis to produce, never a fact to ask the user for) — only present something to the user when the actual blocker is a fact only they can supply: a specific budget amount, explicit approval, or a genuinely ambiguous choice between multiple real options with no safe default. Never surface an internal field name to the user. Set mode to \"explicit_action\" for a single fixed action (\"boost my latest reel\", \"use this photo as an ad\") instead of a full campaign strategy — in that mode only business_goal/action_type/content_selector/budget fields matter; audience/placements/creative_strategy are not required. Asset fields (ad_account/facebook_page/pixel/catalog/instagram_identity) are semantic refs the backend resolves automatically (saved default, or the single connected one) — a REAL id is only ever honored as the user's explicit choice when its field name is also listed in explicitAssetChanges. Full field contract: " +
     JSON.stringify(INTERNAL_STRATEGY_SCHEMA.required),
   category: "meta_expert_v2",
   parameters: {
@@ -115,7 +115,11 @@ registerTool({
     assertV2RuntimeEnabled(context.userId);
     const { explicitAssetChanges, ...strategy } = parameters;
     const result = await buildStrategy({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategy, userMessage: context.userMessage, explicitAssetChanges });
-    if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field };
+    // allIssues (every currently-failing field, not just the first) is
+    // included so the orchestrator's retry-feedback message (round 28 fix)
+    // can show the model everything wrong in one pass instead of the model
+    // discovering issues one at a time across separate attempts.
+    if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field, allIssues: result.unresolved.allIssues };
     return { valid: true, strategyId: result.strategyId, recommendationText: result.recommendationText };
   },
 });
@@ -150,7 +154,7 @@ registerTool({
       requestedChanges: parameters.requestedChanges || {}, freshResearchRequired: Boolean(parameters.freshResearchRequired),
       explicitAssetChanges: parameters.explicitAssetChanges, userMessage: context.userMessage,
     });
-    if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field };
+    if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field, allIssues: result.unresolved.allIssues };
     return { valid: true, strategyId: result.strategyId, recommendationText: result.recommendationText };
   },
 });
