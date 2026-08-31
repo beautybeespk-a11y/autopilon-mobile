@@ -2,7 +2,11 @@
 // No credentials are hardcoded — every value comes from env vars the user sets
 // after creating their own Meta App at developers.facebook.com.
 
-const API_VERSION = process.env.META_API_VERSION || "v19.0";
+// Same META_API_VERSION default as integrations/meta/api.js — kept in
+// sync deliberately: OAuth and Graph API calls sharing one env var but
+// different hardcoded fallbacks would silently diverge if only one file
+// were bumped.
+const API_VERSION = process.env.META_API_VERSION || "v25.0";
 
 export function metaOAuthStatus() {
   const hasAppId = Boolean(process.env.META_APP_ID);

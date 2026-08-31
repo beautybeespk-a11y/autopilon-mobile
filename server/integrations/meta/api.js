@@ -1,6 +1,13 @@
 import { logger } from "../../config/logger.js";
 
-const API_VERSION = process.env.META_API_VERSION || "v19.0";
+// Verified against Meta's Graph API changelog (developers.facebook.com/
+// docs/graph-api/changelog) on 2026-08-31: v25.0 is the current stable
+// version — v23.0 reached end-of-life on 2026-06-09, and v20.0 is
+// scheduled for deprecation 2026-09-24. v26.0 has been announced but was
+// not yet generally available as of this check, so v25.0 is the safe
+// current default; override via META_API_VERSION once a newer version is
+// confirmed stable.
+const API_VERSION = process.env.META_API_VERSION || "v25.0";
 const BASE = `https://graph.facebook.com/${API_VERSION}`;
 
 async function metaFetch(path, { accessToken, method = "GET", body }) {
@@ -274,4 +281,79 @@ export async function listPixels(accessToken, adAccountId) {
 export async function listCatalogs(accessToken, adAccountId) {
   const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/product_catalogs?fields=id,name`, { accessToken });
   return data.data || [];
+}
+
+// --- Ad-level read/fetch helpers ------------------------------------------
+// Genuinely missing before this: campaigns (listCampaigns/createCampaign)
+// already had both a list and a single-entity write path, but ad sets and
+// ads only had writes (createAdSet/createAd above) with no way to read one
+// back — needed for anything that has to check a real ad set/ad's current
+// status or fields after creation (e.g. verifying an execute step actually
+// took effect) rather than trusting the create response alone.
+
+// account_status/currency/timezone_name are already read ad-hoc elsewhere
+// via listAdAccounts' bulk /me/adaccounts call; this is the single-entity
+// equivalent for when the caller already has one specific ad account id
+// (e.g. re-checking currency right before a currency-sensitive write,
+// without re-fetching and re-filtering the whole account list).
+export async function getAdAccount(accessToken, adAccountId) {
+  return metaFetch(`/${normalizeAdAccountId(adAccountId)}?fields=id,name,account_status,currency,timezone_name,amount_spent,balance`, { accessToken });
+}
+
+export async function getAdSet(accessToken, adSetId) {
+  return metaFetch(`/${adSetId}?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,targeting`, { accessToken });
+}
+
+export async function getAd(accessToken, adId) {
+  return metaFetch(`/${adId}?fields=id,name,status,adset_id,campaign_id,creative`, { accessToken });
+}
+
+// Ad-account-scoped, same shape as the existing listCampaigns — ad sets
+// span campaigns within an account, so this lists all of them rather than
+// requiring a specific campaign id up front.
+export async function listAdSets(accessToken, adAccountId) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy`, { accessToken });
+  return data.data || [];
+}
+
+export async function listAds(accessToken, adAccountId) {
+  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/ads?fields=id,name,status,adset_id,campaign_id,creative`, { accessToken });
+  return data.data || [];
+}
+
+// --- Carousel creative support --------------------------------------------
+// The existing creative paths (meta.create_image_ad/meta.create_video_ad
+// in tools/meta/campaigns.js) build a single-image or single-video
+// object_story_spec.link_data/video_data directly. A carousel ad is the
+// same link_data shape but with multiple cards, each needing its own
+// already-uploaded image_hash (via uploadAdImage above) — expressed as
+// object_story_spec.link_data.child_attachments, an array Meta hard-caps
+// at 10 cards. This builds that shape and enforces the cap locally so a
+// caller gets an immediate, clear error instead of a round-trip Meta
+// rejection; it does not upload anything itself — each card's imageHash
+// must already come from a prior uploadAdImage call. Pure data-shaping
+// helper, not a fetch — createAdCreative (existing) is still what actually
+// sends it to Meta.
+const MAX_CAROUSEL_CARDS = 10;
+export function buildCarouselLinkData({ link, message, cards }) {
+  if (!Array.isArray(cards) || cards.length === 0) {
+    throw new Error("A carousel ad needs at least one card.");
+  }
+  if (cards.length > MAX_CAROUSEL_CARDS) {
+    throw new Error(`A carousel ad supports at most ${MAX_CAROUSEL_CARDS} cards (got ${cards.length}).`);
+  }
+  for (const [i, card] of cards.entries()) {
+    if (!card.imageHash) throw new Error(`Carousel card ${i + 1} is missing imageHash (upload it with uploadAdImage first).`);
+    if (!card.link && !link) throw new Error(`Carousel card ${i + 1} has no link, and no fallback link was given.`);
+  }
+  return {
+    link,
+    message,
+    child_attachments: cards.map((card) => ({
+      link: card.link || link,
+      name: card.name,
+      description: card.description,
+      image_hash: card.imageHash,
+    })),
+  };
 }

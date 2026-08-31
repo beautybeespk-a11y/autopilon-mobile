@@ -28,7 +28,8 @@
 import db from "../db.js";
 import { getConnection } from "../integrations/manager.js";
 
-const API_VERSION = process.env.META_API_VERSION || "v19.0";
+// Same META_API_VERSION default as integrations/meta/api.js / oauth.js.
+const API_VERSION = process.env.META_API_VERSION || "v25.0";
 const REQUIRED_SCOPES = ["ads_read", "ads_management", "business_management", "pages_show_list", "pages_read_engagement"];
 const DEFAULT_AD_ACCOUNT_ID = "237956315579168";
 
