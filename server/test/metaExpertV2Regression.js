@@ -783,6 +783,71 @@ async function run() {
     }
   });
 
+  // --- Missing "reasoning_summary" entirely (live bug, round 24) ----------
+  // Live screenshot: build_strategy was hard-rejected with "Missing
+  // required field \"reasoning_summary\"" — right after the model had
+  // recovered from a wrong-tool attempt (execute_strategy called with no
+  // active strategy yet, correctly falling back to build_strategy). Same
+  // principle as repairSalesReasoningSummary above: reasoning_summary is a
+  // templated restatement of already-decided facts, not a unique judgment
+  // call, so a genuinely MISSING summary is just the most extreme case of
+  // "wrong" — fixed the same mechanical way, before structural validation
+  // ever sees it (never a second build_strategy call).
+  await check("[V2 policy] reasoning_summary omitted entirely on an OUTCOME_SALES strategy is derived automatically (sales-framed), never hard-rejected", async () => {
+    const userId = makeUser(`v2-reasoning-summary-missing-sales-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { reasoning_summary, ...strategyNoSummary } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoSummary, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.ok(result.strategy.reasoning_summary && result.strategy.reasoning_summary.trim(), "a real reasoning_summary must be derived, never left blank");
+      assert.match(result.strategy.reasoning_summary, /\bpurchases?\b/i);
+      assert.match(result.strategy.reasoning_summary, /\bcpa\b/i);
+      assert.match(result.strategy.reasoning_summary, /\broas\b/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] reasoning_summary omitted entirely on a non-Sales explicit-action strategy falls back to a generic templated summary of the stated goal/evidence, never hard-rejected", async () => {
+    const userId = makeUser(`v2-reasoning-summary-missing-explicit-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action",
+        business_goal: "boost my latest Facebook post",
+        action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 },
+        budget_daily: 1000,
+        budget_basis: "HEURISTIC_STARTING_TEST",
+        campaign_status: "PAUSED",
+        // reasoning_summary deliberately omitted — this is the exact live bug
+        evidence_used: ["Most recent Facebook Page post"],
+        assumptions: [],
+        unresolved_questions: [],
+        approval_required: true,
+        facebook_page: { ref: "default_facebook_page" },
+        ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.ok(result.strategy.reasoning_summary && result.strategy.reasoning_summary.trim(), "a real reasoning_summary must be derived, never left blank");
+      assert.match(result.strategy.reasoning_summary, /Most recent Facebook Page post/, "the derived fallback must incorporate the strategy's own evidence_used, not be generic boilerplate");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Currency minor-unit conversion (live bug, round 20) ----------------
   // Live screenshot: a PKR account, budget_daily 500 (the user's own
   // words, "500/day" — 500 whole Rupees), and Meta's real Ad Set creation

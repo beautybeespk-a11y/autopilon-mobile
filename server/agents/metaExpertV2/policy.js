@@ -150,6 +150,41 @@ export function repairSalesReasoningSummary(strategy) {
   return `This strategy is optimized to drive ${eventLabel}, not just reach or clicks${evidenceClause}: the goal is a strong conversion volume at an efficient cost-per-acquisition (CPA) and a healthy return on ad spend (ROAS), maximizing revenue and overall conversion efficiency.`;
 }
 
+// Live bug (round 24): a strategy was hard-rejected at the STRUCTURAL
+// stage for "Missing required field \"reasoning_summary\"" — this
+// happened specifically right after the model recovered from a wrong-
+// tool attempt (execute_strategy with no active strategy -> correctly
+// falling back to build_strategy), where it appears to deprioritize a
+// field it may have already reasoned through moments earlier. Same
+// principle repairSalesReasoningSummary above already established for a
+// WEAK/generic reasoning_summary — this system already treats the field
+// as a templated restatement of the strategy's own already-decided
+// facts (objective, optimization event, evidence_used), not a unique
+// independent judgment call — so a genuinely MISSING summary is just the
+// most extreme case of "wrong," fixable the same mechanical way. Runs
+// BEFORE structural validation (unlike the WEAK-text repairs above,
+// which only fire once every other check has already passed) so the
+// hard "missing required field" rejection never has anything to fire on
+// in the first place.
+const OUTCOME_REASONING_FALLBACK_LABEL = {
+  OUTCOME_TRAFFIC: "driving qualified traffic to the site",
+  OUTCOME_LEADS: "generating qualified leads",
+  OUTCOME_ENGAGEMENT: "growing meaningful engagement",
+  OUTCOME_AWARENESS: "building brand awareness with the target audience",
+  OUTCOME_APP_PROMOTION: "driving app installs",
+};
+export function deriveReasoningSummaryIfMissing(strategy) {
+  if (typeof strategy.reasoning_summary === "string" && strategy.reasoning_summary.trim()) return strategy;
+  if (strategy.recommended_objective === "OUTCOME_SALES") {
+    return { ...strategy, reasoning_summary: repairSalesReasoningSummary(strategy) };
+  }
+  const evidenceClause = Array.isArray(strategy.evidence_used) && strategy.evidence_used.length
+    ? ` — using ${strategy.evidence_used.join("; ")}`
+    : "";
+  const label = OUTCOME_REASONING_FALLBACK_LABEL[strategy.recommended_objective] || "the stated business goal";
+  return { ...strategy, reasoning_summary: `This strategy is built around ${label}${evidenceClause}.` };
+}
+
 // Live bug: a live V2 test asked the model to choose the "exact best"
 // creative from the account's real recent content. Nothing forced a real
 // get_business_snapshot call first (see CREATIVE_SELECTION_INTENT_PATTERNS

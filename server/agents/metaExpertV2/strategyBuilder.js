@@ -20,7 +20,7 @@ import {
   checkGoalAlignmentPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
-  checkCreativeSourceAvailabilityPolicy,
+  checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -182,7 +182,17 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // was present, countries (the real ISO codes) was not. Only fires when
   // every location name maps unambiguously to a known country.
   const countriesResolved = deriveCountriesFromLocationsIfMissing(budgetFromMessageResolved);
-  let normalized = capHeuristicBudget(countriesResolved);
+  // Live bug (round 24): "Missing required field 'reasoning_summary'" hard-
+  // rejected a strategy right after the model recovered from a wrong-tool
+  // attempt (execute_strategy with no active strategy -> falling back to
+  // build_strategy), where it appears to deprioritize a field it may have
+  // already reasoned through moments earlier. reasoning_summary is a
+  // templated restatement of already-decided facts (see
+  // repairSalesReasoningSummary below), not a unique judgment call, so a
+  // missing summary is just the most extreme case of "wrong" — fixable the
+  // same mechanical way, before structural validation ever sees it.
+  const reasoningSummaryResolved = deriveReasoningSummaryIfMissing(countriesResolved);
+  let normalized = capHeuristicBudget(reasoningSummaryResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -206,6 +216,9 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   }
   if (traceEnabled && countriesResolved.countries !== budgetFromMessageResolved.countries) {
     trace("strategy countries derived from locations (missing from model output)", { conversationId, derivedCountries: countriesResolved.countries });
+  }
+  if (traceEnabled && reasoningSummaryResolved.reasoning_summary !== countriesResolved.reasoning_summary) {
+    trace("strategy reasoning_summary defaulted (missing from model output)", { conversationId, derivedReasoningSummary: reasoningSummaryResolved.reasoning_summary });
   }
   if (traceEnabled && normalized.budget_daily !== budgetFromMessageResolved.budget_daily) {
     trace("strategy heuristic budget cap", { conversationId, original: budgetFromMessageResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });
