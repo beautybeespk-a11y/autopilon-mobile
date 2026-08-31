@@ -13,7 +13,7 @@ import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
   deriveDefaultAssetRefsIfMissing, deriveAudienceReasoningIfMissing, deriveBudgetFromUserMessageIfMissing,
-  deriveCountriesFromLocationsIfMissing, PURCHASE_LIKE_EVENTS,
+  deriveCountriesFromLocationsIfMissing, deriveEmptyArrayFieldsIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
@@ -192,7 +192,14 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // missing summary is just the most extreme case of "wrong" — fixable the
   // same mechanical way, before structural validation ever sees it.
   const reasoningSummaryResolved = deriveReasoningSummaryIfMissing(countriesResolved);
-  let normalized = capHeuristicBudget(reasoningSummaryResolved);
+  // Live bug (round 26): "Missing required field 'evidence_used'" hard-
+  // rejected a strategy the same way — evidence_used (and the identically-
+  // shaped assumptions) is explicitly allowed to be an empty array by its
+  // own validation rule below, so an omitted value and an explicit []
+  // mean the same thing structurally. Never invents evidence — only fills
+  // in when the field is truly absent.
+  const emptyArrayFieldsResolved = deriveEmptyArrayFieldsIfMissing(reasoningSummaryResolved);
+  let normalized = capHeuristicBudget(emptyArrayFieldsResolved);
   // "campaign" is the default mode everywhere downstream — set it
   // explicitly on the object itself (not just as a local default inside
   // validateStrategyStructure) so every later `strategy.mode === "campaign"`
@@ -219,6 +226,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   }
   if (traceEnabled && reasoningSummaryResolved.reasoning_summary !== countriesResolved.reasoning_summary) {
     trace("strategy reasoning_summary defaulted (missing from model output)", { conversationId, derivedReasoningSummary: reasoningSummaryResolved.reasoning_summary });
+  }
+  if (traceEnabled && (emptyArrayFieldsResolved.evidence_used !== reasoningSummaryResolved.evidence_used || emptyArrayFieldsResolved.assumptions !== reasoningSummaryResolved.assumptions)) {
+    trace("strategy evidence_used/assumptions defaulted to [] (missing from model output)", {
+      conversationId,
+      evidenceUsedDefaulted: emptyArrayFieldsResolved.evidence_used !== reasoningSummaryResolved.evidence_used,
+      assumptionsDefaulted: emptyArrayFieldsResolved.assumptions !== reasoningSummaryResolved.assumptions,
+    });
   }
   if (traceEnabled && normalized.budget_daily !== budgetFromMessageResolved.budget_daily) {
     trace("strategy heuristic budget cap", { conversationId, original: budgetFromMessageResolved.budget_daily, capped: normalized.budget_daily, cap: MAX_SUGGESTED_DAILY_BUDGET });

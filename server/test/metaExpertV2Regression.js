@@ -913,6 +913,59 @@ async function run() {
     }
   });
 
+  // --- Missing "evidence_used"/"assumptions" entirely (live bug, round 26) --
+  // Live screenshot: build_strategy was hard-rejected with "Missing
+  // required field \"evidence_used\"" — same wrong-tool-recovery pattern
+  // as rounds 24/25 (execute_strategy blocked -> get_business_snapshot ->
+  // build_strategy). Unlike other required fields, evidence_used's own
+  // validation rule already accepts an empty array ("can be empty"), so a
+  // MISSING value and an explicit [] mean the same thing structurally —
+  // safe to default, never inventing evidence.
+  await check("[V2 policy] evidence_used omitted entirely is defaulted to [] and accepted — never hard-rejected for a field whose own rule already allows empty", async () => {
+    const userId = makeUser(`v2-evidence-used-missing-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { evidence_used, ...strategyNoEvidence } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoEvidence, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.evidence_used, []);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] assumptions omitted entirely is defaulted to [] and accepted — same 'array, can be empty' shape as evidence_used", async () => {
+    const userId = makeUser(`v2-assumptions-missing-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { assumptions, ...strategyNoAssumptions } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoAssumptions, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.assumptions, []);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] a genuinely provided (non-empty) evidence_used is never overwritten by the missing-field default", async () => {
+    const userId = makeUser(`v2-evidence-used-provided-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const strategy = baseStrategy({ evidence_used: ["WooCommerce: Skincare category, sample product PKR 1,800"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.evidence_used, ["WooCommerce: Skincare category, sample product PKR 1,800"]);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Currency minor-unit conversion (live bug, round 20) ----------------
   // Live screenshot: a PKR account, budget_daily 500 (the user's own
   // words, "500/day" — 500 whole Rupees), and Meta's real Ad Set creation

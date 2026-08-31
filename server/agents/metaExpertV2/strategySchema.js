@@ -239,6 +239,30 @@ export function deriveCountriesFromLocationsIfMissing(strategy) {
   return { ...strategy, countries: [...new Set(mapped)] };
 }
 
+// Live bug (round 26): a build_strategy call was hard-rejected with
+// "Missing required field \"evidence_used\"" — right after the same
+// wrong-tool-recovery pattern (execute_strategy blocked -> get_business_
+// snapshot -> build_strategy), where a field the model appears to have
+// already reasoned about gets dropped from the actual structured call.
+// Unlike every other required field, evidence_used's OWN validation rule
+// (validateStrategyStructure below) already accepts an empty array — its
+// only requirement is "array, can be empty." So a genuinely MISSING value
+// isn't a business decision or an invented fact at all: an omitted array
+// and an explicit empty array mean exactly the same thing structurally.
+// Only fires when the field is truly absent (undefined/null/"") — never
+// overwrites a real (even malformed-type) value the model did provide.
+// assumptions has the identical "array, can be empty" shape and is one
+// omission away from the same bug, so both are covered here together.
+export function deriveEmptyArrayFieldsIfMissing(strategy) {
+  let result = strategy;
+  for (const field of ["evidence_used", "assumptions"]) {
+    if (result[field] === undefined || result[field] === null || result[field] === "") {
+      result = { ...result, [field]: [] };
+    }
+  }
+  return result;
+}
+
 // Live bug (round 18): after execute_strategy was correctly blocked for a
 // missing budget and the user was asked for one, they answered with a
 // plain number ("500/day") — and the model's NEXT build_strategy/
