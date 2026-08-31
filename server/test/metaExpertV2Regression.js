@@ -504,6 +504,79 @@ async function run() {
     }
   });
 
+  // Live bug (round 29): budget_daily missing was only ever discovered at
+  // execute_strategy time — by then the user had already said "approve,"
+  // and the model, blocked by the budget gate, ended up asking the user to
+  // just repeat their approval, which can never fix a missing budget
+  // (infinite loop). Budget is the ONE field only the user can actually
+  // supply — it must be asked for once, up front, during build/revise,
+  // exactly like the ambiguous-Pixel case already does for its own
+  // genuinely-user-only decision.
+  await check("[V2 policy] budget_daily left unset asks for it as a real unresolved_question at BUILD time — never silently presented as ready to approve", async () => {
+    const userId = makeUser(`v2-budget-asked-at-build-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.budget_daily ?? null, null);
+      assert.ok(result.strategy.unresolved_questions?.some((q) => /budget/i.test(q)), `a real budget question must be present: ${JSON.stringify(result.strategy.unresolved_questions)}`);
+      assert.equal(result.strategy.approval_required, true, "must never be presented as ready to approve while budget is still missing");
+      assert.match(result.recommendationText, /before i can build this, i need you to confirm/i, "the recommendation must lead with the open question, not 'approve this strategy'");
+      assert.doesNotMatch(result.recommendationText, /approve this strategy or tell me/i, "must never ALSO say 'approve this' while a real question is still open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 budget gate, orchestrator-level] execute_strategy blocked for missing budget: the model's honest 'what's the budget' reply reaches the user as-is — never nudged into a retry loop, never told to just repeat approval", async () => {
+    const userId = makeUser(`v2-budget-honest-reply-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { budget_daily, ...strategyNoBudget } = baseStrategy();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let built;
+    try {
+      built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.execute_strategy", {}), // blocked: no budget set
+        // The model's own honest, correct reply — asks for the specific
+        // missing fact, never claims execution, never asks for approval again.
+        finalText("Before I can execute this, what daily budget would you like?"),
+      ],
+    }));
+    try {
+      const userMessage = "approve";
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [{ role: "user", content: "I want more sales on my website" }, { role: "assistant", content: built.recommendationText }, { role: "user", content: userMessage }],
+        agentSystemPrompt: "You are the Meta Ads Manager V2.",
+      });
+      // Reaching the model's SECOND scripted reply at all proves the honest
+      // answer was accepted, not overridden by another forced nudge — the
+      // mock throws on exhaustion if a third call were attempted.
+      assert.match(result.reply, /what daily budget would you like/i, `the model's honest reply must reach the user unchanged: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /say ["“]approve["”]/i, "must never tell the user to just repeat their approval — that cannot fix a missing budget");
+      const execCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.execute_strategy");
+      assert.equal(execCalls.length, 1);
+      assert.match(execCalls[0].error, /budget/i);
+      const stored = getStoredStrategy(userId, built.strategyId);
+      assert.notEqual(stored.status, "approved", "must never be marked approved/executed when nothing actually ran");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[V2 budget gate] executeStrategy() itself refuses to run (defense in depth) when budget_daily is missing, even if some other caller bypasses the orchestrator gate", async () => {
     const userId = makeUser(`v2-budget-missing-direct-${stamp}@example.com`);
     connectMeta(userId);

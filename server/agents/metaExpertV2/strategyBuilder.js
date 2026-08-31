@@ -271,6 +271,28 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
+  // Live bug (round 29): a strategy could be built/revised and PRESENTED
+  // to the user with budget_daily left unset — checkBudgetPolicy
+  // (policy.js) deliberately never rejects this (money is a genuine user
+  // decision, never invented, same principle as this block's Pixel case
+  // above), and formatRecommendation already renders "Budget: Not yet
+  // set — needs your input" in the text, but without a matching
+  // unresolved_questions entry the SAME recommendation also closed with
+  // "Approve this strategy...", inviting the user to approve something
+  // that structurally cannot execute. The gap was only ever caught later,
+  // at execute_strategy time, by checkV2ExecutionApprovalGate (orchestrator/
+  // index.js) — by then the user has already said "approve," and no
+  // amount of repeating that word can supply a budget that was never
+  // asked for. Ask for it up front, exactly once, as a real question —
+  // deriveBudgetFromUserMessageIfMissing above already tried extracting
+  // it from the user's own current message, so reaching this point means
+  // it's genuinely not there yet. Applies to both modes (a boost/explicit
+  // action needs a real budget just as much as a full campaign).
+  if (normalized.budget_daily == null) {
+    const question = "What daily budget would you like for this?";
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
   let { contentId, contentError } = resolveContentSelector(normalized, snapshot);
   if (contentError) resolutionErrors.push({ field: "content_selector", message: contentError, code: "META_V2_CONTENT_NOT_FOUND" });
 

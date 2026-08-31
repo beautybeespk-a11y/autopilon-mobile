@@ -108,11 +108,24 @@ const MAX_NARRATION_NUDGES = 1;
 // it.
 const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|successfully executed|(campaign|strategy|ad ?set)\b.{0,30}\b(is now|has been|will be|was)\b.{0,25}\b(created|running|live|executing|executed|set ?up)\b|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
-function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn }) {
+function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   if (executeCalledThisTurn || reviseCalledThisTurn) return null;
   const claimsCompletion = EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message);
-  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage);
+  // Live bug (round 29): "approvedButNeverAttempted" used to fire purely
+  // off hasActiveV2Strategy + approval language, with no way to tell
+  // "the model never even tried" (the original bug this gate exists for)
+  // apart from "the model DID try execute_strategy, got a clear,
+  // structural pre-check rejection (e.g. no budget set), and is now
+  // honestly relaying that reason." Forcing a retry in the second case is
+  // actively harmful — the SAME pre-check blocks it again, and after the
+  // one nudge is spent, the hard-stop fallback below told the user to
+  // just say "approve" again, which cannot fix a missing budget. Now
+  // excluded via executeGateBlockedThisTurn — a genuinely honest final
+  // reply that already explains what's blocking execution is left alone;
+  // only a reply that actively CLAIMS completion (claimsCompletion) is
+  // still caught, since that's dishonest regardless of what happened.
+  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage) && !executeGateBlockedThisTurn;
   if (!claimsCompletion && !approvedButNeverAttempted) return null;
   if (approvedButNeverAttempted && !claimsCompletion) {
     return 'The user just approved the active strategy in their current message, but meta_expert_v2.execute_strategy was never actually called this turn. Call it now with type "tool_call" — never tell the user the campaign is set up, created, executing, or running unless that tool call actually ran (it requires a separate confirmation step, so say that plainly if it comes back awaiting confirmation, never claim it already spent or executed).';
@@ -771,6 +784,12 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let staleAnswerNudges = 0;
   let creativeRevisionNudges = 0;
   let executionClaimNudges = 0;
+  // Set true the moment checkV2ExecutionApprovalGate blocks a real
+  // execute_strategy attempt this turn (see round-29 fix in
+  // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
+  // genuinely never tried" from "the model tried, got a clear pre-check
+  // reason, and is now honestly relaying it."
+  let executeGateBlockedThisTurn = false;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
@@ -871,6 +890,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
             executeCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) > 0,
             reviseCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0,
+            executeGateBlockedThisTurn,
           })
         : null;
       if (executionClaimGateMessage && executionClaimNudges < MAX_EXECUTION_CLAIM_NUDGES) {
@@ -1144,7 +1164,10 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // the once-per-turn dispatch budget, only a genuine execution
         // attempt that reaches runTool() below does.
         const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage });
-        if (gateError) outcome = { status: "failed", error: gateError };
+        if (gateError) {
+          outcome = { status: "failed", error: gateError };
+          executeGateBlockedThisTurn = true;
+        }
       } else if (call.toolName === "meta_expert.create_campaign_plan") {
         const gate = checkCreatePlanRetryGate({
           parameters: call.parameters || {},
@@ -1230,6 +1253,28 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             toolResults,
             usage: usageTotals,
           };
+        }
+
+        // A gate-blocked execute_strategy attempt (checkV2ExecutionApprovalGate
+        // above) gets its own directive feedback instead of the generic
+        // "try a different source or query" wrapper below, which is a poor
+        // fit for an already-specific, already-actionable reason (a missing
+        // budget, missing approval language, etc.) — CONFIRMED LIVE BUG
+        // (round 29): that generic framing, combined with the (now-fixed)
+        // checkExecutionClaimWithoutCallGate bug, previously drove the model
+        // to a dead end where it apologized and asked the user to just say
+        // "approve" again — which cannot fix a missing budget, since nothing
+        // about the strategy changes between identical approvals.
+        if (call.toolName === "meta_expert_v2.execute_strategy" && executeGateBlockedThisTurn) {
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `"${call.toolName}" was blocked: ${outcome.error}\nRespond now with type "final". If the reason names a specific missing fact only the user can supply (like a daily budget amount), ask for exactly that, in plain language — never ask the user to just repeat their approval, since that alone cannot fix this. If instead you already have what's needed, call meta_expert_v2.revise_strategy to fix it, then wait for approval before calling execute_strategy again. Never claim the strategy was executed, created, or is running — it was not.`,
+            },
+          ];
+          continue;
         }
 
         // Report the failure back to the model instead of aborting the whole
