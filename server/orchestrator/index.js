@@ -14,6 +14,9 @@ import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
 import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
+import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
+import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
+import { requireValidToken } from "../integrations/manager.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -803,6 +806,72 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const v2ToolCallCounts = new Map();
   const v2ToolNudgeCounts = new Map();
   const v2ToolLastOutcome = new Map();
+
+  // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
+  // plain chat three separate times ("Rs.500"), the strategy's own
+  // recommendation TEXT displayed it, but execute_strategy kept failing
+  // "no daily budget set" — the model was narrating the update in its
+  // reply instead of ever calling meta_expert_v2.revise_strategy to
+  // actually persist it. Nothing backend-enforced ever REQUIRED that
+  // call, and worse, the two approval gates then bounced the user in an
+  // unsatisfiable loop ("not approved" -> approve -> "no budget" -> give
+  // budget -> "not approved" again), since a bare budget reply carries no
+  // approval language of its own.
+  //
+  // Fixed at the root rather than nudged: BEFORE the model is even asked
+  // for a decision this turn, if there's an active V2 strategy missing
+  // budget_daily and the user's CURRENT message contains an extractable
+  // amount (the exact same narrow pattern deriveBudgetFromUserMessageIfMissing
+  // already uses at build/revise time — currency-prefixed, "/day"-suffixed,
+  // or the entire message is just a bare number), revise_strategy is
+  // called for REAL, directly, before the model ever produces a reply —
+  // "written to the strategy via revise_strategy before any reply is
+  // generated," not a nudge hoping the model does it. A failure here
+  // (not connected, a genuine validation rejection, etc.) is logged and
+  // never breaks the turn — the model still gets exactly the same gates
+  // it would have without this, no worse than before.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    if (activeStrategy && activeStrategy.strategy.budget_daily == null) {
+      const extracted = deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, userMessage);
+      if (typeof extracted.budget_daily === "number") {
+        try {
+          const accessToken = requireValidToken(userId, "meta_ads");
+          const revised = await reviseStrategyV2({
+            userId, conversationId, accessToken, strategyId: activeStrategy.id,
+            requestedChanges: { budget_daily: extracted.budget_daily, budget_basis: extracted.budget_basis },
+            userMessage,
+          });
+          if (revised.ok) {
+            trace.push(traceStep("tool", "Auto-saved the budget you just gave (meta_expert_v2.revise_strategy)", "done"));
+            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+            // Appended to the LAST user turn (never pushed as a separate
+            // message) — the chat API requires strict user/assistant
+            // alternation, and there's no assistant turn to pair a new
+            // message with here (this runs BEFORE the model's first
+            // decision this turn). Same append-in-place pattern
+            // extraContext/extraImage already use above. Only when that
+            // last turn is a plain string (skipped, never crashed, for the
+            // rare case it's a multimodal content array instead) — the
+            // budget is still genuinely saved either way; only this
+            // inline transparency note is what's skipped.
+            const lastIdx = conversationForModel.length - 1;
+            const last = conversationForModel[lastIdx];
+            if (last?.role === "user" && typeof last.content === "string") {
+              conversationForModel = [
+                ...conversationForModel.slice(0, lastIdx),
+                { ...last, content: `${last.content}\n\n[System note: this message's daily budget amount (${extracted.budget_daily}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+              ];
+            }
+          } else {
+            v2Trace("auto-revise budget failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+          }
+        } catch (err) {
+          v2Trace("auto-revise budget failed (error)", { conversationId, error: err.message });
+        }
+      }
+    }
+  }
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";

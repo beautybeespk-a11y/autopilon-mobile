@@ -1141,6 +1141,16 @@ async function run() {
     }
   });
 
+  // Round 30 update: this scenario's userMessage ("500/day") is now ALSO
+  // exactly what the new pre-loop auto-revise (see round 30's fix,
+  // orchestrator/index.js) catches — the missing budget gets genuinely
+  // saved via a REAL revise_strategy call before the model ever gets a
+  // turn, so toolResults is no longer empty and budget_daily is no longer
+  // left null. That's the correct, improved behavior (bug 2's fix). What
+  // this test actually guards — a fabricated "the campaign is now
+  // running"/"executing the strategy" claim must never reach the customer
+  // when execute_strategy was never really called — is unrelated to the
+  // budget being auto-saved and must still hold exactly as before.
   await check("[V2 execution claim gate] the SAME false claim repeated even after the nudge hard-stops with an honest fallback — never reaches the customer as a fabricated success", async () => {
     const userId = makeUser(`v2-execution-claim-hardstop-${stamp}@example.com`);
     connectMeta(userId);
@@ -1160,16 +1170,107 @@ async function run() {
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
       chatResponses: [
         finalText("Executing the strategy with a daily budget of 500 PKR."),
-        finalText("The campaign is now running with the updated budget."), // still no tool call after the nudge
+        finalText("The campaign is now running with the updated budget."), // still no execute_strategy call after the nudge
       ],
     }));
     try {
       const userMessage = "500/day";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
-      assert.equal(result.toolResults.length, 0, "no V2 tool must have actually been dispatched in this scenario");
+      assert.equal(result.toolResults.length, 1, `only the auto-revise (a REAL dispatch that genuinely saved the budget) should appear — never a fabricated execute_strategy: ${JSON.stringify(result.toolResults)}`);
+      assert.equal(result.toolResults[0].toolName, "meta_expert_v2.revise_strategy");
       assert.doesNotMatch(result.reply, /is now running|executing the strategy/i, "the fabricated success claim must never reach the customer even after the nudge is exhausted");
-      const stored = getStoredStrategy(userId, initial.strategyId);
-      assert.equal(stored.strategy.budget_daily ?? null, null, "budget must remain unset — nothing was actually revised");
+      // A revision always inserts a NEW row (never updates in place) — the
+      // original initial.strategyId row stays unchanged forever, so the
+      // CURRENT active strategy must be looked up fresh, not by that id.
+      const stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(stored.strategy.budget_daily, 500, "the budget the user supplied must be genuinely saved by the auto-revise, even though execute_strategy was never really called");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Currency hard guard (live bug, round 30, BUG 1) --------------------
+  // Live report: user said "Rs 500" on a PKR ad account (act_237956315579168)
+  // and the finalized strategy rendered "$500/day" — traced to currency
+  // never being captured anywhere between meta.listAdAccounts()'s real
+  // response and the strategy record (fixed by threading adAccountCurrency
+  // through businessSnapshot.js -> assetResolution.js -> strategyBuilder.js's
+  // stored resolvedAssets). This test guards the explicitly requested hard
+  // guard itself (BUG 1, question 3): if the ad account's real currency has
+  // drifted from what the strategy was built/revised against by the time
+  // execute_strategy actually runs, refuse rather than risk spending the
+  // wrong amount.
+  await check("[V2 execution] executeStrategy() refuses to run when the strategy's built-for currency no longer matches the ad account's real currency at execution time", async () => {
+    const userId = makeUser(`v2-currency-mismatch-guard-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let built;
+    try {
+      built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    // Same ad account id/name, but its real currency has drifted to USD by
+    // execution time (e.g. the billing currency was changed on Meta's side
+    // between build and execution).
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "USD" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        /built for a PKR ad account, but the ad account's real currency is now USD/i
+      );
+      const stored = getStoredStrategy(userId, built.strategyId);
+      assert.notEqual(stored.status, "executed", "must never be marked executed when the currency guard refused to run");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Budget auto-saved from chat, then genuinely executable (live bug, round 30, BUG 2) --
+  // Live report: user supplied Rs.500 three separate times, the strategy
+  // TEXT displayed it, but execute_strategy kept failing "no daily budget
+  // set" — the model was narrating the update instead of ever calling
+  // revise_strategy. Explicit fix request: "a user-supplied value is
+  // written to the strategy via revise_strategy before any reply is
+  // generated, and add a regression test: user supplies a budget in chat
+  // -> revise_strategy is called with budget_daily -> execute_strategy no
+  // longer reports a missing budget." This test is exactly that sequence,
+  // end to end through the real orchestrator entry point.
+  await check("[V2 execution] a budget supplied in plain chat is auto-saved via a REAL revise_strategy call before the model's reply, and execute_strategy no longer reports a missing budget", async () => {
+    const userId = makeUser(`v2-budget-auto-revise-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      const { budget_daily, ...strategyNoBudget } = baseStrategy();
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoBudget, userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [finalText('Got it — the daily budget is saved. Say "approve" when you\'re ready to execute.')],
+    }));
+    try {
+      const userMessage = "Rs.500";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revise, `a REAL revise_strategy call must be dispatched for the user-supplied budget, not just narrated: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.strategy.budget_daily, 500, "the user-supplied budget must actually be saved to the strategy record");
+
+      // execute_strategy must no longer report a missing budget now that
+      // the auto-revise has genuinely saved it.
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id });
+      assert.equal(executed.status, "PAUSED", "execution must succeed now that a real budget is on record, not fail with 'no daily budget set'");
     } finally {
       restoreFetch();
     }

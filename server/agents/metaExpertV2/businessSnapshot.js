@@ -208,9 +208,21 @@ async function gatherMetaAssets(userId, accessToken, conn) {
   }
   const defaultInstagramId = defaults.instagramAccountId && instagram?.accountId === defaults.instagramAccountId ? defaults.instagramAccountId : (instagram?.accountId || null);
 
+  // Live bug (round 30): budget_daily is a bare number with no currency
+  // attached anywhere, and nothing anywhere read the REAL ad account's
+  // currency from Meta at build/revise time — the model, having never
+  // been told what currency the number is actually in, defaulted to "$"
+  // in its own prose on a PKR account. currency was being silently
+  // dropped here even though meta.listAdAccounts already returns it.
+  // Exposed on both the full items list and the resolved default so
+  // assetResolution.js can look it up for WHICHEVER ad account a
+  // strategy actually resolves to (not necessarily the default, if the
+  // user explicitly picked a different one).
+  const adAccountDefaultWithCurrency = { ...adAccountDefault, currency: adAccounts.find((a) => a.id === adAccountDefault.id)?.currency || null };
+
   return {
-    adAccounts: { status: adAccountsResult.status, items: adAccounts.map((a) => ({ id: a.id, name: a.name })) },
-    defaultAdAccount: adAccountDefault,
+    adAccounts: { status: adAccountsResult.status, items: adAccounts.map((a) => ({ id: a.id, name: a.name, currency: a.currency || null })) },
+    defaultAdAccount: adAccountDefaultWithCurrency,
     pages: { status: pagesResult.status, items: pages.map((p) => ({ id: p.id, name: p.name })) },
     defaultPage: pageDefault,
     pixels: { status: scopedAdAccountId ? pixelsResult.status : "not_connected", items: pixels.map((p) => ({ id: p.id, name: p.name })) },

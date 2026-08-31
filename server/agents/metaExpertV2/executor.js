@@ -238,6 +238,24 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
       throw new Error(`The Facebook Page this strategy was built for (${stored.resolvedAssets.pageId}) is no longer connected — build a new strategy.`);
     }
 
+    // Hard guard (round 30): the currency this strategy was built/revised
+    // against (captured at that time — see assetResolution.js) must still
+    // match the ad account's REAL currency right now. executeCampaignMode
+    // below already always converts using the FRESH currency fetched here,
+    // so the actual Meta charge is never wrong on its own — but a mismatch
+    // between what the strategy was built for and what's about to be
+    // charged is exactly the class of silent-drift bug that must never
+    // reach a real spend decision unexamined (an ad account's billing
+    // currency changing between build and execution is rare but real).
+    // Skipped only for a strategy stored before this fix shipped (no
+    // captured currency to compare against at all) — silently allowed to
+    // proceed, not blocked, since blocking retroactively would brick every
+    // already-approved strategy with no way to fix itself.
+    const builtForCurrency = stored.resolvedAssets.adAccountCurrency;
+    if (builtForCurrency && builtForCurrency !== adAccount.currency) {
+      throw new Error(`This strategy was built for a ${builtForCurrency} ad account, but the ad account's real currency is now ${adAccount.currency} — refusing to execute rather than risk spending the wrong amount. Build a new strategy to pick up the current currency.`);
+    }
+
     const executionResult = stored.mode === "explicit_action"
       ? await executeExplicitAction(stored, accessToken, userId, conversationId)
       : await executeCampaignMode(stored, accessToken, userId, adAccount.currency);

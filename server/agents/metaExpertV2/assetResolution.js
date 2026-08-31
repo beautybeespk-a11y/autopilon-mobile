@@ -36,6 +36,14 @@ function nameFrom(list, id) {
   return list.find((item) => item.id === id)?.name || null;
 }
 
+// Live bug (round 30): the resolved ad account's real currency was never
+// captured anywhere at build/revise time — see businessSnapshot.js. Reads
+// from the SAME accounts list nameFrom() above already resolves against
+// (now including currency), so no extra API call.
+function currencyFrom(list, id) {
+  return list.find((item) => item.id === id)?.currency || null;
+}
+
 // priorResolved/explicitAssetChanges (only present on a revision): Step
 // 2's REVISION priority — 1. prior strategy's resolved asset (reused
 // DIRECTLY, no re-resolution, no network call) unless explicitAssetChanges
@@ -44,13 +52,14 @@ function nameFrom(list, id) {
 // saved default > single > ask).
 export async function resolveStrategyAssets(strategy, { userId, accessToken, priorResolved = null, explicitAssetChanges = new Set(), snapshot = null }) {
   const resolved = { adAccountId: null, pageId: null, instagramId: null, pixelId: null, catalogId: null };
-  const names = { adAccountName: null, pageName: null, instagramUsername: null };
+  const names = { adAccountName: null, adAccountCurrency: null, pageName: null, instagramUsername: null };
   const resolutionErrors = [];
 
   let adAccountReused = false;
   if (priorResolved?.adAccountId && !explicitAssetChanges.has("ad_account")) {
     resolved.adAccountId = priorResolved.adAccountId;
     names.adAccountName = priorResolved.adAccountName || null;
+    names.adAccountCurrency = priorResolved.adAccountCurrency || null;
     adAccountReused = true;
   } else {
     try {
@@ -58,6 +67,7 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
       resolved.adAccountId = await resolveAdAccountId({ userId, accessToken, providedAdAccountId: explicitId });
       const accounts = snapshot?.metaAssets?.adAccounts?.items || (await meta.listAdAccounts(accessToken).catch(() => []));
       names.adAccountName = nameFrom(accounts, resolved.adAccountId);
+      names.adAccountCurrency = currencyFrom(accounts, resolved.adAccountId);
     } catch (err) {
       resolutionErrors.push({ field: "ad_account", message: err.message, code: err.code });
     }

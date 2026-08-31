@@ -85,6 +85,22 @@ const BUDGET_BASIS_EXPLANATION = {
 
 // Step 11 — the ONLY thing the customer ever sees: no raw JSON, no
 // internal ids, no schema names, no plan/strategy id.
+// Live bug (round 30): this rendered a bare number ("500/day") with no
+// currency at all — the backend text itself was never wrong, but with
+// nothing telling the model what currency that number is actually in, it
+// defaulted to "$" in its own prose on a real PKR account. Now renders the
+// REAL resolved ad account's currency code (captured at build/revise time
+// — see assetResolution.js/businessSnapshot.js) directly in the backend
+// text itself, so there's no gap left for the model to fill with a guess.
+// Falls back to the old bare-number rendering only when the currency
+// genuinely isn't known yet (no ad account resolved).
+function formatBudgetLine(strategy, names) {
+  if (strategy.budget_daily == null) return "Not yet set — needs your input";
+  const basis = BUDGET_BASIS_EXPLANATION[strategy.budget_basis] || "basis not specified";
+  const amount = names.adAccountCurrency ? `${names.adAccountCurrency} ${strategy.budget_daily}/day` : `${strategy.budget_daily}/day`;
+  return `${amount} (${basis})`;
+}
+
 function formatRecommendation(strategy, names) {
   if (strategy.mode === "explicit_action") {
     const actionLabel = {
@@ -93,9 +109,7 @@ function formatRecommendation(strategy, names) {
       USE_ATTACHED_IMAGE: "run the image you attached as an ad",
       USE_ATTACHED_VIDEO: "run the video you attached as an ad",
     }[strategy.action_type] || "run this as an ad";
-    const budgetLine = strategy.budget_daily != null
-      ? `${strategy.budget_daily}/day (${BUDGET_BASIS_EXPLANATION[strategy.budget_basis] || "basis not specified"})`
-      : "Not yet set — needs your input";
+    const budgetLine = formatBudgetLine(strategy, names);
     const lines = [
       `I'll ${actionLabel}.`,
       ``,
@@ -116,9 +130,7 @@ function formatRecommendation(strategy, names) {
   }
 
   const genderLabel = { ALL: "All genders", MALE: "Men", FEMALE: "Women" }[strategy.gender] || strategy.gender;
-  const budgetLine = strategy.budget_daily != null
-    ? `${strategy.budget_daily}/day (${BUDGET_BASIS_EXPLANATION[strategy.budget_basis] || "basis not specified"})`
-    : "Not yet set — needs your input";
+  const budgetLine = formatBudgetLine(strategy, names);
   const placementsLabel = strategy.placements === "ADVANTAGE_PLUS" ? "Advantage+ (automatic)" : (strategy.manual_placements || []).join(", ");
   const lines = [
     `Based on your store, Meta account, and available business data, I recommend:`,
@@ -257,7 +269,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const snapshot = needsFreshSnapshot ? await gatherBusinessSnapshot(userId) : priorStored.snapshot;
 
   const priorResolved = priorStored
-    ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }
+    ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }
     : null;
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
     await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot });
