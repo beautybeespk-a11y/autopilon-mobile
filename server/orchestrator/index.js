@@ -576,7 +576,10 @@ Rules:
 - Output raw JSON only — no markdown fences, no commentary.`;
 }
 
-function safeParseDecision(text) {
+// Exported so a regression test can call this directly with a non-string
+// argument (the exact case its own coercion below exists to handle)
+// without needing a full mocked chatComplete()/orchestrate() round-trip.
+export function safeParseDecision(text) {
   // Defensive: some providers can hand back something other than a plain
   // string (e.g. an array of content parts) — coerce rather than crash the
   // whole request on a .trim() call.
@@ -622,7 +625,15 @@ function safeParseDecision(text) {
         _malformedEnvelope: true,
       };
     }
-    return { type: "final", message: text.trim() };
+    // Bug fix: this used to call `text.trim()` on the ORIGINAL argument
+    // instead of `asString` (the coerced string computed above) — for the
+    // exact non-string case this function's own coercion exists to handle
+    // (e.g. a provider returning an array of content parts), `text` has no
+    // `.trim` method and this threw a TypeError instead of falling back
+    // gracefully. `asString` is guaranteed to be a real string in every
+    // case, and is identical to `text` whenever `text` already was one, so
+    // this changes nothing for the (already-working) plain-string path.
+    return { type: "final", message: asString.trim() };
   }
 }
 
@@ -1118,7 +1129,32 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       if (outcome.status === "failed") {
         trace[trace.length - 1].state = "done";
         trace.push(traceStep("error", `${call.toolName} failed: ${outcome.error}`, "done"));
-        toolResults.push({ toolName: call.toolName, error: outcome.error });
+        toolResults.push({ toolName: call.toolName, error: outcome.error, code: outcome.code, subcode: outcome.subcode });
+
+        // A raw Meta Ads (meta.* / category "meta_ads") tool failure ends
+        // the turn immediately, deterministically, with the real error —
+        // the model never sees it and therefore never improvises a
+        // different-sounding workaround each time (a different retry
+        // phrasing, an invented alternate parameter, a confident-sounding
+        // "let me try another way" that doesn't actually address a real
+        // Meta-side failure like an expired token, a rate limit, or a
+        // genuine API rejection). Same failure, same customer-facing
+        // wording, every time. This does NOT apply to meta_expert/
+        // meta_expert_v2 (category "meta_expert"/"meta_expert_v2") — those
+        // are a different, already-gated failure class (a REJECTED plan/
+        // strategy is a "completed" result with valid:false, not a thrown
+        // "failed" outcome at all) — nor to any other tool category, which
+        // all keep the existing forgiving retry-nudge below unchanged.
+        if (toolDef?.category === "meta_ads") {
+          if (planId) setPlanStatus(planId, "failed");
+          return {
+            reply: `I couldn't complete this Meta Ads action — ${outcome.error} I haven't tried anything else automatically; let me know how you'd like to proceed.`,
+            trace,
+            toolResults,
+            usage: usageTotals,
+          };
+        }
+
         // Report the failure back to the model instead of aborting the whole
         // response — a single blocked page or bad parameter shouldn't kill a
         // multi-step research flow. The model can retry a different source,

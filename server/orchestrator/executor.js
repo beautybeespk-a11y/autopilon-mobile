@@ -94,7 +94,13 @@ async function executeNow({ executionId, tool, parameters, userId, agentId, conv
     return { executionId, status: "completed", result };
   } catch (err) {
     setExecutionStatus(executionId, "failed", { error: err.message, completedAt: now() });
-    return { executionId, status: "failed", error: err.message };
+    // err.code/err.subcode are set by integrations/meta/api.js's metaFetch
+    // from Meta's own error payload (e.g. code 100, subcode 3858558 for a
+    // too-low budget) — previously dropped here, leaving only the message
+    // string for callers. Additive: undefined for any error that doesn't
+    // set them, which every existing caller already tolerates since they
+    // only ever read .error.
+    return { executionId, status: "failed", error: err.message, code: err.code, subcode: err.subcode };
   }
 }
 

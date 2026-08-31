@@ -26,7 +26,9 @@ process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || "test-anthropic
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection } = await import("../integrations/manager.js");
-const { orchestrate } = await import("../orchestrator/index.js");
+const { orchestrate, safeParseDecision } = await import("../orchestrator/index.js");
+const { runTool } = await import("../orchestrator/executor.js");
+const { registerTool } = await import("../tools/registry.js");
 const { getActivePlanForConversation, getStoredPlan } = await import("../agents/metaExpert/planner.js");
 await import("../tools/index.js"); // registers meta_expert.* tools
 
@@ -50,6 +52,11 @@ function makeUser(email) {
 
 db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
   .run("meta_ads", "Meta Ads", "Manage Facebook and Instagram ad campaigns directly.", "marketing");
+// agent_skills.skillId has a real FK to skills(id) — needed for the
+// test-only "test_tools" category used by the non-meta_ads tool-failure
+// regression test below.
+db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
+  .run("test_tools", "Test Tools", "Test-only tools for regression coverage.", "test");
 
 function makeAgentWithSkills(userId, skillIds) {
   const agentId = cryptoRandom();
@@ -601,6 +608,179 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Meta Ads tool-failure hard stop (round 27 request) -----------------
+  // Question raised: does a failed tool call get fed back to the model with
+  // "try a different approach," meaning a Meta connection/API failure gets
+  // improvised around differently each time instead of failing
+  // consistently? Confirmed true for every tool category, including raw
+  // meta.* (category "meta_ads") ones — orchestrate()'s outcome.status ===
+  // "failed" branch had no category check at all. Fixed: a meta_ads tool
+  // failure now ends the turn immediately with the real, structured error
+  // — the model never sees it (so it can never improvise a different-
+  // sounding workaround on retry) — while every other tool category keeps
+  // the existing forgiving retry-nudge behavior unchanged (verified by the
+  // next test).
+  function scriptedFetchWithMetaFailure({ chatResponses, metaOpts = {}, failPathSuffix, failBody, failStatus = 400 }) {
+    let chatIndex = 0;
+    const metaHandler = metaRouter(metaOpts);
+    return async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) {
+          throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses — the orchestrator called the model more times than this scenario expected.`);
+        }
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if ((options.method || "GET") === "GET" && path.endsWith(failPathSuffix)) {
+        return jsonResponse(failBody, failStatus);
+      }
+      return metaHandler(url, options);
+    };
+  }
+
+  await check("[meta_ads failure] a raw meta.* tool failure ends the turn immediately with the real, structured error — no 'try a different approach' nudge, no second chat call", async () => {
+    const userId = makeUser(`meta-ads-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_ads"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    global.fetch = scriptedFetchWithMetaFailure({
+      metaOpts: metaFixture,
+      failPathSuffix: "/campaigns",
+      failBody: { error: { message: "Invalid OAuth access token.", type: "OAuthException", code: 190, error_subcode: 463 } },
+      failStatus: 401,
+      // Only ONE scripted chat response — if the old forgiving behavior
+      // regressed back in, the orchestrator would call the model a SECOND
+      // time with a retry nudge and this mock would throw "chat mock
+      // exhausted," failing the test.
+      chatResponses: [decisionText({ type: "tool_call", toolName: "meta.list_campaigns", parameters: { adAccountId: "act_1" } })],
+    });
+    try {
+      const userMessage = "Show me my campaigns";
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [{ role: "user", content: userMessage }],
+        agentSystemPrompt: "You manage Meta ads directly.",
+      });
+      assert.match(result.reply, /couldn't complete this Meta Ads action/i, `must use the deterministic hard-stop wording: ${result.reply}`);
+      assert.match(result.reply, /Invalid OAuth access token/i, `the real Meta error must reach the customer verbatim: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /try a different approach/i, "must never carry the generic forgiving-retry wording");
+      const failed = result.toolResults.find((r) => r.toolName === "meta.list_campaigns");
+      assert.ok(failed?.error, "the failure must still be recorded in toolResults for the Trace UI");
+      assert.equal(failed.code, 190, "err.code from Meta's real error payload must be preserved through to toolResults");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // A minimal, directly-registered throwaway tool with a NON-meta_ads
+  // category — deliberately not reusing a real meta_expert tool, since its
+  // internal resilience to a failed Meta API call isn't the point being
+  // tested here and shouldn't be assumed. This isolates the test to
+  // exactly one thing: does a category outside "meta_ads" still get the
+  // pre-existing forgiving retry-nudge, unchanged.
+  registerTool({
+    name: "test.always_fails",
+    description: "Test-only tool that always throws — used to verify non-meta_ads tool failures keep the forgiving retry behavior.",
+    category: "test_tools",
+    parameters: { type: "object", properties: {}, required: [] },
+    requiredPermissions: [],
+    requiresConfirmation: false,
+    async execute() {
+      throw new Error("Simulated non-Meta tool failure.");
+    },
+  });
+
+  await check("[meta_ads failure] a NON-meta_ads tool failure (a different category) still gets the existing forgiving retry-nudge, unchanged", async () => {
+    const userId = makeUser(`non-meta-ads-forgiving-${stamp}@example.com`);
+    const agentId = makeAgentWithSkills(userId, ["test_tools"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    global.fetch = scriptedFetchWithMetaFailure({
+      metaOpts: metaFixture,
+      failPathSuffix: "/__never_hit__",
+      failBody: {},
+      chatResponses: [
+        decisionText({ type: "tool_call", toolName: "test.always_fails", parameters: {} }),
+        finalText("I couldn't complete that, but here's what I can tell you so far."),
+      ],
+    });
+    try {
+      const userMessage = "Do the thing";
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage,
+        history: [{ role: "user", content: userMessage }],
+        agentSystemPrompt: "You are a test agent.",
+      });
+      // Reaching the SECOND scripted chat response at all proves the
+      // failure was fed back to the model (the forgiving path), not
+      // hard-stopped — scriptedFetchWithMetaFailure throws on mock
+      // exhaustion if the orchestrator didn't call the model again.
+      assert.match(result.reply, /here's what I can tell you so far/i, `the model's real second-turn reply must be used: ${result.reply}`);
+      const failed = result.toolResults.find((r) => r.toolName === "test.always_fails");
+      assert.ok(failed?.error, "the failure must still be recorded in toolResults");
+      assert.match(failed.error, /Simulated non-Meta tool failure/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- executor.js preserves err.code (round 27 request) -------------------
+  // Question raised: does runTool preserve err.code, or only err.message?
+  // Confirmed: only err.message before this fix — err.code/err.subcode
+  // (set by integrations/meta/api.js's metaFetch from Meta's own error
+  // payload) were silently dropped in executor.js's executeNow() catch
+  // block. Tested directly against runTool() (not through the full
+  // orchestrate() loop) since this is specifically about what the executor
+  // itself returns.
+  await check("[executor] runTool() preserves err.code/err.subcode from a thrown Meta API error, not just err.message", async () => {
+    const userId = makeUser(`executor-errcode-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_ads"]);
+    global.fetch = scriptedFetchWithMetaFailure({
+      metaOpts: metaFixture,
+      failPathSuffix: "/campaigns",
+      failBody: { error: { message: "Budget too low.", type: "OAuthException", code: 100, error_subcode: 3858558 } },
+      failStatus: 400,
+      chatResponses: [],
+    });
+    try {
+      const outcome = await runTool({
+        toolName: "meta.list_campaigns",
+        parameters: { adAccountId: "act_1" },
+        userId, agentId, conversationId: `conv-${cryptoRandom()}`, planId: null,
+      });
+      assert.equal(outcome.status, "failed");
+      assert.match(outcome.error, /Budget too low/i);
+      assert.equal(outcome.code, 100, `err.code must be preserved: ${JSON.stringify(outcome)}`);
+      assert.equal(outcome.subcode, 3858558, `err.subcode must be preserved: ${JSON.stringify(outcome)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- safeParseDecision non-string crash fix (round 27 request) -----------
+  // Question raised: does safeParseDecision's final fallback call .trim()
+  // on the original argument instead of the coerced string? Confirmed:
+  // yes, before this fix — `text.trim()` instead of `asString.trim()`,
+  // which threw a TypeError for exactly the non-string-provider case the
+  // function's own coercion logic exists to handle, whenever the text also
+  // failed to parse as JSON, had no salvageable "message" field, and didn't
+  // start with "{".
+  await check("[safeParseDecision] a non-string, non-JSON, non-'{'-prefixed input no longer throws — falls back to the coerced string instead of crashing", () => {
+    const contentParts = [{ text: "Sure, " }, { text: "here's my answer." }];
+    const result = safeParseDecision(contentParts);
+    assert.equal(result.type, "final");
+    assert.equal(result.message, "Sure, here's my answer.");
+  });
+
+  await check("[safeParseDecision] the plain-string fallback path is unchanged by the fix", () => {
+    const result = safeParseDecision("  Just a plain freeform reply, not JSON.  ");
+    assert.equal(result.type, "final");
+    assert.equal(result.message, "Just a plain freeform reply, not JSON.");
   });
 
   console.log(`\n# ${results.filter((r) => r.ok).length}/${results.length} Meta Expert orchestrator retry-limit checks passed.`);
