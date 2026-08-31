@@ -226,7 +226,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
 
   const structural = validateStrategyStructure(normalized);
   if (!structural.valid) {
-    trace("strategy rejected (structural)", { conversationId, errors: structural.errors });
+    // Round 25: dump the actual locations/countries values alongside the
+    // error — the error string alone ("Missing required field 'countries'")
+    // doesn't say WHY derivation didn't fire, which is what made this bug
+    // take an extra round to root-cause. Any future occurrence is now
+    // immediately diagnosable from the trace log instead of guessing.
+    trace("strategy rejected (structural)", { conversationId, errors: structural.errors, locations: normalized.locations, countries: normalized.countries });
     return { ok: false, unresolved: buildUnresolvedIssue(structural.errors) };
   }
 

@@ -201,10 +201,40 @@ const COMMON_COUNTRY_NAME_TO_ISO = {
   indonesia: "ID", malaysia: "MY", philippines: "PH", singapore: "SG", "sri lanka": "LK", nepal: "NP", vietnam: "VN", thailand: "TH",
   brazil: "BR", mexico: "MX", argentina: "AR", ireland: "IE", "new zealand": "NZ", japan: "JP", "south korea": "KR", china: "CN",
 };
+// Longest names first so a multi-word match (e.g. "united arab emirates")
+// is tried before a shorter one that could otherwise match a substring of
+// it first. Two-letter/three-letter abbreviations (us, uk, uae) are
+// deliberately excluded from substring matching below — as a whole-word
+// match inside a longer free-text location string they're too easy to
+// false-positive on unrelated text; they still work fine as an EXACT
+// whole-string location value (the fast path below).
+const COUNTRY_NAMES_FOR_SUBSTRING_MATCH = Object.keys(COMMON_COUNTRY_NAME_TO_ISO)
+  .filter((name) => name.length > 3)
+  .sort((a, b) => b.length - a.length);
+function findCountryCodeInLocationText(text) {
+  const lower = text.trim().toLowerCase();
+  if (COMMON_COUNTRY_NAME_TO_ISO[lower]) return COMMON_COUNTRY_NAME_TO_ISO[lower];
+  for (const name of COUNTRY_NAMES_FOR_SUBSTRING_MATCH) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`\\b${escaped}\\b`, "i").test(lower)) return COMMON_COUNTRY_NAME_TO_ISO[name];
+  }
+  return undefined;
+}
 export function deriveCountriesFromLocationsIfMissing(strategy) {
   if (Array.isArray(strategy.countries) && strategy.countries.length) return strategy;
   if (!Array.isArray(strategy.locations) || !strategy.locations.length) return strategy;
-  const mapped = strategy.locations.map((loc) => (typeof loc === "string" ? COMMON_COUNTRY_NAME_TO_ISO[loc.trim().toLowerCase()] : undefined));
+  // Live bug (round 25): the exact-whole-string match above missed a
+  // location the model wrote with any extra qualifier around the country
+  // name — "Karachi, Pakistan", "Pakistan (Nationwide)", "All of Pakistan"
+  // — even though the country is right there in the text, especially
+  // right after a wrong-tool recovery where the model reconstructs the
+  // strategy from scratch and phrases the location less tersely than the
+  // first time. Recognizing the country name ANYWHERE in the string (as a
+  // real whole word, not a fragment) keeps the same "never guess, only
+  // resolve what's objectively already named" guarantee — it still never
+  // fires unless one of this table's actual country names is literally
+  // present — while covering the common qualified phrasings.
+  const mapped = strategy.locations.map((loc) => (typeof loc === "string" ? findCountryCodeInLocationText(loc) : undefined));
   if (mapped.some((code) => !code)) return strategy; // an unrecognized location — never guess, leave the honest rejection in place
   return { ...strategy, countries: [...new Set(mapped)] };
 }

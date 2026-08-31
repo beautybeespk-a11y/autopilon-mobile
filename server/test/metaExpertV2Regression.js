@@ -783,6 +783,71 @@ async function run() {
     }
   });
 
+  // Live bug (round 25): a live build_strategy call was hard-rejected with
+  // "Missing required field \"countries\"" even though the assistant's OWN
+  // prior message had said "Location: Pakistan" — the exact-whole-string
+  // match above missed it because the model this time wrote the location
+  // with a qualifier around the country name, not the bare name alone.
+  await check("[V2 policy] a location qualified with a city ('Karachi, Pakistan') still derives the country — the real country name just isn't the WHOLE string", async () => {
+    const userId = makeUser(`v2-countries-city-qualified-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["Karachi, Pakistan"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["PK"]);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] a location qualified with 'Nationwide' ('Pakistan (Nationwide)') still derives the country", async () => {
+    const userId = makeUser(`v2-countries-nationwide-qualified-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["Pakistan (Nationwide)"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["PK"]);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] a bare short abbreviation ('US') still resolves as an exact whole-string location", async () => {
+    const userId = makeUser(`v2-countries-short-abbrev-exact-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["US"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["US"]);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] a short abbreviation ('US') embedded inside a longer, non-exact location string is NOT matched as a substring — only exact whole-string, to avoid false positives (false-positive guard)", async () => {
+    const userId = makeUser(`v2-countries-short-abbrev-guard-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { countries, ...strategyNoCountries } = baseStrategy({ locations: ["Focus on the US market"] });
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoCountries, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, false, "a short abbreviation like 'US' must never be matched as a substring inside a longer free-text location — too easy to false-positive");
+      assert.match(result.unresolved.issue, /countries/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Missing "reasoning_summary" entirely (live bug, round 24) ----------
   // Live screenshot: build_strategy was hard-rejected with "Missing
   // required field \"reasoning_summary\"" — right after the model had
