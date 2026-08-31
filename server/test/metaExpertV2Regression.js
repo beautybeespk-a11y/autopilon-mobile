@@ -1065,8 +1065,13 @@ async function run() {
       assert.equal(executed.status, "PAUSED");
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
-      assert.equal(campaignWrite?.body?.daily_budget, 50000, "the real Meta campaign write must carry the minor-unit value (500 PKR x 100), never the raw major-unit number");
-      assert.equal(adSetWrite?.body?.daily_budget, 50000, JSON.stringify(adSetWrite?.body));
+      // Round 31: the campaign write must NOT carry its own daily_budget —
+      // see executeCampaignMode's round-31 comment. Budget lives only on
+      // the ad set (ABO), never duplicated onto the campaign (CBO), so
+      // there's only ONE minor-unit value in this whole request, and it's
+      // on the ad set.
+      assert.equal(campaignWrite?.body?.daily_budget, undefined, "the campaign write must never carry its own daily_budget — that's what silently turns on Campaign Budget Optimization and strands the ad set's bid_strategy");
+      assert.equal(adSetWrite?.body?.daily_budget, 50000, "the real Meta ad set write must carry the minor-unit value (500 PKR x 100), never the raw major-unit number");
     } finally {
       restoreFetch();
     }
@@ -1085,6 +1090,42 @@ async function run() {
       assert.equal(executed.status, "PAUSED");
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(adSetWrite?.body?.daily_budget, 3000, "a zero-decimal currency (no minor unit) must be sent as-is, not multiplied");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Bid strategy / bid_amount (live bug, round 31) ----------------------
+  // Live error, AFTER approval/budget/Pixel all worked and the request
+  // actually reached Meta: "Bid amount required: you must provide a bid
+  // cap or target cost in bid_amount field. For LOWEST_COST_WITH_BID_CAP
+  // you must provide bid_amount... For TARGET_COST you must provide
+  // bid_amount... (Meta error 100/1815857)" — even though the ad set's own
+  // bid_strategy was always LOWEST_COST_WITHOUT_CAP (needs no bid_amount).
+  // Root cause: the campaign ALSO carried its own daily_budget, silently
+  // enabling Campaign Budget Optimization — under CBO, Meta reads
+  // bid_strategy from the CAMPAIGN, not the ad set, and this campaign never
+  // set one, so Meta fell back to a capped default with no bid_amount
+  // behind it. This test guards both halves of the fix directly: the ad
+  // set's bid_strategy is the real, never-invented LOWEST_COST_WITHOUT_CAP,
+  // and the campaign carries no daily_budget of its own (so CBO can never
+  // turn on and strand it again).
+  await check("[V2 execution] the ad set's bid_strategy is LOWEST_COST_WITHOUT_CAP (no bid_amount invented) and the campaign never carries its own daily_budget (no CBO to strand it)", async () => {
+    const userId = makeUser(`v2-bid-strategy-abo-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(campaignWrite?.body?.daily_budget, undefined, "the campaign must never carry its own daily_budget — that's what enables CBO and strands the ad set's bid_strategy");
+      assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", `the ad set must send the real, uncapped bid strategy that needs no bid_amount: ${JSON.stringify(adSetWrite?.body)}`);
+      assert.equal(adSetWrite?.body?.bid_amount, undefined, "no bid_amount must ever be invented — LOWEST_COST_WITHOUT_CAP needs none");
     } finally {
       restoreFetch();
     }
@@ -1271,6 +1312,80 @@ async function run() {
       // the auto-revise has genuinely saved it.
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id });
       assert.equal(executed.status, "PAUSED", "execution must succeed now that a real budget is on record, not fail with 'no daily budget set'");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Currency in the model's OWN reply text (live bug, round 31) --------
+  // Live report: every strategy in this run rendered "$500"/"Daily Budget:
+  // $500" on a real PKR account, even after round 30's fix made the
+  // backend's OWN recommendationText correctly say "PKR 500/day" —
+  // agentLibrary.js only ever told the model to present that text "in
+  // plain language," which is an open invitation to paraphrase, and
+  // paraphrasing silently reverted to "$". This test guards the nudge half
+  // of the round-31 fix: a "$" reply on a known non-USD account is caught
+  // and the model is asked to rewrite it — a genuinely corrected second
+  // reply reaches the customer unchanged.
+  await check("[V2 currency] the model's own final reply using '$' on a real PKR account is nudged into rewriting with the real currency", async () => {
+    const userId = makeUser(`v2-currency-dollar-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Here's your plan — Daily Budget: $500/day."),
+        finalText("Here's your plan — Daily Budget: PKR 500/day."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /\$\s?500/, "a dollar sign must never reach the customer on a real PKR account");
+      assert.match(result.reply, /PKR 500/, "the genuinely corrected second reply must reach the customer unchanged");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Same trigger, but the model repeats "$" even after the nudge — the
+  // fail-safe deterministic substitution must still guarantee the customer
+  // never sees a wrong currency symbol, since this is a real spend
+  // decision, not prose the model gets to keep guessing at.
+  await check("[V2 currency] a '$' reply repeated even after the nudge is deterministically corrected to the real currency, never left as '$'", async () => {
+    const userId = makeUser(`v2-currency-dollar-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Here's your plan — Daily Budget: $500/day."),
+        finalText("Still $500/day, sorry for the confusion."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /\$\s?500/, "a dollar sign must never reach the customer on a real PKR account, even after the nudge is exhausted");
+      assert.match(result.reply, /PKR 500/, `the fail-safe substitution must still correct it deterministically: ${result.reply}`);
     } finally {
       restoreFetch();
     }

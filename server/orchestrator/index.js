@@ -182,6 +182,36 @@ export const INTERNAL_LEAK_PATTERNS = new RegExp(
 );
 const MAX_LEAK_NUDGES = 1;
 
+// Live bug (round 31): a PKR ad account, and the model's OWN final reply
+// still wrote "$500"/"Daily Budget: $500" even though the build_strategy/
+// revise_strategy tool result it just received already carried the real
+// currency in recommendationText ("PKR 500/day" — see formatBudgetLine,
+// strategyBuilder.js, round 30's fix). agentLibrary.js only ever told the
+// model to present that text "in plain language," which is an open
+// invitation to paraphrase — and paraphrasing silently reverted to a "$"
+// default. A prompt instruction alone already proved unreliable for this
+// exact class of bug once before (see INTERNAL_LEAK_PATTERNS above, same
+// principle) — this is money, not prose, so it gets the same backend-
+// enforced treatment: nudge the model once to rewrite using the real
+// currency, and if it still doesn't, deterministically substitute every
+// "$<amount>" for "<CURRENCY> <amount>" below rather than let a wrong
+// currency symbol reach a real spend decision. Only fires when the
+// account's real currency is known and genuinely isn't USD (a literal "$"
+// is correct for a real USD account) — never invents a currency that
+// wasn't actually resolved.
+// Two separate regexes (not one shared `g`-flagged one) — a global regex's
+// `.test()` is stateful (lastIndex persists across calls), which would
+// silently alternate true/false across repeated calls on different
+// messages. DOLLAR_AMOUNT_TEST_PATTERN is a plain test; DOLLAR_AMOUNT_
+// REPLACE_PATTERN is only ever used with .replace(), which doesn't share
+// that hazard.
+const DOLLAR_AMOUNT_TEST_PATTERN = /\$\s?\d[\d,]*(?:\.\d+)?/;
+const DOLLAR_AMOUNT_REPLACE_PATTERN = /\$\s?(\d[\d,]*(?:\.\d+)?)/g;
+const MAX_CURRENCY_NUDGES = 1;
+function messageHasWrongDollarSign(message, realCurrency) {
+  return Boolean(realCurrency) && realCurrency !== "USD" && typeof message === "string" && DOLLAR_AMOUNT_TEST_PATTERN.test(message);
+}
+
 // Issue 6 (live testing round 3): "Create the best campaign you recommend
 // for my business" led the model to call meta_expert.execute_campaign_plan
 // as its very first action, with no plan ever proposed — which reached
@@ -787,6 +817,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let staleAnswerNudges = 0;
   let creativeRevisionNudges = 0;
   let executionClaimNudges = 0;
+  let currencyNudges = 0;
   // Set true the moment checkV2ExecutionApprovalGate blocks a real
   // execute_strategy attempt this turn (see round-29 fix in
   // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
@@ -1102,6 +1133,32 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           };
         }
       }
+
+      // Live bug (round 31): see messageHasWrongDollarSign/
+      // DOLLAR_AMOUNT_TEST_PATTERN above — the model's own final reply
+      // used "$" on a real PKR account.
+      const activeStrategyForCurrency = hasV2Tools ? getActiveStrategyForConversation(userId, conversationId) : null;
+      const realCurrency = activeStrategyForCurrency?.resolvedAssets?.adAccountCurrency || null;
+      if (messageHasWrongDollarSign(decision.message, realCurrency)) {
+        if (currencyNudges < MAX_CURRENCY_NUDGES) {
+          currencyNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `This ad account's real currency is ${realCurrency}, not USD — your reply used a "$" sign for a budget amount. Rewrite your reply using "${realCurrency}" in place of every "$", for every amount — never a dollar sign on this account.`,
+            },
+          ];
+          continue;
+        }
+        // Nudge already used and it STILL used "$" — never let a wrong
+        // currency symbol reach a real spend decision. Deterministic, not
+        // another model guess: every "$<amount>" becomes "<CURRENCY>
+        // <amount>" directly, since the real currency is already known.
+        decision.message = decision.message.replace(DOLLAR_AMOUNT_REPLACE_PATTERN, (_, amount) => `${realCurrency} ${amount}`);
+      }
+
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));
       if (planId) setPlanStatus(planId, "completed");

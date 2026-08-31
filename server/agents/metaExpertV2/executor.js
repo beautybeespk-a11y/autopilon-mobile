@@ -105,10 +105,27 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // here, at the one place that actually spends real API calls, rather
   // than let an old row's zombie enum value reach Meta's real API again.
   const safeBidStrategy = strategy.bid_strategy === "LOWEST_COST_WITHOUT_CAP" ? strategy.bid_strategy : "LOWEST_COST_WITHOUT_CAP";
+  // Live bug (round 31): approval/budget/Pixel all worked and the request
+  // reached Meta, which then rejected it: "Bid amount required... For
+  // LOWEST_COST_WITH_BID_CAP you must provide bid_amount... For TARGET_COST
+  // you must provide bid_amount..." (Meta error 100/1815857) — even though
+  // bid_strategy sent on the ad set below was always LOWEST_COST_WITHOUT_
+  // CAP (see safeBidStrategy above), which needs no bid_amount at all. Root
+  // cause: the campaign below ALSO carried its own daily_budget, which is
+  // what turns on Meta's Campaign Budget Optimization (CBO) — and under
+  // CBO, bid_strategy belongs on the CAMPAIGN, not the ad set; Meta ignores
+  // whatever bid_strategy an ad set sends in that mode. Since this campaign
+  // was never given a bid_strategy of its own, Meta fell back to a capped
+  // default at the campaign level with no bid_amount behind it — hence the
+  // error, regardless of what the ad set said. Every strategy this executor
+  // builds is exactly one ad set per campaign (Step 8/9), so there is no
+  // reason to run CBO at all: budget now lives ONLY on the ad set (Ad Set
+  // Budget Optimization/ABO), which is where bid_strategy already is —
+  // eliminating the CBO/ABO mismatch rather than trying to keep both
+  // budget levels and both bid_strategy locations in sync.
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, {
     name: `${strategy.business_goal} — ${strategy.recommended_objective}`,
     objective: strategy.recommended_objective,
-    dailyBudget: minorUnitBudget,
     status: "PAUSED",
   });
   const adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, {
