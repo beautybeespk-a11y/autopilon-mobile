@@ -71,6 +71,57 @@ function buildOptimizationFields(strategy, resolvedPixelId) {
   return { optimization_goal: metaGoal, promoted_object: { pixel_id: resolvedPixelId, custom_event_type: strategy.optimization_event } };
 }
 
+// Live bug (round 31, third recurrence): "You can't use the selected
+// performance goal with your campaign objective. Please select a
+// different goal, or edit your campaign." (Meta error 100/2490408).
+// Traced via the round-31 diagnostic logging to promoted_object.pixel_id:
+// null in the actual ad set request — optimization_event was PURCHASE
+// (requires OFFSITE_CONVERSIONS + a real promoted_object), but
+// resolvedAssets.pixelId was null. Root cause: a strategy with a
+// genuinely ambiguous Pixel (2+ Pixels, no default) is correctly stored
+// with a real unresolved_questions entry and pixelId left null
+// (strategyBuilder.js) — nothing previously blocked execution while that
+// question was still open (fixed separately: checkV2ExecutionApprovalGate/
+// executeStrategy's own unresolved_questions check above).
+//
+// Rather than fix one field per round as each new Meta rejection reveals
+// it, this validates the WHOLE objective/optimization_goal/promoted_object
+// combination once, right before anything is sent, and fails with a clear
+// message naming the exact bad pairing — never another cryptic Meta
+// rejection reaching the customer for a combination this codebase itself
+// produced. OBJECTIVE_ALLOWED_OPTIMIZATION_EVENTS is deliberately scoped
+// to the exact enums this strategy schema supports (internal_strategy_
+// schema.json) and Meta's real, documented Outcome-Driven Ads Experiences
+// objective/optimization-goal compatibility — not an attempt at Meta's
+// full API surface, which this codebase never needs since these are the
+// only combinations it can ever generate.
+const OBJECTIVE_ALLOWED_OPTIMIZATION_EVENTS = {
+  OUTCOME_SALES: new Set(["PURCHASE", "ADD_TO_CART", "LINK_CLICKS", "LANDING_PAGE_VIEWS"]),
+  OUTCOME_TRAFFIC: new Set(["LINK_CLICKS", "LANDING_PAGE_VIEWS", "REACH", "IMPRESSIONS"]),
+  OUTCOME_LEADS: new Set(["LEAD", "COMPLETE_REGISTRATION", "LINK_CLICKS", "LANDING_PAGE_VIEWS"]),
+  OUTCOME_ENGAGEMENT: new Set(["THRUPLAY", "LINK_CLICKS", "IMPRESSIONS", "REACH"]),
+  OUTCOME_AWARENESS: new Set(["REACH", "IMPRESSIONS", "THRUPLAY"]),
+  OUTCOME_APP_PROMOTION: new Set(["APP_INSTALLS", "LINK_CLICKS"]),
+};
+function validateCampaignFieldCombination(strategy, resolvedAssets) {
+  const allowedEvents = OBJECTIVE_ALLOWED_OPTIMIZATION_EVENTS[strategy.recommended_objective];
+  if (allowedEvents && !allowedEvents.has(strategy.optimization_event)) {
+    const err = new Error(`Invalid pairing: campaign objective "${strategy.recommended_objective}" cannot use optimization_event "${strategy.optimization_event}" — Meta rejects this combination. Build a revised strategy with a compatible optimization_event, or a compatible objective.`);
+    err.code = "META_V2_INVALID_FIELD_COMBINATION";
+    throw err;
+  }
+  // OFFSITE_CONVERSIONS (any conversion-event optimization) requires a
+  // real, resolved Pixel to name in promoted_object — Meta rejects the ad
+  // set with an unrelated-sounding "performance goal" error when this is
+  // missing rather than naming the Pixel directly (the exact live bug
+  // this validator exists to catch before it ever reaches Meta).
+  if (CONVERSION_EVENT_TO_META_GOAL[strategy.optimization_event] && !resolvedAssets.pixelId) {
+    const err = new Error(`optimization_event "${strategy.optimization_event}" requires a real Meta Pixel (promoted_object.pixel_id), but none is resolved for this strategy. Build a revised strategy once a Pixel is chosen.`);
+    err.code = "META_V2_INVALID_FIELD_COMBINATION";
+    throw err;
+  }
+}
+
 function loadExecutable(userId, conversationId, strategyId) {
   const stored = strategyId ? getStoredStrategy(userId, strategyId) : getActiveStrategyForConversation(userId, conversationId);
   if (!stored) {
@@ -93,6 +144,9 @@ function loadExecutable(userId, conversationId, strategyId) {
 
 async function executeCampaignMode(stored, accessToken, userId, currency) {
   const { strategy, resolvedAssets } = stored;
+  // Fail fast, before any Meta network call — see
+  // validateCampaignFieldCombination's own comment above.
+  validateCampaignFieldCombination(strategy, resolvedAssets);
   const minorUnitBudget = toMetaBudgetMinorUnits(strategy.budget_daily, currency);
   // Defense in depth — deriveXIfMissing/normalizeStrategyEnumAliases
   // (strategySchema.js) only run at build/revise TIME. A strategy that
@@ -309,6 +363,20 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   if (dailyBudgetAtExecution > MAX_EXECUTABLE_DAILY_BUDGET) {
     const err = new Error(`This strategy's daily budget (${dailyBudgetAtExecution}) exceeds the current maximum executable daily budget (${MAX_EXECUTABLE_DAILY_BUDGET}) — it cannot be executed as-is. Build a revised strategy with a lower budget.`);
     err.code = "META_V2_BUDGET_LIMIT_EXCEEDED";
+    throw err;
+  }
+
+  // Defense in depth — checkV2ExecutionApprovalGate in orchestrator/
+  // index.js already blocks this before the tool is even dispatched (same
+  // reasoning as the budget checks above: this function is also reachable
+  // directly). A real unresolved_questions entry (e.g. an ambiguous Pixel
+  // with no default — strategyBuilder.js) means resolvedAssets is
+  // genuinely incomplete (pixelId null); executing anyway reaches Meta
+  // with a broken promoted_object and a confusing rejection instead of
+  // this clear one.
+  if (Array.isArray(stored.strategy.unresolved_questions) && stored.strategy.unresolved_questions.length > 0) {
+    const err = new Error(`This strategy still has an unresolved question: "${stored.strategy.unresolved_questions[0]}" — build a revised strategy answering it before executing.`);
+    err.code = "META_V2_UNRESOLVED_QUESTION";
     throw err;
   }
 

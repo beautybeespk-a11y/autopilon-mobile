@@ -1179,6 +1179,110 @@ async function run() {
     }
   });
 
+  // --- Ambiguous Pixel reaching execution (live bug, round 31) ------------
+  // Live report: Meta rejected the ad set with "You can't use the selected
+  // performance goal with your campaign objective" (100/2490408) — traced
+  // via the round-31 diagnostic logging to promoted_object.pixel_id: null.
+  // Root cause: this ad account has 2+ Pixels with no saved default, so
+  // build_strategy correctly stores unresolved_questions (asking which
+  // Pixel to use) and leaves resolvedAssets.pixelId null — but nothing
+  // previously stopped "approve" from reaching execute_strategy anyway.
+  await check("[V2 execution] a genuinely unresolved question (ambiguous Pixel, pixelId left null) blocks execute_strategy even with explicit approval — both at the approval gate and as defense in depth in the executor itself", async () => {
+    const userId = makeUser(`v2-unresolved-question-blocks-exec-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel A" }, { id: "px2", name: "Pixel B" }] },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "an ambiguous Pixel (2+, no default) must be left genuinely unresolved, never guessed");
+
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve it" });
+      assert.ok(gate, "explicit approval must NOT be enough to execute while a real unresolved question is still open");
+      assert.match(gate, /unresolved question/i);
+
+      // Defense in depth — executeStrategy() itself, not just the
+      // orchestrator gate (this function is also reachable directly).
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_V2_UNRESOLVED_QUESTION"
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Objective/optimization_event/promoted_object validation (round 31) --
+  // Explicit request: rather than fixing one Meta-rejected field per round,
+  // validate the whole combination before sending and fail with a clear
+  // message naming the bad pairing. This test constructs a strategy with a
+  // genuinely mismatched pairing (nothing at build time currently checks
+  // objective-vs-optimization_event consistency — only that a Traffic
+  // objective isn't silently recommended for a clear e-commerce business)
+  // and confirms execute_strategy refuses it with a clear, specific error
+  // instead of ever reaching Meta with an invalid request.
+  await check("[V2 execution] a mismatched objective/optimization_event pairing is refused with a clear, specific error before it ever reaches Meta", async () => {
+    const userId = makeUser(`v2-invalid-field-combination-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      // OUTCOME_ENGAGEMENT paired with PURCHASE (an OFFSITE_CONVERSIONS-only
+      // event, meaningless for an Engagement campaign) — Meta would reject
+      // this exact combination the same way it rejected the live bug.
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500, recommended_objective: "OUTCOME_ENGAGEMENT" }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_V2_INVALID_FIELD_COMBINATION" && /OUTCOME_ENGAGEMENT/.test(err.message) && /PURCHASE/.test(err.message)
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- promoted_object.pixel_id validation, direct (round 31) -------------
+  // Same validator, the OTHER half: a PURCHASE-optimized strategy that
+  // somehow reaches execution with no resolved Pixel at all (defense in
+  // depth for any path other than the ambiguous-Pixel one above) must
+  // still be refused with a clear, specific error naming the real problem
+  // (a missing Pixel), never a raw, confusing Meta rejection.
+  await check("[V2 execution] a PURCHASE-optimized strategy with no resolved Pixel at all is refused with a clear error naming the missing Pixel", async () => {
+    const userId = makeUser(`v2-missing-pixel-combination-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // Zero Pixels connected — Acceptance H already covers the BUILD-time
+    // hard rejection for this case; this test targets EXECUTE-time defense
+    // in depth for a strategy that reached storage some other way (e.g. a
+    // stale row from before this validator existed) with pixelId genuinely
+    // null and a PURCHASE optimization_event still on it.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.resolved.pixelId, "sanity: this strategy DOES have a real Pixel resolved going into the corruption below");
+      // Simulate a stale/corrupted stored row (the class of scenario this
+      // defense-in-depth check exists for) by clearing pixelId directly in
+      // storage — never reachable through the normal build/revise path
+      // while a real Pixel is connected. Same pattern as the stale
+      // bid_strategy defense-in-depth test above; reads the CURRENT full
+      // resolvedAssets first so adAccountName/adAccountCurrency/pageName
+      // (never part of buildStrategy()'s own return value — see
+      // assetResolution.js's separate `names` object) aren't dropped.
+      const staleResolvedAssets = { ...getStoredStrategy(userId, built.strategyId).resolvedAssets, pixelId: null };
+      db.prepare("UPDATE meta_v2_strategies SET resolvedAssetsJson = ? WHERE id = ?").run(JSON.stringify(staleResolvedAssets), built.strategyId);
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_V2_INVALID_FIELD_COMBINATION" && /requires a real Meta Pixel/i.test(err.message)
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Claimed execution without ever calling the tool (live bug, round 17) --
   // Live screenshot: execute_strategy was blocked for a missing budget,
   // the model correctly asked the user for one, the user replied "500/

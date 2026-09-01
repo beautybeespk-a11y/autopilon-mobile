@@ -274,6 +274,36 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
     await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot });
 
+  // Live bug (round 31): a revision's requestedChanges only ever names the
+  // fields actually changing (e.g. just budget_daily, from the round-30
+  // auto-revise triggered by the user supplying a budget in chat) —
+  // mergeForRevision above carries every OTHER field forward from the
+  // prior row via the generic "any key present in requestedChanges
+  // overrides" merge, and unresolved_questions is one of those (not an
+  // ASSET_FIELD). A MECHANICALLY-injected question from a PRIOR row (the
+  // budget-missing ask below, or the ambiguous-Pixel ask further below)
+  // therefore survives verbatim into a revision that actually answers
+  // it — the underlying condition is now false, but the stale question
+  // text is still sitting in unresolved_questions, which the round-31
+  // execution-time gate (checkV2ExecutionApprovalGate/executeStrategy)
+  // correctly refuses to execute past, blocking a strategy that's
+  // genuinely ready. Prune BOTH known mechanical questions the moment
+  // their trigger condition is no longer true, right before the two
+  // injection blocks below (so a condition that's STILL true simply gets
+  // re-added by them, deduplicated via the same Set pattern they already
+  // use) — never touches a genuine, model-authored business question,
+  // which is never exactly one of these two fixed strings.
+  if (normalized.unresolved_questions?.length) {
+    normalized = {
+      ...normalized,
+      unresolved_questions: normalized.unresolved_questions.filter((q) => {
+        if (q === "What daily budget would you like for this?") return normalized.budget_daily == null;
+        if (q === "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?") return !resolved.pixelId;
+        return true;
+      }),
+    };
+  }
+
   // Requirement (round-14-equivalent, built in from the start this time):
   // a genuinely AMBIGUOUS Pixel (2+ available, no default, no explicit
   // choice) becomes a real unresolved_questions ask, never a hard

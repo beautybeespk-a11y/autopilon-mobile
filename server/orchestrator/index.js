@@ -265,6 +265,23 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   if (typeof active.strategy.budget_daily !== "number" || active.strategy.budget_daily <= 0) {
     return "This strategy still has no daily budget set — Meta requires a real budget to create the Ad Set and this call would fail. Ask the user what daily budget they'd like (or call meta_expert_v2.revise_strategy with a budget_daily once they answer) before calling execute_strategy again.";
   }
+  // Live bug (round 31): a strategy with a genuinely AMBIGUOUS Pixel (2+
+  // Pixels connected, none set as default — see strategyBuilder.js) is
+  // correctly stored with a real unresolved_questions entry asking which
+  // one to use, and resolvedAssets.pixelId is genuinely null until that's
+  // answered — but nothing here ever checked for a real unresolved
+  // question before letting an "approve" reach execute_strategy. The
+  // strategy still had PURCHASE optimization_event, so the ad set request
+  // built with a null promoted_object.pixel_id, and Meta rejected it with
+  // "You can't use the selected performance goal with your campaign
+  // objective" (Meta error 100/2490408) — a genuinely confusing message
+  // for what was actually a missing-Pixel-choice problem. A real
+  // unresolved_questions entry means a genuine business decision is still
+  // open regardless of what the user's message says — "approve" cannot
+  // answer a question it never addressed.
+  if (Array.isArray(active.strategy.unresolved_questions) && active.strategy.unresolved_questions.length > 0) {
+    return `This strategy still has an unresolved question that must be answered first: "${active.strategy.unresolved_questions[0]}" — ask the user for that specific answer, then call meta_expert_v2.revise_strategy with the answer before calling execute_strategy again.`;
+  }
   return null;
 }
 
