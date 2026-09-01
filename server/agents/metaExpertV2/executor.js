@@ -21,6 +21,7 @@ import { publishEvent } from "../../automation/triggers.js";
 import { MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
 import { getStoredStrategy, getActiveStrategyForConversation, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
+import { logger } from "../../config/logger.js";
 
 // Live bug (round 20): a PKR ad account, "budget_daily: 500" (the user's
 // own words, "500/day", meaning 500 whole Rupees), and Meta's real Ad Set
@@ -123,12 +124,27 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // Budget Optimization/ABO), which is where bid_strategy already is —
   // eliminating the CBO/ABO mismatch rather than trying to keep both
   // budget levels and both bid_strategy locations in sync.
-  const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, {
-    name: `${strategy.business_goal} — ${strategy.recommended_objective}`,
-    objective: strategy.recommended_objective,
-    status: "PAUSED",
-  });
-  const adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, {
+  const campaignParams = { name: `${strategy.business_goal} — ${strategy.recommended_objective}`, objective: strategy.recommended_objective, status: "PAUSED" };
+  // Diagnostic logging (round 31 live bug: the identical Meta error
+  // 100/1815857 recurred after the CBO/ABO fix above was deployed) — the
+  // NEXT live attempt needs real evidence instead of another guess.
+  // campaignRequestBody mirrors meta.createCampaign's own body
+  // construction exactly (api.js adds special_ad_categories: [] and
+  // renames dailyBudget -> daily_budget; there is no dailyBudget key in
+  // campaignParams at all, so no daily_budget reaches this request) —
+  // this is genuinely what leaves the server, not an approximation.
+  // meta.createAdSet passes its fields argument straight through as the
+  // body with no renaming, so adSetParams below IS the real request body.
+  // Always-on (not gated by META_EXPERT_V2_TRACE) since this is the one
+  // call path that spends real money and needs to be diagnosable from
+  // production logs on the very next attempt, not just when tracing is
+  // deliberately turned on beforehand.
+  const campaignRequestBody = { ...campaignParams, special_ad_categories: [] };
+  logger.info("meta_expert_v2.execute_strategy.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: campaignRequestBody });
+  const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, campaignParams);
+  logger.info("meta_expert_v2.execute_strategy.campaign_response", { strategyId: stored.id, campaign });
+
+  const adSetParams = {
     name: `${strategy.business_goal} — ad set`,
     campaign_id: campaign.id,
     daily_budget: minorUnitBudget,
@@ -137,7 +153,11 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
     bid_strategy: safeBidStrategy,
     targeting: buildTargeting({ countries: strategy.countries, ageMin: strategy.age_min, ageMax: strategy.age_max, gender: strategy.gender === "ALL" ? undefined : strategy.gender?.toLowerCase() }),
     status: "PAUSED",
-  });
+  };
+  logger.info("meta_expert_v2.execute_strategy.adset_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: adSetParams });
+  const adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, adSetParams);
+  logger.info("meta_expert_v2.execute_strategy.adset_response", { strategyId: stored.id, adSet });
+
   const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED" };
   publishEvent(userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: campaign.id, name: strategy.business_goal, source: "meta_expert_v2" });
   return executionResult;
@@ -163,17 +183,19 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
 async function executeExplicitAction(stored, accessToken, userId, conversationId) {
   const { strategy, resolvedAssets } = stored;
   const objective = strategy.recommended_objective || "OUTCOME_ENGAGEMENT";
-  const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, {
-    name: `${strategy.business_goal} — ${objective}`,
-    objective,
-    dailyBudget: strategy.budget_daily,
-    status: "PAUSED",
-  });
+  const campaignParams = { name: `${strategy.business_goal} — ${objective}`, objective, dailyBudget: strategy.budget_daily, status: "PAUSED" };
+  // Diagnostic logging (round 31) — see executeCampaignMode's matching log
+  // lines above; kept here too so a live report is distinguishable by
+  // which of the two modes actually dispatched (see the dispatch log in
+  // executeStrategy below), not assumed from the conversation's shape.
+  logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: { name: campaignParams.name, objective: campaignParams.objective, status: campaignParams.status, daily_budget: campaignParams.dailyBudget, special_ad_categories: [] } });
+  const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, campaignParams);
+  logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_response", { strategyId: stored.id, campaign });
   const adSetTool = getTool("meta.create_ad_set");
-  const adSetResult = await adSetTool.execute(
-    { adAccountId: resolvedAssets.adAccountId, campaignId: campaign.id, name: `${strategy.business_goal} — ad set`, dailyBudget: strategy.budget_daily, optimizationGoal: "LINK_CLICKS", billingEvent: "IMPRESSIONS", countries: strategy.countries || ["PK"] },
-    { userId, conversationId }
-  );
+  const adSetToolParams = { adAccountId: resolvedAssets.adAccountId, campaignId: campaign.id, name: `${strategy.business_goal} — ad set`, dailyBudget: strategy.budget_daily, optimizationGoal: "LINK_CLICKS", billingEvent: "IMPRESSIONS", countries: strategy.countries || ["PK"] };
+  logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_request", { strategyId: stored.id, params: adSetToolParams });
+  const adSetResult = await adSetTool.execute(adSetToolParams, { userId, conversationId });
+  logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_response", { strategyId: stored.id, adSetResult });
 
   let creativeResult;
   if (strategy.action_type === "BOOST_FACEBOOK_POST") {
@@ -273,6 +295,9 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
       throw new Error(`This strategy was built for a ${builtForCurrency} ad account, but the ad account's real currency is now ${adAccount.currency} — refusing to execute rather than risk spending the wrong amount. Build a new strategy to pick up the current currency.`);
     }
 
+    // Diagnostic logging (round 31) — which branch actually ran, so a live
+    // report can be checked against the real dispatch instead of assumed.
+    logger.info("meta_expert_v2.execute_strategy.dispatch", { strategyId: stored.id, mode: stored.mode, adAccountId: stored.resolvedAssets.adAccountId, adAccountCurrency: adAccount.currency });
     const executionResult = stored.mode === "explicit_action"
       ? await executeExplicitAction(stored, accessToken, userId, conversationId)
       : await executeCampaignMode(stored, accessToken, userId, adAccount.currency);
