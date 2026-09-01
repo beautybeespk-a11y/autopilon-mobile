@@ -37,7 +37,24 @@ const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instag
 function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
   const merged = { ...prior.strategy, ...requestedChanges };
   for (const field of ASSET_FIELDS) {
-    if (!explicitAssetChanges.has(field)) merged[field] = prior.strategy[field];
+    if (explicitAssetChanges.has(field)) continue;
+    // Live bug (round 31): this protection exists to stop an ALREADY-
+    // resolved asset from being silently reassigned by a restated field
+    // (round 11's original bug) — it has nothing to protect when the
+    // field was left genuinely UNRESOLVED (an ambiguous Pixel with no
+    // default, resolvedAssets.pixelId null — see the matching relaxation
+    // in assetResolution.js's pixel resolution). Reverting merged.pixel
+    // back to the prior strategy's raw field in that case discarded the
+    // user's actual answer to the open question before resolution ever
+    // ran, causing a real live infinite loop: the SAME unresolved-
+    // question error recurring forever even after the user answered it.
+    // Only pixel currently has this "stored with a real open question,
+    // resolvedAssets null" state — every other asset field either
+    // resolves deterministically or hard-rejects the whole build/revise
+    // at build time (never reaches storage half-resolved), so this
+    // exception is scoped to pixel alone.
+    if (field === "pixel" && !prior.resolvedAssets?.pixelId) continue;
+    merged[field] = prior.strategy[field];
   }
   return merged;
 }
@@ -163,6 +180,14 @@ function formatRecommendation(strategy, names) {
 
 async function runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput, revisionOf, priorStored, freshResearchRequired }) {
   const explicitAssetChanges = new Set(Array.isArray(explicitAssetChangesInput) ? explicitAssetChangesInput.filter((f) => ASSET_FIELDS.includes(f)) : []);
+  // Diagnostic (round 31 live bug: a revise_strategy call answering an
+  // open Pixel-ambiguity question kept re-hitting the SAME question in a
+  // loop) — the raw call parameters, before any merge/normalization, so a
+  // future incident is diagnosable directly from this line rather than
+  // inferred from the final stored row.
+  if (traceEnabled && revisionOf) {
+    trace("revise_strategy request", { conversationId, revisionOf, requestedChangesPixelRef: requestedChanges?.pixel?.ref ?? null, explicitAssetChangesInput: explicitAssetChangesInput || [] });
+  }
 
   let merged = priorStored ? mergeForRevision(priorStored, requestedChanges, explicitAssetChanges) : requestedChanges;
 
@@ -402,6 +427,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     anyPixelExists, usablePixelForSelectedAdAccount, resolvedPixelId: resolved.pixelId, pixelAmbiguous,
     recommended_objective: normalized.recommended_objective, optimization_event: normalized.optimization_event,
     budget_daily: normalized.budget_daily, budget_basis: normalized.budget_basis,
+    unresolvedQuestions: normalized.unresolved_questions || [],
     errorCount: errors.length,
   });
 

@@ -1215,6 +1215,54 @@ async function run() {
     }
   });
 
+  // --- Answering the ambiguous-Pixel question (live bug, round 31) --------
+  // Live report: after the unresolved-question gate above correctly
+  // blocked execution, the user answered "Pixel ID: 1241102478031429" —
+  // revise_strategy ran and claimed the Pixel was updated, but the SAME
+  // unresolved-question error kept recurring forever. Root cause: the
+  // model's revise_strategy call supplied requestedChanges.pixel.ref but
+  // never ALSO declared explicitAssetChanges: ["pixel"] — the ordinary
+  // explicitAssetChanges gate (which exists to stop an ALREADY-resolved
+  // asset from being silently reassigned, round 11) then ignored the id
+  // entirely and re-resolved into the SAME ambiguity every time. This
+  // test reproduces the exact call shape that caused the loop — a real
+  // pixel ref with NO explicitAssetChanges — against a prior row whose
+  // Pixel was never actually resolved (nothing for that gate to protect).
+  await check("[V2 execution] answering an open ambiguous-Pixel question via revise_strategy (a real ref, with or without explicitAssetChanges) actually resolves the Pixel and clears the question — no infinite loop", async () => {
+    const userId = makeUser(`v2-pixel-answer-persists-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      // Realistic Meta Pixel id shape (numeric) — matches the live report
+      // ("Pixel ID: 1241102478031429") and resolvePixelId's own real
+      // validation (isPlausiblePixelId requires a numeric-looking id).
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the revision below");
+
+      // The exact live shape: the model's answer, with NO explicitAssetChanges.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { pixel: { ref: "1241102478031429" } },
+        userMessage: "Pixel ID: 1241102478031429",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.resolved.pixelId, "1241102478031429", "the user's chosen Pixel must actually be resolved, not silently dropped for lack of explicitAssetChanges");
+      assert.deepEqual(revised.strategy.unresolved_questions, [], "the Pixel question must be cleared now that it's genuinely resolved");
+
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve it" });
+      assert.equal(gate, null, "execution must now be allowed — the real question was actually answered");
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
+      assert.equal(executed.status, "PAUSED");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Objective/optimization_event/promoted_object validation (round 31) --
   // Explicit request: rather than fixing one Meta-rejected field per round,
   // validate the whole combination before sending and fail with a clear

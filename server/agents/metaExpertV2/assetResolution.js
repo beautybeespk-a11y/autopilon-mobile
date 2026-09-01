@@ -26,10 +26,18 @@ import { PURCHASE_LIKE_EVENTS } from "./strategySchema.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
-function explicitAssetRef(refObj, field, explicitAssetChanges) {
+// A real, non-semantic ref value (never a bare id trusted just because the
+// model happened to emit one — see the module comment at the top of this
+// file) — used both as the ordinary explicitAssetChanges-gated case below
+// and, for pixel only, as the ungated fallback (see its call site).
+function realAssetRef(refObj) {
   const ref = refObj?.ref;
   if (!ref || SEMANTIC_REFS.has(ref)) return undefined;
-  return explicitAssetChanges.has(field) ? ref : undefined;
+  return ref;
+}
+function explicitAssetRef(refObj, field, explicitAssetChanges) {
+  const ref = realAssetRef(refObj);
+  return ref && explicitAssetChanges.has(field) ? ref : undefined;
 }
 
 function nameFrom(list, id) {
@@ -108,7 +116,24 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
       resolved.pixelId = priorResolved.pixelId;
     } else {
       try {
-        const explicitId = explicitAssetRef(strategy.pixel, "pixel", explicitAssetChanges);
+        // Live bug (round 31): a genuinely AMBIGUOUS prior Pixel
+        // (priorResolved.pixelId null — nothing was ever actually
+        // resolved, only a real unresolved_questions entry asking which
+        // one) has nothing for the ordinary explicitAssetChanges gate to
+        // protect — that gate exists specifically to stop an ALREADY-
+        // resolved asset from being silently reassigned just because the
+        // model restated it in prose (round 11), which cannot apply when
+        // nothing was resolved yet. Requiring the model to ALSO remember
+        // explicitAssetChanges:["pixel"] on top of directly answering the
+        // question it was just asked produced a genuine live infinite
+        // loop: the model called revise_strategy with the user's chosen
+        // Pixel id, said "updated," but the backend silently dropped the
+        // id (explicitAssetChanges wasn't set), re-resolved into the SAME
+        // ambiguity, and re-asked the SAME question forever. A real,
+        // non-semantic ref is honored here whenever there was genuinely
+        // nothing resolved to protect — never for an already-resolved
+        // Pixel, where the ordinary gated path below still applies.
+        const explicitId = explicitAssetRef(strategy.pixel, "pixel", explicitAssetChanges) || (!priorResolved?.pixelId ? realAssetRef(strategy.pixel) : undefined);
         const { pixelId, available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: explicitId, userId });
         resolved.pixelId = pixelId;
         availablePixels = available;
