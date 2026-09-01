@@ -155,7 +155,28 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
     status: "PAUSED",
   };
   logger.info("meta_expert_v2.execute_strategy.adset_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: adSetParams });
-  const adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, adSetParams);
+  // Live gap (round 31): the campaign above is created FIRST — if this ad
+  // set creation then fails (exactly what the bid_amount rejection does),
+  // nothing previously cleaned it up. A real, empty, PAUSED campaign was
+  // left behind on the actual ad account on every single failed attempt —
+  // never spending money by itself, but a genuine orphan accumulating with
+  // every retry during live testing. Best-effort: on any failure past this
+  // point, delete the campaign we just created before rethrowing the
+  // original error (never masking it with a cleanup failure) — a cleanup
+  // failure is logged, not thrown, since the customer needs the REAL
+  // reason execution failed, not a secondary cleanup problem.
+  let adSet;
+  try {
+    adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, adSetParams);
+  } catch (err) {
+    try {
+      await meta.setCampaignStatus(accessToken, campaign.id, "DELETED");
+      logger.warn("meta_expert_v2.execute_strategy.orphaned_campaign_cleaned_up", { strategyId: stored.id, campaignId: campaign.id });
+    } catch (cleanupErr) {
+      logger.error("meta_expert_v2.execute_strategy.orphaned_campaign_cleanup_failed", { strategyId: stored.id, campaignId: campaign.id, cleanupError: cleanupErr.message });
+    }
+    throw err;
+  }
   logger.info("meta_expert_v2.execute_strategy.adset_response", { strategyId: stored.id, adSet });
 
   const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED" };
@@ -191,34 +212,52 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
   logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: { name: campaignParams.name, objective: campaignParams.objective, status: campaignParams.status, daily_budget: campaignParams.dailyBudget, special_ad_categories: [] } });
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, campaignParams);
   logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_response", { strategyId: stored.id, campaign });
-  const adSetTool = getTool("meta.create_ad_set");
-  const adSetToolParams = { adAccountId: resolvedAssets.adAccountId, campaignId: campaign.id, name: `${strategy.business_goal} — ad set`, dailyBudget: strategy.budget_daily, optimizationGoal: "LINK_CLICKS", billingEvent: "IMPRESSIONS", countries: strategy.countries || ["PK"] };
-  logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_request", { strategyId: stored.id, params: adSetToolParams });
-  const adSetResult = await adSetTool.execute(adSetToolParams, { userId, conversationId });
-  logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_response", { strategyId: stored.id, adSetResult });
-
+  // Live gap (round 31) — same orphaned-campaign risk as executeCampaignMode
+  // above: the campaign is already created by this point, and everything
+  // below it (the shared ad set tool, then the boost/create-image-ad call)
+  // can still fail. Best-effort cleanup on any failure past this point,
+  // same pattern: delete the campaign we just created, log the cleanup
+  // outcome, and always rethrow the ORIGINAL error — a cleanup failure
+  // must never replace the real reason execution failed.
+  let adSetResult;
   let creativeResult;
-  if (strategy.action_type === "BOOST_FACEBOOK_POST") {
-    creativeResult = await getTool("meta.boost_post").execute(
-      { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, postId: resolvedAssets.contentId },
-      { userId, conversationId }
-    );
-  } else if (strategy.action_type === "BOOST_INSTAGRAM_POST") {
-    creativeResult = await getTool("meta.boost_post").execute(
-      { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, instagramMediaId: resolvedAssets.contentId, pageId: resolvedAssets.pageId },
-      { userId, conversationId }
-    );
-  } else if (strategy.action_type === "USE_ATTACHED_IMAGE") {
-    creativeResult = await getTool("meta.create_image_ad").execute(
-      {
-        adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, pageId: resolvedAssets.pageId, name: strategy.business_goal,
-        imageReferenceId: resolvedAssets.contentId, primaryText: strategy.reasoning_summary, headline: strategy.business_goal, link: "",
-      },
-      { userId, conversationId }
-    );
-  } else {
-    const err = new Error(`Explicit action type "${strategy.action_type}" is not yet supported for execution.`);
-    err.code = "META_V2_ACTION_NOT_SUPPORTED";
+  try {
+    const adSetTool = getTool("meta.create_ad_set");
+    const adSetToolParams = { adAccountId: resolvedAssets.adAccountId, campaignId: campaign.id, name: `${strategy.business_goal} — ad set`, dailyBudget: strategy.budget_daily, optimizationGoal: "LINK_CLICKS", billingEvent: "IMPRESSIONS", countries: strategy.countries || ["PK"] };
+    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_request", { strategyId: stored.id, params: adSetToolParams });
+    adSetResult = await adSetTool.execute(adSetToolParams, { userId, conversationId });
+    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_response", { strategyId: stored.id, adSetResult });
+
+    if (strategy.action_type === "BOOST_FACEBOOK_POST") {
+      creativeResult = await getTool("meta.boost_post").execute(
+        { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, postId: resolvedAssets.contentId },
+        { userId, conversationId }
+      );
+    } else if (strategy.action_type === "BOOST_INSTAGRAM_POST") {
+      creativeResult = await getTool("meta.boost_post").execute(
+        { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, instagramMediaId: resolvedAssets.contentId, pageId: resolvedAssets.pageId },
+        { userId, conversationId }
+      );
+    } else if (strategy.action_type === "USE_ATTACHED_IMAGE") {
+      creativeResult = await getTool("meta.create_image_ad").execute(
+        {
+          adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, pageId: resolvedAssets.pageId, name: strategy.business_goal,
+          imageReferenceId: resolvedAssets.contentId, primaryText: strategy.reasoning_summary, headline: strategy.business_goal, link: "",
+        },
+        { userId, conversationId }
+      );
+    } else {
+      const err = new Error(`Explicit action type "${strategy.action_type}" is not yet supported for execution.`);
+      err.code = "META_V2_ACTION_NOT_SUPPORTED";
+      throw err;
+    }
+  } catch (err) {
+    try {
+      await meta.setCampaignStatus(accessToken, campaign.id, "DELETED");
+      logger.warn("meta_expert_v2.execute_strategy.orphaned_campaign_cleaned_up", { strategyId: stored.id, campaignId: campaign.id });
+    } catch (cleanupErr) {
+      logger.error("meta_expert_v2.execute_strategy.orphaned_campaign_cleanup_failed", { strategyId: stored.id, campaignId: campaign.id, cleanupError: cleanupErr.message });
+    }
     throw err;
   }
 

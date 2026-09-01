@@ -1131,6 +1131,49 @@ async function run() {
     }
   });
 
+  // --- Orphaned campaign cleanup (live gap, round 31) ----------------------
+  // Live report: on the exact bid_amount rejection above (Meta error
+  // 100/1815857), the campaign IS created successfully — the error is on
+  // the ad set POST only, no campaign-level error at all. Nothing
+  // previously cleaned that campaign up on a subsequent failure, so every
+  // failed execute_strategy attempt (and this bug fired on every live
+  // attempt during this debugging session) left a real, empty, PAUSED
+  // campaign behind on the actual ad account. This test guards the fix:
+  // on an ad set creation failure, the just-created campaign is deleted
+  // before the original error is rethrown.
+  await check("[V2 execution] a failed ad set creation deletes the just-created campaign instead of leaving it orphaned on the real ad account", async () => {
+    const userId = makeUser(`v2-orphan-cleanup-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        writes,
+        // The exact live shape: rejected on /adsets only, with no
+        // campaign-level error — the campaign write above it must succeed.
+        writeError: { pathSuffix: "/adsets", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 1815857, error_user_title: "Bid Amount Required For The Bid Strategy Provided" } },
+      },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === 100 && err.subcode === 1815857
+      );
+      const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
+      assert.ok(campaignWrite, "the campaign must genuinely have been created — Meta only rejects at the ad set step in this scenario");
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.ok(adSetWrite, "the ad set creation must have been attempted and rejected");
+      const cleanupWrite = writes.find((w) => /^\/\d+$/.test(w.path) && w.body?.status === "DELETED");
+      assert.ok(cleanupWrite, `the orphaned campaign must be deleted after the ad set creation fails, not left behind: ${JSON.stringify(writes)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Claimed execution without ever calling the tool (live bug, round 17) --
   // Live screenshot: execute_strategy was blocked for a missing budget,
   // the model correctly asked the user for one, the user replied "500/
