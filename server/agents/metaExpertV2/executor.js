@@ -124,13 +124,26 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // Budget Optimization/ABO), which is where bid_strategy already is —
   // eliminating the CBO/ABO mismatch rather than trying to keep both
   // budget levels and both bid_strategy locations in sync.
-  const campaignParams = { name: `${strategy.business_goal} — ${strategy.recommended_objective}`, objective: strategy.recommended_objective, status: "PAUSED" };
+  // Live bug (round 31, second recurrence): with CBO genuinely off (no
+  // campaign-level daily_budget — confirmed: the bid_amount error is gone,
+  // replaced by a DIFFERENT one), Meta now requires
+  // is_adset_budget_sharing_enabled to be explicitly declared: "You must
+  // specify True or False in the field is_adset_budget_sharing_enabled if
+  // you are not using campaign budget... Passing in True will enable your
+  // ad sets to share 20% of their budget to optimize overall performance"
+  // (Meta error 100/4834011). Explicitly false — each ad set's approved
+  // budget must stay exactly what was approved; Meta reallocating a slice
+  // of it on its own is exactly the kind of silent-drift a real spend
+  // decision must never be subject to unasked.
+  const campaignParams = { name: `${strategy.business_goal} — ${strategy.recommended_objective}`, objective: strategy.recommended_objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
   // Diagnostic logging (round 31 live bug: the identical Meta error
-  // 100/1815857 recurred after the CBO/ABO fix above was deployed) — the
-  // NEXT live attempt needs real evidence instead of another guess.
-  // campaignRequestBody mirrors meta.createCampaign's own body
-  // construction exactly (api.js adds special_ad_categories: [] and
-  // renames dailyBudget -> daily_budget; there is no dailyBudget key in
+  // 100/1815857 recurred after the CBO/ABO fix above was deployed, because
+  // that fix hadn't actually been deployed yet — see round 31's follow-up
+  // commits) — the NEXT live attempt needs real evidence instead of
+  // another guess. campaignRequestBody mirrors meta.createCampaign's own
+  // body construction exactly (api.js adds special_ad_categories: [] and
+  // renames dailyBudget -> daily_budget/isAdsetBudgetSharingEnabled ->
+  // is_adset_budget_sharing_enabled; there is no dailyBudget key in
   // campaignParams at all, so no daily_budget reaches this request) —
   // this is genuinely what leaves the server, not an approximation.
   // meta.createAdSet passes its fields argument straight through as the
@@ -139,7 +152,7 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // call path that spends real money and needs to be diagnosable from
   // production logs on the very next attempt, not just when tracing is
   // deliberately turned on beforehand.
-  const campaignRequestBody = { ...campaignParams, special_ad_categories: [] };
+  const campaignRequestBody = { name: campaignParams.name, objective: campaignParams.objective, status: campaignParams.status, is_adset_budget_sharing_enabled: campaignParams.isAdsetBudgetSharingEnabled, special_ad_categories: [] };
   logger.info("meta_expert_v2.execute_strategy.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: campaignRequestBody });
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, campaignParams);
   logger.info("meta_expert_v2.execute_strategy.campaign_response", { strategyId: stored.id, campaign });

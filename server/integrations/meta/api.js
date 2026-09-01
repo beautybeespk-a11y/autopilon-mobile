@@ -61,11 +61,22 @@ export async function listCampaigns(accessToken, adAccountId) {
   return data.data || [];
 }
 
-export async function createCampaign(accessToken, adAccountId, { name, objective, dailyBudget, status = "PAUSED" }) {
+// isAdsetBudgetSharingEnabled: optional, new (round 31 live bug) — a
+// campaign created with NO campaign-level budget (ABO — see
+// metaExpertV2/executor.js's executeCampaignMode) now gets rejected by
+// Meta with "You must specify True or False in the field
+// is_adset_budget_sharing_enabled if you are not using campaign budget"
+// (error 100/4834011) unless this is explicitly declared. Left undefined
+// (dropped from the request body, exactly as before) for every existing
+// caller that doesn't pass it — V1's own callers, and V2's
+// executeExplicitAction (which sets a campaign-level budget/CBO, so this
+// field's error condition doesn't apply there) — never sending it unless
+// a caller opts in.
+export async function createCampaign(accessToken, adAccountId, { name, objective, dailyBudget, status = "PAUSED", isAdsetBudgetSharingEnabled }) {
   return metaFetch(`/${normalizeAdAccountId(adAccountId)}/campaigns`, {
     accessToken,
     method: "POST",
-    body: { name, objective, status, daily_budget: dailyBudget, special_ad_categories: [] },
+    body: { name, objective, status, daily_budget: dailyBudget, is_adset_budget_sharing_enabled: isAdsetBudgetSharingEnabled, special_ad_categories: [] },
   });
 }
 

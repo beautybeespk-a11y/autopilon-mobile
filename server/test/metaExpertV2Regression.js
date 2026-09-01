@@ -1124,6 +1124,11 @@ async function run() {
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(campaignWrite?.body?.daily_budget, undefined, "the campaign must never carry its own daily_budget — that's what enables CBO and strands the ad set's bid_strategy");
+      // Round 31, second recurrence: with CBO genuinely off, Meta requires
+      // is_adset_budget_sharing_enabled to be explicitly declared (Meta
+      // error 100/4834011 otherwise) — false, so each ad set's approved
+      // budget is never silently reallocated by Meta's own 20% sharing.
+      assert.equal(campaignWrite?.body?.is_adset_budget_sharing_enabled, false, `the campaign must explicitly declare budget sharing off: ${JSON.stringify(campaignWrite?.body)}`);
       assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", `the ad set must send the real, uncapped bid strategy that needs no bid_amount: ${JSON.stringify(adSetWrite?.body)}`);
       assert.equal(adSetWrite?.body?.bid_amount, undefined, "no bid_amount must ever be invented — LOWEST_COST_WITHOUT_CAP needs none");
     } finally {
