@@ -293,6 +293,100 @@ async function run() {
     }
   });
 
+  // --- Symmetric goal substitution (live bug, round 31) -------------------
+  // Live report: "I want more visitors on my website" -> Website Purchases
+  // (OUTCOME_SALES) recommended, the "Why" section argued for purchases,
+  // and the literal ask was never once acknowledged. Acceptance B above
+  // only ever guards the OPPOSITE direction (silently downgrading FROM
+  // sales TO traffic for a clear e-commerce business) — this guards the
+  // direction that actually broke: silently upgrading FROM a literal
+  // traffic request TO something else. Deliberately NOT connected to
+  // WooCommerce here (no clear-ecommerce signal at all) — proving this
+  // fires independent of how confidently the backend can classify the
+  // business, which is exactly the gap that let the live case through.
+  await check("[V2 policy] a literal 'more visitors' request recommended as Sales with NO acknowledgment is REJECTED — silently substituting a stated goal is not allowed even without a clear e-commerce signal", async () => {
+    const userId = makeUser(`v2-literal-traffic-silent-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const strategy = baseStrategy(); // recommended_objective OUTCOME_SALES, no goal_alignment
+      const result = await buildStrategy({ userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more visitors on my website" });
+      assert.equal(result.ok, false, "recommending Sales for a literal traffic request must require acknowledgment");
+      assert.match(result.unresolved.issue, /asked for traffic\/visitors specifically/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] the same literal 'more visitors' request is ACCEPTED once goal_alignment acknowledges the substitution, and the acknowledgment actually reaches the customer-facing text", async () => {
+    const userId = makeUser(`v2-literal-traffic-acknowledged-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const strategy = baseStrategy({
+        goal_alignment: { literal_request: "more visitors", likely_business_outcome: "a store makes money from purchases, not raw visits", recommendation_differs_from_literal_request: true },
+      });
+      const result = await buildStrategy({ userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more visitors on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      // The actual point of the fix: the acknowledgment must reach the
+      // TEXT the customer reads, not just satisfy a schema field — never
+      // relying on the model's own reasoning_summary prose to mention it.
+      assert.match(result.recommendationText, /You asked for: more visitors/i, `the substitution must be explicitly acknowledged in the customer-facing text: ${result.recommendationText}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Non-Sales objectives reachable end-to-end (round 31) ---------------
+  // Explicit request: confirm OUTCOME_TRAFFIC and OUTCOME_AWARENESS work
+  // end to end, including that the objective/optimization_goal/
+  // promoted_object validator (executor.js) does NOT wrongly require a
+  // Pixel for either — neither needs one, and OBJECTIVE_ALLOWED_
+  // OPTIMIZATION_EVENTS/CONVERSION_EVENT_TO_META_GOAL never pair either
+  // with OFFSITE_CONVERSIONS, so promoted_object is never even built for
+  // them. Zero Pixels connected on purpose — proving the ad set request
+  // itself never depends on one for these objectives.
+  await check("[V2 execution] OUTCOME_TRAFFIC builds and executes end to end with ZERO Pixels connected — the field-combination validator does not require one", async () => {
+    const userId = makeUser(`v2-traffic-objective-e2e-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [], writes } }));
+    try {
+      const strategy = baseStrategy({ recommended_objective: "OUTCOME_TRAFFIC", optimization_event: "LINK_CLICKS", pixel: null, budget_daily: 500 });
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more traffic" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely no Pixel resolved");
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.optimization_goal, "LINK_CLICKS");
+      assert.equal(adSetWrite?.body?.promoted_object, undefined, "Traffic must never carry a promoted_object at all — it isn't a conversion-event optimization");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 execution] OUTCOME_AWARENESS builds and executes end to end with ZERO Pixels connected — the field-combination validator does not require one", async () => {
+    const userId = makeUser(`v2-awareness-objective-e2e-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [], writes } }));
+    try {
+      const strategy = baseStrategy({ recommended_objective: "OUTCOME_AWARENESS", optimization_event: "REACH", pixel: null, budget_daily: 500 });
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more brand awareness" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.optimization_goal, "REACH");
+      assert.equal(adSetWrite?.body?.promoted_object, undefined);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test C -------------------------------------------------
   await check("[Acceptance C] 'Why did you choose this audience and budget? Review my WooCommerce and Meta history.' — snapshot refreshed, assets preserved, audience/budget actually reconsidered", async () => {
     const userId = makeUser(`accept-c-${stamp}@example.com`);

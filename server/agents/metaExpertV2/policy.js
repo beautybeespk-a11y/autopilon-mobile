@@ -93,6 +93,41 @@ export function checkGoalAlignmentPolicy(strategy, businessSignals = {}) {
   return errors;
 }
 
+// Live bug (round 31): the check above only ever catches ONE direction of
+// substitution — silently downgrading FROM sales TO traffic. It has no
+// symmetric check for the opposite: the user's own message literally
+// asked for traffic/visitors, and the model recommended something else
+// entirely (usually Sales) with zero acknowledgment. Live report: "I want
+// more visitors on my website" -> Website Purchases (OUTCOME_SALES) was
+// recommended, the "Why" section argued for purchases, and the literal
+// ask was never once mentioned. "Recommending against a stated goal is
+// fine. Silently substituting it is not" (the user's own framing,
+// implemented directly). Deliberately NOT gated behind
+// clearEcommerceWithPurchaseTracking like the check above — a literal
+// traffic-only request deserves acknowledgment regardless of how
+// confidently the backend can classify the business, and gating it the
+// same way would have missed this exact live case if store data wasn't
+// unambiguously "exists" yet. Checked against the RAW userMessage, never
+// strategy.business_goal (the model's own paraphrase of what the user
+// asked for) — same reason userMessageContainsAmount above never trusts
+// the model's own budget claim.
+const LITERAL_TRAFFIC_WORDS = /\b(traffic|visitors?|website visits?)\b/i;
+const LITERAL_SALES_WORDS = /\b(sales?|purchases?|buy(?:ing)?|revenue|conversions?|orders?|checkout)\b/i;
+export function checkLiteralGoalSubstitutionPolicy(strategy, userMessage) {
+  const errors = [];
+  if (typeof userMessage !== "string") return errors;
+  const literalTrafficOnly = LITERAL_TRAFFIC_WORDS.test(userMessage) && !LITERAL_SALES_WORDS.test(userMessage);
+  if (!literalTrafficOnly || strategy.recommended_objective === "OUTCOME_TRAFFIC") return errors;
+  const ga = strategy.goal_alignment;
+  if (!ga || ga.recommendation_differs_from_literal_request !== true) {
+    errors.push({
+      field: "goal_alignment",
+      message: `The user's own message asked for traffic/visitors specifically, but the recommended objective is "${strategy.recommended_objective}" — recommending a different objective than what was literally asked for is fine, but it must be acknowledged, never substituted silently. Set goal_alignment.literal_request/likely_business_outcome/recommendation_differs_from_literal_request=true so the customer-facing recommendation explicitly says what was asked for, what's being recommended instead, and why — e.g. "you asked for traffic; for a store I'd recommend purchases instead, because X — want traffic anyway?"`,
+    });
+  }
+  return errors;
+}
+
 // Step 5 — Sales consistency: an OUTCOME_SALES recommendation must reason
 // about purchases/CPA/ROAS/conversion volume/revenue, never reach/
 // engagement/cheap clicks as the primary framing. A loose, deliberately

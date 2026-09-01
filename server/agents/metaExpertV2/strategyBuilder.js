@@ -17,7 +17,7 @@ import {
 } from "./strategySchema.js";
 import {
   checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
-  checkGoalAlignmentPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
+  checkGoalAlignmentPolicy, checkLiteralGoalSubstitutionPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
@@ -118,6 +118,28 @@ function formatBudgetLine(strategy, names) {
   return `${amount} (${basis})`;
 }
 
+// Live bug (round 31): the schema has ALWAYS had a goal_alignment field
+// (literal_request/likely_business_outcome/recommendation_differs_from_
+// literal_request) — designed exactly for "the user asked for traffic,
+// the recommendation is sales instead" (checkGoalAlignmentPolicy/
+// checkLiteralGoalSubstitutionPolicy above can both require it be SET —
+// but nothing here ever rendered it into the text the customer actually
+// reads. A policy check on a schema field only proves the model typed
+// something into a property; it never guaranteed the visible
+// recommendation actually explains the swap in its own prose. Rendered
+// deterministically here so the acknowledgment reaches the customer
+// regardless of whether the model's own reasoning_summary happens to
+// restate it.
+function formatGoalAlignmentNote(strategy) {
+  if (!strategy.goal_alignment?.recommendation_differs_from_literal_request) return null;
+  const { literal_request, likely_business_outcome } = strategy.goal_alignment;
+  if (!literal_request && !likely_business_outcome) return null;
+  const parts = [];
+  if (literal_request) parts.push(`You asked for: ${literal_request}.`);
+  parts.push(`Recommending ${objectiveLabel(strategy.recommended_objective)} instead${likely_business_outcome ? ` — ${likely_business_outcome}` : "."}`);
+  return parts.join(" ");
+}
+
 function formatRecommendation(strategy, names) {
   if (strategy.mode === "explicit_action") {
     const actionLabel = {
@@ -149,10 +171,14 @@ function formatRecommendation(strategy, names) {
   const genderLabel = { ALL: "All genders", MALE: "Men", FEMALE: "Women" }[strategy.gender] || strategy.gender;
   const budgetLine = formatBudgetLine(strategy, names);
   const placementsLabel = strategy.placements === "ADVANTAGE_PLUS" ? "Advantage+ (automatic)" : (strategy.manual_placements || []).join(", ");
+  const goalAlignmentNote = formatGoalAlignmentNote(strategy);
   const lines = [
     `Based on your store, Meta account, and available business data, I recommend:`,
     ``,
     `Goal: ${objectiveLabel(strategy.recommended_objective)}`,
+  ];
+  if (goalAlignmentNote) lines.push(goalAlignmentNote);
+  lines.push(
     `Audience: ${genderLabel} ${strategy.age_min}–${strategy.age_max}`,
     `Location: ${strategy.locations.join(", ")}`,
     `Strategy: ${strategy.targeting_approach.replace(/_/g, " ").toLowerCase()}`,
@@ -161,7 +187,7 @@ function formatRecommendation(strategy, names) {
     `Creative: ${strategy.creative_strategy.description}`,
     `Budget: ${budgetLine}`,
     `Facebook Page: ${names.pageName || "(not resolved)"}`,
-  ];
+  );
   if (names.instagramUsername) lines.push(`Instagram: @${names.instagramUsername}`);
   lines.push(`Status: Paused (won't spend until you approve)`);
   lines.push(``, `Why:`, strategy.reasoning_summary);
@@ -381,7 +407,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   }
   normalized = audienceReasoningResolved;
 
-  const goalErrors = checkGoalAlignmentPolicy(normalized, businessSignals);
+  const goalErrors = [...checkGoalAlignmentPolicy(normalized, businessSignals), ...checkLiteralGoalSubstitutionPolicy(normalized, userMessage)];
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
   let creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   // NOT eligible for the text-only auto-repair below — which specific
