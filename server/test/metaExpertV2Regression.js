@@ -20,7 +20,7 @@ process.env.META_EXPERT_V2 = "true";
 
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
-const { saveConnection, updateConnectionMeta } = await import("../integrations/manager.js");
+const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
@@ -1260,10 +1260,83 @@ async function run() {
       assert.equal(revised.resolved.pixelId, "1241102478031429", "the user's chosen Pixel must actually be resolved, not silently dropped for lack of explicitAssetChanges");
       assert.deepEqual(revised.strategy.unresolved_questions, [], "the Pixel question must be cleared now that it's genuinely resolved");
 
+      // Design fix (round 31, per the user's own architectural review):
+      // resolving a genuine ambiguity must be saved to the account-level
+      // Default Pixel — the SAME record resolvePixelId already reads at
+      // priority 2 — not just to this one strategy row.
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.pixelId, "1241102478031429", "the disambiguated Pixel must be saved as the account's Default Pixel, not just resolved for this one strategy");
+
       const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve it" });
       assert.equal(gate, null, "execution must now be allowed — the real question was actually answered");
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
       assert.equal(executed.status, "PAUSED");
+
+      // The actual point of saving the default: a completely FRESH
+      // strategy (new conversation, no priorResolved, no revision-carrying
+      // machinery involved at all) must now resolve the SAME Pixel
+      // automatically, with NO ambiguity and NO question — this is what
+      // makes the bug class structurally impossible to hit a second time
+      // for this ad account, rather than one more successful patch.
+      const freshConversationId = `conv-${cryptoRandom()}`;
+      const freshBuild = await buildStrategy({ userId, conversationId: freshConversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(freshBuild.ok, true, JSON.stringify(freshBuild.unresolved));
+      assert.equal(freshBuild.resolved.pixelId, "1241102478031429", "a brand-new strategy must auto-resolve the saved Default Pixel — never re-ask the same question for the same ad account");
+      assert.deepEqual(freshBuild.strategy.unresolved_questions, [], "no ambiguity question at all — the account-level default already answers it");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Pixel auto-revise when the model never calls any tool (round 31) --
+  // Live report: the user supplied the exact Pixel id FOUR separate times
+  // in one conversation and it was asked again every time — this trace
+  // showed revise_strategy was NEVER dispatched at all; the model just
+  // narrated and re-asked. Distinct from the merge-carry-forward bug fixed
+  // earlier this round (there, revise_strategy at least fired) — this is
+  // the SAME "model doesn't reliably call the tool for a plain-text
+  // answer" class round 30 already found and fixed for budget. This test
+  // reproduces the exact failure: the model's ONLY scripted response is a
+  // narration with ZERO tool calls, yet the Pixel must still resolve for
+  // real via the deterministic pre-loop auto-revise, which runs BEFORE
+  // the model is ever asked for a decision.
+  await check("[V2 execution] a Pixel id supplied in plain chat resolves via the deterministic auto-revise even when the model never calls revise_strategy at all — just narrates and would otherwise re-ask forever", async () => {
+    const userId = makeUser(`v2-pixel-auto-revise-no-tool-call-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
+    }));
+    let built;
+    try {
+      built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the turn below");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
+      // Live-bug shape: the model just narrates, with ZERO tool calls —
+      // exactly what the trace showed. Only ONE scripted response: if the
+      // auto-revise didn't already resolve the Pixel before the model's
+      // turn, this mock would need a second response it never gets.
+      chatResponses: [finalText("Got it, I've noted Pixel ID 1241102478031429 — updating the strategy now.")],
+    }));
+    try {
+      const userMessage = "Pixel ID: 1241102478031429";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revise, `the auto-revise must dispatch a REAL revise_strategy call even though the model never called any tool itself: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.pixelId, "1241102478031429", "the Pixel must actually be resolved in storage, not just narrated");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.pixelId, "1241102478031429", "resolving via the auto-revise must also save the account-level Default Pixel, same as a model-initiated revision does");
     } finally {
       restoreFetch();
     }

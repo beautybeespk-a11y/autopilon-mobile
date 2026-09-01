@@ -921,6 +921,69 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     }
   }
 
+  // CONFIRMED LIVE BUG (round 31, third recurrence of "a user-supplied
+  // answer doesn't persist" — user's own diagnosis, confirmed correct):
+  // this account has a genuinely ambiguous Pixel (2+ Pixels, no saved
+  // default). The user supplied the exact Pixel id FOUR separate times in
+  // one conversation; the trace showed revise_strategy was never even
+  // called — the model just narrated and re-asked the same question. The
+  // SAME class of bug budget had (round 30) — the model cannot be relied
+  // on to reliably call revise_strategy for a plain-text answer to its
+  // own question — extended here to Pixel, with the SAME fix: BEFORE the
+  // model is even asked for a decision this turn, if there's an active V2
+  // strategy with a genuinely ambiguous Pixel (resolvedAssets.pixelId
+  // null, resolvedAssets.pixelCandidates populated — see assetResolution.
+  // js) and the user's CURRENT message contains one of those REAL
+  // candidate ids as a standalone number (never a guess, never a partial
+  // match — extracted digit runs compared for an EXACT match against ids
+  // Meta itself already confirmed exist on this ad account), revise_strategy
+  // is called for real, directly.
+  //
+  // This is also where the deeper design fix lives: resolveStrategyAssets
+  // (assetResolution.js) now writes a genuinely-disambiguated Pixel choice
+  // back to the account-level Default Pixel (integrations.meta_ads.
+  // defaults.pixelId — the SAME saved-default record the resolver already
+  // reads at priority 2, previously read-only from this chat flow). Once
+  // this auto-revise succeeds ONE time, every FUTURE build_strategy — in
+  // this conversation or any other — resolves the Pixel automatically at
+  // that existing priority-2 step, before ambiguity is even possible
+  // again, and never needs this auto-revise (or the model's cooperation)
+  // a second time for this ad account.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const pixelCandidates = activeStrategy?.resolvedAssets?.pixelCandidates;
+    if (activeStrategy && activeStrategy.resolvedAssets?.pixelId == null && Array.isArray(pixelCandidates) && pixelCandidates.length) {
+      const digitRuns = typeof userMessage === "string" ? userMessage.match(/\d+/g) || [] : [];
+      const matchedPixelId = pixelCandidates.find((id) => digitRuns.includes(id));
+      if (matchedPixelId) {
+        try {
+          const accessToken = requireValidToken(userId, "meta_ads");
+          const revised = await reviseStrategyV2({
+            userId, conversationId, accessToken, strategyId: activeStrategy.id,
+            requestedChanges: { pixel: { ref: matchedPixelId } },
+            userMessage,
+          });
+          if (revised.ok) {
+            trace.push(traceStep("tool", "Auto-saved the Pixel you just chose (meta_expert_v2.revise_strategy)", "done"));
+            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+            const lastIdx = conversationForModel.length - 1;
+            const last = conversationForModel[lastIdx];
+            if (last?.role === "user" && typeof last.content === "string") {
+              conversationForModel = [
+                ...conversationForModel.slice(0, lastIdx),
+                { ...last, content: `${last.content}\n\n[System note: this message's chosen Pixel id (${matchedPixelId}) has already been saved to the active strategy via revise_strategy, and saved as your account's Default Pixel for future strategies too — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+              ];
+            }
+          } else {
+            v2Trace("auto-revise pixel failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+          }
+        } catch (err) {
+          v2Trace("auto-revise pixel failed (error)", { conversationId, error: err.message });
+        }
+      }
+    }
+  }
+
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
     const completion = await chatComplete({

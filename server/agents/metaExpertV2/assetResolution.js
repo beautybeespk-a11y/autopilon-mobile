@@ -23,6 +23,7 @@ import { resolvePageId } from "../../tools/shared/metaPageId.js";
 import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { PURCHASE_LIKE_EVENTS } from "./strategySchema.js";
+import { getConnection, updateConnectionMeta } from "../../integrations/manager.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
@@ -137,6 +138,39 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
         const { pixelId, available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: explicitId, userId });
         resolved.pixelId = pixelId;
         availablePixels = available;
+        // Live design fix (round 31, user's own diagnosis): the connection-
+        // level Default Pixel (integrations.meta_ads.defaults.pixelId —
+        // the SAME record resolvePixelId already reads at priority 2,
+        // above; also settable directly via the Integrations UI) has
+        // always been readable but never WRITABLE from this chat flow —
+        // every ambiguous-Pixel resolution lived only on one strategy row,
+        // re-derived through merge logic on every revision, which is what
+        // made a real answer this fragile to lose across three separate
+        // incidents this session. Fixed at the actual design level: the
+        // moment the user's own explicit answer resolves a GENUINE
+        // ambiguity (priorResolved.pixelId was null — nothing was already
+        // saved to protect or override), it's written back to the SAME
+        // saved-default record permanently. Every future build_strategy —
+        // in this conversation or any other — then resolves the Pixel at
+        // the resolver's own existing priority-2 step, before ambiguity is
+        // even possible, and never asks again. Never overwrites an
+        // existing DELIBERATE default just because a strategy is reusing
+        // it (priorResolved.pixelId already truthy takes the reuse branch
+        // above, never reaching here) or picking a different one for one
+        // specific campaign while a default remains set.
+        if (explicitId && pixelId && !priorResolved?.pixelId && userId) {
+          try {
+            const conn = getConnection(userId, "meta_ads");
+            const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
+            if (currentDefaults.pixelId !== pixelId) {
+              updateConnectionMeta(userId, "meta_ads", { defaults: { ...currentDefaults, pixelId } });
+            }
+          } catch {
+            // Best-effort — the strategy's own resolution above already
+            // succeeded regardless; only the "never ask again" durability
+            // is lost if this fails, not this strategy's correctness.
+          }
+        }
       } catch (err) {
         resolutionErrors.push({ field: "pixel", message: err.message, code: err.code });
       }
@@ -172,6 +206,15 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
   const anyPixelExists = !!resolved.pixelId || availablePixels.length > 0;
   const usablePixelForSelectedAdAccount = !!resolved.pixelId;
   const pixelAmbiguous = !resolved.pixelId && availablePixels.length > 1;
+  // Persisted on `resolved` (unlike availablePixels itself, which is only
+  // ever used transiently within this call — see strategyBuilder.js's own
+  // ambiguous-Pixel unresolved_questions injection) so it survives into
+  // the stored strategy row via insertStrategy's resolvedAssets spread.
+  // Lets the orchestrator's pixel auto-revise (round 31) recognize a REAL
+  // candidate id the user names in plain chat without an extra live
+  // meta.listPixels() call of its own, and without ever guessing — only
+  // ids Meta itself already confirmed exist on this ad account.
+  resolved.pixelCandidates = pixelAmbiguous ? availablePixels.map((p) => p.id) : null;
 
   return { resolved, names, resolutionErrors, availablePixels, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous };
 }
