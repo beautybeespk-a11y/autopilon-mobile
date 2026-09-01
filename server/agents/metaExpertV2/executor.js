@@ -103,7 +103,7 @@ const OBJECTIVE_ALLOWED_OPTIMIZATION_EVENTS = {
   OUTCOME_AWARENESS: new Set(["REACH", "IMPRESSIONS", "THRUPLAY"]),
   OUTCOME_APP_PROMOTION: new Set(["APP_INSTALLS", "LINK_CLICKS"]),
 };
-function validateCampaignFieldCombination(strategy, resolvedAssets) {
+function validateCampaignFieldCombination(strategy, resolvedAssets, targeting) {
   const allowedEvents = OBJECTIVE_ALLOWED_OPTIMIZATION_EVENTS[strategy.recommended_objective];
   if (allowedEvents && !allowedEvents.has(strategy.optimization_event)) {
     const err = new Error(`Invalid pairing: campaign objective "${strategy.recommended_objective}" cannot use optimization_event "${strategy.optimization_event}" — Meta rejects this combination. Build a revised strategy with a compatible optimization_event, or a compatible objective.`);
@@ -120,6 +120,42 @@ function validateCampaignFieldCombination(strategy, resolvedAssets) {
     err.code = "META_V2_INVALID_FIELD_COMBINATION";
     throw err;
   }
+  // Live bug (round 31, fourth recurrence): Meta now hard-requires
+  // targeting_automation.advantage_audience to be explicitly 0 or 1 — no
+  // default, and omitting it entirely is rejected outright ("you need to
+  // enable or disable the Advantage audience feature," Meta error
+  // 100/1870227). buildV2Targeting below always sets it, so a failure
+  // here means some future code path built a targeting spec that skipped
+  // it — caught here, before ANY Meta call, rather than as a round trip
+  // to Meta's API to rediscover the same mandatory field a second time.
+  const advantageAudience = targeting?.targeting_automation?.advantage_audience;
+  if (advantageAudience !== 0 && advantageAudience !== 1) {
+    const err = new Error("targeting_automation.advantage_audience must be explicitly 0 or 1 — Meta requires this field with no default and rejects the ad set outright when it's missing.");
+    err.code = "META_V2_INVALID_FIELD_COMBINATION";
+    throw err;
+  }
+}
+
+// Live bug (round 31, fourth recurrence): "To create your ad set, you need
+// to enable or disable the Advantage audience feature. This can be done by
+// setting the advantage_audience flag to either 1 or 0 within the
+// targeting_automation field in the targeting spec." (Meta error
+// 100/1870227) — a newer Meta API requirement with no default; omitting
+// the field entirely is rejected. Always 0 for every V2 campaign-mode
+// strategy — never Meta's audience-EXPANSION default: the strategy names
+// an explicit audience (gender/age/countries) the user actually approved,
+// and Meta's "Advantage audience" (value 1) is documented to let Meta
+// expand DELIVERY beyond that stated targeting on its own — silently
+// running against people outside what was approved is exactly the class
+// of drift a real spend decision must never be subject to unasked. If a
+// future strategy genuinely wants broad/automatic audience expansion,
+// that must become a real field on the strategy schema the user sees and
+// approves, never a value hardcoded here without their knowledge.
+function buildV2Targeting(strategy) {
+  return {
+    ...buildTargeting({ countries: strategy.countries, ageMin: strategy.age_min, ageMax: strategy.age_max, gender: strategy.gender === "ALL" ? undefined : strategy.gender?.toLowerCase() }),
+    targeting_automation: { advantage_audience: 0 },
+  };
 }
 
 function loadExecutable(userId, conversationId, strategyId) {
@@ -144,9 +180,12 @@ function loadExecutable(userId, conversationId, strategyId) {
 
 async function executeCampaignMode(stored, accessToken, userId, currency) {
   const { strategy, resolvedAssets } = stored;
-  // Fail fast, before any Meta network call — see
-  // validateCampaignFieldCombination's own comment above.
-  validateCampaignFieldCombination(strategy, resolvedAssets);
+  const targeting = buildV2Targeting(strategy);
+  // Fail fast, before any Meta network call (including the campaign
+  // create — a broken targeting spec is now caught before that call too,
+  // rather than after a campaign already exists that then needs cleanup)
+  // — see validateCampaignFieldCombination's own comment above.
+  validateCampaignFieldCombination(strategy, resolvedAssets, targeting);
   const minorUnitBudget = toMetaBudgetMinorUnits(strategy.budget_daily, currency);
   // Defense in depth — deriveXIfMissing/normalizeStrategyEnumAliases
   // (strategySchema.js) only run at build/revise TIME. A strategy that
@@ -218,7 +257,7 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
     billing_event: "IMPRESSIONS",
     ...buildOptimizationFields(strategy, resolvedAssets.pixelId),
     bid_strategy: safeBidStrategy,
-    targeting: buildTargeting({ countries: strategy.countries, ageMin: strategy.age_min, ageMax: strategy.age_max, gender: strategy.gender === "ALL" ? undefined : strategy.gender?.toLowerCase() }),
+    targeting,
     status: "PAUSED",
   };
   logger.info("meta_expert_v2.execute_strategy.adset_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: adSetParams });

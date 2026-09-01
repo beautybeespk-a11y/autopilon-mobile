@@ -1131,6 +1131,12 @@ async function run() {
       assert.equal(campaignWrite?.body?.is_adset_budget_sharing_enabled, false, `the campaign must explicitly declare budget sharing off: ${JSON.stringify(campaignWrite?.body)}`);
       assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", `the ad set must send the real, uncapped bid strategy that needs no bid_amount: ${JSON.stringify(adSetWrite?.body)}`);
       assert.equal(adSetWrite?.body?.bid_amount, undefined, "no bid_amount must ever be invented — LOWEST_COST_WITHOUT_CAP needs none");
+      // Round 31, fourth recurrence: Meta requires targeting_automation.
+      // advantage_audience explicitly 0 or 1 (error 100/1870227) — always
+      // 0 here, since the strategy's own explicit audience (gender/age/
+      // countries) must be what actually runs, never silently expanded by
+      // Meta's own "Advantage audience" delivery feature.
+      assert.equal(adSetWrite?.body?.targeting?.targeting_automation?.advantage_audience, 0, `advantage_audience must be explicitly 0 — the approved audience must never be silently expanded: ${JSON.stringify(adSetWrite?.body?.targeting)}`);
     } finally {
       restoreFetch();
     }
