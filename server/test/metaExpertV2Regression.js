@@ -1855,6 +1855,73 @@ async function run() {
     }
   });
 
+  // --- Already-executed strategy: wrong message + dangerous model reaction (live bug, round 31) --
+  // Live report: idempotency itself was correct — approving a second time
+  // never created a second campaign. But the FAILURE the model received
+  // was the generic "No active strategy exists... call build_strategy
+  // first" message (getActiveStrategyForConversation's hard status filter
+  // structurally can't find an EXECUTED strategy — see strategyStore.js's
+  // round-31 comment), and the model then improvised "It seems I need to
+  // rebuild the strategy due to a technical issue. Let me do that again
+  // with the budget of PKR 750/day you provided earlier." — promising
+  // exactly the duplicate campaign the guard exists to prevent. This test
+  // proves the fix at the ONLY place that matters for user safety: the
+  // tool-dispatch call site itself. A second execute_strategy tool call
+  // from the model, on a conversation whose strategy is already executed,
+  // must never reach runTool() at all (checkAlreadyExecutedV2Strategy
+  // short-circuits it in orchestrator/index.js, before any Meta API call
+  // could happen) — zero Meta writes on the second turn — and the reply
+  // the model is forced to send must name the real campaign/ad set ids
+  // and describe it as already existing, never as something to fix.
+  await check("[V2 execution] a second execute_strategy on an already-executed strategy makes zero Meta calls and the reply identifies it as already executed with the original campaign/ad set ids", async () => {
+    const userId = makeUser(`v2-already-executed-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+
+    // Turn 1: build and REALLY execute the strategy, capturing the genuine
+    // campaign/ad set ids Meta (mocked) assigned.
+    const firstTurnWrites = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes: firstTurnWrites },
+    }));
+    let campaignId, adSetId;
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 750 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      campaignId = executed.campaignId;
+      adSetId = executed.adSetId;
+      assert.ok(campaignId && adSetId, `execution must return real ids: ${JSON.stringify(executed)}`);
+    } finally {
+      restoreFetch();
+    }
+
+    // Turn 2: the user says "approved" again (exactly the live scenario —
+    // a second approval on a strategy that's already live). The model
+    // decides to call execute_strategy again — the SAME thing it did the
+    // first time, since nothing told it not to. This must never reach the
+    // mocked Meta API at all.
+    const secondTurnWrites = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [toolCall("meta_expert_v2.execute_strategy", {})],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes: secondTurnWrites },
+    }));
+    try {
+      const userMessage = "approved";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.deepEqual(secondTurnWrites, [], `a second execute_strategy on an already-executed strategy must make ZERO Meta API calls: ${JSON.stringify(secondTurnWrites)}`);
+      assert.ok(result.reply.includes(campaignId), `the reply must name the real, original campaign id: ${result.reply}`);
+      assert.ok(result.reply.includes(adSetId), `the reply must name the real, original ad set id: ${result.reply}`);
+      assert.match(result.reply, /already/i, `the reply must identify this as already done, not a fresh execution: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /technical issue|rebuild|let me do that again/i, "the reply must never suggest rebuilding/re-executing, even in wording");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Acceptance Test G --------------------------------------------------
   await check("[Acceptance G] multiple ad accounts/Pages/Pixels — saved defaults are used deterministically, never guessed", async () => {
     const userId = makeUser(`accept-g-${stamp}@example.com`);

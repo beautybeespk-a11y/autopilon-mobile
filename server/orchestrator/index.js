@@ -11,7 +11,7 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
-import { getActiveStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
 import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
@@ -244,9 +244,37 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
 // approval language in the user's own, current message — just pointed at
 // V2's own strategy store (server/agents/metaExpertV2/strategyStore.js)
 // instead of the original planner's meta_campaign_plans table.
+// Live bug (round 31): getActiveStrategyForConversation only ever returns
+// a 'proposed'/'approved' row (see strategyStore.js) — once a strategy is
+// executed, it structurally CANNOT be found there again. A user who
+// approved a second time (idempotency working exactly as designed — no
+// second campaign gets created) was told "No active strategy exists...
+// call build_strategy first," the SAME message a conversation where
+// nothing had ever been built would get. The model, facing an
+// unexplained failure on a request it had every reason to think should
+// succeed, improvised "It seems I need to rebuild the strategy due to a
+// technical issue" — precisely the duplicate-campaign outcome this whole
+// gate exists to prevent. Exported separately from the message-returning
+// gate below (rather than folded into it) specifically so the tool-
+// dispatch call site (orchestrator/index.js's main loop) can hard-bypass
+// the model ENTIRELY for this case — same reasoning as the meta_ads raw-
+// tool-failure short-circuit elsewhere in this file: a message fed back
+// to the model as a generic "error" gives it room to improvise a
+// different-sounding reaction each time, which is exactly what happened
+// here. Returns the real ids so the caller never has to re-derive them.
+export function checkAlreadyExecutedV2Strategy({ userId, conversationId }) {
+  const mostRecent = getMostRecentStrategyForConversation(userId, conversationId);
+  if (mostRecent?.status !== "executed" || !mostRecent.executionResult) return null;
+  return { strategyId: mostRecent.id, campaignId: mostRecent.executionResult.campaignId, adSetId: mostRecent.executionResult.adSetId };
+}
+
 export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage }) {
   const active = getActiveStrategyForConversation(userId, conversationId);
   if (!active) {
+    const alreadyExecuted = checkAlreadyExecutedV2Strategy({ userId, conversationId });
+    if (alreadyExecuted) {
+      return `This strategy has ALREADY been executed — do not rebuild it, and do not call execute_strategy or build_strategy again for this. Campaign ID: ${alreadyExecuted.campaignId}. Ad Set ID: ${alreadyExecuted.adSetId}. The correct reply is to tell the user their campaign already exists (it's paused until they resume it in Meta Ads Manager) and share those two ids in plain language — never describe this as a technical issue or a problem that needs fixing.`;
+    }
     return "No active strategy exists for this conversation yet. Call meta_expert_v2.build_strategy first (after meta_expert_v2.get_business_snapshot if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
   }
   if (!messageIndicatesExecutionApprovalV2(userMessage)) {
@@ -1363,6 +1391,27 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         const gateError = checkExecutionApprovalGate({ userId, conversationId, userMessage });
         if (gateError) outcome = { status: "failed", error: gateError };
       } else if (call.toolName === "meta_expert_v2.execute_strategy") {
+        // Live bug (round 31): a second approval attempt on an ALREADY-
+        // executed strategy used to fall through to checkV2
+        // ExecutionApprovalGate's message being fed back to the model as
+        // a generic tool "error" — which the model then improvised a
+        // reaction to ("let me rebuild the strategy due to a technical
+        // issue"), exactly the duplicate-campaign risk this whole gate
+        // exists to prevent. Same reasoning as the meta_ads raw-tool-
+        // failure short-circuit below: end the turn immediately,
+        // deterministically, with the real campaign/ad set ids — the
+        // model never gets a chance to react to this as if it were
+        // something to fix.
+        const alreadyExecuted = checkAlreadyExecutedV2Strategy({ userId, conversationId });
+        if (alreadyExecuted) {
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("completed", "Campaign already exists — nothing to execute.", "done"));
+          if (planId) setPlanStatus(planId, "completed");
+          return {
+            reply: `Your campaign is already live — Campaign ID: ${alreadyExecuted.campaignId}, Ad Set ID: ${alreadyExecuted.adSetId}. It's currently paused; resume it in Meta Ads Manager whenever you're ready to spend.`,
+            trace, toolResults, usage: usageTotals,
+          };
+        }
         // Meta Ads Expert V2's own approval gate — see
         // checkV2ExecutionApprovalGate above. This runs IN ADDITION to the
         // V2 single-call gate above — a gate-blocked attempt here (no

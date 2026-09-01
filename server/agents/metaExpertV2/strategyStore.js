@@ -76,6 +76,25 @@ export function getActiveStrategyForConversation(userId, conversationId) {
   return found;
 }
 
+// Live bug (round 31): getActiveStrategyForConversation above has a hard
+// status IN ('proposed','approved') filter by design — once a strategy is
+// executed, it structurally CANNOT be found there again. That's exactly
+// right for "is there something waiting to be approved," but it means
+// nothing could ever distinguish "no strategy was ever built for this
+// conversation" from "a strategy was built AND already executed" — a
+// second approval attempt (idempotency working correctly) got the SAME
+// generic "no active strategy... call build_strategy first" message as a
+// conversation where nothing had ever happened, which then led the model
+// to improvise "let me rebuild the strategy due to a technical issue."
+// No status filter here on purpose — answers "what's the most recent
+// strategy for this conversation, in whatever state it's actually in."
+export function getMostRecentStrategyForConversation(userId, conversationId) {
+  if (!conversationId) return null;
+  return row(
+    db.prepare("SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? ORDER BY createdAt DESC LIMIT 1").get(userId, conversationId)
+  );
+}
+
 export function setStrategyStatus(strategyId, status) {
   db.prepare("UPDATE meta_v2_strategies SET status = ?, updatedAt = ? WHERE id = ?").run(status, new Date().toISOString(), strategyId);
 }
