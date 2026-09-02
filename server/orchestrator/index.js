@@ -16,6 +16,7 @@ import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
+import { userMessageContainsText } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
@@ -234,36 +235,67 @@ function activeCreativeHasRealEngagement(activeStrategy) {
   return allContent.find((c) => c.id === creative.contentId)?.engagement?.status === "exists";
 }
 
-// Matches a user's plain-chat reply against the REAL candidate ids a
+// Matches a user's plain-chat reply against the REAL creative candidates a
 // creative-ambiguity question already showed (resolvedAssets.
-// creativeCandidates — see creativeResolution.js/strategyBuilder.js),
-// same "never a guessed id" discipline as the Pixel auto-revise's digit-
-// run match above, extended to also recognize a numbered-list position
-// ("1)") since formatCreativeCandidatesQuestion (creativeResolution.js)
-// always presents candidates that way and a user very plausibly replies
-// with just the number.
+// creativeCandidates — see creativeResolution.js/strategyBuilder.js: each
+// entry is { id, label }, label being the SAME display text
+// formatCreativeCandidatesQuestion already showed — the product name for
+// PRODUCT_IMAGE, or the post's caption excerpt otherwise).
+//
+// CONFIRMED LIVE BUG (round 32): this only ever matched the full "(id
+// 5814, 2050)" string the question itself rendered — the id embedded in
+// prose. But the question's own closing line says "reply with the number,
+// or describe which one," and the rendered list shows numbers and names,
+// not raw ids. A bare "1", "1.", or the product name typed back verbatim
+// all fell through to null, so the auto-revise pre-loop never fired, the
+// creative question stayed open, and execute_strategy kept re-listing
+// every candidate. Extended to recognize four forms, in this order — the
+// first UNAMBIGUOUS match wins, same "never a guessed id" discipline as
+// the Pixel auto-revise's digit-run match above:
 //   1. An exact real id — numeric ids (WooCommerce/Shopify product ids)
 //      matched as a standalone digit run, never a substring of a larger
 //      number; composite Facebook/Instagram ids ("pageId_postId") matched
 //      as a literal substring, safe since that's the exact string shown.
-//      If the message's digit runs happen to match MORE than one real
-//      candidate id (e.g. it also contains an unrelated number like a
-//      budget amount that coincidentally equals another candidate's id),
-//      this returns null rather than guessing between them.
-//   2. Only when no id matched at all: an explicit "N)" list-position
-//      marker, resolved against the SAME list position order the
-//      question was built from.
-function matchCreativeCandidateId(userMessage, candidateIds) {
-  if (typeof userMessage !== "string" || !Array.isArray(candidateIds) || !candidateIds.length) return null;
+//      2+ id matches (e.g. the message also contains an unrelated number
+//      like a budget amount that coincidentally equals another
+//      candidate's id) returns null rather than guessing between them.
+//   2. The candidate's own displayed label as a literal, case/whitespace-
+//      insensitive substring of the message (userMessageContainsText,
+//      creativeResolution.js — the identical non-fuzzy discipline already
+//      used for a user-supplied primaryText answer). 2+ label matches
+//      returns null.
+//   3. A list-position reference to the SAME order the question was built
+//      from — an explicit "N)" or "N." marker anywhere in the message
+//      (the trailing-period form excludes a decimal, e.g. "2.5", via the
+//      negative lookahead so a price/quantity is never misread as a
+//      pick), or — only when the ENTIRE message (trimmed, minus one
+//      trailing period) is just that number — a bare list number ("1").
+//      A bare number is deliberately NOT matched mid-sentence: a reply
+//      like "budget 600" must never be misread as picking candidate 600.
+function matchCreativeCandidateId(userMessage, candidates) {
+  if (typeof userMessage !== "string" || !Array.isArray(candidates) || !candidates.length) return null;
+
   const digitRuns = userMessage.match(/\d+/g) || [];
-  const idMatches = candidateIds.filter((id) => (/^\d+$/.test(id) ? digitRuns.includes(id) : userMessage.includes(id)));
-  if (idMatches.length === 1) return idMatches[0];
+  const idMatches = candidates.filter((c) => (/^\d+$/.test(c.id) ? digitRuns.includes(c.id) : userMessage.includes(c.id)));
+  if (idMatches.length === 1) return idMatches[0].id;
   if (idMatches.length > 1) return null;
-  const positionMatch = userMessage.match(/\b(\d+)\)/);
-  if (positionMatch) {
-    const position = Number(positionMatch[1]);
-    if (Number.isInteger(position) && position >= 1 && position <= candidateIds.length) return candidateIds[position - 1];
+
+  const labelMatches = candidates.filter((c) => userMessageContainsText(userMessage, c.label));
+  if (labelMatches.length === 1) return labelMatches[0].id;
+  if (labelMatches.length > 1) return null;
+
+  const explicitPosition = userMessage.match(/\b(\d+)(?:\)|\.(?!\d))/);
+  if (explicitPosition) {
+    const position = Number(explicitPosition[1]);
+    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
   }
+
+  const bareNumber = userMessage.trim().replace(/\.$/, "");
+  if (/^\d+$/.test(bareNumber)) {
+    const position = Number(bareNumber);
+    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
+  }
+
   return null;
 }
 

@@ -3792,6 +3792,127 @@ async function run() {
     }
   });
 
+  // --- Creative auto-revise matcher forms (round 32) -----------------
+  // Live report: the fix above only ever matched the full "(id 5814,
+  // 2050)" string the question rendered — an id embedded in prose. But
+  // formatCreativeCandidatesQuestion's own closing line says "reply with
+  // the number, or describe which one," and the rendered list shows
+  // numbers and names, not raw ids on their own. A bare "1", "1.", or the
+  // product name typed back verbatim all left the creative auto-revise
+  // pre-loop silent, so the question stayed open and execute_strategy
+  // kept re-listing every candidate. matchCreativeCandidateId
+  // (orchestrator/index.js) now also recognizes a bare list number, an
+  // explicit "N)" or "N." marker, and the candidate's own displayed
+  // label (creativeResolution.js's formatCreativeCandidatesQuestion —
+  // product name for PRODUCT_IMAGE) — each proven independently here,
+  // isolating that this exact input form, alone, clears the question.
+  const CREATIVE_FORM_WC_PRODUCTS = [
+    {
+      id: 5814, name: "La Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50", price: "2050", categories: [{ name: "Skincare" }],
+      images: [{ src: "https://store.example.com/wp-content/uploads/sunscreen.jpg" }],
+      permalink: "https://store.example.com/product/sunscreen/",
+      short_description: "Mineral sunscreen with zinc oxide, SPF 50.",
+    },
+    {
+      id: 5900, name: "Hydrating Facial Cleanser", price: "1200", categories: [{ name: "Skincare" }],
+      images: [{ src: "https://store.example.com/wp-content/uploads/cleanser.jpg" }],
+      permalink: "https://store.example.com/product/cleanser/",
+      short_description: "Gentle daily cleanser for all skin types.",
+    },
+  ];
+
+  async function checkCreativeAutoReviseForm(formLabel, userMessage, expectedProductId) {
+    await check(`[Creative auto-revise matcher] ${formLabel} clears the ambiguous-creative question`, async () => {
+      const userId = makeUser(`v2-creative-form-${formLabel.replace(/[^a-z0-9]+/gi, "-")}-${stamp}@example.com`);
+      connectMeta(userId);
+      connectWooCommerce(userId);
+      const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+      const conversationId = `conv-${cryptoRandom()}`;
+      const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] };
+
+      mockFetch(scriptedFetch({ chatResponses: [], wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts }));
+      try {
+        const built = await buildStrategy({
+          userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+          strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad — pick the best product." } }),
+          userMessage: "I want more sales on my website",
+        });
+        assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+        assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the creative question must be open");
+      } finally {
+        restoreFetch();
+      }
+
+      // The model gets NO scripted tool calls — if the matcher doesn't
+      // recognize this input form, the auto-revise pre-loop stays
+      // silent, the question stays open, and this only reaches the
+      // model via the scripted final-text fallback (which the
+      // assertions below would then fail against).
+      mockFetch(scriptedFetch({
+        wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts,
+        chatResponses: [finalText("Got it — I've saved your product choice as the creative. Reply 'approve' whenever you're ready.")],
+      }));
+      try {
+        const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+        const creativeAutoSaves = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy");
+        assert.equal(creativeAutoSaves.length, 1, `the creative auto-revise pre-loop must fire for ${JSON.stringify(userMessage)}: ${JSON.stringify(result.toolResults)}`);
+
+        const updated = getActiveStrategyForConversation(userId, conversationId);
+        assert.equal(updated.resolvedAssets.creative?.productId, expectedProductId, `must resolve to the SPECIFIC product named, not a guess: ${JSON.stringify(updated.resolvedAssets.creative)}`);
+        assert.deepEqual(updated.strategy.unresolved_questions, [], "the creative question must be cleared, not re-asked");
+      } finally {
+        restoreFetch();
+      }
+    });
+  }
+
+  await checkCreativeAutoReviseForm("a bare list number (\"2\")", "2", "5900");
+  await checkCreativeAutoReviseForm("an explicit \"N)\" marker (\"1)\")", "1)", "5814");
+  await checkCreativeAutoReviseForm("an explicit \"N.\" marker (\"2.\")", "2.", "5900");
+  await checkCreativeAutoReviseForm("the product name as displayed", "The Hydrating Facial Cleanser please", "5900");
+
+  // A decimal that happens to start with a valid position digit (e.g. a
+  // budget reply) must never be misread as an "N." list-position pick —
+  // the false-positive risk the negative lookahead in matchCreativeCandidateId
+  // guards against. Verified directly here (not just via the standalone
+  // matcher) so a future change to the auto-revise wiring can't silently
+  // reintroduce it: the question must stay open and unresolved, not
+  // silently resolve to whichever product happens to sit at position 2.
+  await check("[Creative auto-revise matcher] a decimal number (\"2.5\") never mismatches an \"N.\" list-position pick", async () => {
+    const userId = makeUser(`v2-creative-form-decimal-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] };
+
+    mockFetch(scriptedFetch({ chatResponses: [], wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad — pick the best product." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts,
+      chatResponses: [finalText("Which product would you like to use? Also, could you confirm the budget?")],
+    }));
+    try {
+      const userMessage = "make it 2.5k per day";
+      await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.resolvedAssets.creative, null, `a decimal must never resolve the creative: ${JSON.stringify(updated.resolvedAssets.creative)}`);
+      assert.ok(updated.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the creative question must remain open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {

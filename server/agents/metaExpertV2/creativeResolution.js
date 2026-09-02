@@ -57,8 +57,10 @@ function candidatesForSource(source, snapshot) {
 // transcription of what the user said is never trusted on its own for a
 // field that governs real ad copy. Normalizes whitespace/case only —
 // never a fuzzy/semantic match, which could let something the user never
-// actually wrote through.
-function userMessageContainsText(userMessage, text) {
+// actually wrote through. Exported for reuse by orchestrator/index.js's
+// matchCreativeCandidateId, which needs the identical literal-substring
+// discipline to match a candidate's displayed name/caption.
+export function userMessageContainsText(userMessage, text) {
   if (!userMessage || typeof text !== "string" || !text.trim()) return false;
   const normalize = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
   return normalize(userMessage).includes(normalize(text));

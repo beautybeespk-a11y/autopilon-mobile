@@ -524,8 +524,19 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // auto-revise pre-loop (index.js, mirroring the pixel auto-revise) can
   // match the user's plain-chat answer against them without re-resolving
   // from scratch or trusting the model to call revise_strategy on its own.
-  const creativeCandidateIds = creativeResolution.ambiguousCandidates.length ? creativeResolution.ambiguousCandidates.map((c) => c.id) : null;
-  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateIds };
+  // Each entry also carries `label` — the SAME display text
+  // formatCreativeCandidatesQuestion already showed the user (the product
+  // name for PRODUCT_IMAGE, the post's caption excerpt otherwise) — so the
+  // auto-revise matcher can recognize "the product name as displayed", not
+  // just the id, exactly as the question invited ("reply with the number,
+  // or describe which one").
+  const creativeCandidateRefs = creativeResolution.ambiguousCandidates.length
+    ? creativeResolution.ambiguousCandidates.map((c) => ({
+        id: c.id,
+        label: (normalized.creative_strategy?.source === "PRODUCT_IMAGE" ? c.name : c.captionExcerpt) || null,
+      }))
+    : null;
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs };
   const recommendationText = formatRecommendation(normalized, names);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
