@@ -143,11 +143,58 @@ async function run() {
   });
 
   // --- disconnect must not leave anything readable behind ---
-  await check("org disconnect clears both encrypted columns (no leftover ciphertext)", async () => {
+  // Live bug: disconnectOrgConnection() cleared accessToken/refreshToken
+  // but left `meta` untouched — org WordPress's meta.username and org
+  // WooCommerce's meta.consumerKey (the other half of the REST API
+  // credential pair; consumerSecret is what's stored as accessToken)
+  // survived disconnect indefinitely, in plaintext (meta is not covered
+  // by the AES-256-GCM encryption applied to accessToken/refreshToken).
+  await check("org disconnect clears both encrypted columns AND meta (no leftover ciphertext, no leftover consumerKey)", async () => {
     await sess.req("POST", `/api/organizations/${org.id}/integrations/woocommerce/disconnect`);
-    const row = db.prepare("SELECT accessToken, refreshToken FROM integrations WHERE orgId = ? AND provider = 'woocommerce'").get(org.id);
+    const row = db.prepare("SELECT accessToken, refreshToken, meta FROM integrations WHERE orgId = ? AND provider = 'woocommerce'").get(org.id);
     assert.equal(row.accessToken, null, "accessToken is cleared, not left as stale ciphertext");
     assert.equal(row.refreshToken, null, "refreshToken is cleared, not left as stale ciphertext");
+    const meta = JSON.parse(row.meta || "{}");
+    assert.deepEqual(meta, {}, `org WooCommerce meta (including consumerKey) must be cleared on disconnect, not left behind: ${row.meta}`);
+  });
+
+  // --- personal (non-org) disconnect: the exact live report — a
+  // WooCommerce consumerKey sitting in the database in plaintext after
+  // the user disconnects. Uses the personal connection seeded at the top
+  // of this file (WOO_KEY/WOO_SECRET), through the real HTTP disconnect
+  // route (routes/woocommerceAuth.js), not a direct function call.
+  await check("personal WooCommerce disconnect clears meta.consumerKey — the real live report this fix addresses", async () => {
+    const before = db.prepare("SELECT meta FROM integrations WHERE userId = ? AND provider = 'woocommerce'").get(user.id);
+    assert.ok(JSON.parse(before.meta).consumerKey, "sanity: consumerKey must genuinely be present before disconnect, or this test proves nothing");
+
+    const { json } = await sess.req("POST", "/api/integrations/woocommerce/disconnect");
+    assert.equal(json.ok, true, JSON.stringify(json));
+
+    const after = db.prepare("SELECT status, accessToken, refreshToken, meta FROM integrations WHERE userId = ? AND provider = 'woocommerce'").get(user.id);
+    assert.equal(after.status, "not_connected");
+    assert.equal(after.accessToken, null);
+    assert.equal(after.refreshToken, null);
+    const meta = JSON.parse(after.meta || "{}");
+    assert.deepEqual(meta, {}, `meta must be fully cleared, not just missing the token — a real credential (consumerKey) was left behind here before this fix: ${after.meta}`);
+    assertNoLeak(after.meta, WOO_KEY, "raw integrations.meta after disconnect");
+
+    // A reconnect must still work normally afterward — clearing meta on
+    // disconnect must never brick the ability to connect again.
+    // saveConnection() (the same call routes/woocommerceAuth.js's real
+    // /connect route makes after a successful checkStore(), and the same
+    // seeding pattern this file already uses above) always REPLACES meta
+    // wholesale rather than merging into whatever's already there, so
+    // this is safe by construction — proven directly here rather than
+    // through an actual HTTP round trip (which would need a real,
+    // reachable WooCommerce store to verify against, unlike this file's
+    // own db/activity_log assertions).
+    saveConnection(user.id, "woocommerce", {
+      accessToken: WOO_SECRET, expiresAt: null, scopes: [],
+      meta: { siteUrl: "https://leak-test-store.example.com", consumerKey: WOO_KEY },
+    });
+    const reconnected = db.prepare("SELECT status, meta FROM integrations WHERE userId = ? AND provider = 'woocommerce'").get(user.id);
+    assert.equal(reconnected.status, "connected");
+    assert.equal(JSON.parse(reconnected.meta).consumerKey, WOO_KEY, "reconnecting after a meta-clearing disconnect must restore meta normally");
   });
 
   // --- WooCommerce API client credential-in-URL check (Phase 18.1 §2 fix:

@@ -172,9 +172,21 @@ export function updateConnectionMeta(userId, provider, patch) {
   return nextMeta;
 }
 
+// Live bug: this cleared accessToken/refreshToken/tokenExpiresAt but left
+// the `meta` column untouched — for WooCommerce, `meta.consumerKey` (the
+// other half of the REST API credential pair; `consumerSecret` is what's
+// stored as accessToken) survived disconnect indefinitely, in plaintext
+// (meta is NOT covered by the AES-256-GCM encryption applied to accessToken/
+// refreshToken above). WordPress's `meta.username` and Meta Ads' saved
+// `meta.defaults` (pixelId/pageId/adAccountId/...) had the same gap, just
+// lower sensitivity. Every disconnect route's own comment already claimed
+// "local credentials are always still fully deleted" — true for the token,
+// not for this. Reset to '{}' rather than NULL so every existing reader
+// (all of which do `JSON.parse(conn.meta || "{}")`) keeps working exactly
+// as if nothing were ever connected.
 export function disconnectIntegration(userId, provider) {
   db.prepare(
-    "UPDATE integrations SET status = 'not_connected', accessToken = NULL, refreshToken = NULL, tokenExpiresAt = NULL, updatedAt = ? WHERE userId = ? AND provider = ? AND orgId IS NULL"
+    "UPDATE integrations SET status = 'not_connected', accessToken = NULL, refreshToken = NULL, tokenExpiresAt = NULL, meta = '{}', updatedAt = ? WHERE userId = ? AND provider = ? AND orgId IS NULL"
   ).run(now(), userId, provider);
 }
 
@@ -219,9 +231,12 @@ export function saveOrgConnection(orgId, connectedByUserId, provider, { accessTo
   return id;
 }
 
+// Same gap, same fix as disconnectIntegration() above — this is the
+// org-shared-connection sibling of that function and had the identical
+// bug (meta left behind after disconnect).
 export function disconnectOrgConnection(orgId, provider) {
   db.prepare(
-    "UPDATE integrations SET status = 'not_connected', accessToken = NULL, refreshToken = NULL, tokenExpiresAt = NULL, updatedAt = ? WHERE orgId = ? AND provider = ?"
+    "UPDATE integrations SET status = 'not_connected', accessToken = NULL, refreshToken = NULL, tokenExpiresAt = NULL, meta = '{}', updatedAt = ? WHERE orgId = ? AND provider = ?"
   ).run(now(), orgId, provider);
 }
 
