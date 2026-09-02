@@ -4,7 +4,12 @@ import { createNotification } from "./notifications.js";
 
 const now = () => new Date().toISOString();
 
-function recomputeAssetRating(assetId) {
+// Exported for reuse by accountDeletion.js, which deletes a departing
+// user's own reviews directly (not via deleteReview(), since that
+// requires the acting user to own the review — here the caller IS the
+// account being deleted) but still needs the exact same recompute so the
+// asset's cached rating never drifts.
+export function recomputeAssetRating(assetId) {
   const agg = db.prepare("SELECT COUNT(*) c, COALESCE(SUM(rating), 0) s FROM asset_reviews WHERE assetId = ?").get(assetId);
   db.prepare("UPDATE marketplace_assets SET ratingCount = ?, ratingSum = ? WHERE id = ?").run(agg.c, agg.s, assetId);
 }

@@ -463,6 +463,14 @@ if (!userCols.includes("activeOrgId")) db.exec("ALTER TABLE users ADD COLUMN act
 if (!userCols.includes("isPlatformAdmin")) db.exec("ALTER TABLE users ADD COLUMN isPlatformAdmin INTEGER NOT NULL DEFAULT 0");
 if (!userCols.includes("stripeCustomerId")) db.exec("ALTER TABLE users ADD COLUMN stripeCustomerId TEXT"); // for personal Marketplace purchases — distinct from the per-org subscription customer
 if (!userCols.includes("onboardingCompletedAt")) db.exec("ALTER TABLE users ADD COLUMN onboardingCompletedAt TEXT"); // Phase 21 — NULL means the first-run onboarding flow hasn't been shown/finished yet
+// Closed-beta account creation (see routes/platformAdmin.js's POST /users) —
+// createdByAdmin marks a row inserted by an admin rather than through
+// public signup (still gated by PUBLIC_SIGNUP_ENABLED regardless — this
+// column doesn't touch that gate, it's just a durable "who has access"
+// marker so admin-created accounts can be listed and later removed).
+// createdByAdminId records which admin, for audit purposes only.
+if (!userCols.includes("createdByAdmin")) db.exec("ALTER TABLE users ADD COLUMN createdByAdmin INTEGER NOT NULL DEFAULT 0");
+if (!userCols.includes("createdByAdminId")) db.exec("ALTER TABLE users ADD COLUMN createdByAdminId TEXT");
 
 const integrationOrgCols = db.prepare("PRAGMA table_info(integrations)").all().map((c) => c.name);
 if (!integrationOrgCols.includes("orgId")) db.exec("ALTER TABLE integrations ADD COLUMN orgId TEXT");

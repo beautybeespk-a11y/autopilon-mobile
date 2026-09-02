@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Sun, Moon, ShieldCheck, Cpu, AlertTriangle, CheckCircle2, Mic2 } from "lucide-react";
+import { Sun, Moon, ShieldCheck, Cpu, AlertTriangle, CheckCircle2, Mic2, Trash2 } from "lucide-react";
 import { Card, Button } from "../components/ui/index.jsx";
 import { useTheme } from "../lib/theme.jsx";
 import { useAuth } from "../lib/auth.jsx";
@@ -7,11 +7,14 @@ import { api } from "../lib/api.js";
 
 export default function Settings() {
   const { theme, toggle } = useTheme();
-  const { user, logout } = useAuth();
+  const { user, logout, deleteAccount } = useAuth();
   const [provider, setProvider] = useState(null);
   const [voiceStatus, setVoiceStatus] = useState(null);
   const [voiceSettings, setVoiceSettings] = useState(null);
   const [voiceSaving, setVoiceSaving] = useState(false);
+  const [deleteConfirmEmail, setDeleteConfirmEmail] = useState("");
+  const [deleteError, setDeleteError] = useState("");
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => { api.get("/chat/provider-status").then(setProvider).catch(() => {}); }, []);
   useEffect(() => {
@@ -29,6 +32,20 @@ export default function Settings() {
       // Best-effort; the next page load will re-sync from the server if this failed.
     } finally {
       setVoiceSaving(false);
+    }
+  };
+
+  const handleDeleteAccount = async () => {
+    setDeleteError("");
+    setDeleting(true);
+    try {
+      await deleteAccount();
+      // No navigation needed — deleteAccount() clears `user`, and the
+      // route guard (ProtectedRoute) redirects to /login on its own once
+      // that happens, same as logout().
+    } catch (err) {
+      setDeleteError(err.message);
+      setDeleting(false);
     }
   };
 
@@ -135,6 +152,34 @@ export default function Settings() {
           <li>Sessions use httpOnly cookies; passwords are hashed.</li>
           <li>You can only access your own data.</li>
         </ul>
+      </Card>
+
+      <Card className="border-red-500/30 p-6">
+        <div className="flex items-center gap-2 text-red-500"><Trash2 size={18} /><h2 className="font-display font-semibold">Danger zone</h2></div>
+        <p className="mt-2 text-sm text-muted">
+          Permanently delete your account and everything in it — agents, conversations, connected integrations, files. This cannot be undone.
+        </p>
+        <div className="mt-4 space-y-2">
+          <label className="block text-sm">
+            <span className="mb-1.5 block text-muted">Type <strong>{user?.email}</strong> to confirm</span>
+            <input
+              type="email"
+              value={deleteConfirmEmail}
+              onChange={(e) => setDeleteConfirmEmail(e.target.value)}
+              placeholder={user?.email}
+              className="w-full rounded-xl border border-line bg-bg px-3.5 py-2.5 text-sm outline-none focus:border-red-500 focus:ring-2 focus:ring-red-500/25"
+            />
+          </label>
+          {deleteError && <p className="text-sm text-red-500">{deleteError}</p>}
+          <Button
+            variant="outline"
+            disabled={deleteConfirmEmail.trim().toLowerCase() !== user?.email?.toLowerCase() || deleting}
+            onClick={handleDeleteAccount}
+            className="border-red-500/50 text-red-500 hover:bg-red-500/10"
+          >
+            {deleting ? "Deleting…" : "Delete my account"}
+          </Button>
+        </div>
       </Card>
     </div>
   );

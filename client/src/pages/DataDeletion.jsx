@@ -24,6 +24,11 @@ export default function DataDeletion() {
         </P>
       </Section>
 
+      {/* FOLLOW-UP LOGGED (not yet done): a real self-service delete button
+          now exists — Settings.jsx's "Danger zone" card, DELETE /api/auth/me
+          (see server/orchestrator/accountDeletion.js). This copy still says
+          email-only, which stopped being true the moment that shipped.
+          Update this section to point at Settings once confirmed live. */}
       <Section heading="Option 2 — Delete your entire account">
         <P>To permanently delete your account and everything associated with it, email us — see "Request deletion by email" below.</P>
       </Section>

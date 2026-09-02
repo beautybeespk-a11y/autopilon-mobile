@@ -1,8 +1,9 @@
 import { Router } from "express";
 import bcrypt from "bcryptjs";
 import db from "../db.js";
-import { cryptoRandom, logActivity } from "../middleware.js";
+import { cryptoRandom, logActivity, requireAuth } from "../middleware.js";
 import { rateLimit } from "../orchestrator/rateLimiter.js";
+import { deleteUserAccount } from "../orchestrator/accountDeletion.js";
 
 const router = Router();
 
@@ -69,6 +70,24 @@ router.get("/me", (req, res) => {
 // emails exist, so the flow can be wired to a mailer later.
 router.post("/forgot-password", authLimiter, (req, res) => {
   res.json({ ok: true, message: "If an account exists for that email, reset instructions will be sent." });
+});
+
+// Self-service account deletion (Meta App Review expects this to exist;
+// see client/src/pages/DataDeletion.jsx). Always targets the caller's own
+// session — never an id from the request body — so there's no way to
+// delete anyone else through this route. Session-only for this closed
+// beta; before real customers this should also require re-entering the
+// current password in the request body (a valid session cookie alone
+// shouldn't be enough to trigger an irreversible delete) and ideally a
+// soft-delete grace period instead of an immediate hard delete — neither
+// is built yet, see accountDeletion.js.
+router.delete("/me", requireAuth, async (req, res) => {
+  try {
+    const result = await deleteUserAccount(req.session.userId, { requestedBy: req.session.userId });
+    req.session.destroy(() => res.json(result));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 export default router;

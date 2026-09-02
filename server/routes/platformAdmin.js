@@ -11,6 +11,8 @@ import { listJobs, getJob, jobStats, retryJob, cancelJob } from "../jobs/jobMana
 import { listFlags, getFlag, createFlag, updateFlag, disableFlag, deleteFlag, setOverride, removeOverride } from "../orchestrator/featureFlags.js";
 import { maintenanceStatus, setMaintenanceMode } from "../orchestrator/maintenanceMode.js";
 import { getPlatformApiUsageDashboard } from "../orchestrator/apiUsageService.js";
+import { createUserAsAdmin, listAdminCreatedUsers } from "../orchestrator/adminUserManager.js";
+import { deleteUserAccount } from "../orchestrator/accountDeletion.js";
 
 const router = Router();
 router.use(requireAuth, requirePlatformAdmin);
@@ -212,6 +214,41 @@ router.patch("/marketplace/categories/:id", (req, res) => {
 router.delete("/marketplace/categories/:id", (req, res) => {
   try { res.json(deleteCategory(req.params.id)); }
   catch (err) { res.status(404).json({ error: err.message }); }
+});
+
+// --- Closed-beta account management ---
+// Admin-created-account path (see orchestrator/adminUserManager.js's own
+// header comment): a completely separate insert path from public signup,
+// reachable only through requirePlatformAdmin above. Never reads or
+// writes PUBLIC_SIGNUP_ENABLED — routes/auth.js's own gate on
+// POST /api/auth/signup is untouched by anything here.
+router.get("/users", (req, res) => {
+  res.json(listAdminCreatedUsers());
+});
+
+router.post("/users", (req, res) => {
+  const { name, email } = req.body || {};
+  try {
+    const result = createUserAsAdmin(req.session.userId, { name, email });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+router.delete("/users/:id", async (req, res) => {
+  const target = db.prepare("SELECT isPlatformAdmin FROM users WHERE id = ?").get(req.params.id);
+  if (!target) return res.status(404).json({ error: "Account not found." });
+  // Never let this become a way to accidentally remove a platform admin —
+  // deliberate rail, not something the blocker checks in
+  // accountDeletion.js would otherwise catch on their own.
+  if (target.isPlatformAdmin) return res.status(403).json({ error: "Cannot remove a platform admin through this route." });
+  try {
+    const result = await deleteUserAccount(req.params.id, { requestedBy: req.session.userId });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 export default router;

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity, ToggleLeft, Trash2, History, MessageSquareText } from "lucide-react";
+import { Building2, Ticket, FileText, Gift, Plus, DollarSign, ShieldAlert, Flag, Activity, ToggleLeft, Trash2, History, MessageSquareText, UserPlus, Copy, Check } from "lucide-react";
 import { Card, Button, Badge, Input } from "../components/ui/index.jsx";
 import { api } from "../lib/api.js";
 
@@ -9,6 +9,10 @@ function fmtCents(cents) {
 
 export default function AdminPanel() {
   const [orgs, setOrgs] = useState([]);
+  const [betaUsers, setBetaUsers] = useState([]);
+  const [betaForm, setBetaForm] = useState({ name: "", email: "" });
+  const [newBetaCredential, setNewBetaCredential] = useState(null); // { email, tempPassword } — shown once
+  const [copied, setCopied] = useState(false);
   const [plans, setPlans] = useState([]);
   const [coupons, setCoupons] = useState([]);
   const [logs, setLogs] = useState([]);
@@ -28,6 +32,7 @@ export default function AdminPanel() {
 
   const load = () => {
     api.get("/admin/organizations").then(setOrgs).catch(() => {});
+    api.get("/admin/users").then(setBetaUsers).catch(() => {});
     api.get("/admin/plans").then(setPlans).catch(() => {});
     api.get("/admin/coupons").then(setCoupons).catch(() => {});
     api.get("/admin/billing-logs").then(setLogs).catch(() => {});
@@ -41,6 +46,32 @@ export default function AdminPanel() {
   useEffect(load, []);
 
   const setFeedbackStatus = async (id, status) => { await api.patch(`/feedback/${id}`, { status }); load(); };
+
+  const createBetaUser = async () => {
+    if (!betaForm.name.trim() || !betaForm.email.trim()) return;
+    try {
+      const result = await api.post("/admin/users", betaForm);
+      setNewBetaCredential({ email: result.email, tempPassword: result.tempPassword });
+      setCopied(false);
+      setBetaForm({ name: "", email: "" });
+      load();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+  const removeBetaUser = async (id, email) => {
+    if (!confirm(`Remove access for ${email}? This permanently deletes the account and everything in it. This cannot be undone.`)) return;
+    try {
+      await api.del(`/admin/users/${id}`);
+      load();
+    } catch (err) {
+      alert(err.message);
+    }
+  };
+  const copyTempPassword = () => {
+    navigator.clipboard.writeText(newBetaCredential.tempPassword);
+    setCopied(true);
+  };
 
   const createFlag = async () => {
     if (!newFlagForm.key.trim() || !newFlagForm.name.trim()) return;
@@ -137,6 +168,47 @@ export default function AdminPanel() {
                 <td className="py-2"><Badge tone={o.subscriptionStatus === "trialing" ? "warn" : "success"}>{o.subscriptionStatus}</Badge></td>
               </tr>
             ))}
+          </tbody>
+        </table>
+      </Card>
+
+      <Card className="p-5">
+        <div className="flex items-center gap-2"><UserPlus size={18} className="text-accent" /><h3 className="font-display font-semibold">Beta accounts</h3></div>
+        <p className="mt-1 text-xs text-muted">Public signup is closed. Create an account directly for a named tester — this doesn't touch the public signup gate.</p>
+
+        {newBetaCredential && (
+          <div className="mt-3 rounded-xl border border-accent/40 bg-accent/5 p-3.5">
+            <p className="text-sm font-medium">Account created for {newBetaCredential.email}</p>
+            <p className="mt-1 text-xs text-muted">Copy this password now and send it to them — it won't be shown again.</p>
+            <div className="mt-2 flex items-center gap-2">
+              <code className="flex-1 rounded-lg bg-elevated px-3 py-2 text-sm">{newBetaCredential.tempPassword}</code>
+              <Button variant="outline" onClick={copyTempPassword}>{copied ? <Check size={14} /> : <Copy size={14} />} {copied ? "Copied" : "Copy"}</Button>
+              <Button variant="outline" onClick={() => setNewBetaCredential(null)}>Dismiss</Button>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <div className="w-48"><Input label="Name" value={betaForm.name} onChange={(e) => setBetaForm({ ...betaForm, name: e.target.value })} placeholder="Tester's name" /></div>
+          <div className="w-64"><Input label="Email" type="email" value={betaForm.email} onChange={(e) => setBetaForm({ ...betaForm, email: e.target.value })} placeholder="tester@example.com" /></div>
+          <Button onClick={createBetaUser}><Plus size={16} /> Create account</Button>
+        </div>
+
+        <table className="mt-4 w-full text-left text-sm">
+          <thead><tr className="border-b border-line text-xs text-muted">
+            <th className="py-2 font-medium">Name</th><th className="py-2 font-medium">Email</th>
+            <th className="py-2 font-medium">Created</th><th className="py-2 font-medium"></th>
+          </tr></thead>
+          <tbody>
+            {betaUsers.map((u) => (
+              <tr key={u.id} className="border-b border-line last:border-0">
+                <td className="py-2">{u.name}</td>
+                <td className="py-2 text-muted">{u.email}</td>
+                <td className="py-2 text-xs text-muted">{new Date(u.createdAt).toLocaleDateString()}</td>
+                <td className="py-2 text-right"><Button variant="outline" onClick={() => removeBetaUser(u.id, u.email)}><Trash2 size={14} /> Remove access</Button></td>
+              </tr>
+            ))}
+            {betaUsers.length === 0 && <tr><td colSpan={4} className="py-3 text-center text-muted">No beta accounts created yet.</td></tr>}
           </tbody>
         </table>
       </Card>

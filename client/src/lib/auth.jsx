@@ -24,9 +24,15 @@ export function AuthProvider({ children }) {
     await api.post("/auth/logout");
     setUser(null);
   };
+  // The server already destroys the session as part of DELETE /auth/me —
+  // this just clears the client's own copy of it, same as logout().
+  const deleteAccount = async () => {
+    await api.del("/auth/me");
+    setUser(null);
+  };
 
   return (
-    <AuthContext.Provider value={{ user, loading, login, signup, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, signup, logout, deleteAccount }}>
       {children}
     </AuthContext.Provider>
   );
