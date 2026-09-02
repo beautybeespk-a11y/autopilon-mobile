@@ -87,44 +87,129 @@ prompt_yn() {
   [[ "$__input" =~ ^[Yy] ]]
 }
 
-# Returns the exact image reference (repo:tag) the `app` container is
-# CURRENTLY running, straight from Docker — not from .env, which could be
-# stale relative to what's actually deployed.
+# Returns the exact image reference (repo:tag) the given container
+# (service name, default "app") is CURRENTLY running, straight from
+# Docker — not from .env, which could be stale relative to what's
+# actually deployed.
 current_running_image() {
-  local cid
-  cid="$(cd "$APP_DIR" && $COMPOSE ps -q app 2>/dev/null || true)"
+  local svc="${1:-app}" cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q "$svc" 2>/dev/null || true)"
   [[ -n "$cid" ]] || { echo ""; return; }
   docker inspect -f '{{.Config.Image}}' "$cid" 2>/dev/null || echo ""
 }
 
-# Returns the CURRENTLY-running app container's actual local image ID
-# (a content digest, e.g. "sha256:abc123...") — immutable and distinct per
-# build, unlike current_running_image()'s tag string, which can be the same
-# floating "latest" across two genuinely different deploys. This is what
-# lets deploy.sh/rollback.sh tell two "latest"-tagged builds apart.
+# Returns the CURRENTLY-running container's (default "app") actual local
+# image ID (a content digest, e.g. "sha256:abc123...") — immutable and
+# distinct per build, unlike current_running_image()'s tag string, which
+# can be the same floating "latest" across two genuinely different
+# deploys. This is what lets deploy.sh/rollback.sh tell two
+# "latest"-tagged builds apart.
 current_image_digest() {
-  local cid
-  cid="$(cd "$APP_DIR" && $COMPOSE ps -q app 2>/dev/null || true)"
+  local svc="${1:-app}" cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q "$svc" 2>/dev/null || true)"
   [[ -n "$cid" ]] || { echo ""; return; }
   docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || echo ""
 }
 
-# The CURRENTLY-running app container's org.opencontainers.image.revision
-# label — the exact git commit build-and-push.yml built the image from
-# (baked in at build time, see .github/workflows/build-and-push.yml).
-# Empty string if the container isn't running, or if its image has no such
-# label (e.g. a locally-built fallback image, or one built before this
-# label existed). This is what lets deploy.sh tell "the pull genuinely
-# shipped new code" apart from "docker compose up -d was a silent no-op
-# because the target tag's digest hadn't actually changed" — the exact
-# live failure mode this was added for: a stale :latest that hadn't been
-# rebuilt since the last push made deploy.sh report success against a
-# 4-hour-old container.
+# The CURRENTLY-running container's (default "app") org.opencontainers.
+# image.revision label — the exact git commit build-and-push.yml built
+# the image from (baked in at build time, see
+# .github/workflows/build-and-push.yml). Empty string if the container
+# isn't running, or if its image has no such label (e.g. a locally-built
+# fallback image, which carries no labels at all — nothing in this repo's
+# `docker compose build` path stamps one — or an image built before this
+# label existed). Never rely on this alone to detect a stale deploy (see
+# verify_container_restarted() below) — it's for display/cross-reference
+# only, since it's silently absent exactly on the local-build path.
 current_image_revision() {
-  local cid
-  cid="$(cd "$APP_DIR" && $COMPOSE ps -q app 2>/dev/null || true)"
+  local svc="${1:-app}" cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q "$svc" 2>/dev/null || true)"
   [[ -n "$cid" ]] || { echo ""; return; }
   docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$cid" 2>/dev/null || echo ""
+}
+
+# The CURRENTLY-running container's (default "app") State.StartedAt
+# timestamp (RFC3339Nano UTC, e.g. "2026-09-02T10:15:23.123456789Z").
+# Empty string if the container isn't running.
+current_container_started_at() {
+  local svc="${1:-app}" cid
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q "$svc" 2>/dev/null || true)"
+  [[ -n "$cid" ]] || { echo ""; return; }
+  docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || echo ""
+}
+
+# Epoch seconds for an RFC3339 timestamp, or 0 if it can't be parsed
+# (empty/missing input) — 0 always compares as "before" any real deploy
+# start time, so callers get a safe (failing-closed) comparison rather
+# than a crash.
+_epoch_of() {
+  [[ -n "${1:-}" ]] || { echo 0; return; }
+  date -u -d "$1" +%s 2>/dev/null || echo 0
+}
+
+# CONFIRMED LIVE BUG, seen twice in production: `docker compose up -d` is
+# a silent no-op for a service whose target image digest hasn't actually
+# changed from what's already running — e.g. a stale :latest in GHCR that
+# hadn't been rebuilt since the last push. Docker prints "Running 0.0s"
+# (not "Started"/"Recreated") for that service, the OLD container just
+# keeps going untouched (an hours-old StartedAt), and the calling script's
+# health checks then pass against it — deploy.sh/rollback.sh would
+# otherwise report success at a commit that was never actually deployed.
+# The one previous defense (comparing the running image's
+# org.opencontainers.image.revision label) only worked when that label
+# was present, which it never is on a locally-built fallback image — a
+# real gap. This is the unconditional, unskippable check: compare the
+# running container's actual image digest against the digest the caller
+# targeted, AND confirm the container's StartedAt is genuinely at or
+# after this operation began. Either failing means nothing was really
+# restarted, full stop — never merely warned about.
+#   $1 = compose service name (e.g. "app", "worker")
+#   $2 = the image digest (local image ID, e.g. "sha256:...") this
+#        deploy/rollback targeted. Empty string skips ONLY the digest
+#        half of the check (with a warning) — used when the caller
+#        genuinely has no target digest to compare against (e.g. very old
+#        rollback state predating digest tracking); the StartedAt half
+#        always runs regardless, since it needs no prior state at all.
+#   $3 = epoch seconds this deploy/rollback began (StartedAt must be >=
+#        this).
+# Returns 0 if genuinely restarted and verified, 1 otherwise. Always
+# prints a human-readable report either way — callers that need the
+# verified digest/revision/StartedAt afterward can just call
+# current_image_digest/current_image_revision <service> again, since by
+# definition nothing changes between this returning 0 and that call.
+verify_container_restarted() {
+  local service="$1" expected_digest="$2" op_start_epoch="$3"
+  local cid actual_digest revision started_at started_epoch ok=1
+  cid="$(cd "$APP_DIR" && $COMPOSE ps -q "$service" 2>/dev/null || true)"
+  if [[ -z "$cid" ]]; then
+    err "No running container found for '$service' after restart."
+    return 1
+  fi
+  actual_digest="$(docker inspect -f '{{.Image}}' "$cid" 2>/dev/null || true)"
+  revision="$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$cid" 2>/dev/null || true)"
+  started_at="$(docker inspect -f '{{.State.StartedAt}}' "$cid" 2>/dev/null || true)"
+  started_epoch="$(_epoch_of "$started_at")"
+
+  if [[ -n "$expected_digest" ]]; then
+    if [[ "$actual_digest" != "$expected_digest" ]]; then
+      err "'$service' is running image digest ${actual_digest:-<none>}, not the digest this operation targeted (${expected_digest})."
+      err "'docker compose up -d' did not actually restart '$service' — this almost always means the target image's digest is unchanged from what was already running (nothing new to deploy, or a stale registry tag)."
+      ok=0
+    fi
+  else
+    warn "No target digest available to verify '$service' against — checking StartedAt only."
+  fi
+
+  if [[ "$started_epoch" -lt "$op_start_epoch" ]]; then
+    err "'$service' container's StartedAt ($started_at) is BEFORE this operation began — it was never actually restarted, it's the same process that was already running."
+    ok=0
+  fi
+
+  if [[ "$ok" == "1" ]]; then
+    log "Verified '$service': digest ${actual_digest} (commit ${revision:-unknown}), started ${started_at} — genuinely restarted by this operation."
+    return 0
+  fi
+  return 1
 }
 
 # Short git commit hash of the checkout deploy.sh is running from, or

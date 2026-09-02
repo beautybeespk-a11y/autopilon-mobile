@@ -107,10 +107,40 @@ require_env_file # reload with the (possibly just-updated) tag
 
 GIT_SHA="$(current_git_commit)"
 
+# EXPECTED_REVISION: the full-length commit this deploy targets,
+# independent of whatever ends up actually running — computed BEFORE the
+# pull so it can catch a stale registry tag immediately below, not just
+# after wastefully restarting/health-checking against it.
+EXPECTED_REVISION=""
+if [[ "$IMAGE_TAG" =~ ^sha-([0-9a-f]{40})$ ]]; then
+  EXPECTED_REVISION="${BASH_REMATCH[1]}"
+elif [[ "$IMAGE_TAG" == "latest" && -d .git ]]; then
+  EXPECTED_REVISION="$(git rev-parse HEAD)"
+fi
+
 log "Pulling ${IMAGE_REPO}:${IMAGE_TAG}..."
-USED_LOCAL_FALLBACK_BUILD=0
+NEED_LOCAL_BUILD=0
 if ! $COMPOSE pull app worker; then
   warn "Pull failed for ${IMAGE_REPO}:${IMAGE_TAG} — falling back to building on this VPS instead (same path install-production.sh uses when no pre-built image is available yet, e.g. before this branch's first build-and-push.yml run, or while the GHCR package is still private). If this tag was just pushed by build-and-push.yml, GitHub Actions may still be running — check the Actions tab. If the GHCR package is private, see install-production.sh's registry-access step / PRODUCTION_DEPLOYMENT.md for how to 'docker login ghcr.io' on this VPS instead."
+  NEED_LOCAL_BUILD=1
+elif [[ -n "$EXPECTED_REVISION" ]]; then
+  # CONFIRMED LIVE BUG, requirement 3: the pull can succeed while still
+  # handing us STALE code — build-and-push.yml is workflow_dispatch-only
+  # (never auto-triggers on push), so ":latest" in GHCR can sit unchanged
+  # across several commits. Check the label on the image we JUST pulled
+  # before ever touching the running containers, so a doomed
+  # restart+health-check cycle never even starts. Never silently deploy
+  # an older image — either build fresh from this checkout (below) or the
+  # post-restart gate further down catches it as a hard failure.
+  PULLED_REVISION="$(docker inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${IMAGE_REPO}:${IMAGE_TAG}" 2>/dev/null || true)"
+  if [[ -n "$PULLED_REVISION" && "$PULLED_REVISION" != "$EXPECTED_REVISION" ]]; then
+    warn "The pulled ${IMAGE_REPO}:${IMAGE_TAG} image was built from commit $PULLED_REVISION, not the commit this deploy targets ($EXPECTED_REVISION) — build-and-push.yml has not (re)built this tag for the latest commit(s) yet. Falling back to building on this VPS instead of deploying stale code. (Trigger build-and-push.yml — workflow_dispatch works on any branch — if you'd rather deploy the real GHCR image once it exists.)"
+    NEED_LOCAL_BUILD=1
+  fi
+fi
+
+USED_LOCAL_FALLBACK_BUILD=0
+if [[ "$NEED_LOCAL_BUILD" == "1" ]]; then
   USED_LOCAL_FALLBACK_BUILD=1
   $COMPOSE build app worker
   $COMPOSE pull redis traefik
@@ -124,44 +154,64 @@ if ! $COMPOSE pull app worker; then
   log "Tagged this build as ${IMAGE_REPO}:${LOCAL_VERSION_TAG} (permanent, in addition to :${IMAGE_TAG})."
 fi
 
+# The digest of whatever image is now tagged :${IMAGE_TAG} locally —
+# just pulled from the registry, or just built above — is exactly what
+# this deploy is targeting for the containers to end up running. This is
+# requirement 1's "digest the deploy targeted."
+TARGET_DIGEST="$(docker inspect -f '{{.Id}}' "${IMAGE_REPO}:${IMAGE_TAG}" 2>/dev/null || true)"
+[[ -n "$TARGET_DIGEST" ]] || warn "Could not determine the target image's digest (docker inspect on ${IMAGE_REPO}:${IMAGE_TAG} returned nothing) — the post-restart verification below will only be able to check StartedAt, not digest."
+
+# Distinguish "legitimately nothing changed" (this exact image was
+# already running — e.g. deploy.sh re-run with no new commit) from "the
+# restart should have happened but didn't." Only the latter is a bug.
+ALREADY_UP_TO_DATE=0
+if [[ -n "$PREV_DIGEST" && -n "$TARGET_DIGEST" && "$PREV_DIGEST" == "$TARGET_DIGEST" ]]; then
+  log "The currently-running containers already match this target image (digest $TARGET_DIGEST) — nothing to restart."
+  ALREADY_UP_TO_DATE=1
+fi
+
 log "Restarting containers (named volumes are preserved — this never runs 'docker compose down -v')..."
+DEPLOY_OP_START_EPOCH="$(date -u +%s)"
 $COMPOSE up -d --remove-orphans
 
-# CONFIRMED LIVE BUG: `docker compose up -d` is a no-op for a service
-# whose target image digest hasn't actually changed — a real occurrence
-# was a stale :latest in GHCR that hadn't been rebuilt since the last
-# push, so the pull above silently fetched nothing new, the OLD container
-# just kept running untouched ("Running 0.0s" / an hours-old StartedAt),
-# and health checks then passed against it — this script reported success
-# at a commit that was never actually deployed. Verify what's ACTUALLY
-# running before declaring success, using org.opencontainers.image.
-# revision (baked into every image build-and-push.yml produces) — the
-# same signal a human would use `docker inspect` for by hand. Skipped
-# (with a warning, not a failure) only when there's genuinely nothing to
-# verify against: a local-build fallback (matches this checkout by
-# construction — see USED_LOCAL_FALLBACK_BUILD above) or a tag that
-# doesn't encode a commit and isn't "latest" (e.g. a plain release tag).
-EXPECTED_REVISION=""
-if [[ "$IMAGE_TAG" =~ ^sha-([0-9a-f]{40})$ ]]; then
-  EXPECTED_REVISION="${BASH_REMATCH[1]}"
-elif [[ "$IMAGE_TAG" == "latest" && -d .git ]]; then
-  EXPECTED_REVISION="$(git rev-parse HEAD)"
-fi
-if [[ "$USED_LOCAL_FALLBACK_BUILD" == "1" ]]; then
-  log "Skipping image-revision verification — this deploy built locally from the current checkout, so it matches by construction."
-elif [[ -z "$EXPECTED_REVISION" ]]; then
-  warn "Cannot determine the expected commit for tag '${IMAGE_TAG}' (not a sha-<commit> tag, and not 'latest' in a git checkout) — skipping the revision-match check. Verify manually with: docker inspect --format '{{ index .Config.Labels \"org.opencontainers.image.revision\" }}' \$($COMPOSE ps -q app)"
+# CONFIRMED LIVE BUG, seen twice in production: `docker compose up -d` is
+# a silent no-op for a service whose target image digest hasn't actually
+# changed from what's already running — e.g. a stale :latest in GHCR that
+# hadn't been rebuilt since the last push. Docker prints "Running 0.0s"
+# (not "Started") for that service, the OLD container just keeps going
+# untouched (an hours-old StartedAt), and the health checks below then
+# pass against it — this script would otherwise report success at a
+# commit that was never actually deployed. The previous defense here
+# (comparing only the running image's org.opencontainers.image.revision
+# label, and only warning when it was absent) had a real gap: a
+# locally-built fallback image carries no such label at all, so that path
+# was silently unverifiable. verify_container_restarted() (_common.sh) is
+# the hard, unconditional replacement — requirements 1+2: it compares the
+# running container's actual image digest against TARGET_DIGEST above,
+# AND confirms its StartedAt is genuinely at-or-after DEPLOY_OP_START_EPOCH.
+# Either failing is a hard stop, never a mere warning.
+if [[ "$ALREADY_UP_TO_DATE" == "1" ]]; then
+  log "Skipping restart verification — already confirmed above that nothing needed to restart."
+  APP_VERIFY_OK=1
+  WORKER_VERIFY_OK=1
 else
-  RUNNING_REVISION="$(current_image_revision)"
-  if [[ -z "$RUNNING_REVISION" ]]; then
-    warn "The running app image has no org.opencontainers.image.revision label — cannot verify it matches the expected commit ($EXPECTED_REVISION). This means it was built by something other than this repo's current build-and-push.yml (or an older version of it, before this label existed). Proceeding, but this deploy is unverified."
-  elif [[ "$RUNNING_REVISION" != "$EXPECTED_REVISION" ]]; then
-    err "The running app container's image was built from commit $RUNNING_REVISION, but this deploy targeted commit $EXPECTED_REVISION."
-    err "'docker compose up -d' did not actually restart anything — the pulled ${IMAGE_REPO}:${IMAGE_TAG} image's digest is unchanged from what was already running. This almost always means the :${IMAGE_TAG} tag in GHCR has not been rebuilt since $EXPECTED_REVISION was pushed."
-    die "Refusing to report success: the deployed code is stale, not the commit this deploy claims. Trigger build-and-push.yml (workflow_dispatch works on any branch) so :${IMAGE_TAG} is actually rebuilt, or deploy an explicit ./deploy.sh sha-<commit> tag once it exists, then re-run ./deploy.sh."
-  else
-    log "Verified: the running app image was built from commit $RUNNING_REVISION — matches what this deploy targeted."
+  if verify_container_restarted app "$TARGET_DIGEST" "$DEPLOY_OP_START_EPOCH"; then APP_VERIFY_OK=1; else APP_VERIFY_OK=0; fi
+  if verify_container_restarted worker "$TARGET_DIGEST" "$DEPLOY_OP_START_EPOCH"; then WORKER_VERIFY_OK=1; else WORKER_VERIFY_OK=0; fi
+fi
+
+# Requirement 4: what's ACTUALLY running right now, straight from Docker
+# — printed below on every path (success, health-check failure, and
+# restart-verification failure) so it's visible without a second command.
+RUNNING_REVISION_NOW="$(current_image_revision app)"
+RUNNING_DIGEST_NOW="$(current_image_digest app)"
+
+if [[ "$APP_VERIFY_OK" != "1" || "$WORKER_VERIFY_OK" != "1" ]]; then
+  err "Deploy did not actually take effect — see the errors above for which service never restarted."
+  err "Currently running: commit ${RUNNING_REVISION_NOW:-unknown} (digest ${RUNNING_DIGEST_NOW:-unknown}) — this deploy targeted commit ${EXPECTED_REVISION:-$GIT_SHA} (digest ${TARGET_DIGEST:-unknown})."
+  if [[ -n "$PREV_IMAGE" ]]; then
+    err "This is the same image that was already running before this deploy started ($PREV_IMAGE) — no rollback is needed, nothing changed. Investigate why the restart didn't happen (often: build-and-push.yml hasn't rebuilt :${IMAGE_TAG} for the latest commit yet — trigger it, or deploy an explicit ./deploy.sh sha-<commit> tag), then re-run ./deploy.sh."
   fi
+  die "Refusing to report success: this deploy is not what's actually running."
 fi
 
 log "No separate migration step needed — the new containers apply any additive schema changes automatically on boot."
@@ -169,13 +219,15 @@ log "No separate migration step needed — the new containers apply any additive
 log "Running health checks..."
 if run_health_checks; then
   echo "${IMAGE_REPO}:${IMAGE_TAG}" > "$STATE_DIR/current-image"
-  current_image_digest > "$STATE_DIR/current-digest"
+  echo "$RUNNING_DIGEST_NOW" > "$STATE_DIR/current-digest"
   echo "$GIT_SHA" > "$STATE_DIR/current-commit"
   date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE_DIR/current-deployed-at"
-  log "Deploy succeeded and is healthy: ${IMAGE_REPO}:${IMAGE_TAG} (commit $GIT_SHA, digest $(current_image_digest))"
+  log "Deploy succeeded and is healthy: ${IMAGE_REPO}:${IMAGE_TAG} ($([[ "$USED_LOCAL_FALLBACK_BUILD" == "1" ]] && echo "built locally on this VPS" || echo "pulled from the registry"))"
+  log "Running commit: ${RUNNING_REVISION_NOW:-$GIT_SHA} (digest ${RUNNING_DIGEST_NOW:-unknown}) — verified genuinely restarted, not stale."
   exit 0
 else
   err "Deploy completed but one or more health checks failed."
+  err "Running commit: ${RUNNING_REVISION_NOW:-$GIT_SHA} (digest ${RUNNING_DIGEST_NOW:-unknown}) — this part DID actually restart; the failure is in the health checks themselves, not staleness."
   if [[ -n "$PREV_IMAGE" ]]; then
     err "Previous known-good image: $PREV_IMAGE — run ./rollback.sh to revert to it."
   else

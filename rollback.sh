@@ -100,7 +100,32 @@ log "Pulling ${PREV_IMAGE}..."
 $COMPOSE pull || warn "Pull failed for ${PREV_IMAGE} — expected if this is a local-only version tag (never pushed to a registry). Continuing with whatever image already exists locally under this tag."
 
 log "Restarting containers on the previous image (named volumes untouched)..."
+ROLLBACK_OP_START_EPOCH="$(date -u +%s)"
 $COMPOSE up -d --remove-orphans
+
+# Same live bug deploy.sh fixes (see _common.sh's verify_container_restarted
+# comment): `docker compose up -d` can silently no-op instead of actually
+# restarting onto PREV_IMAGE. The early "already the same build" exit
+# above only catches the case where we were ALREADY on PREV_IMAGE before
+# rollback started — it doesn't prove the restart just now actually
+# happened. Same hard, unconditional gate: real digest match (when
+# PREV_DIGEST is known) AND a StartedAt genuinely at-or-after this
+# rollback began.
+EXPECT_DIGEST=""
+[[ -n "$PREV_DIGEST" && "$PREV_DIGEST" != "unknown" ]] && EXPECT_DIGEST="$PREV_DIGEST"
+if verify_container_restarted app "$EXPECT_DIGEST" "$ROLLBACK_OP_START_EPOCH"; then APP_VERIFY_OK=1; else APP_VERIFY_OK=0; fi
+if verify_container_restarted worker "$EXPECT_DIGEST" "$ROLLBACK_OP_START_EPOCH"; then WORKER_VERIFY_OK=1; else WORKER_VERIFY_OK=0; fi
+
+# What's ACTUALLY running now, straight from Docker — printed below on
+# every path so it's visible without a second command.
+RUNNING_REVISION_NOW="$(current_image_revision app)"
+RUNNING_DIGEST_NOW="$(current_image_digest app)"
+
+if [[ "$APP_VERIFY_OK" != "1" || "$WORKER_VERIFY_OK" != "1" ]]; then
+  err "Rollback did not actually take effect — see the errors above for which service never restarted."
+  err "Currently running: commit ${RUNNING_REVISION_NOW:-unknown} (digest ${RUNNING_DIGEST_NOW:-unknown}) — this rollback targeted $PREV_IMAGE (commit $PREV_COMMIT, digest ${PREV_DIGEST:-unknown})."
+  die "Refusing to report success: this rollback is not what's actually running."
+fi
 
 log "Running health checks..."
 if run_health_checks; then
@@ -109,7 +134,7 @@ if run_health_checks; then
   # so running rollback.sh a second time in a row correctly rolls
   # forward again instead of being a no-op.
   echo "$PREV_IMAGE" > "$STATE_DIR/current-image"
-  echo "$PREV_DIGEST" > "$STATE_DIR/current-digest"
+  echo "$RUNNING_DIGEST_NOW" > "$STATE_DIR/current-digest"
   echo "$PREV_COMMIT" > "$STATE_DIR/current-commit"
   echo "$PREV_DEPLOYED_AT" > "$STATE_DIR/current-deployed-at"
   if [[ -n "$CURRENT_IMAGE" ]]; then
@@ -117,7 +142,9 @@ if run_health_checks; then
     echo "$CURRENT_DIGEST" > "$STATE_DIR/previous-digest"
   fi
   log "Rollback succeeded and is healthy: $PREV_IMAGE (commit $PREV_COMMIT, digest $PREV_DIGEST)"
+  log "Running commit: ${RUNNING_REVISION_NOW:-$PREV_COMMIT} (digest ${RUNNING_DIGEST_NOW:-unknown}) — verified genuinely restarted, not stale."
 else
   err "Rollback completed but health checks failed. This means BOTH the version you rolled back from AND the one you rolled back to are showing problems right now — check ./logs.sh for every service (traefik, app, worker, redis), this is likely an infrastructure issue (DNS, Redis, disk) rather than an application-version issue."
+  err "Running commit: ${RUNNING_REVISION_NOW:-$PREV_COMMIT} (digest ${RUNNING_DIGEST_NOW:-unknown}) — this part DID actually restart; the failure is in the health checks themselves."
   exit 1
 fi
