@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1000" viewBox="0 0 800 500">
+  <g transform="translate(400,180)">
+    <circle cx="0" cy="0" r="92" fill="none" stroke="#2DD4FF" stroke-width="3" opacity="0.35"/>
+    <circle cx="0" cy="0" r="70" fill="none" stroke="#2DD4FF" stroke-width="1.5" opacity="0.25"/>
+    <path d="M0,-78 L44,70 L22,70 L0,4 L-22,70 L-44,70 Z M-13,30 L13,30 L13,50 L-13,50 Z"
+          fill="#2DD4FF" fill-rule="evenodd"/>
+    <circle cx="92" cy="0" r="5" fill="#2DD4FF"/>
+    <circle cx="-92" cy="0" r="5" fill="#2DD4FF" opacity="0.5"/>
+  </g>
+
+  <text x="400" y="350" font-family="Helvetica, Arial, sans-serif" font-size="56" font-weight="700" fill="#F5F7FA" text-anchor="middle" letter-spacing="2">AUTOPILON</text>
+  <text x="400" y="385" font-family="Helvetica, Arial, sans-serif" font-size="18" font-weight="400" fill="#2DD4FF" text-anchor="middle" letter-spacing="4">AI THAT RUNS YOUR BUSINESS</text>
+</svg>

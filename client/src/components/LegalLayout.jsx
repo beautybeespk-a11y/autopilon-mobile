@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { Sparkles } from "lucide-react";
+import { LogoMark } from "./Logo.jsx";
 
 // Shared chrome for public, no-login legal/compliance pages (Privacy.jsx,
 // DataDeletion.jsx) — same header mark and footer link pattern as
@@ -14,9 +14,7 @@ export default function LegalLayout({ title, lastUpdated, children }) {
     <div className="min-h-full">
       <header className="mx-auto flex max-w-3xl items-center justify-between px-6 py-5">
         <Link to="/" className="flex items-center gap-2.5">
-          <div className="grid h-9 w-9 place-items-center rounded-xl accent-gradient text-white shadow-glow">
-            <Sparkles size={18} />
-          </div>
+          <LogoMark size={36} />
           <span className="font-display text-[15px] font-semibold">Autopilon</span>
         </Link>
         <nav className="flex items-center gap-4 text-sm text-muted">

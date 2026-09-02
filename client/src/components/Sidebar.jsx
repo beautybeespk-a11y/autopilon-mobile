@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
-import { Sparkles, Shield, MessageSquareText } from "lucide-react";
+import { Shield, MessageSquareText } from "lucide-react";
 import { NAV } from "./nav-items.js";
 import { useAuth } from "../lib/auth.jsx";
 import FeedbackModal from "./FeedbackModal.jsx";
+import { LogoMark } from "./Logo.jsx";
 
 export default function Sidebar() {
   const { user } = useAuth();
@@ -11,10 +12,8 @@ export default function Sidebar() {
   return (
     <aside className="hidden w-64 shrink-0 flex-col border-r border-line bg-surface md:flex">
       <div className="flex items-center gap-2.5 px-5 py-5">
-        <div className="grid h-9 w-9 place-items-center rounded-xl accent-gradient text-white shadow-glow">
-          <Sparkles size={18} />
-        </div>
-        <span className="font-display text-[15px] font-semibold tracking-tight">AI Agent Platform</span>
+        <LogoMark size={32} />
+        <span className="font-display text-[15px] font-semibold tracking-tight">Autopilon</span>
       </div>
 
       <nav className="flex-1 space-y-1 px-3 py-2">

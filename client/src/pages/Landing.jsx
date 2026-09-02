@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
-import { Sparkles, ArrowRight, Bot, Wrench, Zap, Plug, FolderKanban, Users } from "lucide-react";
+import { ArrowRight, Bot, Wrench, Zap, Plug, FolderKanban, Users } from "lucide-react";
 import { Button, Card } from "../components/ui/index.jsx";
+import { LogoMark } from "../components/Logo.jsx";
 
 const FEATURES = [
   { icon: Bot, title: "AI agents", body: "Give an agent a job, instructions, and a personality — then talk to it like a teammate." },
@@ -34,9 +35,7 @@ export default function Landing() {
     <div className="min-h-full">
       <header className="mx-auto flex max-w-6xl items-center justify-between px-6 py-5">
         <div className="flex items-center gap-2.5">
-          <div className="grid h-9 w-9 place-items-center rounded-xl accent-gradient text-white shadow-glow">
-            <Sparkles size={18} />
-          </div>
+          <LogoMark size={36} />
           <span className="font-display text-[15px] font-semibold">Autopilon</span>
         </div>
         <div className="flex items-center gap-2">
@@ -162,6 +161,9 @@ export default function Landing() {
       </section>
 
       <footer className="border-t border-line py-8 text-center text-sm text-muted">
+        <div className="mb-3 flex justify-center">
+          <LogoMark size={28} />
+        </div>
         <Link to="/signup" className="hover:text-ink">Request Beta Access</Link> · Private beta
         <div className="mt-2">
           <Link to="/privacy" className="hover:text-ink">Privacy Policy</Link> ·{" "}

@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { NavLink, Link } from "react-router-dom";
-import { Menu, X, Sparkles } from "lucide-react";
+import { Menu, X } from "lucide-react";
 import { NAV, MOBILE_PRIMARY } from "./nav-items.js";
+import { LogoMark } from "./Logo.jsx";
 
 export default function MobileNav() {
   const [open, setOpen] = useState(false);
@@ -12,10 +13,8 @@ export default function MobileNav() {
       {/* Top bar */}
       <div className="flex items-center justify-between border-b border-line bg-surface px-4 py-3 md:hidden">
         <Link to="/app" className="flex items-center gap-2">
-          <div className="grid h-8 w-8 place-items-center rounded-lg accent-gradient text-white">
-            <Sparkles size={16} />
-          </div>
-          <span className="font-display text-sm font-semibold">AI Agent Platform</span>
+          <LogoMark size={28} />
+          <span className="font-display text-sm font-semibold">Autopilon</span>
         </Link>
         <button onClick={() => setOpen(true)} className="rounded-lg p-2 text-muted hover:bg-elevated" aria-label="Open menu">
           <Menu size={20} />

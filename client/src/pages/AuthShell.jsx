@@ -1,16 +1,13 @@
 import { Link } from "react-router-dom";
-import { Sparkles } from "lucide-react";
+import { LogoLockup } from "../components/Logo.jsx";
 
 export default function AuthShell({ title, subtitle, children, footer }) {
   return (
     <div className="grid min-h-full lg:grid-cols-2">
       <div className="relative hidden aurora lg:block">
         <div className="flex h-full flex-col justify-between p-10">
-          <Link to="/" className="flex items-center gap-2.5">
-            <div className="grid h-9 w-9 place-items-center rounded-xl accent-gradient text-white shadow-glow">
-              <Sparkles size={18} />
-            </div>
-            <span className="font-display font-semibold">AI Agent Platform</span>
+          <Link to="/">
+            <LogoLockup height={28} />
           </Link>
           <div>
             <p className="font-display text-2xl font-semibold leading-snug">
@@ -24,12 +21,9 @@ export default function AuthShell({ title, subtitle, children, footer }) {
 
       <div className="flex items-center justify-center p-6">
         <div className="w-full max-w-sm">
-          <div className="mb-6 lg:hidden">
-            <Link to="/" className="flex items-center gap-2.5">
-              <div className="grid h-9 w-9 place-items-center rounded-xl accent-gradient text-white">
-                <Sparkles size={18} />
-              </div>
-              <span className="font-display font-semibold">AI Agent Platform</span>
+          <div className="mb-6 flex justify-center">
+            <Link to="/">
+              <LogoLockup height={32} />
             </Link>
           </div>
           <h1 className="font-display text-2xl font-semibold">{title}</h1>
