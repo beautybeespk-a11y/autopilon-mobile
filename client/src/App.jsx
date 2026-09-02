@@ -6,6 +6,8 @@ import Landing from "./pages/Landing.jsx";
 import Login from "./pages/Login.jsx";
 import Signup from "./pages/Signup.jsx";
 import ForgotPassword from "./pages/ForgotPassword.jsx";
+import Privacy from "./pages/Privacy.jsx";
+import DataDeletion from "./pages/DataDeletion.jsx";
 
 import Dashboard from "./pages/Dashboard.jsx";
 import Chat from "./pages/Chat.jsx";
@@ -44,6 +46,8 @@ export default function App() {
       <Route path="/signup" element={<Signup />} />
       <Route path="/forgot-password" element={<ForgotPassword />} />
       <Route path="/share/:token" element={<SharedFile />} />
+      <Route path="/privacy" element={<Privacy />} />
+      <Route path="/data-deletion" element={<DataDeletion />} />
 
       <Route
         path="/app"

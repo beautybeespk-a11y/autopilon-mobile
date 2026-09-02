@@ -163,6 +163,10 @@ export default function Landing() {
 
       <footer className="border-t border-line py-8 text-center text-sm text-muted">
         <Link to="/signup" className="hover:text-ink">Request Beta Access</Link> · Private beta
+        <div className="mt-2">
+          <Link to="/privacy" className="hover:text-ink">Privacy Policy</Link> ·{" "}
+          <Link to="/data-deletion" className="hover:text-ink">Data Deletion</Link>
+        </div>
       </footer>
     </div>
   );
