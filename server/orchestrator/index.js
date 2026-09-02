@@ -234,6 +234,39 @@ function activeCreativeHasRealEngagement(activeStrategy) {
   return allContent.find((c) => c.id === creative.contentId)?.engagement?.status === "exists";
 }
 
+// Matches a user's plain-chat reply against the REAL candidate ids a
+// creative-ambiguity question already showed (resolvedAssets.
+// creativeCandidates — see creativeResolution.js/strategyBuilder.js),
+// same "never a guessed id" discipline as the Pixel auto-revise's digit-
+// run match above, extended to also recognize a numbered-list position
+// ("1)") since formatCreativeCandidatesQuestion (creativeResolution.js)
+// always presents candidates that way and a user very plausibly replies
+// with just the number.
+//   1. An exact real id — numeric ids (WooCommerce/Shopify product ids)
+//      matched as a standalone digit run, never a substring of a larger
+//      number; composite Facebook/Instagram ids ("pageId_postId") matched
+//      as a literal substring, safe since that's the exact string shown.
+//      If the message's digit runs happen to match MORE than one real
+//      candidate id (e.g. it also contains an unrelated number like a
+//      budget amount that coincidentally equals another candidate's id),
+//      this returns null rather than guessing between them.
+//   2. Only when no id matched at all: an explicit "N)" list-position
+//      marker, resolved against the SAME list position order the
+//      question was built from.
+function matchCreativeCandidateId(userMessage, candidateIds) {
+  if (typeof userMessage !== "string" || !Array.isArray(candidateIds) || !candidateIds.length) return null;
+  const digitRuns = userMessage.match(/\d+/g) || [];
+  const idMatches = candidateIds.filter((id) => (/^\d+$/.test(id) ? digitRuns.includes(id) : userMessage.includes(id)));
+  if (idMatches.length === 1) return idMatches[0];
+  if (idMatches.length > 1) return null;
+  const positionMatch = userMessage.match(/\b(\d+)\)/);
+  if (positionMatch) {
+    const position = Number(positionMatch[1]);
+    if (Number.isInteger(position) && position >= 1 && position <= candidateIds.length) return candidateIds[position - 1];
+  }
+  return null;
+}
+
 // Issue 6 (live testing round 3): "Create the best campaign you recommend
 // for my business" led the model to call meta_expert.execute_campaign_plan
 // as its very first action, with no plan ever proposed — which reached
@@ -1030,6 +1063,57 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           }
         } catch (err) {
           v2Trace("auto-revise pixel failed (error)", { conversationId, error: err.message });
+        }
+      }
+    }
+  }
+
+  // Live bug (creative attach follow-up — same class as the Pixel fix
+  // directly above, and the budget fix above that): a genuinely ambiguous
+  // creative (2+ real candidates, resolvedAssets.creative null,
+  // resolvedAssets.creativeCandidates populated — see creativeResolution.js/
+  // strategyBuilder.js) was left depending on the model calling
+  // revise_strategy for a plain-chat answer — exactly the mechanism that
+  // failed repeatedly for Pixel. Same fix, same shape: BEFORE the model
+  // gets a turn, match the user's CURRENT message against the REAL
+  // candidate ids/list-position already shown, and call revise_strategy
+  // directly if there's exactly one unambiguous match.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const creativeCandidates = activeStrategy?.resolvedAssets?.creativeCandidates;
+    if (activeStrategy && activeStrategy.resolvedAssets?.creative == null && Array.isArray(creativeCandidates) && creativeCandidates.length) {
+      const matchedCreativeId = matchCreativeCandidateId(userMessage, creativeCandidates);
+      if (matchedCreativeId) {
+        try {
+          const accessToken = requireValidToken(userId, "meta_ads");
+          const revised = await reviseStrategyV2({
+            userId, conversationId, accessToken, strategyId: activeStrategy.id,
+            requestedChanges: { content_selector: { confirmedId: matchedCreativeId } },
+            userMessage,
+          });
+          if (revised.ok) {
+            trace.push(traceStep("tool", "Auto-saved the creative you just chose (meta_expert_v2.revise_strategy)", "done"));
+            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+            // Same append-in-place pattern as the budget/Pixel auto-revise
+            // blocks above — including when ONE of those already fired for
+            // THIS SAME message (a single reply answering two open
+            // questions at once, e.g. "1) <product> ... budget 600/day"):
+            // conversationForModel/lastIdx are re-read fresh here, after
+            // whichever earlier block already appended its own note, so
+            // both notes stack rather than one overwriting the other.
+            const lastIdx = conversationForModel.length - 1;
+            const last = conversationForModel[lastIdx];
+            if (last?.role === "user" && typeof last.content === "string") {
+              conversationForModel = [
+                ...conversationForModel.slice(0, lastIdx),
+                { ...last, content: `${last.content}\n\n[System note: this message's chosen creative (id ${matchedCreativeId}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+              ];
+            }
+          } else {
+            v2Trace("auto-revise creative failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+          }
+        } catch (err) {
+          v2Trace("auto-revise creative failed (error)", { conversationId, error: err.message });
         }
       }
     }

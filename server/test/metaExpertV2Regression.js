@@ -143,7 +143,16 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
   };
 }
 
-function scriptedFetch({ chatResponses, metaOpts = {} }) {
+const DEFAULT_WC_PRODUCTS = [{
+  id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }],
+  // Real fields PRODUCT_IMAGE creative resolution needs (creativeResolution.js)
+  // — added alongside the pre-existing name/price/category, never replacing them.
+  images: [{ src: "https://store.example.com/wp-content/uploads/vitamin-c-serum.jpg" }],
+  permalink: "https://store.example.com/product/vitamin-c-serum/",
+  short_description: "A brightening serum with 15% Vitamin C for daily use.",
+}];
+
+function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_PRODUCTS }) {
   let chatIndex = 0;
   const metaHandler = metaRouter(metaOpts);
   return async (url, options = {}) => {
@@ -156,16 +165,7 @@ function scriptedFetch({ chatResponses, metaOpts = {} }) {
     }
     if (u.pathname.startsWith("/wp-json/wc/v3/")) {
       if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
-      if (u.pathname.endsWith("/products")) {
-        return jsonResponse([{
-          id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }],
-          // Real fields PRODUCT_IMAGE creative resolution needs (creativeResolution.js)
-          // — added alongside the pre-existing name/price/category, never replacing them.
-          images: [{ src: "https://store.example.com/wp-content/uploads/vitamin-c-serum.jpg" }],
-          permalink: "https://store.example.com/product/vitamin-c-serum/",
-          short_description: "A brightening serum with 15% Vitamin C for daily use.",
-        }]);
-      }
+      if (u.pathname.endsWith("/products")) return jsonResponse(wcProducts);
       if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
       if (u.pathname.endsWith("/reports/top_sellers")) return jsonResponse([]);
       return jsonResponse([]);
@@ -3688,6 +3688,105 @@ async function run() {
       const userMessage = "Can you recap the plan?";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       assert.match(result.reply, /best-performing/i, "a claim genuinely backed by real engagement data must reach the customer unchanged, not be treated as a false claim");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Creative auto-revise pre-loop (live bug: same class as Pixel) ------
+  // Live report: the strategy asked which product AND the budget in one
+  // message ("This ad account has ... which product ... What daily budget
+  // would you like for this?"). The user answered both at once: "1) La
+  // Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50 (id 5814,
+  // 2050)   budget will be 600/day". The trace showed the budget auto-save
+  // fired ("Auto-saved the budget you just gave"), but the creative
+  // question stayed open — nothing backend-enforced ever called
+  // revise_strategy for the creative answer, so every subsequent
+  // execute_strategy kept failing and re-showing the full candidate list,
+  // and the model then improvised "say approve one more time" / claimed an
+  // action that was never taken downstream of that. Fixed the same way
+  // budget/Pixel were: a deterministic pre-loop auto-save
+  // (matchCreativeCandidateId, orchestrator/index.js) that fires BEFORE the
+  // model gets a turn, and — the specific gap in THIS report — the budget
+  // and creative auto-revise blocks are separate, sequential, and each
+  // re-fetches the active strategy fresh, so a single message answering
+  // BOTH questions must clear BOTH, not just whichever block runs first.
+  await check("[Creative auto-revise] a single message answering BOTH the ambiguous-creative and missing-budget questions clears both deterministically, and execute_strategy then proceeds — no dependence on the model calling revise_strategy", async () => {
+    const userId = makeUser(`v2-creative-autorevise-both-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const wcProducts = [
+      {
+        id: 5814, name: "La Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50", price: "2050", categories: [{ name: "Skincare" }],
+        images: [{ src: "https://store.example.com/wp-content/uploads/sunscreen.jpg" }],
+        permalink: "https://store.example.com/product/sunscreen/",
+        short_description: "Mineral sunscreen with zinc oxide, SPF 50.",
+      },
+      {
+        id: 5900, name: "Hydrating Facial Cleanser", price: "1200", categories: [{ name: "Skincare" }],
+        images: [{ src: "https://store.example.com/wp-content/uploads/cleanser.jpg" }],
+        permalink: "https://store.example.com/product/cleanser/",
+        short_description: "Gentle daily cleanser for all skin types.",
+      },
+    ];
+
+    // Build a strategy with BOTH questions genuinely open at once: no
+    // budget_daily, and a PRODUCT_IMAGE source with 2 real, eligible
+    // candidates (no explicit pick) — the exact live shape reported.
+    mockFetch(scriptedFetch({ chatResponses: [], wcProducts, metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: undefined, creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad — pick the best product." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy.unresolved_questions.length, 2, `both questions must be open at once: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+      const creativeQuestion = built.strategy.unresolved_questions.find((q) => q.startsWith("Which "));
+      assert.match(creativeQuestion, /5814/, "the real candidate id must be named");
+      assert.match(creativeQuestion, /5900/, "the real candidate id must be named");
+      assert.ok(built.strategy.unresolved_questions.includes("What daily budget would you like for this?"));
+    } finally {
+      restoreFetch();
+    }
+
+    // A single reply answering BOTH — the exact live shape reported,
+    // naming the product's real id/price from the question just shown and
+    // a budget amount, in one message. The model gets NO scripted tool
+    // calls at all — if either auto-revise pre-loop depended on the model,
+    // this test would fail with "chat mock exhausted" or leave a question
+    // open, proving both fire deterministically before the model's turn.
+    mockFetch(scriptedFetch({
+      wcProducts,
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [finalText("Got it — I've saved the sunscreen as your creative and set the budget to 600/day. Reply 'approve' whenever you're ready.")],
+    }));
+    try {
+      const userMessage = "1) La Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50 (id 5814, 2050)   budget will be 600/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const autoSavedNames = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length;
+      assert.equal(autoSavedNames, 2, `both the budget AND the creative must be auto-saved from this one message: ${JSON.stringify(result.toolResults)}`);
+
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.strategy.budget_daily, 600, "the budget answer must be saved");
+      assert.equal(updated.resolvedAssets.creative?.productId, "5814", "the creative answer must be saved — the SPECIFIC product named, not a guess");
+      assert.deepEqual(updated.strategy.unresolved_questions, [], "both questions must be cleared — neither re-asked");
+    } finally {
+      restoreFetch();
+    }
+
+    // execute_strategy must now actually proceed — no "unresolved
+    // question" error, no re-listing of all candidates, no model
+    // improvising "say approve one more time".
+    mockFetch(scriptedFetch({ chatResponses: [], wcProducts, metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const strategyId = getActiveStrategyForConversation(userId, conversationId).id;
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId });
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+      assert.equal(executed.status, "PAUSED");
     } finally {
       restoreFetch();
     }

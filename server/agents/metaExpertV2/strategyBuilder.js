@@ -518,7 +518,14 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     return { ok: false, unresolved: buildUnresolvedIssue(errors) };
   }
 
-  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative };
+  // Persisted the SAME way resolved.pixelCandidates already is
+  // (assetResolution.js) — real, Meta/WooCommerce/Shopify-confirmed
+  // candidate ids only, never guessed — so the orchestrator's creative
+  // auto-revise pre-loop (index.js, mirroring the pixel auto-revise) can
+  // match the user's plain-chat answer against them without re-resolving
+  // from scratch or trusting the model to call revise_strategy on its own.
+  const creativeCandidateIds = creativeResolution.ambiguousCandidates.length ? creativeResolution.ambiguousCandidates.map((c) => c.id) : null;
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateIds };
   const recommendationText = formatRecommendation(normalized, names);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
