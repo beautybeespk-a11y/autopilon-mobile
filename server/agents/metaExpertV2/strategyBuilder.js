@@ -9,6 +9,7 @@
 // another LLM attempt.
 import { gatherBusinessSnapshot } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
+import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatPrimaryTextQuestion } from "./creativeResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
@@ -325,6 +326,32 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
     await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot });
 
+  // Creative selection (Phase 1 follow-up: attach a real ad, not just a
+  // Campaign + Ad Set) — same resolution shape as Pixel above: explicit
+  // pick wins, then the prior strategy's ALREADY-RESOLVED choice is reused
+  // verbatim (contentSelectorProvidedThisCall is checked against the RAW,
+  // pre-merge requestedChanges — same "explicit this turn" signal
+  // explicitAssetChanges is for identity assets), then a single real
+  // candidate auto-resolves, then genuine ambiguity becomes a real
+  // question. See creativeResolution.js's header comment for why this
+  // deliberately does NOT write back to the account-level defaults record
+  // the way Pixel does — content isn't a stable identity.
+  const priorCreative = priorStored?.resolvedAssets?.creative || null;
+  const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined;
+  const creativeResolution = normalized.mode === "campaign"
+    ? resolveCreativeSelection({ strategy: normalized, snapshot, priorCreative, contentSelectorProvidedThisCall, userMessage })
+    : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false };
+  if (creativeResolution.creativeError) {
+    resolutionErrors.push({ field: "creative_strategy", message: creativeResolution.creativeError, code: "META_V2_CREATIVE_NOT_FOUND" });
+  }
+  if (traceEnabled) {
+    trace("creative resolution", {
+      conversationId, source: normalized.creative_strategy?.source, resolved: Boolean(creativeResolution.creative),
+      ambiguousCount: creativeResolution.ambiguousCandidates.length, needsPrimaryTextQuestion: creativeResolution.needsPrimaryTextQuestion,
+      unsupportedSource: creativeResolution.unsupportedSource, reusedFromPrior: !contentSelectorProvidedThisCall && Boolean(priorCreative),
+    });
+  }
+
   // Live bug (round 31): a revision's requestedChanges only ever names the
   // fields actually changing (e.g. just budget_daily, from the round-30
   // auto-revise triggered by the user supplying a budget in chat) —
@@ -344,12 +371,22 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // re-added by them, deduplicated via the same Set pattern they already
   // use) — never touches a genuine, model-authored business question,
   // which is never exactly one of these two fixed strings.
+  // Creative candidate/primaryText questions are DYNAMIC strings (the real
+  // candidate list, or the real product name, embedded in the text) — the
+  // exact-string match above can't recognize them, so they're pruned by a
+  // stable prefix instead (see creativeResolution.js's formatters — both
+  // always start with these exact phrases regardless of which real
+  // candidates/product they name).
+  const isCreativeCandidatesQuestion = (q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?");
+  const isPrimaryTextQuestion = (q) => q.startsWith('What ad text would you like for the "');
   if (normalized.unresolved_questions?.length) {
     normalized = {
       ...normalized,
       unresolved_questions: normalized.unresolved_questions.filter((q) => {
         if (q === "What daily budget would you like for this?") return normalized.budget_daily == null;
         if (q === "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?") return !resolved.pixelId;
+        if (isCreativeCandidatesQuestion(q)) return creativeResolution.ambiguousCandidates.length > 0;
+        if (isPrimaryTextQuestion(q)) return creativeResolution.needsPrimaryTextQuestion;
         return true;
       }),
     };
@@ -361,6 +398,25 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // rejection and never a silent objective downgrade.
   if (normalized.mode === "campaign" && PURCHASE_LIKE_EVENTS.has(normalized.optimization_event) && !resolved.pixelId && pixelAmbiguous) {
     const question = "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?";
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
+  // Same principle, for creative: 2+ real candidates for the strategy's
+  // chosen creative_strategy.source, no explicit pick — a real question
+  // naming the real candidates (ids, captions/product names, real
+  // engagement or an honest "no engagement data available"), never a
+  // silent "use the first one."
+  if (creativeResolution.ambiguousCandidates.length > 0) {
+    const question = formatCreativeCandidatesQuestion(normalized.creative_strategy?.source, creativeResolution.ambiguousCandidates);
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
+  // A resolved PRODUCT_IMAGE candidate with no real shortDescription and
+  // no verified user-supplied answer — never let the model invent ad
+  // copy (explicitly out of scope). Asked exactly once, in plain
+  // language, the same way budget_daily is asked for above.
+  if (creativeResolution.needsPrimaryTextQuestion) {
+    const question = formatPrimaryTextQuestion(creativeResolution.resolvedProductForQuestion);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
@@ -462,7 +518,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     return { ok: false, unresolved: buildUnresolvedIssue(errors) };
   }
 
-  const resolvedForStorage = { ...resolved, contentId };
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative };
   const recommendationText = formatRecommendation(normalized, names);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,

@@ -158,6 +158,86 @@ function buildV2Targeting(strategy) {
   };
 }
 
+// Creative attach (Phase 1 follow-up) — a campaign-mode strategy's real
+// creative was already resolved at build/revise time (creativeResolution.js,
+// stored on resolvedAssets.creative — never re-derived here). This builds
+// the same request shapes meta.boost_post/meta.create_image_ad
+// (tools/meta/campaigns.js) already use, but calls meta.createAdCreative/
+// meta.createAd DIRECTLY rather than through those tools' execute()
+// wrappers — the ONLY reason being that this file's own always-on
+// diagnostic logging (see executeCampaignMode's comment) needs the real
+// request bodies, which the tool wrappers don't expose to a caller.
+// resolvedAssets.creative is null for the three sources explicitly out of
+// scope this session (GENERATED_IMAGE/GENERATED_VIDEO/USER_ATTACHED_MEDIA
+// — see creativeResolution.js) or for a strategy stored before this
+// feature existed — the campaign/ad set are still created either way,
+// just honestly reported as not having a creative attached, never
+// silently skipped without saying so.
+const CREATIVE_UNSUPPORTED_SOURCES = new Set(["GENERATED_IMAGE", "GENERATED_VIDEO", "USER_ATTACHED_MEDIA"]);
+async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId, campaignId, pageId) {
+  const { strategy, resolvedAssets } = stored;
+  const creative = resolvedAssets.creative;
+  if (!creative) {
+    const source = strategy.creative_strategy?.source;
+    const skippedReason = CREATIVE_UNSUPPORTED_SOURCES.has(source)
+      ? `creative_strategy.source "${source}" isn't supported for automatic ad attach yet — the campaign and ad set were created (paused), but you'll need to add the actual ad creative manually in Ads Manager.`
+      : "No creative was resolved for this strategy — the campaign and ad set were created (paused), but no ad was attached.";
+    return { adId: null, creativeId: null, attached: false, skippedReason };
+  }
+
+  let creativeFields;
+  if (creative.source === "EXISTING_PAGE_POST") {
+    creativeFields = { name: `${strategy.business_goal} — creative`, object_story_id: creative.contentId };
+  } else if (creative.source === "EXISTING_INSTAGRAM_POST") {
+    const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
+    if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected — cannot attach the resolved Instagram post.");
+    creativeFields = { name: `${strategy.business_goal} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: creative.contentId };
+  } else if (creative.source === "PRODUCT_IMAGE") {
+    const imgRes = await fetch(creative.imageUrl);
+    if (!imgRes.ok) throw new Error(`Could not fetch the resolved product image from ${creative.imageUrl}`);
+    const base64 = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
+    const { hash } = await meta.uploadAdImage(accessToken, adAccountId, base64);
+    creativeFields = {
+      name: `${strategy.business_goal} — creative`,
+      object_story_spec: { page_id: pageId, link_data: { image_hash: hash, message: creative.primaryText, name: creative.productName, link: creative.link } },
+    };
+  } else {
+    throw new Error(`Unrecognized resolved creative source "${creative.source}".`);
+  }
+
+  logger.info("meta_expert_v2.execute_strategy.creative_request", { strategyId: stored.id, adAccountId, body: creativeFields });
+  const adCreative = await meta.createAdCreative(accessToken, adAccountId, creativeFields);
+  logger.info("meta_expert_v2.execute_strategy.creative_response", { strategyId: stored.id, adCreative });
+
+  const adFields = { name: strategy.business_goal, adset_id: adSetId, creative: { creative_id: adCreative.id }, status: "PAUSED" };
+  logger.info("meta_expert_v2.execute_strategy.ad_request", { strategyId: stored.id, adAccountId, body: adFields });
+  const ad = await meta.createAd(accessToken, adAccountId, adFields);
+  logger.info("meta_expert_v2.execute_strategy.ad_response", { strategyId: stored.id, ad });
+
+  // Read-back verification (requirement: confirm the created ad actually
+  // matches the plan, not just trust the create call's own response) —
+  // re-fetches both the ad and its creative directly from Meta and checks
+  // them against what this call actually intended, rather than assuming
+  // a 200 response means the real stored object is correct.
+  const verifyAd = await meta.getAd(accessToken, ad.id);
+  if (verifyAd.status !== "PAUSED" || verifyAd.adset_id !== adSetId || verifyAd.campaign_id !== campaignId) {
+    throw new Error(`Ad verification failed: readback (status=${verifyAd.status}, adset_id=${verifyAd.adset_id}, campaign_id=${verifyAd.campaign_id}) does not match what was created (expected status=PAUSED, adset_id=${adSetId}, campaign_id=${campaignId}).`);
+  }
+  const verifyCreative = await meta.getAdCreative(accessToken, adCreative.id);
+  if (creative.source === "EXISTING_PAGE_POST" && verifyCreative.object_story_id !== creative.contentId) {
+    throw new Error(`Creative verification failed: readback object_story_id (${verifyCreative.object_story_id}) does not match the resolved post (${creative.contentId}).`);
+  }
+  if (creative.source === "EXISTING_INSTAGRAM_POST" && verifyCreative.object_story_spec?.source_instagram_media_id !== creative.contentId) {
+    throw new Error(`Creative verification failed: readback source_instagram_media_id (${verifyCreative.object_story_spec?.source_instagram_media_id}) does not match the resolved post (${creative.contentId}).`);
+  }
+  if (creative.source === "PRODUCT_IMAGE" && verifyCreative.object_story_spec?.link_data?.link !== creative.link) {
+    throw new Error(`Creative verification failed: readback link (${verifyCreative.object_story_spec?.link_data?.link}) does not match the resolved product link (${creative.link}).`);
+  }
+  logger.info("meta_expert_v2.execute_strategy.readback_verify", { strategyId: stored.id, adId: ad.id, creativeId: adCreative.id, verifiedAgainstPlan: true });
+
+  return { adId: ad.id, creativeId: adCreative.id, attached: true, skippedReason: null };
+}
+
 function loadExecutable(userId, conversationId, strategyId) {
   const stored = strategyId ? getStoredStrategy(userId, strategyId) : getActiveStrategyForConversation(userId, conversationId);
   if (!stored) {
@@ -271,9 +351,18 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // original error (never masking it with a cleanup failure) — a cleanup
   // failure is logged, not thrown, since the customer needs the REAL
   // reason execution failed, not a secondary cleanup problem.
+  // Live gap (this feature): the ad set above was the last step before —
+  // now the creative/ad attach (attachCampaignCreative) runs too, and a
+  // failure THERE is exactly as orphan-prone as an ad-set failure (a real
+  // campaign + ad set left behind, no ad ever attached). Both now share
+  // this ONE try block and the SAME cleanup on any failure past this
+  // point, rather than only guarding the ad set creation.
   let adSet;
+  let creativeResult;
   try {
     adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, adSetParams);
+    logger.info("meta_expert_v2.execute_strategy.adset_response", { strategyId: stored.id, adSet });
+    creativeResult = await attachCampaignCreative(stored, accessToken, resolvedAssets.adAccountId, adSet.id, campaign.id, resolvedAssets.pageId);
   } catch (err) {
     try {
       await meta.setCampaignStatus(accessToken, campaign.id, "DELETED");
@@ -283,10 +372,15 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
     }
     throw err;
   }
-  logger.info("meta_expert_v2.execute_strategy.adset_response", { strategyId: stored.id, adSet });
 
-  const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED" };
+  const executionResult = {
+    campaignId: campaign.id, adSetId: adSet.id, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED",
+    adId: creativeResult.adId, creativeId: creativeResult.creativeId, creativeAttached: creativeResult.attached, creativeSkippedReason: creativeResult.skippedReason,
+  };
   publishEvent(userId, "meta_ads", "meta_ads_event", { eventSubtype: "campaign_created", campaignId: campaign.id, name: strategy.business_goal, source: "meta_expert_v2" });
+  if (creativeResult.attached) {
+    publishEvent(userId, "meta_ads", "meta_ads_event", { eventSubtype: "ad_created", adId: creativeResult.adId, adSetId: adSet.id, name: strategy.business_goal, source: "meta_expert_v2", format: resolvedAssets.creative?.source || null });
+  }
   return executionResult;
 }
 
@@ -462,7 +556,13 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
       : await executeCampaignMode(stored, accessToken, userId, adAccount.currency);
 
     markStrategyExecuted(stored.id, executionResult);
-    return { ...executionResult, nextStep: "Campaign and ad set are created and PAUSED — nothing will spend until you resume it." };
+    // Honest, mode/attach-aware nextStep — never claims an ad exists when
+    // creativeAttached is explicitly false (the exact "false completion
+    // claim" class of bug this whole feature exists to avoid repeating).
+    const nextStep = executionResult.adId
+      ? "Campaign, ad set, and ad are created and PAUSED — nothing will spend until you resume it."
+      : `Campaign and ad set are created and PAUSED — no ad was attached yet.${executionResult.creativeSkippedReason ? ` ${executionResult.creativeSkippedReason}` : ""}`;
+    return { ...executionResult, nextStep };
   } catch (err) {
     // Live bug: Meta's real Ad Set creation rejected an approved strategy
     // with "(#100/3858558) To avoid zero results, your budget must be at

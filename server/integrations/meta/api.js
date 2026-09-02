@@ -319,6 +319,17 @@ export async function getAd(accessToken, adId) {
   return metaFetch(`/${adId}?fields=id,name,status,adset_id,campaign_id,creative`, { accessToken });
 }
 
+// Read-back verification for a just-created ad's actual creative (Meta
+// Ads Expert V2's creative-attach step, executor.js) — getAd above only
+// returns the creative as a bare {id} reference; this expands it so the
+// executor can confirm what Meta actually stored (object_story_id /
+// instagram_actor_id+source_instagram_media_id for a boosted post, or the
+// link_data image_hash/link for a product-image ad) genuinely matches
+// what was sent, rather than trusting the create call's response alone.
+export async function getAdCreative(accessToken, creativeId) {
+  return metaFetch(`/${creativeId}?fields=id,name,object_story_id,object_story_spec`, { accessToken });
+}
+
 // Ad-account-scoped, same shape as the existing listCampaigns — ad sets
 // span campaigns within an account, so this lists all of them rather than
 // requiring a specific campaign id up front.

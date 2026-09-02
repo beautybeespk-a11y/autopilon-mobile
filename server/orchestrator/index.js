@@ -12,7 +12,7 @@ import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "../agents/metaExpertV2/policy.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
@@ -210,6 +210,28 @@ const DOLLAR_AMOUNT_REPLACE_PATTERN = /\$\s?(\d[\d,]*(?:\.\d+)?)/g;
 const MAX_CURRENCY_NUDGES = 1;
 function messageHasWrongDollarSign(message, realCurrency) {
   return Boolean(realCurrency) && realCurrency !== "USD" && typeof message === "string" && DOLLAR_AMOUNT_TEST_PATTERN.test(message);
+}
+
+// Same nudge-then-deterministic-hardstop shape as the dollar-sign guard
+// above, for the SAME class of bug (a structured-field check alone can't
+// stop the model's own free-text final reply from editorializing beyond
+// what was actually verified) applied to creative performance claims.
+// checkCreativeGroundingPolicy (policy.js) already rejects a STRATEGY
+// FIELD claiming "high/best-performing" without real engagement data
+// behind it — this is the missing other half: the model's own customer-
+// facing prose could still say "this is your best-performing post!" on
+// top of an otherwise fully-compliant, honest strategy, and nothing
+// caught that. PERFORMANCE_CLAIM_WORDS is imported (not redefined) so
+// both layers agree on exactly what counts as a performance claim.
+const MAX_PERFORMANCE_CLAIM_NUDGES = 1;
+function activeCreativeHasRealEngagement(activeStrategy) {
+  const creative = activeStrategy?.resolvedAssets?.creative;
+  if (!creative || creative.source === "PRODUCT_IMAGE" || !activeStrategy?.snapshot) return false;
+  const allContent = [
+    ...(activeStrategy.snapshot.recentContent?.facebookPosts?.items || []),
+    ...(activeStrategy.snapshot.recentContent?.instagramPosts?.items || []),
+  ];
+  return allContent.find((c) => c.id === creative.contentId)?.engagement?.status === "exists";
 }
 
 // Issue 6 (live testing round 3): "Create the best campaign you recommend
@@ -863,6 +885,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let creativeRevisionNudges = 0;
   let executionClaimNudges = 0;
   let currencyNudges = 0;
+  let performanceClaimNudges = 0;
   // Set true the moment checkV2ExecutionApprovalGate blocks a real
   // execute_strategy attempt this turn (see round-29 fix in
   // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
@@ -1265,6 +1288,33 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // another model guess: every "$<amount>" becomes "<CURRENCY>
         // <amount>" directly, since the real currency is already known.
         decision.message = decision.message.replace(DOLLAR_AMOUNT_REPLACE_PATTERN, (_, amount) => `${realCurrency} ${amount}`);
+      }
+
+      // Same class of bug, for creative performance claims — see
+      // PERFORMANCE_CLAIM_WORDS' export comment (policy.js) and
+      // activeCreativeHasRealEngagement above. checkCreativeGroundingPolicy
+      // already rejects this in the STRATEGY's own reasoning_summary/
+      // creative_strategy.description field; this catches the same
+      // unsupported claim if it shows up in the model's free-text final
+      // reply instead, which that field-level check never sees.
+      if (hasV2Tools && PERFORMANCE_CLAIM_WORDS.test(decision.message || "") && !activeCreativeHasRealEngagement(activeStrategyForCurrency)) {
+        if (performanceClaimNudges < MAX_PERFORMANCE_CLAIM_NUDGES) {
+          performanceClaimNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: "Your reply calls a piece of creative high-performing/best-performing/proven, but there's no real engagement or performance data behind that claim anywhere in this conversation's data. Rewrite your reply without that claim — describe the choice by relevance, format, or recency instead, never as proven or best-performing.",
+            },
+          ];
+          continue;
+        }
+        // Nudge already used and it STILL made the claim — never let an
+        // unsupported performance claim reach the customer. Deterministic
+        // substitution, not another model guess: replace the specific
+        // claim phrase with a neutral, honest one.
+        decision.message = decision.message.replace(PERFORMANCE_CLAIM_WORDS, "a suitable");
       }
 
       trace[trace.length - 1].state = "done";

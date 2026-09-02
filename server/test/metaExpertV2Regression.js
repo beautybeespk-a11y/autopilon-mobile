@@ -26,6 +26,8 @@ const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/s
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
+const { resolveCreativeSelection } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { logger } = await import("../config/logger.js");
 const { checkV2ExecutionApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
@@ -67,8 +69,14 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [], writeError = null } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
   let nextId = 900000000000001n;
+  // Tracks every successfully-created object by its real assigned id, so a
+  // later read-back GET (meta.getAd/getAdCreative/getAdSet — the creative-
+  // attach verification step, executor.js) reflects what was ACTUALLY
+  // posted rather than a value hardcoded independently of it — a bug in
+  // the real read-back logic would show up here too, not just always pass.
+  const recordsById = new Map();
   return async (url, options = {}) => {
     const u = new URL(url);
     const path = u.pathname.replace(/^\/v[\d.]+/, "");
@@ -76,6 +84,10 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     if (method !== "GET") {
       const writeBody = options.body ? JSON.parse(options.body) : {};
       writes.push({ path, body: writeBody });
+      // meta.uploadAdImage (PRODUCT_IMAGE creative attach) expects a
+      // specific { images: { <arbitrary key>: { hash, url } } } shape,
+      // not the generic { id } every other write returns.
+      if (path.endsWith("/adimages")) return jsonResponse({ images: { fakeimage: { hash: "fake-image-hash-1", url: "https://example.com/fake-image.jpg" } } });
       // writeError simulates a real Meta API rejection (e.g. "(#100/
       // 3858558) budget too low") for ONE specific write path — every
       // other write still succeeds normally, matching a real partial
@@ -87,7 +99,9 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
       if (writeError && path.endsWith(writeError.pathSuffix) && (!writeError.failWhen || writeError.failWhen(writeBody))) {
         return jsonResponse({ error: writeError.error }, writeError.status || 400);
       }
-      return jsonResponse({ id: String(nextId++) });
+      const newId = String(nextId++);
+      recordsById.set(newId, { path, body: writeBody });
+      return jsonResponse({ id: newId });
     }
     if (path === "/me/adaccounts") return jsonResponse({ data: adAccounts });
     if (path === "/me/accounts") return jsonResponse({ data: pages });
@@ -96,6 +110,24 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     if (pageFieldsMatch && u.searchParams.get("fields") === "instagram_business_account") {
       const igId = igByPageId[pageFieldsMatch[1]];
       return jsonResponse(igId ? { instagram_business_account: { id: igId } } : {});
+    }
+    if (pageFieldsMatch && recordsById.has(pageFieldsMatch[1])) {
+      const id = pageFieldsMatch[1];
+      const record = recordsById.get(id);
+      if (record.path.endsWith("/ads")) {
+        const adSetRecord = recordsById.get(record.body.adset_id);
+        // corruptAdReadback simulates a genuine mismatch between what was
+        // created and what a read-back GET reports (a Meta-side propagation
+        // glitch, or a bug in this test's own assumptions) — used to prove
+        // executor.js's read-back verification actually inspects the
+        // result rather than trusting the create response unconditionally.
+        return jsonResponse({ id, name: record.body.name, status: record.body.status, adset_id: corruptAdReadback ? "0000000000000" : record.body.adset_id, campaign_id: adSetRecord?.body?.campaign_id || null, creative: { id: record.body.creative?.creative_id } });
+      }
+      if (record.path.endsWith("/adcreatives")) {
+        return jsonResponse({ id, name: record.body.name, object_story_id: record.body.object_story_id || null, object_story_spec: record.body.object_story_spec || null });
+      }
+      if (record.path.endsWith("/adsets")) return jsonResponse({ id, ...record.body });
+      if (record.path.endsWith("/campaigns")) return jsonResponse({ id, ...record.body });
     }
     if (path.endsWith("/adspixels")) return jsonResponse({ data: pixels });
     if (path.endsWith("/product_catalogs")) return jsonResponse({ data: catalogs });
@@ -124,10 +156,29 @@ function scriptedFetch({ chatResponses, metaOpts = {} }) {
     }
     if (u.pathname.startsWith("/wp-json/wc/v3/")) {
       if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
-      if (u.pathname.endsWith("/products")) return jsonResponse([{ id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }] }]);
+      if (u.pathname.endsWith("/products")) {
+        return jsonResponse([{
+          id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }],
+          // Real fields PRODUCT_IMAGE creative resolution needs (creativeResolution.js)
+          // — added alongside the pre-existing name/price/category, never replacing them.
+          images: [{ src: "https://store.example.com/wp-content/uploads/vitamin-c-serum.jpg" }],
+          permalink: "https://store.example.com/product/vitamin-c-serum/",
+          short_description: "A brightening serum with 15% Vitamin C for daily use.",
+        }]);
+      }
       if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
       if (u.pathname.endsWith("/reports/top_sellers")) return jsonResponse([]);
       return jsonResponse([]);
+    }
+    // The store's own real, public product image URL (PRODUCT_IMAGE
+    // creative attach fetches this directly, same as meta.create_image_ad's
+    // imageUrl path already does — see executor.js's attachCampaignCreative)
+    // — a plain binary fetch, not a JSON API, so it needs its own shape
+    // (.arrayBuffer(), not .json()). Checked AFTER the /wp-json/wc/v3/
+    // block above, not before — the store's WooCommerce API and its public
+    // image both live on the same store.example.com host.
+    if (u.hostname === "store.example.com" && u.pathname.startsWith("/wp-content/uploads/")) {
+      return { ok: true, status: 200, arrayBuffer: async () => new Uint8Array([1, 2, 3, 4]).buffer };
     }
     return metaHandler(url, options);
   };
@@ -161,13 +212,19 @@ function baseStrategy(overrides = {}) {
     countries: ["PK"],
     targeting_approach: "BROAD_WITH_TEST",
     placements: "ADVANTAGE_PLUS",
-    // PRODUCT_IMAGE rather than EXISTING_PAGE_POST — grounded regardless of
-    // whether a given test happens to mock any Facebook/Instagram posts
-    // (most don't, since post content isn't what they're testing); an
-    // EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST claim is now backend-
-    // enforced against real snapshot content (checkCreativeSourceAvailabilityPolicy)
-    // and would be rejected against an empty mocked post list.
-    creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" },
+    // USER_ATTACHED_MEDIA — the one creative_strategy.source explicitly out
+    // of scope for automatic ad-creative attach (creativeResolution.js
+    // treats it as unsupportedSource: a clean no-op, campaign+adset only,
+    // no candidate-resolution requirement) — grounded regardless of
+    // whether a given test happens to mock any Facebook/Instagram posts or
+    // WooCommerce products (most don't, since creative attach isn't what
+    // they're testing). EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST are
+    // backend-enforced against real snapshot content
+    // (checkCreativeSourceAvailabilityPolicy) and PRODUCT_IMAGE against a
+    // real, image-bearing product (creativeResolution.js) — both would be
+    // rejected against this suite's default empty mocks. Tests that
+    // specifically exercise creative attach (below) override this field.
+    creative_strategy: { source: "USER_ATTACHED_MEDIA", description: "Image ad using a photo the customer will attach" },
     budget_daily: 3000,
     budget_basis: "HEURISTIC_STARTING_TEST",
     bid_strategy: "LOWEST_COST_WITHOUT_CAP",
@@ -3237,6 +3294,400 @@ async function run() {
       assert.match(result.reply, /wasn't able to finalize a strategy/i);
       const active = getActiveStrategyForConversation(userId, conversationId);
       assert.equal(active, null, "no strategy must exist for this conversation — the backend override only fires when it can PROVE nothing was saved");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // =========================================================================
+  // Creative selection + attach (Phase 1 follow-up) — Session goal: attach a
+  // real ad, not just a Campaign + Ad Set. Covers: real-ID ambiguous-asset
+  // resolution mirroring Pixel (never re-derived through merge on revision,
+  // no account-level default write-back for content); the real attach
+  // (creative + ad, PAUSED, same approval gate/idempotency as campaign
+  // creation, logged the same way); read-back verification; and the
+  // backend-enforced "never call something best-performing without data"
+  // guard, both at the strategy-field layer (pre-existing) and the model's
+  // own final chat reply (new, same shape as the currency-symbol fix).
+  // =========================================================================
+
+  await check("[Creative attach] business snapshot exposes real WooCommerce product id/imageUrl/permalink/shortDescription — the only source ever used to attach a PRODUCT_IMAGE ad", async () => {
+    const userId = makeUser(`v2-creative-snapshot-fields-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId);
+      const product = snapshot.business.sampleProducts[0];
+      assert.equal(product.id, "1");
+      assert.equal(product.imageUrl, "https://store.example.com/wp-content/uploads/vitamin-c-serum.jpg");
+      assert.equal(product.permalink, "https://store.example.com/product/vitamin-c-serum/");
+      assert.equal(product.shortDescription, "A brightening serum with 15% Vitamin C for daily use.");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative resolution] a single eligible Facebook post auto-resolves without asking, mirroring Pixel's single_available case", async () => {
+    const userId = makeUser(`v2-creative-single-auto-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post about the Vitamin C Serum." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.deepEqual(built.strategy.unresolved_questions, [], "a single real candidate must auto-resolve, never ask");
+      assert.deepEqual(built.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" }, "the real, single candidate's real id must be resolved — never invented");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative resolution] 2+ real Facebook post candidates, no explicit pick: a real question naming the real ids — never a silent 'use the first one'", async () => {
+    const userId = makeUser(`v2-creative-ambiguous-${stamp}@example.com`);
+    connectMeta(userId);
+    const secondPost = { id: "111_2", message: "Spring skincare routine tips", created_time: "2024-02-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT, secondPost] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.creative, null, "genuine ambiguity must never silently resolve to any candidate");
+      const question = built.strategy.unresolved_questions.find((q) => q.startsWith("Which "));
+      assert.ok(question, `a real candidate-naming question must be asked: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+      assert.match(question, /111_1/, "the real id of the first candidate must be named");
+      assert.match(question, /111_2/, "the real id of the second candidate must be named");
+      assert.match(question, /480 likes\/52 comments/, "real engagement numbers must be shown when the platform actually returned them");
+      assert.match(question, /no engagement data available/, "the second post has none — must say so honestly, never omit or invent a number");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative resolution] content_selector.position answers the ambiguous question, and the SAME choice is reused verbatim on a later, unrelated revision — never re-asked, never re-derived (the Pixel bug class)", async () => {
+    const userId = makeUser(`v2-creative-persist-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const secondPost = { id: "111_2", message: "Spring skincare routine tips", created_time: "2024-02-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST, secondPost] } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.length, "must genuinely be ambiguous first");
+
+      // Answer: pick the second candidate explicitly.
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "Use the second one.",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "must resolve to the SPECIFIC candidate explicitly picked, id 111_2");
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "resolving the ambiguity must clear the question");
+
+      // A LATER, unrelated revision (budget only, no content_selector at
+      // all) must reuse the SAME resolved creative verbatim — never
+      // silently re-run candidate resolution (which, with the exact same
+      // two candidates still ambiguous, would otherwise re-ask or drift).
+      const laterRevision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { budget_daily: 4000 }, userMessage: "Increase the budget to 4000.",
+      });
+      assert.equal(laterRevision.ok, true, JSON.stringify(laterRevision.unresolved));
+      assert.deepEqual(laterRevision.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "the already-resolved creative must be reused verbatim, never re-derived or re-asked, across an unrelated revision");
+      assert.deepEqual(laterRevision.strategy.unresolved_questions, [], "must not silently reintroduce the already-answered question");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative resolution] PRODUCT_IMAGE ad text: derived from the product's OWN real short_description — never model-authored, never invented", async () => {
+    const userId = makeUser(`v2-creative-primarytext-derived-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.deepEqual(built.strategy.unresolved_questions, [], "a real product with a real description must never trigger an ad-text question");
+      assert.equal(built.resolved.creative.primaryText, "A brightening serum with 15% Vitamin C for daily use.", "primaryText must be EXACTLY the product's own real short_description — never rewritten");
+      assert.equal(built.resolved.creative.primaryTextSource, "product_short_description");
+      assert.equal(built.resolved.creative.link, "https://store.example.com/product/vitamin-c-serum/");
+      assert.equal(built.resolved.creative.productName, "Vitamin C Serum");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative resolution] PRODUCT_IMAGE with no real product description: never invented — asked once, verified against the user's OWN raw message, rejected if not genuinely supplied", () => {
+    // Unit-level (resolveCreativeSelection called directly with a hand-built
+    // snapshot) — the exact scenario a live product with an empty
+    // short_description produces, isolated from the WooCommerce/HTTP mock
+    // plumbing so the verification logic itself is what's being proven.
+    const strategyNoAnswer = { mode: "campaign", creative_strategy: { source: "PRODUCT_IMAGE", description: "..." }, content_selector: {} };
+    const snapshot = { recentContent: { facebookPosts: { items: [] }, instagramPosts: { items: [] } }, business: { sampleProducts: [{ id: "p1", name: "Mystery Box", price: "20.00", imageUrl: "https://store.example.com/mystery.jpg", permalink: "https://store.example.com/product/mystery-box/", shortDescription: null }] } };
+
+    // No answer at all — must ask, never invent.
+    const noAnswer = resolveCreativeSelection({ strategy: strategyNoAnswer, snapshot, priorCreative: null, contentSelectorProvidedThisCall: false, userMessage: "I want more sales on my website" });
+    assert.equal(noAnswer.creative, null);
+    assert.equal(noAnswer.needsPrimaryTextQuestion, true);
+    assert.equal(noAnswer.resolvedProductForQuestion.name, "Mystery Box");
+
+    // The model claims an answer the user never actually typed — must be
+    // REJECTED (treated as not genuinely supplied), same principle as
+    // USER_PROVIDED budget verification. The question must stay open.
+    const fabricatedAnswer = { ...strategyNoAnswer, content_selector: { primaryTextAnswer: "Grab yours today — limited stock!" } };
+    const rejected = resolveCreativeSelection({ strategy: fabricatedAnswer, snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "yes go ahead" });
+    assert.equal(rejected.creative, null, "an answer the user never actually typed must never be used, even if the model claims it");
+    assert.equal(rejected.needsPrimaryTextQuestion, true);
+
+    // The user's OWN message genuinely contains that exact text — verified,
+    // used exactly as written, never rewritten/improved.
+    const genuineAnswer = { ...strategyNoAnswer, content_selector: { primaryTextAnswer: "Grab yours today — limited stock!" } };
+    const verified = resolveCreativeSelection({ strategy: genuineAnswer, snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "Sure, use this text: Grab yours today — limited stock!" });
+    assert.equal(verified.creative.primaryText, "Grab yours today — limited stock!");
+    assert.equal(verified.creative.primaryTextSource, "user_supplied");
+    assert.equal(verified.needsPrimaryTextQuestion, false);
+  });
+
+  await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
+    const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], writes } }));
+    const loggedInfos = [];
+    const originalInfo = logger.info;
+    logger.info = (message, context) => { loggedInfos.push({ message, context }); };
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+
+      assert.equal(executed.status, "PAUSED");
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+      assert.ok(executed.adId, "a real ad id must be returned");
+      assert.ok(executed.creativeId, "a real creative id must be returned");
+      assert.match(executed.nextStep, /ad are created and PAUSED/i, "nextStep must honestly say an ad exists, since one genuinely does");
+
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite?.body?.object_story_id, "111_1", "the real, resolved post id must be sent to Meta — never invented");
+      const adWrite = writes.find((w) => w.path.endsWith("/ads"));
+      assert.equal(adWrite?.body?.status, "PAUSED");
+      assert.equal(adWrite?.body?.creative?.creative_id, executed.creativeId);
+      assert.equal(adWrite?.body?.adset_id, executed.adSetId);
+
+      // Logged the same way execute_strategy already logs campaign/adset
+      // requests — real request/response bodies, not just a summary.
+      const logMessages = loggedInfos.map((l) => l.message);
+      assert.ok(logMessages.includes("meta_expert_v2.execute_strategy.creative_request"), JSON.stringify(logMessages));
+      assert.ok(logMessages.includes("meta_expert_v2.execute_strategy.creative_response"), JSON.stringify(logMessages));
+      assert.ok(logMessages.includes("meta_expert_v2.execute_strategy.ad_request"), JSON.stringify(logMessages));
+      assert.ok(logMessages.includes("meta_expert_v2.execute_strategy.ad_response"), JSON.stringify(logMessages));
+      const creativeRequestLog = loggedInfos.find((l) => l.message === "meta_expert_v2.execute_strategy.creative_request");
+      assert.equal(creativeRequestLog.context.body.object_story_id, "111_1", "the logged request body must be the REAL body sent, not an approximation");
+
+      // Read-back verification actually ran (getAd/getAdCreative) and
+      // confirmed the created ad matches the plan.
+      assert.ok(logMessages.includes("meta_expert_v2.execute_strategy.readback_verify"), "the ad must be read back and verified against the plan, not just trusted from the create response");
+    } finally {
+      logger.info = originalInfo;
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative attach] PRODUCT_IMAGE execute_strategy uploads the real image, attaches a link_data creative with the resolved product's real fields, and creates the ad", async () => {
+    const userId = makeUser(`v2-attach-product-image-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+
+      const imageUpload = writes.find((w) => w.path.endsWith("/adimages"));
+      assert.ok(imageUpload, "the real product image must actually be uploaded to Meta");
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite.body.object_story_spec.link_data.image_hash, "fake-image-hash-1");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.message, "A brightening serum with 15% Vitamin C for daily use.", "primaryText in the real request must be the product's own real description");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.name, "Vitamin C Serum");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.link, "https://store.example.com/product/vitamin-c-serum/");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative attach] creative_strategy.source out of scope this session (USER_ATTACHED_MEDIA): campaign + ad set are still created, but the ad attach is honestly skipped, never silently pretended", async () => {
+    const userId = makeUser(`v2-attach-unsupported-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      assert.equal(executed.creativeAttached, false);
+      assert.equal(executed.adId, null);
+      assert.match(executed.creativeSkippedReason, /USER_ATTACHED_MEDIA.*isn't supported/i);
+      assert.match(executed.nextStep, /no ad was attached yet/i, "must never claim an ad exists when none was created");
+      assert.doesNotMatch(executed.nextStep, /ad are created and PAUSED/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative attach] a failure during creative/ad creation (after the ad set already exists) deletes the orphaned campaign, same cleanup as an ad-set failure", async () => {
+    const userId = makeUser(`v2-attach-orphan-cleanup-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST],
+        writes,
+        writeError: { pathSuffix: "/ads", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 1885132 } },
+      },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === 100 && err.subcode === 1885132
+      );
+      const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
+      assert.ok(campaignWrite, "the campaign must genuinely have been created");
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.ok(creativeWrite, "the creative must genuinely have been created — the ad call is what fails");
+      const cleanupWrite = writes.find((w) => /^\/\d+$/.test(w.path) && w.body?.status === "DELETED");
+      assert.ok(cleanupWrite, `the orphaned campaign must be deleted after the ad creation fails, not left behind: ${JSON.stringify(writes)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative attach] read-back verification catches a real mismatch and refuses to report success", async () => {
+    const userId = makeUser(`v2-attach-readback-mismatch-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+    // Second mock: the ad set/campaign/creative/ad all get created normally,
+    // but the read-back GET for the ad is corrupted to report the WRONG
+    // adset_id (metaRouter's corruptAdReadback) — proving the verification
+    // step actually inspects the read-back rather than trusting the create
+    // response unconditionally.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], corruptAdReadback: true } }));
+    try {
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: getActiveStrategyForConversation(userId, conversationId).id }),
+        /verification failed/i
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 final-reply guard] the model calling a resolved creative 'best performing' with NO real engagement data is nudged, then deterministically corrected — same shape as the currency-symbol fix", async () => {
+    const userId = makeUser(`v2-perfclaim-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Here's your plan — this is your best-performing post, so I've used it as the creative."),
+        finalText("Still your best-performing post — great choice."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /best-performing/i, "an unsupported performance claim must never reach the customer, even after the nudge is exhausted");
+      assert.match(result.reply, /a suitable post/i, `the fail-safe substitution must still correct it deterministically: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 final-reply guard] a performance claim backed by REAL engagement data is never touched — no false positive", async () => {
+    const userId = makeUser(`v2-perfclaim-genuine-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post (480 likes, 52 comments, 30 shares)." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [finalText("Here's your plan — this is your best-performing post (480 likes, 52 comments, 30 shares), so I've used it as the creative.")],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /best-performing/i, "a claim genuinely backed by real engagement data must reach the customer unchanged, not be treated as a false claim");
     } finally {
       restoreFetch();
     }

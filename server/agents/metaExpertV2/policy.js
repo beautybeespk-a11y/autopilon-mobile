@@ -233,7 +233,14 @@ export function deriveReasoningSummaryIfMissing(strategy) {
 // reject the model's prose regardless of how convincing it reads"
 // principle as checkSalesConsistencyPolicy above, just grounded against
 // real snapshot facts instead of a fixed keyword list.
-const PERFORMANCE_CLAIM_WORDS = /\b(high(?:est)?[- ]?(?:performing|engagement)|top[- ]?performing|best[- ]?performing|proven (effectiveness|track record)|strong engagement|great engagement|top performer)\b/i;
+// Exported (not just used locally) — orchestrator/index.js reuses this
+// SAME regex to guard the model's own FINAL CHAT REPLY text too (the
+// currency-symbol/false-completion-claim class of bug: a structured-field
+// check alone doesn't stop the model from editorializing "this is your
+// best-performing post!" in its own prose on top of an honest, compliant
+// strategy). One definition of "a performance claim," used at both
+// layers, never two regexes drifting apart.
+export const PERFORMANCE_CLAIM_WORDS = /\b(high(?:est)?[- ]?(?:performing|engagement)|top[- ]?performing|best[- ]?performing|proven (effectiveness|track record)|strong engagement|great engagement|top performer)\b/i;
 export function checkCreativeGroundingPolicy(strategy, snapshot) {
   const errors = [];
   const texts = [strategy.reasoning_summary, strategy.creative_strategy?.description].filter((t) => typeof t === "string");

@@ -86,6 +86,21 @@ function inferBusinessType(categories) {
   return null;
 }
 
+// Creative selection (Step: PRODUCT_IMAGE attach) needs a product's real
+// image and link — meta.create_image_ad already requires exactly these
+// (imageUrl/link), and the V1 woocommerce.list_products tool already
+// surfaces them for that same reason (see its own comment). Never
+// invented: null when the platform genuinely has no image/permalink for
+// that product, never a guessed/constructed one for WooCommerce (a real
+// site URL, but products can genuinely lack an image).
+const PRODUCT_TEXT_EXCERPT_LENGTH = 300;
+function stripHtmlAndTruncate(html, maxLength) {
+  if (typeof html !== "string" || !html.trim()) return null;
+  const text = html.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return text.length > maxLength ? `${text.slice(0, maxLength).trim()}…` : text;
+}
+
 async function gatherCommerce(userId) {
   const wooConn = getConnection(userId, "woocommerce");
   const shopifyConn = getConnection(userId, "shopify");
@@ -106,7 +121,18 @@ async function gatherCommerce(userId) {
     }
     const products = productsResult.value;
     const categories = (categoriesResult.value || []).map((c) => c.name);
-    const sampleProducts = products.slice(0, MAX_PRODUCTS).map((p) => ({ name: p.name, price: p.price, category: p.categories?.[0]?.name || null }));
+    const sampleProducts = products.slice(0, MAX_PRODUCTS).map((p) => ({
+      id: String(p.id), name: p.name, price: p.price, category: p.categories?.[0]?.name || null,
+      // For PRODUCT_IMAGE creative attach (creativeResolution.js) — the
+      // same real fields the V1 woocommerce.list_products tool already
+      // surfaces for meta.create_image_ad's imageUrl/link. shortDescription
+      // is WooCommerce's own real short_description field (HTML stripped,
+      // truncated) — the ONLY source ever used for an ad's primaryText
+      // without asking the user; never invented, never LLM-authored.
+      imageUrl: p.images?.[0]?.src || null,
+      permalink: p.permalink || null,
+      shortDescription: stripHtmlAndTruncate(p.short_description, PRODUCT_TEXT_EXCERPT_LENGTH),
+    }));
     const prices = sampleProducts.map((p) => Number(p.price)).filter((n) => !Number.isNaN(n));
     const countryResult = await attempt(() => wc.getStoreCountry(m.siteUrl, m.consumerKey, accessToken));
     const topSellersResult = await attempt(() => wc.getTopSellers(m.siteUrl, m.consumerKey, accessToken, "month"));
@@ -139,7 +165,17 @@ async function gatherCommerce(userId) {
   }
   const products = productsResult.value;
   const categories = [...new Set(products.map((p) => p.product_type).filter(Boolean))];
-  const sampleProducts = products.slice(0, MAX_PRODUCTS).map((p) => ({ name: p.title, price: p.variants?.[0]?.price || null, category: p.product_type || null }));
+  // Shopify's own product object has no direct "permalink" field the way
+  // WooCommerce does — this composes the real, always-reachable storefront
+  // URL from the real shop domain + the real product handle (both actual
+  // API fields, never guessed), the same URL shape every Shopify store
+  // resolves regardless of a custom domain being layered on top.
+  const sampleProducts = products.slice(0, MAX_PRODUCTS).map((p) => ({
+    id: String(p.id), name: p.title, price: p.variants?.[0]?.price || null, category: p.product_type || null,
+    imageUrl: p.images?.[0]?.src || null,
+    permalink: p.handle ? `https://${m.shopDomain}/products/${p.handle}` : null,
+    shortDescription: stripHtmlAndTruncate(p.body_html, PRODUCT_TEXT_EXCERPT_LENGTH),
+  }));
   const prices = sampleProducts.map((p) => Number(p.price)).filter((n) => !Number.isNaN(n));
   const countryResult = await attempt(() => shopify.getStoreCountry(m.shopDomain, token));
   const topProductsResult = await attempt(() => shopify.getTopProducts(m.shopDomain, token, { sinceDays: 30, limit: 5 }));
