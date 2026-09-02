@@ -1069,14 +1069,39 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
     const pixelCandidates = activeStrategy?.resolvedAssets?.pixelCandidates;
     if (activeStrategy && activeStrategy.resolvedAssets?.pixelId == null && Array.isArray(pixelCandidates) && pixelCandidates.length) {
+      // CONFIRMED LIVE BUG (round 33, user's own diagnosis): this used
+      // Array.find(), which returns the FIRST candidate whose id appears
+      // among the message's digit runs — with no check for whether a
+      // SECOND real candidate id also appears. A natural correction
+      // ("not 1299666955022281, I mean 1241102478031429") names BOTH real
+      // ids in one message; find() silently picked whichever candidate
+      // happened to come first in pixelCandidates' order (Meta's own
+      // listPixels() response order — arbitrary, unrelated to which one
+      // the user meant) and saved it as the permanent account-level
+      // default with total confidence. Same "2+ matches → don't guess"
+      // discipline matchCreativeCandidateId already has (this file, and
+      // its own header comment) — that guard was built AFTER this pixel
+      // matcher and never retrofitted here until now.
       const digitRuns = typeof userMessage === "string" ? userMessage.match(/\d+/g) || [] : [];
-      const matchedPixelId = pixelCandidates.find((id) => digitRuns.includes(id));
+      const digitMatches = pixelCandidates.filter((id) => digitRuns.includes(id));
+      const matchedPixelId = digitMatches.length === 1 ? digitMatches[0] : null;
       if (matchedPixelId) {
         try {
           const accessToken = requireValidToken(userId, "meta_ads");
           const revised = await reviseStrategyV2({
             userId, conversationId, accessToken, strategyId: activeStrategy.id,
             requestedChanges: { pixel: { ref: matchedPixelId } },
+            // Round 33 (Bug B): this is the ONE trusted caller the
+            // explicitAssetChanges gate is meant to let through — a real
+            // id verified against the user's own raw message, not the
+            // model's unverified claim. Declaring it explicitly here
+            // (rather than leaving assetResolution.js's gate bypassed for
+            // every caller, including the model, whenever nothing was
+            // previously resolved) restores the documented contract in
+            // tools/meta/metaExpertV2.js: "a REAL id is only ever honored
+            // as the user's explicit choice when its field name is also
+            // listed in explicitAssetChanges."
+            explicitAssetChanges: ["pixel"],
             userMessage,
           });
           if (revised.ok) {

@@ -1372,28 +1372,28 @@ async function run() {
     }
   });
 
-  // --- Answering the ambiguous-Pixel question (live bug, round 31) --------
-  // Live report: after the unresolved-question gate above correctly
-  // blocked execution, the user answered "Pixel ID: 1241102478031429" —
-  // revise_strategy ran and claimed the Pixel was updated, but the SAME
-  // unresolved-question error kept recurring forever. Root cause: the
-  // model's revise_strategy call supplied requestedChanges.pixel.ref but
-  // never ALSO declared explicitAssetChanges: ["pixel"] — the ordinary
-  // explicitAssetChanges gate (which exists to stop an ALREADY-resolved
-  // asset from being silently reassigned, round 11) then ignored the id
-  // entirely and re-resolved into the SAME ambiguity every time. This
-  // test reproduces the exact call shape that caused the loop — a real
-  // pixel ref with NO explicitAssetChanges — against a prior row whose
-  // Pixel was never actually resolved (nothing for that gate to protect).
-  await check("[V2 execution] answering an open ambiguous-Pixel question via revise_strategy (a real ref, with or without explicitAssetChanges) actually resolves the Pixel and clears the question — no infinite loop", async () => {
-    const userId = makeUser(`v2-pixel-answer-persists-${stamp}@example.com`);
+  // --- Answering the ambiguous-Pixel question (round 31, revised round 33) -
+  // Round 31's live report: after the unresolved-question gate above
+  // correctly blocked execution, the user answered "Pixel ID:
+  // 1241102478031429" — revise_strategy ran and claimed the Pixel was
+  // updated, but the SAME unresolved-question error kept recurring
+  // forever, because the model's call supplied requestedChanges.pixel.ref
+  // without ALSO declaring explicitAssetChanges: ["pixel"], and the
+  // ordinary gate silently dropped it. Round 31's fix bypassed the gate
+  // entirely for genuine ambiguity — which round 33 (below, and in
+  // strategyBuilder's own comment) found let a WRONG real candidate get
+  // permanently saved with zero verification, since the bypass doesn't
+  // care whether the id came from the user's own message or the model's
+  // own unverified reasoning. Round 33 restores the gate for every
+  // caller, including the model: a real ref is only ever honored when
+  // explicitAssetChanges also lists it — no exception for genuine
+  // ambiguity. This test now covers BOTH halves of that contract.
+  await check("[V2 execution] a model-supplied Pixel ref WITHOUT explicitAssetChanges is never honored, never saved as the account default, and the question stays open — restores the documented contract for every caller, including the model", async () => {
+    const userId = makeUser(`v2-pixel-answer-no-flag-${stamp}@example.com`);
     connectMeta(userId);
     const conversationId = `conv-${cryptoRandom()}`;
     mockFetch(scriptedFetch({
       chatResponses: [],
-      // Realistic Meta Pixel id shape (numeric) — matches the live report
-      // ("Pixel ID: 1241102478031429") and resolvePixelId's own real
-      // validation (isPlausiblePixelId requires a numeric-looking id).
       metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
     }));
     try {
@@ -1401,20 +1401,50 @@ async function run() {
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the revision below");
 
-      // The exact live shape: the model's answer, with NO explicitAssetChanges.
+      // The exact round-31 live shape: a real pixel ref, with NO
+      // explicitAssetChanges. Round 31 treated this as "the user's
+      // answer" and honored it; round 33 does not — this is now
+      // indistinguishable, by design, from the model guessing a
+      // candidate id on its own with no user confirmation at all.
       const revised = await reviseStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
         requestedChanges: { pixel: { ref: "1241102478031429" } },
         userMessage: "Pixel ID: 1241102478031429",
       });
       assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
-      assert.equal(revised.resolved.pixelId, "1241102478031429", "the user's chosen Pixel must actually be resolved, not silently dropped for lack of explicitAssetChanges");
+      assert.equal(revised.resolved.pixelId, null, "a real ref without explicitAssetChanges must NOT be honored, even though it names a genuine candidate");
+      assert.ok(revised.strategy.unresolved_questions.some((q) => /[Pp]ixel/.test(q)), "the ambiguous-Pixel question must remain open, not silently cleared");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults || {};
+      assert.equal(savedDefaults.pixelId, undefined, "nothing must be written to the account-level Default Pixel from an unverified ref — this is the exact live bug (round 33): a real but WRONG candidate was permanently saved this way");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 execution] a Pixel ref WITH explicitAssetChanges: [\"pixel\"] still resolves and saves the account default — the gate protects, it doesn't just block", async () => {
+    const userId = makeUser(`v2-pixel-answer-with-flag-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the revision below");
+
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { pixel: { ref: "1241102478031429" } },
+        explicitAssetChanges: ["pixel"],
+        userMessage: "Pixel ID: 1241102478031429",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.resolved.pixelId, "1241102478031429", "a real ref WITH explicitAssetChanges must be honored");
       assert.deepEqual(revised.strategy.unresolved_questions, [], "the Pixel question must be cleared now that it's genuinely resolved");
 
-      // Design fix (round 31, per the user's own architectural review):
-      // resolving a genuine ambiguity must be saved to the account-level
-      // Default Pixel — the SAME record resolvePixelId already reads at
-      // priority 2 — not just to this one strategy row.
       const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
       assert.equal(savedDefaults?.pixelId, "1241102478031429", "the disambiguated Pixel must be saved as the account's Default Pixel, not just resolved for this one strategy");
 
@@ -1488,6 +1518,58 @@ async function run() {
 
       const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
       assert.equal(savedDefaults?.pixelId, "1241102478031429", "resolving via the auto-revise must also save the account-level Default Pixel, same as a model-initiated revision does");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Pixel auto-revise ambiguity guard (round 33, user's own diagnosis) -
+  // CONFIRMED LIVE BUG: the digit-run matcher used Array.find(), which
+  // returns the FIRST candidate whose id appears among the message's
+  // digit runs — with no check for a SECOND real candidate also matching.
+  // A natural correction ("not 1299666955022281, I meant
+  // 1241102478031429") names BOTH real ids in one message; find() silently
+  // picked whichever candidate happened to come first in pixelCandidates'
+  // order (Meta's own listPixels() response order — unrelated to which
+  // one the user meant) and permanently saved it as the account-level
+  // default. This test reproduces that exact message shape and requires
+  // the SAME "2+ matches → don't guess" discipline matchCreativeCandidateId
+  // already has for creative selection.
+  await check("[V2 execution] a message naming TWO real Pixel ids is never resolved by the auto-revise — neither is saved, the question stays open, no guess", async () => {
+    const userId = makeUser(`v2-pixel-two-ids-ambiguous-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1299666955022281", name: "Old Pixel" }, { id: "1241102478031429", name: "Working Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the turn below");
+    } finally {
+      restoreFetch();
+    }
+
+    // The exact live shape: a correction naming BOTH real ids in one
+    // message. The model gets NO scripted tool calls — if the auto-revise
+    // wrongly "resolves" this, the test would need a second mocked
+    // response it never gets, or the assertions below would catch the
+    // wrong id being saved.
+    mockFetch(scriptedFetch({
+      metaOpts,
+      chatResponses: [finalText("Got it — noted. Which Pixel should I use: could you confirm the exact id?")],
+    }));
+    try {
+      const userMessage = "not 1299666955022281, I meant 1241102478031429 — that's the one that actually gets Purchase events";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.equal(revise, undefined, `the auto-revise must NOT fire on an ambiguous two-id message — it must never guess between real candidates: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.pixelId, null, "neither candidate must be resolved from an ambiguous message");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults || {};
+      assert.equal(savedDefaults.pixelId, undefined, "neither candidate — especially not the wrong one — must be saved as the account-level Default Pixel");
     } finally {
       restoreFetch();
     }

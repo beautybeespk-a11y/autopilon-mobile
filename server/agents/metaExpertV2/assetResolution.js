@@ -117,47 +117,66 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
       resolved.pixelId = priorResolved.pixelId;
     } else {
       try {
-        // Live bug (round 31): a genuinely AMBIGUOUS prior Pixel
-        // (priorResolved.pixelId null — nothing was ever actually
-        // resolved, only a real unresolved_questions entry asking which
-        // one) has nothing for the ordinary explicitAssetChanges gate to
-        // protect — that gate exists specifically to stop an ALREADY-
-        // resolved asset from being silently reassigned just because the
-        // model restated it in prose (round 11), which cannot apply when
-        // nothing was resolved yet. Requiring the model to ALSO remember
-        // explicitAssetChanges:["pixel"] on top of directly answering the
-        // question it was just asked produced a genuine live infinite
-        // loop: the model called revise_strategy with the user's chosen
-        // Pixel id, said "updated," but the backend silently dropped the
-        // id (explicitAssetChanges wasn't set), re-resolved into the SAME
-        // ambiguity, and re-asked the SAME question forever. A real,
-        // non-semantic ref is honored here whenever there was genuinely
-        // nothing resolved to protect — never for an already-resolved
-        // Pixel, where the ordinary gated path below still applies.
-        const explicitId = explicitAssetRef(strategy.pixel, "pixel", explicitAssetChanges) || (!priorResolved?.pixelId ? realAssetRef(strategy.pixel) : undefined);
+        // Round 31 fixed "revise_strategy never gets called for a plain-
+        // chat Pixel answer" by adding the orchestrator's deterministic
+        // digit-run auto-revise pre-loop (index.js) — a real id verified
+        // against the user's OWN raw message before revise_strategy is
+        // ever called. Its accompanying assetResolution.js change,
+        // though, went further: it bypassed the explicitAssetChanges gate
+        // entirely for genuine ambiguity (priorResolved.pixelId null),
+        // reasoning that the gate "has nothing to protect yet." That
+        // reasoning missed that the gate is ALSO the only thing standing
+        // between the tool contract's own documented promise —
+        // tools/meta/metaExpertV2.js: "a REAL id is only ever honored as
+        // the user's explicit choice when its field name is also listed
+        // in explicitAssetChanges" — and a MODEL-initiated revise_strategy
+        // call that puts a pixel ref in requestedChanges without the user
+        // ever having confirmed it via their own message (the model has
+        // pixel id+name in the business snapshot and can reach for one on
+        // its own reasoning). CONFIRMED LIVE (round 33, user's own
+        // diagnosis): the wrong candidate — a real, connected Pixel, just
+        // not the one that actually received Purchase events — was
+        // permanently saved as the account-level default this way.
+        //
+        // Fixed by making the ONE trusted caller satisfy the gate instead
+        // of removing it: the orchestrator's pixel auto-revise pre-loop
+        // now passes explicitAssetChanges: ["pixel"] itself (index.js) —
+        // it has genuine grounds to (a real id, verified unambiguous
+        // against the raw userMessage), so the ordinary gate below is all
+        // that's needed. No other caller, model included, gets a REAL id
+        // honored here without also declaring explicitAssetChanges —
+        // restoring the documented contract for every caller, not just
+        // this one. A model call that skips the flag now falls through to
+        // normal resolution (ambiguous → re-asks the same open question,
+        // same as any other unresolved ambiguity) rather than being
+        // silently accepted — never a silent wrong answer, at the cost of
+        // needing the deterministic pre-loop (or an explicit-flag model
+        // call) to actually resolve a purely-natural-language answer that
+        // never named a digit the pre-loop's own matcher recognizes.
+        const explicitId = explicitAssetRef(strategy.pixel, "pixel", explicitAssetChanges);
         const { pixelId, available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: explicitId, userId });
         resolved.pixelId = pixelId;
         availablePixels = available;
         // Live design fix (round 31, user's own diagnosis): the connection-
         // level Default Pixel (integrations.meta_ads.defaults.pixelId —
         // the SAME record resolvePixelId already reads at priority 2,
-        // above; also settable directly via the Integrations UI) has
-        // always been readable but never WRITABLE from this chat flow —
-        // every ambiguous-Pixel resolution lived only on one strategy row,
-        // re-derived through merge logic on every revision, which is what
-        // made a real answer this fragile to lose across three separate
-        // incidents this session. Fixed at the actual design level: the
-        // moment the user's own explicit answer resolves a GENUINE
-        // ambiguity (priorResolved.pixelId was null — nothing was already
-        // saved to protect or override), it's written back to the SAME
-        // saved-default record permanently. Every future build_strategy —
-        // in this conversation or any other — then resolves the Pixel at
-        // the resolver's own existing priority-2 step, before ambiguity is
-        // even possible, and never asks again. Never overwrites an
-        // existing DELIBERATE default just because a strategy is reusing
-        // it (priorResolved.pixelId already truthy takes the reuse branch
-        // above, never reaching here) or picking a different one for one
-        // specific campaign while a default remains set.
+        // above) has always been readable but never WRITABLE from this
+        // chat flow — every ambiguous-Pixel resolution lived only on one
+        // strategy row, re-derived through merge logic on every revision,
+        // which is what made a real answer this fragile to lose across
+        // three separate incidents this session. Fixed at the actual
+        // design level: the moment a genuinely explicit, gate-satisfying
+        // answer resolves a GENUINE ambiguity (priorResolved.pixelId was
+        // null — nothing was already saved to protect or override), it's
+        // written back to the SAME saved-default record permanently.
+        // Every future build_strategy — in this conversation or any other
+        // — then resolves the Pixel at the resolver's own existing
+        // priority-2 step, before ambiguity is even possible, and never
+        // asks again. Never overwrites an existing DELIBERATE default
+        // just because a strategy is reusing it (priorResolved.pixelId
+        // already truthy takes the reuse branch above, never reaching
+        // here) or picking a different one for one specific campaign
+        // while a default remains set.
         if (explicitId && pixelId && !priorResolved?.pixelId && userId) {
           try {
             const conn = getConnection(userId, "meta_ads");
