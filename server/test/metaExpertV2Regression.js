@@ -3100,6 +3100,52 @@ async function run() {
     }
   });
 
+  await check("[Literal creative-source] LIVE REPORT: 'use one of my facebook page posts as the ad' (no 'boost' verb, plural, 'page' in between) — the exact real phrasing that first-version regexes missed — is caught on the very first build_strategy call", async () => {
+    const userId = makeUser(`v2-literal-fb-live-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const wrongSource = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } }),
+        userMessage: "I want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(wrongSource.ok, false, "must reject PRODUCT_IMAGE — the real live phrasing has no 'boost' verb and is plural with 'page' in between, and the regex must still catch it");
+      assert.match(wrongSource.unresolved.issue, /literally asked to boost an existing Facebook post/i);
+
+      const corrected = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post about the Vitamin C Serum." } }),
+        userMessage: "I want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
+      assert.deepEqual(corrected.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Literal creative-source] 'use a product image instead of the Facebook post' still declines correctly — the decline-word guard survives the broadened mention regex", async () => {
+    const userId = makeUser(`v2-literal-fb-decline-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } }),
+        userMessage: "Actually, use a product image instead of the Facebook post.",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy?.creative_strategy?.source, "PRODUCT_IMAGE", "explicitly declining the Facebook post must never be treated as requesting it");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Literal creative-source] no literal platform wording in the user's message: PRODUCT_IMAGE is accepted with no new rejection (no over-correction)", async () => {
     const userId = makeUser(`v2-literal-none-${stamp}@example.com`);
     connectMeta(userId);

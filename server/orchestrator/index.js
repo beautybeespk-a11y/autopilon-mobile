@@ -594,8 +594,12 @@ const CREATIVE_SELECTION_INTENT_PATTERN_LIST = [
   // follow-up: this exact phrasing reached build/revise_strategy without
   // ever forcing a fresh snapshot, which is also what let a stale/absent
   // Instagram-content status go unchecked before creative_strategy.source
-  // was picked.
-  { label: "bare platform statement", pattern: /\b(instagram (post|reel)|ig (post|reel)|facebook post|fb post|boost (my|this|the)( facebook)? post|not a product|no product)\b/i },
+  // was picked. Second live-bug follow-up: the original "facebook post"
+  // (singular, adjacent) alternative missed the real phrasing "use one of
+  // my facebook page posts" — broadened to match "facebook"/"fb" followed
+  // by "post(s)" with up to 2 words in between, same fix as
+  // policy.js's LITERAL_FACEBOOK_POST_WORDS.
+  { label: "bare platform statement", pattern: /\b(instagram (post|reel)|ig (post|reel)|facebook\b(?:\s+\S+){0,2}?\s+posts?|fb\b(?:\s+\S+){0,2}?\s+posts?|not a product|no product)\b/i },
 ];
 const CREATIVE_SELECTION_INTENT_PATTERNS = new RegExp(
   CREATIVE_SELECTION_INTENT_PATTERN_LIST.map((p) => p.pattern.source).join("|"),

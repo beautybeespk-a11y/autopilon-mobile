@@ -338,21 +338,29 @@ export function checkCreativeSourceAvailabilityPolicy(strategy, snapshot) {
 // below — never by a rejection, since no retry can fix real data
 // unavailability.
 const LITERAL_INSTAGRAM_WORDS = /\b(instagram|ig\s*post|ig\s*reel|reels?)\b/i;
-// Deliberately narrower than a bare "facebook post"/"fb post" mention
-// (unlike LITERAL_INSTAGRAM_WORDS above) — this check causes a hard
-// rejection, unlike orchestrator/index.js's CREATIVE_SELECTION_INTENT_PATTERNS
-// bare-mention gate (harmless on a false positive, it only forces an
-// extra snapshot). A bare mention is genuinely ambiguous for Facebook —
-// "use a product image instead of the Facebook post" MENTIONS a Facebook
-// post while explicitly declining it, and a real test case exactly like
-// this false-positived before this pattern was narrowed to require an
-// actual request verb.
-const LITERAL_FACEBOOK_POST_WORDS = /\bboost (my|this|the)( facebook)? post\b/i;
+// Live bug (follow-up): requiring the literal verb "boost" missed the far
+// more common real phrasing "use one of my facebook page posts as the
+// ad" — no "boost", and "page" between "facebook" and "posts" also broke
+// an earlier, even narrower "facebook post" (singular, adjacent) attempt.
+// Matches "facebook", then up to 2 intervening words (e.g. "page", "top"),
+// then "post"/"posts" — covers "facebook post", "facebook page post(s)",
+// "my recent facebook posts", etc.
+const LITERAL_FACEBOOK_POST_WORDS = /\bfacebook\b(?:\s+\S+){0,2}?\s+posts?\b|\bfb\b(?:\s+\S+){0,2}?\s+posts?\b/i;
+// "instead of"/"rather than" alongside a platform mention means the user
+// is DECLINING that platform, not requesting it — "use a product image
+// instead of the Facebook post" mentions Facebook while explicitly ruling
+// it out. A real, pre-existing test hit exactly this once the check above
+// was broadened to a bare mention. Message-level (not proximity-based) —
+// deliberately mechanical like every other literal check in this file,
+// not a semantic negation parser.
+const DECLINE_WORDS = /\b(instead of|rather than)\b/i;
 export function checkLiteralCreativeSourceSubstitutionPolicy(strategy, userMessage, snapshot) {
   const errors = [];
   if (typeof userMessage !== "string") return errors;
   const source = strategy.creative_strategy?.source;
   if (!source) return errors;
+
+  if (DECLINE_WORDS.test(userMessage)) return errors;
 
   if (LITERAL_INSTAGRAM_WORDS.test(userMessage) && source !== "EXISTING_INSTAGRAM_POST" && hasUsableContent(snapshot?.recentContent?.instagramPosts)) {
     errors.push({
