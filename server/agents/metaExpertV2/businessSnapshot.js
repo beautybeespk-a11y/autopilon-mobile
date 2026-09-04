@@ -393,13 +393,23 @@ function normalizeContentItem(platform, raw, sampleProducts) {
 async function gatherRecentContent(accessToken, pageId, instagram, sampleProducts) {
   const facebook = pageId
     ? await attempt(async () => (await meta.listPagePosts(accessToken, pageId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts)))
-    : { status: "not_connected", value: [] };
+    : { status: "not_connected", value: [], reason: null };
   const instagramPosts = instagram?.accountId
     ? await attempt(async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts)))
-    : { status: "not_connected", value: [] };
+    : { status: "not_connected", value: [], reason: null };
+  // Same friendly-reason wrapping as the meta.list_instagram_posts tool
+  // (tools/meta/campaigns.js:268-270) — an IG account IS linked but the
+  // read itself failed (missing OAuth scope on this deployment today), so
+  // say that plainly instead of surfacing Meta's raw Graph API error text.
+  // Previously this reason was captured by attempt() and then silently
+  // dropped here, leaving nothing for the policy layer or the model to
+  // explain to the user.
+  const instagramReason = instagramPosts.status === "fetch_failed"
+    ? `Instagram account is linked, but reading its posts isn't available yet (${instagramPosts.reason}). Facebook post boosting still works.`
+    : instagramPosts.reason || null;
   return {
-    facebookPosts: { status: facebook.status, items: facebook.value || [] },
-    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value || [] },
+    facebookPosts: { status: facebook.status, items: facebook.value || [], reason: facebook.reason || null },
+    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value || [], reason: instagramReason },
   };
 }
 
@@ -459,7 +469,7 @@ export async function gatherBusinessSnapshot(userId) {
       business,
       metaAssets: { adAccounts: emptyList, defaultAdAccount: emptyDefault, pages: emptyList, defaultPage: emptyDefault, pixels: emptyList, defaultPixel: emptyDefault, catalogs: emptyList, defaultCatalog: emptyDefault, instagram: { status: "not_connected", account: null }, defaultInstagramId: null },
       metaHistory: { status: "not_connected", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "not_connected", items: [] } },
-      recentContent: { facebookPosts: { status: "not_connected", items: [] }, instagramPosts: { status: "not_connected", items: [] } },
+      recentContent: { facebookPosts: { status: "not_connected", items: [], reason: null }, instagramPosts: { status: "not_connected", items: [], reason: null } },
       metaConnected: false,
       metaConnectionError: err.message,
       audienceEvidenceHint: computeAudienceEvidenceHint(business.commerceConnected && business.commerceDataStatus === "exists", false),

@@ -191,7 +191,15 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   } else if (creative.source === "EXISTING_INSTAGRAM_POST") {
     const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
     if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected — cannot attach the resolved Instagram post.");
-    creativeFields = { name: `${strategy.business_goal} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: creative.contentId };
+    // instagram_user_id, not instagram_actor_id — Meta deprecated the
+    // latter in Marketing API v22.0 (migration deadline Jan 21, 2026,
+    // already passed); source_instagram_media_id is unaffected. Both
+    // belong INSIDE object_story_spec (confirmed against Meta's own
+    // docs) — a flat top-level pair is silently ignored by the real API,
+    // which is exactly why the read-back verification below (checking
+    // object_story_spec.source_instagram_media_id) previously could never
+    // have passed against a real account.
+    creativeFields = { name: `${strategy.business_goal} — creative`, object_story_spec: { instagram_user_id: igAccountId, source_instagram_media_id: creative.contentId } };
   } else if (creative.source === "PRODUCT_IMAGE") {
     const imgRes = await fetch(creative.imageUrl);
     if (!imgRes.ok) throw new Error(`Could not fetch the resolved product image from ${creative.imageUrl}`);

@@ -69,7 +69,7 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
   // later read-back GET (meta.getAd/getAdCreative/getAdSet — the creative-
@@ -138,7 +138,12 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     // distinct from "not_connected"/empty, matching businessSnapshot.js's
     // real fetch_failed status (attempt() catches the thrown error).
     if (path.endsWith("/posts")) return postsError ? jsonResponse({ error: { message: "Simulated Facebook posts fetch failure" } }, 500) : jsonResponse({ data: posts });
-    if (path.endsWith("/media")) return jsonResponse({ data: [] });
+    // igPostsError simulates a real Instagram content-read failure while
+    // the IG account IS linked (igByPageId set) — this deployment's actual
+    // production state, since instagram_basic isn't a granted OAuth scope
+    // (see oauth.js's SCOPES comment) — distinct from "not_connected"
+    // (no igByPageId entry at all, never reaches this handler).
+    if (path.endsWith("/media")) return igPostsError ? jsonResponse({ error: { message: "Invalid Scopes: instagram_basic" } }, 400) : jsonResponse({ data: igPosts });
     return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
   };
 }
@@ -2928,6 +2933,219 @@ async function run() {
       });
       assert.equal(revision.ok, false, "an existing-post claim must be rejected when that platform's content is actually unusable");
       assert.match(revision.unresolved.issue, /never present a WooCommerce\/Shopify product.*as if it were an existing Facebook creative/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Live report follow-up: literal Instagram/Facebook-post creative ---
+  // requests always fell back to WooCommerce products with no
+  // acknowledgment. Two independent gaps, fixed here: (0) the Instagram
+  // boost path used instagram_actor_id, a field Meta deprecated in
+  // Marketing API v22.0; (1-5) nothing compared the user's literal words
+  // against creative_strategy.source, and the real Instagram-unavailable
+  // reason was captured then silently discarded before it reached anyone.
+  const CREATIVE_TEST_IG_POST = {
+    id: "179999999", caption: "New arrival! Vitamin C Serum now in stock.", media_type: "IMAGE",
+    media_url: "https://instagram.example.com/photo.jpg", permalink: "https://instagram.com/p/abc123/",
+    timestamp: "2024-03-03T10:00:00+0000", like_count: 120, comments_count: 8,
+  };
+
+  await check("[Fix 0] meta.boost_post sends instagram_user_id, never the deprecated instagram_actor_id, for an Instagram boost", async () => {
+    const userId = makeUser(`v2-boost-ig-${stamp}@example.com`);
+    connectMeta(userId);
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], igByPageId: { "111": "ig_acct_1" }, writes } }));
+    try {
+      const result = await getTool("meta.boost_post").execute({ adSetId: "as1", name: "Test Ad", instagramMediaId: "179999999" }, { userId });
+      assert.ok(result.adId, "a real ad id must be returned");
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite?.body?.object_story_spec?.instagram_user_id, "ig_acct_1", "instagram_user_id must be sent, nested inside object_story_spec — the field Meta still accepts on Marketing API v22+");
+      assert.equal(creativeWrite?.body?.instagram_actor_id, undefined, "instagram_actor_id was deprecated in Marketing API v22.0 (migration deadline already passed) and must never be sent");
+      assert.equal(creativeWrite?.body?.object_story_spec?.source_instagram_media_id, "179999999", "the real, resolved IG media id must be sent — never invented");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Fix 0] V2 execute_strategy's EXISTING_INSTAGRAM_POST attach sends instagram_user_id, never the deprecated instagram_actor_id", async () => {
+    const userId = makeUser(`v2-attach-ig-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], igByPageId: { "111": "ig_acct_1" }, igPosts: [CREATIVE_TEST_IG_POST], writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_INSTAGRAM_POST", description: "Use the recent Instagram post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite?.body?.object_story_spec?.instagram_user_id, "ig_acct_1");
+      assert.equal(creativeWrite?.body?.instagram_actor_id, undefined, "instagram_actor_id was deprecated in Marketing API v22.0 and must never be sent");
+      assert.equal(creativeWrite?.body?.object_story_spec?.source_instagram_media_id, "179999999");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Literal creative-source] a literal Instagram request with USABLE Instagram content: a PRODUCT_IMAGE response is rejected, EXISTING_INSTAGRAM_POST against the real candidate is accepted", async () => {
+    const userId = makeUser(`v2-literal-ig-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], igByPageId: { "111": "ig_acct_1" }, igPosts: [CREATIVE_TEST_IG_POST] } }));
+    try {
+      const wrongSource = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } },
+        userMessage: "I want an Instagram post as the creative, not a product.",
+      });
+      assert.equal(wrongSource.ok, false, "must reject PRODUCT_IMAGE when the user literally asked for Instagram and Instagram content IS usable");
+      assert.match(wrongSource.unresolved.issue, /literally asked for an Instagram post\/Reel/i);
+
+      const corrected = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "EXISTING_INSTAGRAM_POST", description: "Use the recent Instagram post about the Vitamin C Serum." } },
+        userMessage: "I want an Instagram post as the creative, not a product.",
+      });
+      assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_INSTAGRAM_POST", contentId: "179999999" }, "must resolve against the real Instagram candidate");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Literal creative-source] a literal Instagram request with Instagram UNUSABLE: PRODUCT_IMAGE is accepted, and the description is mechanically rewritten to name the request and cite the real reason", async () => {
+    const userId = makeUser(`v2-literal-ig-unavailable-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], igByPageId: { "111": "ig_acct_1" }, igPostsError: true } }));
+    try {
+      const snapshotCheck = await gatherBusinessSnapshot(userId);
+      assert.equal(snapshotCheck.recentContent.instagramPosts.status, "fetch_failed", "test setup sanity check: Instagram must genuinely fail, not just be disconnected");
+      assert.match(snapshotCheck.recentContent.instagramPosts.reason, /Instagram account is linked, but reading its posts isn't available yet/i);
+
+      const revision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } },
+        userMessage: "I want an Instagram post as the creative.",
+      });
+      assert.equal(revision.ok, true, JSON.stringify(revision.unresolved));
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.match(updated.strategy.creative_strategy.description, /^You asked for an Instagram post\/Reel/i, "must mechanically acknowledge the literal request, never silently substitute");
+      assert.match(updated.strategy.creative_strategy.description, /Instagram account is linked, but reading its posts isn't available yet/i, "the real reason must be cited, not a vague generic message");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Literal creative-source] a literal 'boost my Facebook post' request with usable Facebook content resolves to EXISTING_PAGE_POST — the already-working platform is not regressed", async () => {
+    const userId = makeUser(`v2-literal-fb-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const wrongSource = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } },
+        userMessage: "Boost my Facebook post as the ad.",
+      });
+      assert.equal(wrongSource.ok, false, "must reject PRODUCT_IMAGE when the user literally asked to boost a Facebook post and Facebook content IS usable");
+
+      const corrected = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post about the Vitamin C Serum." } },
+        userMessage: "Boost my Facebook post as the ad.",
+      });
+      assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Literal creative-source] no literal platform wording in the user's message: PRODUCT_IMAGE is accepted with no new rejection (no over-correction)", async () => {
+    const userId = makeUser(`v2-literal-none-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], igByPageId: { "111": "ig_acct_1" }, igPosts: [CREATIVE_TEST_IG_POST] },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.strategy.creative_strategy.source, "PRODUCT_IMAGE", "no platform was literally requested — PRODUCT_IMAGE must stand, never over-corrected");
+      assert.equal(updated.strategy.creative_strategy.description, "A new product-led creative around the Vitamin C Serum.", "the description must be untouched — no mechanical acknowledgment when nothing was literally requested");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Creative gate — bare platform statement] 'I want an Instagram post as the creative' (no choose/pick/compare wording) still forces a real get_business_snapshot call before any creative claim is finalized", async () => {
+    const userId = makeUser(`v2-creative-gate-bare-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], igByPageId: { "111": "ig_acct_1" }, igPosts: [CREATIVE_TEST_IG_POST] },
+      chatResponses: [
+        // Misbehaving model: finalizes immediately, no choose/pick/compare
+        // verb in the user's message means none of the OLDER intent
+        // patterns would have caught this — proving the new bare-platform-
+        // statement pattern is what forces the retry below.
+        finalText("Sure, I'll use your Instagram post as the creative."),
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("Based on your recent Instagram content, here's what I'd use."),
+      ],
+    }));
+    try {
+      const userMessage = "I want an Instagram post as the creative, not a product.";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `bare platform statement must still force a real snapshot call: ${JSON.stringify(toolNames)}`);
     } finally {
       restoreFetch();
     }

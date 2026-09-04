@@ -22,6 +22,7 @@ import {
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
+  checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -491,13 +492,30 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   }
   normalized = audienceReasoningResolved;
 
+  // Live bug fix (creative-selection follow-up): when the user literally
+  // asked for a platform whose content genuinely isn't usable right now,
+  // mechanically acknowledge that in creative_strategy.description instead
+  // of silently falling back to PRODUCT_IMAGE with no mention of what was
+  // asked (see repairCreativeDescriptionForUnavailableLiteralSource in
+  // policy.js). Applied unconditionally — it only edits description text,
+  // never a real business decision, so unlike the two reasoning_summary
+  // repairs below it doesn't need to be gated behind baseChecksClean.
+  normalized = repairCreativeDescriptionForUnavailableLiteralSource(normalized, userMessage, snapshot);
+
   const goalErrors = [...checkGoalAlignmentPolicy(normalized, businessSignals), ...checkLiteralGoalSubstitutionPolicy(normalized, userMessage)];
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
   let creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   // NOT eligible for the text-only auto-repair below — which specific
   // product to recommend instead is a real business decision, not a
   // wording fix (see checkCreativeSourceAvailabilityPolicy in policy.js).
-  const creativeSourceErrors = checkCreativeSourceAvailabilityPolicy(normalized, snapshot);
+  // Also includes checkLiteralCreativeSourceSubstitutionPolicy — the user
+  // literally asked for a platform whose content IS usable but the model
+  // picked something else anyway; same "genuine business decision, not a
+  // mechanical patch" reasoning applies.
+  const creativeSourceErrors = [
+    ...checkCreativeSourceAvailabilityPolicy(normalized, snapshot),
+    ...checkLiteralCreativeSourceSubstitutionPolicy(normalized, userMessage, snapshot),
+  ];
   const audienceErrors = checkAudienceQualityPolicy(normalized, businessSignals);
   const budgetErrors = checkBudgetPolicy(normalized);
   const revisionErrors = priorStored ? checkRevisionSubstantive({ priorStrategy: priorStored.strategy, newStrategy: normalized, requestedChanges }) : [];

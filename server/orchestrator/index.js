@@ -588,6 +588,14 @@ const CREATIVE_SELECTION_INTENT_PATTERN_LIST = [
   // is the exact live-bug follow-up shape ("optimize the campaign
   // creative") reported after the snapshot-forcing fix above shipped.
   { label: "change/update/optimize the creative", pattern: /\b(change|update|swap|replace|optimi[sz]e|revise)\b.{0,40}\b(the )?(ad |campaign )?creative\b/i },
+  // Bare platform statement — no choose/pick/select/compare/best verb at
+  // all ("I want an Instagram post/Reel," "boost my Facebook post," "not
+  // a product"), so none of the patterns above catch it. Live-bug
+  // follow-up: this exact phrasing reached build/revise_strategy without
+  // ever forcing a fresh snapshot, which is also what let a stale/absent
+  // Instagram-content status go unchecked before creative_strategy.source
+  // was picked.
+  { label: "bare platform statement", pattern: /\b(instagram (post|reel)|ig (post|reel)|facebook post|fb post|boost (my|this|the)( facebook)? post|not a product|no product)\b/i },
 ];
 const CREATIVE_SELECTION_INTENT_PATTERNS = new RegExp(
   CREATIVE_SELECTION_INTENT_PATTERN_LIST.map((p) => p.pattern.source).join("|"),

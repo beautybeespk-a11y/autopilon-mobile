@@ -305,7 +305,12 @@ registerTool({
       const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
       const igAccountId = await meta.getInstagramAccountId(accessToken, pageId);
       if (!igAccountId) throw new Error("This Page has no Instagram Business Account connected.");
-      creativeFields = { name: `${parameters.name} — creative`, instagram_actor_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId };
+      // instagram_user_id, not instagram_actor_id — Meta deprecated the
+      // latter in Marketing API v22.0 (migration deadline Jan 21, 2026,
+      // already passed); source_instagram_media_id is unaffected. Both
+      // belong INSIDE object_story_spec — a flat top-level pair is
+      // silently ignored by the real API.
+      creativeFields = { name: `${parameters.name} — creative`, object_story_spec: { instagram_user_id: igAccountId, source_instagram_media_id: parameters.instagramMediaId } };
     }
     const creative = await meta.createAdCreative(accessToken, adAccountId, creativeFields);
     const ad = await meta.createAd(accessToken, adAccountId, {

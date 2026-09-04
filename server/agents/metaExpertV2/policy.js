@@ -320,6 +320,85 @@ export function checkCreativeSourceAvailabilityPolicy(strategy, snapshot) {
   return errors;
 }
 
+// Live bug (creative-selection follow-up #2): checkCreativeSourceAvailabilityPolicy
+// above only guards a source the model already CLAIMED — it does nothing
+// when the model never attempted the platform the user literally asked
+// for in the first place, so "I want an Instagram post" could silently
+// return PRODUCT_IMAGE with zero rejection. Unlike budget
+// (verifyUserProvidedBudget) and objective
+// (checkLiteralGoalSubstitutionPolicy), nothing compared the user's own
+// words against creative_strategy.source. Deliberately checked against the
+// RAW userMessage, same discipline as those two. Only fires when the
+// requested platform's content is ACTUALLY usable (hasUsableContent) —
+// when it genuinely isn't, checkCreativeSourceAvailabilityPolicy already
+// owns forcing a switch away from it, and requiring both at once (this
+// check demanding the existing-post source, that one rejecting it as
+// unusable) would deadlock. The genuinely-unusable case is handled
+// separately, mechanically, by repairCreativeDescriptionForUnavailableLiteralSource
+// below — never by a rejection, since no retry can fix real data
+// unavailability.
+const LITERAL_INSTAGRAM_WORDS = /\b(instagram|ig\s*post|ig\s*reel|reels?)\b/i;
+// Deliberately narrower than a bare "facebook post"/"fb post" mention
+// (unlike LITERAL_INSTAGRAM_WORDS above) — this check causes a hard
+// rejection, unlike orchestrator/index.js's CREATIVE_SELECTION_INTENT_PATTERNS
+// bare-mention gate (harmless on a false positive, it only forces an
+// extra snapshot). A bare mention is genuinely ambiguous for Facebook —
+// "use a product image instead of the Facebook post" MENTIONS a Facebook
+// post while explicitly declining it, and a real test case exactly like
+// this false-positived before this pattern was narrowed to require an
+// actual request verb.
+const LITERAL_FACEBOOK_POST_WORDS = /\bboost (my|this|the)( facebook)? post\b/i;
+export function checkLiteralCreativeSourceSubstitutionPolicy(strategy, userMessage, snapshot) {
+  const errors = [];
+  if (typeof userMessage !== "string") return errors;
+  const source = strategy.creative_strategy?.source;
+  if (!source) return errors;
+
+  if (LITERAL_INSTAGRAM_WORDS.test(userMessage) && source !== "EXISTING_INSTAGRAM_POST" && hasUsableContent(snapshot?.recentContent?.instagramPosts)) {
+    errors.push({
+      field: "creative_strategy.source",
+      message: "The user's own message literally asked for an Instagram post/Reel as the creative, and usable Instagram content exists in the current business snapshot — set creative_strategy.source to EXISTING_INSTAGRAM_POST and select from that real content. Never substitute a WooCommerce/Shopify product silently when the requested platform's content is genuinely available.",
+    });
+  }
+  if (LITERAL_FACEBOOK_POST_WORDS.test(userMessage) && source !== "EXISTING_PAGE_POST" && hasUsableContent(snapshot?.recentContent?.facebookPosts)) {
+    errors.push({
+      field: "creative_strategy.source",
+      message: "The user's own message literally asked to boost an existing Facebook post as the creative, and usable Facebook post content exists in the current business snapshot — set creative_strategy.source to EXISTING_PAGE_POST and select from that real content. Never substitute a WooCommerce/Shopify product silently when the requested platform's content is genuinely available.",
+    });
+  }
+  return errors;
+}
+
+// Deterministic, non-LLM regeneration — same "mechanical fix, don't burn
+// the model's one generation attempt on something no amount of retrying
+// can change" principle as repairCreativeReasoningForMissingEvidence
+// above. Pairs with checkLiteralCreativeSourceSubstitutionPolicy: when the
+// user literally asked for a platform's existing content and that
+// platform's content genuinely ISN'T usable (hasUsableContent is false),
+// the model has no way to comply — but silently falling back to
+// PRODUCT_IMAGE with zero mention of what was asked is still the live bug
+// being fixed (same "recommending something else is fine, substituting it
+// silently is not" principle as checkLiteralGoalSubstitutionPolicy).
+// Prepends an honest, factual acknowledgment sentence citing the real
+// reason (snapshot.recentContent.*.reason — see businessSnapshot.js)
+// instead of relying on the model to volunteer it.
+export function repairCreativeDescriptionForUnavailableLiteralSource(strategy, userMessage, snapshot) {
+  if (typeof userMessage !== "string") return strategy;
+  const source = strategy.creative_strategy?.source;
+  if (!source || source === "EXISTING_INSTAGRAM_POST" || source === "EXISTING_PAGE_POST") return strategy;
+
+  const wantsInstagram = LITERAL_INSTAGRAM_WORDS.test(userMessage) && !hasUsableContent(snapshot?.recentContent?.instagramPosts);
+  const wantsFacebookPost = !wantsInstagram && LITERAL_FACEBOOK_POST_WORDS.test(userMessage) && !hasUsableContent(snapshot?.recentContent?.facebookPosts);
+  if (!wantsInstagram && !wantsFacebookPost) return strategy;
+
+  const platform = wantsInstagram ? "an Instagram post/Reel" : "an existing Facebook post";
+  const reason = wantsInstagram ? snapshot?.recentContent?.instagramPosts?.reason : snapshot?.recentContent?.facebookPosts?.reason;
+  const description = strategy.creative_strategy.description || "";
+  if (description.startsWith("You asked for")) return strategy;
+  const acknowledgment = `You asked for ${platform} as the creative, but I couldn't find usable content for that right now${reason ? ` (${reason})` : ""}. `;
+  return { ...strategy, creative_strategy: { ...strategy.creative_strategy, description: acknowledgment + description } };
+}
+
 // Step 4/5 — Audience quality. Same "generic audience needs a real reason"
 // principle: All genders 18-65 is Meta's own widest possible range, not a
 // considered choice.
