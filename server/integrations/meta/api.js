@@ -10,14 +10,48 @@ import { logger } from "../../config/logger.js";
 const API_VERSION = process.env.META_API_VERSION || "v25.0";
 const BASE = `https://graph.facebook.com/${API_VERSION}`;
 
+// Walks a raw fetch()-level exception's .cause chain (Node's undici throws
+// `TypeError: fetch failed` with the REAL error — ECONNREFUSED, ENOTFOUND,
+// ETIMEDOUT, a TLS failure, etc. — nested one or more .cause levels deep,
+// sometimes an AggregateError with multiple attempts in .errors) into a
+// flat, loggable list. Never assumes a fixed depth or shape.
+function describeNetworkError(err) {
+  const chain = [];
+  let current = err;
+  let depth = 0;
+  while (current && depth < 5) {
+    chain.push({ name: current.name, message: current.message, code: current.code });
+    if (Array.isArray(current.errors) && current.errors.length) {
+      for (const inner of current.errors) chain.push({ name: inner.name, message: inner.message, code: inner.code });
+      break;
+    }
+    current = current.cause;
+    depth += 1;
+  }
+  return chain;
+}
+
 async function metaFetch(path, { accessToken, method = "GET", body }) {
   const url = new URL(`${BASE}${path}`);
   if (method === "GET") url.searchParams.set("access_token", accessToken);
-  const res = await fetch(url, {
-    method,
-    headers: { "content-type": "application/json" },
-    body: body ? JSON.stringify({ ...body, access_token: method !== "GET" ? accessToken : undefined }) : undefined,
-  });
+  let res;
+  try {
+    res = await fetch(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body ? JSON.stringify({ ...body, access_token: method !== "GET" ? accessToken : undefined }) : undefined,
+    });
+  } catch (err) {
+    // Diagnostic (user-reported live failure: a call logged its request,
+    // then nothing — no response, no meta_api.request_failed — because
+    // fetch() itself threw before an HTTP response ever existed, which
+    // the request_failed log below can't see since it needs a real `res`
+    // to read a status/body from). Previously silent; this is the ONLY
+    // place in this file that can observe a raw network-level failure,
+    // so every caller gets it for free rather than needing its own catch.
+    logger.error("meta_api.network_error", { path, method, chain: describeNetworkError(err) });
+    throw err;
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const apiError = data?.error || {};
