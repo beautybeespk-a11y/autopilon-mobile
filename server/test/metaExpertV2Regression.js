@@ -3741,11 +3741,16 @@ async function run() {
   });
 
   // Regression guard for the OTHER half of the same live sequence: this
-  // user's WooCommerce store WAS connected (12 real products) — a genuine
-  // audience_strategy=HEURISTIC/no-reasoning rejection with real store
-  // data available must NOT be silently auto-filled; narrowing using that
-  // real data is a genuine analysis step the model must still do.
-  await check("[V2 policy] a fully generic audience (ALL, 18-65) with no audience_reasoning is still REJECTED when real store data exists to narrow it — never auto-filled away", async () => {
+  // user's WooCommerce store WAS connected (12 real products) with
+  // audience_strategy=HEURISTIC — that specific combination (the LAZY
+  // strategy-basis choice despite real data existing to narrow by) is a
+  // genuine business-decision failure, not a missing-text problem, and
+  // stays rejected via checkAudienceQualityPolicy's separate
+  // audience_strategy check (policy.js) regardless of whether
+  // audience_reasoning text is present. See the next test for the case
+  // that changed: missing audience_reasoning TEXT ALONE, with a
+  // non-lazy audience_strategy, now auto-fills instead of hard-rejecting.
+  await check("[V2 policy] a fully generic audience with audience_strategy=HEURISTIC is still REJECTED when real store data exists to narrow it — a lazy strategy-basis choice is never auto-filled away", async () => {
     const userId = makeUser(`v2-audience-reasoning-hasevidence-${stamp}@example.com`);
     connectMeta(userId);
     connectWooCommerce(userId);
@@ -3754,8 +3759,41 @@ async function run() {
     try {
       const genericStrategy = baseStrategy({ gender: "ALL", age_min: 18, age_max: 65, audience_strategy: "HEURISTIC" });
       const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: genericStrategy, userMessage: "I want more sales on my website" });
-      assert.equal(result.ok, false, "a generic audience left unexplained must still be rejected when real store data exists to narrow it");
+      assert.equal(result.ok, false, "a lazy HEURISTIC strategy basis must still be rejected when real store data exists to narrow it, even though the missing audience_reasoning text itself is now auto-filled");
       assert.match(result.unresolved.issue, /audience/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // LIVE REPORT: production log showed ONLY the audience_reasoning error
+  // (no audience_strategy error alongside it) — meaning the model's
+  // audience_strategy was something OTHER than HEURISTIC (already a
+  // reasonable basis choice), just missing the free-text explanation.
+  // build_strategy was called 3 times, each rejected identically — the
+  // retry loop DOES feed the rejection + explicit guidance back
+  // (V2_RETRYABLE_BUILD_TOOLS, orchestrator/index.js), but the model
+  // still never complied. Standing rule: a missing free-text field must
+  // never be able to hard-block an otherwise sound strategy through 3
+  // identical rejections — deriveAudienceReasoningIfMissing now covers
+  // this case too, with real, evidence-based wording (never the
+  // no-evidence-exists sentence, which would be false here).
+  await check("[V2 policy] LIVE REPORT: audience_reasoning missing with real store data AND a non-lazy audience_strategy (PRODUCT_CATEGORY) is now auto-explained with evidence-based wording and accepted, not hard-rejected", async () => {
+    const userId = makeUser(`v2-audience-reasoning-hasevidence-autofill-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const genericStrategy = baseStrategy({ gender: "ALL", age_min: 18, age_max: 65, audience_strategy: "PRODUCT_CATEGORY" });
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: genericStrategy,
+        userMessage: "I want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.ok(result.strategy.audience_reasoning && result.strategy.audience_reasoning.trim(), "a missing audience_reasoning must be auto-filled, not left empty, once a non-lazy strategy basis is already chosen");
+      assert.doesNotMatch(result.strategy.audience_reasoning, /no connected store data/i, "must never use the no-evidence-exists wording when a store IS actually connected — that would be false");
+      assert.match(result.strategy.audience_reasoning, /skincare/i, "must cite the real, connected store's actual product category — never a generic placeholder");
     } finally {
       restoreFetch();
     }

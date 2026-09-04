@@ -507,7 +507,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     hasStrongerAudienceEvidence: hasStoreData || hasCampaignHistory,
   };
 
-  const audienceReasoningResolved = deriveAudienceReasoningIfMissing(normalized, businessSignals);
+  const audienceReasoningResolved = deriveAudienceReasoningIfMissing(normalized, businessSignals, snapshot);
   if (traceEnabled && audienceReasoningResolved.audience_reasoning !== normalized.audience_reasoning) {
     trace("strategy audience_reasoning defaulted (no stronger evidence exists)", { conversationId });
   }
