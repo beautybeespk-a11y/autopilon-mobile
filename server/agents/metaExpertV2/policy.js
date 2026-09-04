@@ -306,15 +306,24 @@ export function checkCreativeSourceAvailabilityPolicy(strategy, snapshot) {
   const fbUsable = hasUsableContent(snapshot?.recentContent?.facebookPosts);
   const igUsable = hasUsableContent(snapshot?.recentContent?.instagramPosts);
   if (source === "EXISTING_PAGE_POST" && !fbUsable) {
+    // Live bug (user-reported follow-up): the model's own free-text final
+    // reply invented a vague "permissions issue" explanation instead of
+    // quoting the real, specific reason — because this message never gave
+    // it the real reason to quote in the first place. reasonClause below
+    // is the same raw Fix-1-threaded value businessSnapshot.js captures
+    // from Meta's own error, when a real one exists (not every
+    // "unavailable" status has one — not_connected/no items never do).
+    const reasonClause = snapshot?.recentContent?.facebookPosts?.reason ? ` The real reason: ${snapshot.recentContent.facebookPosts.reason}` : "";
     errors.push({
       field: "creative_strategy",
-      message: `creative_strategy claims an existing Facebook post as the creative, but no usable Facebook post content exists in the current snapshot (status: ${snapshot?.recentContent?.facebookPosts?.status || "unknown"}) — never present a WooCommerce/Shopify product, or anything else, as if it were an existing Facebook creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance."`,
+      message: `creative_strategy claims an existing Facebook post as the creative, but no usable Facebook post content exists in the current snapshot (status: ${snapshot?.recentContent?.facebookPosts?.status || "unknown"}).${reasonClause} Never present a WooCommerce/Shopify product, or anything else, as if it were an existing Facebook creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance." If you mention WHY the Facebook post isn't available, quote the real reason above verbatim — never invent or guess at a cause (e.g. never say "a permissions issue" unless that's the actual reason given).`,
     });
   }
   if (source === "EXISTING_INSTAGRAM_POST" && !igUsable) {
+    const reasonClause = snapshot?.recentContent?.instagramPosts?.reason ? ` The real reason: ${snapshot.recentContent.instagramPosts.reason}` : "";
     errors.push({
       field: "creative_strategy",
-      message: `creative_strategy claims an existing Instagram post/Reel as the creative, but no usable Instagram content exists in the current snapshot (status: ${snapshot?.recentContent?.instagramPosts?.status || "unknown"}) — never present a WooCommerce/Shopify product, or anything else, as if it were an existing Instagram creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance."`,
+      message: `creative_strategy claims an existing Instagram post/Reel as the creative, but no usable Instagram content exists in the current snapshot (status: ${snapshot?.recentContent?.instagramPosts?.status || "unknown"}).${reasonClause} Never present a WooCommerce/Shopify product, or anything else, as if it were an existing Instagram creative. Set source to PRODUCT_IMAGE (or another non-existing-post source) and recommend a NEW product-led creative grounded in a real product from the business snapshot instead — say plainly: "I couldn't verify a usable existing Reel/post, so I recommend creating a new product-led creative around [product] based on WooCommerce relevance." If you mention WHY the Instagram content isn't available, quote the real reason above verbatim — never invent or guess at a cause (e.g. never say "a permissions issue" unless that's the actual reason given).`,
     });
   }
   return errors;

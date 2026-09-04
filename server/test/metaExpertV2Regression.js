@@ -1995,6 +1995,114 @@ async function run() {
     }
   });
 
+  // --- Unavailable-reason paraphrasing guard (live report follow-up) -----
+  // Live report: asked why Facebook posts weren't available, the model's
+  // own final reply invented "a permissions issue" — wrong (the user's
+  // real account had pages_read_engagement granted the whole time,
+  // confirmed against Meta's own /me/permissions). The REAL reason was
+  // already captured (Fix 1) and mechanically embedded in
+  // creative_strategy.description (repairCreativeDescriptionForUnavailableLiteralSource),
+  // but nothing stopped the model's own free-text final reply from
+  // paraphrasing it away. Same nudge-then-deterministic-append shape as
+  // the currency-symbol guard above.
+  await check("[V2 unavailable-reason guard] the model's own final reply inventing a vague explanation ('a permissions issue') is nudged into quoting the real captured reason verbatim", async () => {
+    const userId = makeUser(`v2-reason-guard-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    // Instagram genuinely linked but unreadable — same setup as the
+    // earlier [Literal creative-source] Instagram-unusable test — so
+    // repairCreativeDescriptionForUnavailableLiteralSource mechanically
+    // embeds a REAL captured reason into creative_strategy.description.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], igByPageId: { "111": "ig_acct_1" }, igPostsError: true } }));
+    try {
+      const revision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } },
+        userMessage: "I want an Instagram post as the creative.",
+      });
+      assert.equal(revision.ok, true, JSON.stringify(revision.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    const active = getActiveStrategyForConversation(userId, conversationId);
+    const capturedReason = active.strategy.creative_strategy.description.match(/\((.+?)\)\./)?.[1];
+    assert.ok(capturedReason, `test setup sanity check: a real reason must be captured: ${active.strategy.creative_strategy.description}`);
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Unfortunately, I still can't access your recent Instagram posts due to a permissions issue."),
+        finalText(`Unfortunately, I still can't access your recent Instagram posts. Specific reason: ${capturedReason}`),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.doesNotMatch(result.reply, /a permissions issue/i, "an invented, vague explanation must never reach the customer once the real reason is known");
+      assert.ok(result.reply.includes(capturedReason), `the real, captured reason must reach the customer verbatim: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 unavailable-reason guard] the invented explanation repeated even after the nudge is deterministically appended with the real reason", async () => {
+    const userId = makeUser(`v2-reason-guard-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    let initial;
+    try {
+      initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(initial.ok, true, JSON.stringify(initial.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], igByPageId: { "111": "ig_acct_1" }, igPostsError: true } }));
+    try {
+      const revision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: initial.strategyId, freshResearchRequired: true,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "A new product-led creative around the Vitamin C Serum." } },
+        userMessage: "I want an Instagram post as the creative.",
+      });
+      assert.equal(revision.ok, true, JSON.stringify(revision.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        finalText("Unfortunately, I still can't access your recent Instagram posts due to a permissions issue."),
+        finalText("Still just a permissions issue, sorry for the confusion."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      const capturedReason = active.strategy.creative_strategy.description.match(/\((.+?)\)\./)?.[1];
+      assert.ok(capturedReason, "test setup sanity check: a real reason must be captured");
+      assert.ok(result.reply.includes(capturedReason), `the fail-safe append must still guarantee the real, captured reason reaches the customer: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- "Approved" with the strategy never actually executed (live bug, round 19) --
   // Live screenshot: user said "approved" with an active strategy in
   // place. The model's reply: "Your campaign to increase website sales is

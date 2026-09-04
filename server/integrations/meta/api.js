@@ -177,14 +177,27 @@ export async function listPages(accessToken) {
 // server-side only.
 export async function getPageAccessToken(accessToken, pageId) {
   const direct = await metaFetch(`/${pageId}?fields=access_token`, { accessToken }).catch(() => ({}));
-  if (direct.access_token) return direct.access_token;
+  if (direct.access_token) {
+    logger.info("meta_api.get_page_access_token", { pageId, resolution: "direct" });
+    return direct.access_token;
+  }
 
   const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
   for (const business of businesses.data || []) {
     const pages = await metaFetch(`/${business.id}/owned_pages?fields=id,access_token`, { accessToken }).catch(() => ({ data: [] }));
     const match = (pages.data || []).find((p) => p.id === pageId);
-    if (match?.access_token) return match.access_token;
+    if (match?.access_token) {
+      logger.info("meta_api.get_page_access_token", { pageId, resolution: "business_portfolio", businessId: business.id });
+      return match.access_token;
+    }
   }
+  // Diagnostic (user-reported: "the Page has no eligible posts, or
+  // getPageAccessToken is returning nothing, or the fields parameter
+  // includes something the API rejects" — this is the second of those
+  // three, previously silent either way). businessesChecked distinguishes
+  // "no Business Portfolio to even check" (0) from "checked N, none had
+  // this page" (>0) — different real causes for the same null return.
+  logger.warn("meta_api.get_page_access_token", { pageId, resolution: "none_found", businessesChecked: (businesses.data || []).length });
   return null;
 }
 
@@ -239,7 +252,21 @@ export async function createAd(accessToken, adAccountId, fields) {
 // "high engagement" from nothing.
 export async function listPagePosts(accessToken, pageId) {
   const pageToken = await getPageAccessToken(accessToken, pageId);
+  // Diagnostic (user-reported live failure: the model's own reply claimed
+  // "a permissions issue" reading this Page's posts even though Meta's
+  // own /me/permissions confirmed pages_read_engagement IS granted — so
+  // the real cause is something else this call itself can now show).
+  // Logged the same way execute_strategy already logs its own request/
+  // response payloads (executor.js) — a real failure is already fully
+  // logged by metaFetch's own meta_api.request_failed (code/subcode/
+  // message/error_user_msg/fbtrace_id); this adds the success path
+  // (previously silent) and which credential this call actually used.
+  // Deliberately named credentialSource, not "...Token..." — logger.js's
+  // redact() strips any field whose KEY matches /token/i regardless of
+  // its value, which would have silently hidden this exact diagnostic.
+  logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: pageToken ? "page" : "user" });
   const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media},likes.summary(true),comments.summary(true),shares`, { accessToken: pageToken || accessToken });
+  logger.info("meta_api.list_page_posts.response", { pageId, postCount: (data.data || []).length, raw: data });
   return data.data || [];
 }
 

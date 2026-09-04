@@ -224,6 +224,32 @@ function messageHasWrongDollarSign(message, realCurrency) {
 // top of an otherwise fully-compliant, honest strategy, and nothing
 // caught that. PERFORMANCE_CLAIM_WORDS is imported (not redefined) so
 // both layers agree on exactly what counts as a performance claim.
+// Live bug (user-reported follow-up): asked why Facebook posts couldn't be
+// read, the model's own final reply said "due to a permissions issue" —
+// invented, and wrong (the user's live account had pages_read_engagement
+// granted the whole time, confirmed against Meta's own /me/permissions).
+// The REAL reason was already captured, unwrapped, straight from Meta's
+// Graph API error (businessSnapshot.js's attempt() -> Fix 1's reason
+// threading), and mechanically inserted into
+// creative_strategy.description by
+// repairCreativeDescriptionForUnavailableLiteralSource (policy.js) — but
+// nothing stopped the model's own free-text final reply from paraphrasing
+// that specific, real detail into a vaguer, invented-sounding one. Same
+// failure class, same fix shape, as messageHasWrongDollarSign above: a
+// structured field being correct doesn't stop the model's own prose from
+// diverging from it. capturedUnavailableReason() parses the exact
+// sentence shape repairCreativeDescriptionForUnavailableLiteralSource
+// always produces ("You asked for X ... right now (<reason>). ...") — if
+// that shape isn't present, there's nothing captured to enforce, so this
+// never fires as a false positive on an ordinary reply.
+const MAX_UNAVAILABLE_REASON_NUDGES = 1;
+const CAPTURED_UNAVAILABLE_REASON_PATTERN = /^You asked for .+? right now \((.+?)\)\./;
+function capturedUnavailableReason(activeStrategy) {
+  const description = activeStrategy?.strategy?.creative_strategy?.description;
+  if (typeof description !== "string") return null;
+  return description.match(CAPTURED_UNAVAILABLE_REASON_PATTERN)?.[1] || null;
+}
+
 const MAX_PERFORMANCE_CLAIM_NUDGES = 1;
 function activeCreativeHasRealEngagement(activeStrategy) {
   const creative = activeStrategy?.resolvedAssets?.creative;
@@ -997,6 +1023,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let executionClaimNudges = 0;
   let currencyNudges = 0;
   let performanceClaimNudges = 0;
+  let unavailableReasonNudges = 0;
   // Set true the moment checkV2ExecutionApprovalGate blocks a real
   // execute_strategy attempt this turn (see round-29 fix in
   // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
@@ -1502,6 +1529,32 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // substitution, not another model guess: replace the specific
         // claim phrase with a neutral, honest one.
         decision.message = decision.message.replace(PERFORMANCE_CLAIM_WORDS, "a suitable");
+      }
+
+      // Live bug (user-reported follow-up): asked why Facebook posts
+      // weren't available, the model's final reply said "due to a
+      // permissions issue" — the real, captured reason
+      // (capturedUnavailableReason above) said something specific and
+      // different. Same nudge-then-deterministic-append shape as the
+      // dollar-sign/performance-claim guards above.
+      const capturedReason = hasV2Tools ? capturedUnavailableReason(activeStrategyForCurrency) : null;
+      if (capturedReason && typeof decision.message === "string" && !decision.message.includes(capturedReason)) {
+        if (unavailableReasonNudges < MAX_UNAVAILABLE_REASON_NUDGES) {
+          unavailableReasonNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `Your reply explains why a platform's content isn't available, but doesn't include the actual captured reason. Rewrite your reply to include this exact detail verbatim: "${capturedReason}" — never a vaguer paraphrase like "a permissions issue" or "a technical issue."`,
+            },
+          ];
+          continue;
+        }
+        // Nudge already used and it STILL left out the real reason — never
+        // let an invented-sounding explanation reach the customer in place
+        // of the specific one that was actually captured.
+        decision.message = `${decision.message}\n\nSpecific reason: ${capturedReason}`;
       }
 
       trace[trace.length - 1].state = "done";
