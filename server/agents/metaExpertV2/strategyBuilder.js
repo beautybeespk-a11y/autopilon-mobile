@@ -7,7 +7,7 @@
 // fails after that is a genuine unresolved business issue, returned once
 // as a single clean, customer-safe explanation — never fed back into
 // another LLM attempt.
-import { gatherBusinessSnapshot } from "./businessSnapshot.js";
+import { gatherBusinessSnapshot, getStoreCountryForFallback } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
 import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatPrimaryTextQuestion } from "./creativeResolution.js";
 import {
@@ -275,6 +275,27 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // was present, countries (the real ISO codes) was not. Only fires when
   // every location name maps unambiguously to a known country.
   const countriesResolved = deriveCountriesFromLocationsIfMissing(budgetFromMessageResolved);
+  // Live bug (user-reported follow-up): the derivation above only helps
+  // when the model supplied `locations` but omitted `countries` — it does
+  // nothing when the model supplies NEITHER, which is what a live report
+  // hit ("use one of my facebook page posts as the ad," no location
+  // wording at all, 3 identical rejections). Falls back to the store's
+  // own real, already-connected country (getStoreCountryForFallback,
+  // businessSnapshot.js) — never invented, and never overrides a value
+  // the model (or the user) actually supplied: only fires when BOTH
+  // locations and countries are absent. If the store's country is
+  // missing or ambiguous, getStoreCountryForFallback returns null and
+  // this falls straight through to the existing "Missing required field"
+  // rejection — advertising in the wrong country is worse than asking.
+  const needsStoreCountryFallback = (!Array.isArray(countriesResolved.locations) || !countriesResolved.locations.length)
+    && (!Array.isArray(countriesResolved.countries) || !countriesResolved.countries.length);
+  const fallbackStoreCountry = needsStoreCountryFallback ? await getStoreCountryForFallback(userId) : null;
+  const storeCountryResolved = fallbackStoreCountry
+    ? { ...countriesResolved, locations: [fallbackStoreCountry], countries: [fallbackStoreCountry] }
+    : countriesResolved;
+  if (traceEnabled && fallbackStoreCountry) {
+    trace("strategy locations/countries derived from store's own connected country (missing from model output entirely)", { conversationId, derivedCountry: fallbackStoreCountry });
+  }
   // Live bug (round 24): "Missing required field 'reasoning_summary'" hard-
   // rejected a strategy right after the model recovered from a wrong-tool
   // attempt (execute_strategy with no active strategy -> falling back to
@@ -284,7 +305,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // repairSalesReasoningSummary below), not a unique judgment call, so a
   // missing summary is just the most extreme case of "wrong" — fixable the
   // same mechanical way, before structural validation ever sees it.
-  const reasoningSummaryResolved = deriveReasoningSummaryIfMissing(countriesResolved);
+  const reasoningSummaryResolved = deriveReasoningSummaryIfMissing(storeCountryResolved);
   // Live bug (round 26): "Missing required field 'evidence_used'" hard-
   // rejected a strategy the same way — evidence_used (and the identically-
   // shaped assumptions) is explicitly allowed to be an empty array by its
@@ -317,7 +338,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   if (traceEnabled && countriesResolved.countries !== budgetFromMessageResolved.countries) {
     trace("strategy countries derived from locations (missing from model output)", { conversationId, derivedCountries: countriesResolved.countries });
   }
-  if (traceEnabled && reasoningSummaryResolved.reasoning_summary !== countriesResolved.reasoning_summary) {
+  if (traceEnabled && reasoningSummaryResolved.reasoning_summary !== storeCountryResolved.reasoning_summary) {
     trace("strategy reasoning_summary defaulted (missing from model output)", { conversationId, derivedReasoningSummary: reasoningSummaryResolved.reasoning_summary });
   }
   if (traceEnabled && (emptyArrayFieldsResolved.evidence_used !== reasoningSummaryResolved.evidence_used || emptyArrayFieldsResolved.assumptions !== reasoningSummaryResolved.assumptions)) {

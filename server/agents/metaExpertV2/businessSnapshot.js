@@ -194,6 +194,54 @@ async function gatherCommerce(userId) {
   };
 }
 
+// Live bug (user-reported): a build_strategy call that omitted BOTH
+// locations and countries hard-rejected with "Missing required field
+// 'countries'" — real, three times, no self-correction. strategyBuilder.js's
+// deriveCountriesFromLocationsIfMissing only helps when locations is
+// present; this is the fallback for when it's absent too, deliberately
+// separate from the full gatherBusinessSnapshot() above (which validation
+// runs BEFORE fetching, precisely so a structurally-broken strategy never
+// pays for a snapshot fetch it doesn't need) — a lightweight, targeted
+// call to the store's own already-connected country, reusing the exact
+// same wc/shopify.getStoreCountry() functions gatherCommerce() above
+// already uses for the same field, so the value returned here is
+// identical to what the full snapshot would eventually report. Real data
+// from the store — never invented — same principle as PRODUCT_IMAGE's
+// primaryText-from-shortDescription and the budget minor-unit conversion.
+// Returns null (never guesses) unless exactly one real, valid-looking
+// answer exists: no store connected, a fetch failure, or two connected
+// stores (WooCommerce + Shopify) disagreeing on country all return null,
+// deferring to the existing "Missing required field" rejection rather
+// than risking the wrong country.
+export async function getStoreCountryForFallback(userId) {
+  const countries = new Set();
+  const wooConn = getConnection(userId, "woocommerce");
+  if (wooConn) {
+    try {
+      const m = JSON.parse(wooConn.meta || "{}");
+      if (m.siteUrl && m.consumerKey) {
+        const accessToken = requireValidToken(userId, "woocommerce");
+        const result = await attempt(() => wc.getStoreCountry(m.siteUrl, m.consumerKey, accessToken));
+        if (result.status === "exists" && result.value) countries.add(result.value);
+      }
+    } catch { /* best-effort fallback — a stale/invalid token here just means no answer, not a crash */ }
+  }
+  const shopifyConn = getConnection(userId, "shopify");
+  if (shopifyConn) {
+    try {
+      const m = JSON.parse(shopifyConn.meta || "{}");
+      if (m.shopDomain) {
+        const token = requireValidToken(userId, "shopify");
+        const result = await attempt(() => shopify.getStoreCountry(m.shopDomain, token));
+        if (result.status === "exists" && result.value) countries.add(result.value);
+      }
+    } catch { /* best-effort fallback — a stale/invalid token here just means no answer, not a crash */ }
+  }
+  if (countries.size !== 1) return null; // none found, or two connected stores disagree — never guess
+  const [code] = countries;
+  return /^[A-Z]{2}$/.test(code) ? code : null; // defensively reject anything that isn't a clean ISO-2 code
+}
+
 async function gatherMetaAssets(userId, accessToken, conn) {
   const defaults = readDefaults(conn);
 

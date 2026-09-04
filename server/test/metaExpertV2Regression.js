@@ -1077,6 +1077,93 @@ async function run() {
     }
   });
 
+  // --- Store-country fallback (live report follow-up) --------------------
+  // Live report: deriveCountriesFromLocationsIfMissing above only helps
+  // when the model supplied `locations` but omitted `countries` — a build
+  // that omitted BOTH hard-rejected 3 times identically, with no
+  // self-correction. Falls back to the store's own real, already-
+  // connected country (getStoreCountryForFallback, businessSnapshot.js) —
+  // never invented, never overrides an explicitly-supplied value, and
+  // never guesses when the store's country is missing or ambiguous.
+  await check("[V2 policy] LIVE REPORT: neither locations NOR countries supplied — derived from the store's own connected country, never guessed", async () => {
+    const userId = makeUser(`v2-countries-store-fallback-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId); // store country resolves to "PK" per the mock's settings/general response
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { locations, countries, ...strategyNoLocationOrCountry } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoLocationOrCountry, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["PK"], "must derive the real ISO code from the store's own connected country");
+      assert.deepEqual(result.strategy.locations, ["PK"], "locations must also be filled in from the same real value — never invented separately");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] neither locations NOR countries supplied AND no store connected: falls through to the existing rejection — never guesses a country", async () => {
+    const userId = makeUser(`v2-countries-no-store-${stamp}@example.com`);
+    connectMeta(userId); // no connectWooCommerce/Shopify — nothing for the fallback to use
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const { locations, countries, ...strategyNoLocationOrCountry } = baseStrategy();
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: strategyNoLocationOrCountry, userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, false, "with no store connected there is no real country to derive from — must never guess");
+      assert.match(result.unresolved.issue, /countries|locations/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 policy] the store-country fallback never overrides locations/countries the model actually supplied, even when they differ from the store's own country", async () => {
+    const userId = makeUser(`v2-countries-explicit-not-overridden-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId); // store country resolves to "PK" per the mock — deliberately different from what's supplied below
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ locations: ["United States"], countries: ["US"] }),
+        userMessage: "I want more sales in the US",
+      });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.deepEqual(result.strategy.countries, ["US"], "an explicitly-supplied country must never be overridden by the store's own country, even when they differ");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 gate] LIVE REPORT: countries missing (locations present but empty) on every retry with no store to fall back to — the exhausted-retry reply names the field in plain language, not raw schema text", async () => {
+    const userId = makeUser(`v2-gate-countries-plain-language-${stamp}@example.com`);
+    connectMeta(userId); // no commerce connection — nothing for the store-country fallback to use
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const { countries, ...strategyMissingCountries } = baseStrategy({ locations: [] });
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", strategyMissingCountries),
+        toolCall("meta_expert_v2.build_strategy", strategyMissingCountries),
+        toolCall("meta_expert_v2.build_strategy", strategyMissingCountries),
+        toolCall("meta_expert_v2.build_strategy", strategyMissingCountries), // 4th — blocked before ever reaching runTool()
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales to my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const buildCalls = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy");
+      assert.equal(buildCalls.length, 3, `exactly 3 real dispatches (the retry cap) must happen: ${JSON.stringify(buildCalls)}`);
+      assert.ok(buildCalls.every((c) => c.result?.field === "countries"), `countries must be the real, reproduced blocker on every attempt: ${JSON.stringify(buildCalls.map((c) => c.result?.field))}`);
+      assert.match(result.reply, /which country to target/i, "the reply must name the field in plain language, not raw validation text");
+      assert.doesNotMatch(result.reply, /ISO 3166-1|non-empty array/i, "raw internal validation/schema text must never reach the customer-facing reply");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Missing "reasoning_summary" entirely (live bug, round 24) ----------
   // Live screenshot: build_strategy was hard-rejected with "Missing
   // required field \"reasoning_summary\"" — right after the model had

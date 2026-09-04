@@ -475,6 +475,40 @@ function summarizeV2ToolResult(toolName, outcome) {
   return `it returned: ${JSON.stringify(result)}`;
 }
 
+// User-answerable required fields only — everything else in
+// internal_strategy_schema.json's `required` list (objective, audience
+// reasoning, bid strategy, evidence_used, etc.) is explicitly the model's
+// OWN job to generate per the retry guidance above, so it should
+// essentially never be the reason a strategy exhausts its retry budget.
+const USER_FACING_FIELD_LABELS = {
+  locations: "which location(s) to target",
+  countries: "which country to target",
+  budget_daily: "a daily budget",
+  creative_strategy: "which ad creative to use",
+  "creative_strategy.source": "which ad creative to use",
+  "creative_strategy.description": "which ad creative to use",
+  manual_placements: "which ad placements to use",
+  age_min: "the target age range",
+  age_max: "the target age range",
+  content_selector: "which content to use for the ad",
+};
+
+// Live bug (user-reported): the exhausted-retry and fabricated-success-
+// guard replies below used to splice the raw internal validation message
+// straight into the customer-facing reply — e.g. "countries must be a
+// non-empty array of 2-letter ISO 3166-1 country codes" — which names
+// nothing actionable to a real user. Translates the rejection's `field`
+// into a genuinely plain-language ask for the small set of fields a user
+// could actually answer; anything else (which per the retry guidance
+// should always be the model's own job) gets an honest, non-technical
+// fallback instead of a guessed translation or schema-speak.
+function describeUnresolvedIssueForCustomer(outcome) {
+  const field = outcome?.result?.field;
+  const label = field && USER_FACING_FIELD_LABELS[field];
+  if (label) return `I still need to know ${label} before I can finish this.`;
+  return "I ran into an issue completing this that I wasn't able to resolve after a few tries.";
+}
+
 // CONFIRMED LIVE BUG (round 13): "Why did you choose all genders 18-65 and
 // PKR 10,000/day? Review my WooCommerce products, Meta history, and
 // audience data, then improve the plan before I approve it" was answered
@@ -1410,7 +1444,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace.push(traceStep("completed", "Strategy could not be finalized — nothing was saved this turn.", "done"));
           if (planId) setPlanStatus(planId, "failed");
           return {
-            reply: `I wasn't able to finalize a strategy for this request — ${rejectedOutcome.result.issue} Could you tell me more, or would you like me to try a different approach?`,
+            reply: `I wasn't able to finalize a strategy for this request. ${describeUnresolvedIssueForCustomer(rejectedOutcome)} Could you tell me more, or would you like me to try a different approach?`,
             trace,
             toolResults,
             usage: usageTotals,
@@ -1579,9 +1613,8 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace[trace.length - 1].state = "done";
           trace.push(traceStep("completed", `${call.toolName} could not be finalized after ${priorCalls} attempts this turn.`, "done"));
           if (planId) setPlanStatus(planId, "failed");
-          const lastIssue = priorOutcome?.result?.issue || "an unresolved issue";
           return {
-            reply: `I wasn't able to finalize a strategy for this request — ${lastIssue} Could you tell me more, or would you like me to try a different approach?`,
+            reply: `I wasn't able to finalize a strategy for this request after a few tries. ${describeUnresolvedIssueForCustomer(priorOutcome)} Could you tell me more, or would you like me to try a different approach?`,
             trace, toolResults, usage: usageTotals,
           };
         }
