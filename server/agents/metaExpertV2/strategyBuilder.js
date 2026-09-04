@@ -57,6 +57,34 @@ function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
     if (field === "pixel" && !prior.resolvedAssets?.pixelId) continue;
     merged[field] = prior.strategy[field];
   }
+  // Round 33 sweep finding: content_selector isn't in ASSET_FIELDS above —
+  // unlike ad_account/facebook_page/pixel/catalog, it has no single stable
+  // identity of its own; its meaning depends entirely on WHICH list it's
+  // resolved against (action_type for explicit_action mode,
+  // creative_strategy.source for campaign mode — see resolveContentSelector
+  // below and resolveCreativeSelection in creativeResolution.js). Module
+  // header comments elsewhere claim this follows "the SAME ordinal/
+  // confirmed-id contract" as the identity assets, but it never got the
+  // matching protection: if THIS call changes action_type or
+  // creative_strategy.source without also resending a fresh
+  // content_selector, the plain spread above silently carries the OLD
+  // selector forward — a `position` that indexed into the PREVIOUS list
+  // could then silently apply against the NEW one. Fixed the same way as
+  // the ASSET_FIELDS loop: discard the carried-forward selector when the
+  // list it refers to changed and no fresh answer arrived this call. Both
+  // consumers already degrade safely from there — resolveContentSelector
+  // defaults to "most recent" (position 1), resolveCreativeSelection
+  // re-asks on genuine ambiguity — neither guesses.
+  const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined;
+  if (!contentSelectorProvidedThisCall) {
+    const priorActionType = prior.strategy.action_type;
+    const priorSource = prior.strategy.creative_strategy?.source;
+    const newActionType = merged.action_type;
+    const newSource = merged.creative_strategy?.source;
+    if (priorActionType !== newActionType || priorSource !== newSource) {
+      delete merged.content_selector;
+    }
+  }
   return merged;
 }
 

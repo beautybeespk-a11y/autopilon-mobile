@@ -3493,6 +3493,72 @@ async function run() {
     }
   });
 
+  // --- content_selector merge protection (round 33 sweep finding) ---------
+  // content_selector isn't in strategyBuilder.js's ASSET_FIELDS the way
+  // ad_account/facebook_page/pixel/catalog are — it has no stable identity
+  // of its own; its meaning depends entirely on WHICH candidate list it
+  // indexes into (creative_strategy.source here). Before this fix, a
+  // revision that changed creative_strategy.source WITHOUT also resending
+  // a fresh content_selector would let the plain merge silently carry the
+  // OLD selector forward — a `position` that indexed into the PREVIOUS
+  // source's candidate list could then get applied against the NEW
+  // source's completely unrelated list. This test reproduces exactly that
+  // sequence: resolve position 2 against 2 Facebook posts, then switch to
+  // PRODUCT_IMAGE (2 real products) with no fresh content_selector.
+  await check("[Creative resolution] switching creative_strategy.source without resending content_selector never applies the OLD source's stale position against the NEW source's candidates — re-asks instead", async () => {
+    const userId = makeUser(`v2-content-selector-source-switch-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const secondPost = { id: "111_2", message: "Spring skincare routine tips", created_time: "2024-02-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
+    const twoProducts = [
+      { id: 5001, name: "Product A", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/product/a/", short_description: "Product A description." },
+      { id: 5002, name: "Product B", price: "2000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/b.jpg" }], permalink: "https://store.example.com/product/b/", short_description: "Product B description." },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST, secondPost] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: twoProducts }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.length, "sanity: genuinely ambiguous first");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: twoProducts }));
+    try {
+      // Answer the Facebook-post question: position 2.
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "Use the second one.",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "sanity: position 2 resolved against the Facebook post list");
+
+      // Switch source to PRODUCT_IMAGE — a COMPLETELY different candidate
+      // list — WITHOUT sending a fresh content_selector. Before the fix,
+      // the stale { position: 2 } would silently carry forward and index
+      // into `twoProducts` instead (position 2 -> Product B) with no
+      // question, no error, and no way to tell the wrong product had been
+      // picked.
+      const switched = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image instead." } },
+        userMessage: "Actually, use a product image instead of the Facebook post.",
+      });
+      assert.equal(switched.ok, true, JSON.stringify(switched.unresolved));
+      assert.equal(switched.resolved.creative, null, "must NOT silently resolve using the stale Facebook-post position against the product list");
+      assert.ok(switched.strategy.unresolved_questions.some((q) => /product/i.test(q)), `must re-ask a genuine question naming the real product candidates: ${JSON.stringify(switched.strategy.unresolved_questions)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative resolution] PRODUCT_IMAGE ad text: derived from the product's OWN real short_description — never model-authored, never invented", async () => {
     const userId = makeUser(`v2-creative-primarytext-derived-${stamp}@example.com`);
     connectMeta(userId);

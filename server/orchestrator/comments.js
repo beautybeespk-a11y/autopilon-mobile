@@ -49,11 +49,28 @@ function resolveMentions(authorUserId, content) {
      WHERE om.orgId IN (${orgIds.map(() => "?").join(",")}) AND om.status = 'active'`
   ).all(...orgIds);
 
+  // Round 33 sweep finding: this used a single find() combining an exact
+  // email match with a normalized-name match, with no check for whether
+  // 2+ candidates matched by name. Email is safe unguarded — it's UNIQUE
+  // per user (users.email has a UNIQUE constraint, db.js) so it can never
+  // match more than one candidate. Name is not: two org members can share
+  // a display name, and find() silently returned whichever came first in
+  // SQL result order — notifying/mentioning the wrong person with no
+  // indication anything was ambiguous. Same "2+ matches -> don't guess"
+  // discipline matchCreativeCandidateId already has (orchestrator/index.js).
   const matched = new Set();
   for (const frag of fragments) {
     const lower = frag.toLowerCase();
-    const hit = candidates.find((c) => c.email.toLowerCase() === lower || c.name.toLowerCase().replace(/\s+/g, "") === lower.replace(/\s+/g, ""));
-    if (hit && hit.id !== authorUserId) matched.add(hit.id);
+    const emailHit = candidates.find((c) => c.email.toLowerCase() === lower);
+    if (emailHit) {
+      if (emailHit.id !== authorUserId) matched.add(emailHit.id);
+      continue;
+    }
+    const normalizedFrag = lower.replace(/\s+/g, "");
+    const nameHits = candidates.filter((c) => c.name.toLowerCase().replace(/\s+/g, "") === normalizedFrag);
+    if (nameHits.length === 1 && nameHits[0].id !== authorUserId) matched.add(nameHits[0].id);
+    // nameHits.length > 1: genuinely ambiguous — this fragment resolves
+    // to no one rather than guessing which "John Smith" was meant.
   }
   return Array.from(matched);
 }
