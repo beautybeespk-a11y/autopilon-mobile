@@ -69,7 +69,7 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
+function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false, pageTokenUnavailable = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
   // later read-back GET (meta.getAd/getAdCreative/getAdSet — the creative-
@@ -110,6 +110,18 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     if (pageFieldsMatch && u.searchParams.get("fields") === "instagram_business_account") {
       const igId = igByPageId[pageFieldsMatch[1]];
       return jsonResponse(igId ? { instagram_business_account: { id: igId } } : {});
+    }
+    // getPageAccessToken's primary resolution — GET /{pageId}?fields=
+    // access_token — mocked directly now, so this path is actually
+    // exercised in tests instead of silently 400ing into the "Unmocked
+    // GET path" catch-all below (which is what made every prior test
+    // exercise the pre-fix `pageToken || accessToken` fallback without
+    // anyone noticing). pageTokenUnavailable simulates the real
+    // permission-gap scenario the fail-loudly fix exists for: Meta knows
+    // the page (via /me/accounts) but grants no token for it here.
+    if (pageFieldsMatch && u.searchParams.get("fields") === "access_token") {
+      const page = pages.find((p) => p.id === pageFieldsMatch[1]);
+      return jsonResponse(page && !pageTokenUnavailable ? { access_token: `fake-page-token-${page.id}` } : {});
     }
     if (pageFieldsMatch && recordsById.has(pageFieldsMatch[1])) {
       const id = pageFieldsMatch[1];
@@ -2809,7 +2821,20 @@ async function run() {
     id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-03T10:00:00+0000",
     permalink_url: "https://facebook.com/111/posts/1", attachments: { data: [{ media_type: "video" }] },
   };
-  const CREATIVE_TEST_POST_WITH_ENGAGEMENT = {
+  // NOTE (post-field-list-fix reality check): listPagePosts() no longer
+  // requests likes.summary/comments.summary/shares at all — requesting
+  // them broke the ENTIRE /posts read in production (Meta's "(#10)"
+  // rejects the whole call if any one field is gated; comments.summary
+  // needs pages_read_user_content, which this app doesn't have). So a
+  // REAL Facebook Page post can never carry this fixture's engagement
+  // shape again until that permission is separately granted. This mock
+  // still returns it regardless of the `fields` param requested (same as
+  // every other mocked endpoint in this file — none of them filter by
+  // the caller's `fields`), so it remains useful for exercising the
+  // downstream normalization/policy logic (checkCreativeGroundingPolicy's
+  // "genuine evidence must be honored" branch) with a realistic-shaped
+  // payload — just not one reachable via today's real Facebook fetch.
+  const CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT = {
     ...CREATIVE_TEST_POST,
     likes: { summary: { total_count: 480 } }, comments: { summary: { total_count: 52 } }, shares: { count: 30 },
   };
@@ -2900,7 +2925,7 @@ async function run() {
     const userId = makeUser(`v2-creative-witheng-${stamp}@example.com`);
     connectMeta(userId);
     const conversationId = `conv-${cryptoRandom()}`;
-    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] } }));
     try {
       const strategy = {
         mode: "explicit_action",
@@ -2931,7 +2956,7 @@ async function run() {
     const conversationId = `conv-${cryptoRandom()}`;
     mockFetch(scriptedFetch({
       chatResponses: [],
-      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
     }));
     try {
       const initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
@@ -3000,7 +3025,7 @@ async function run() {
     connectWooCommerce(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
     const conversationId = `conv-${cryptoRandom()}`;
-    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] } }));
     let initial;
     try {
       initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
@@ -3010,7 +3035,7 @@ async function run() {
     }
 
     mockFetch(scriptedFetch({
-      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
         // Live-bug shape: finalizes right after the snapshot, without ever
@@ -3029,6 +3054,36 @@ async function run() {
       const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
       assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
       assert.doesNotMatch(result.reply, /I recommend using the Vitamin C Serum post \(480 likes, 52 comments, 30 shares\) as your creative\.$/, "the premature pre-revision answer must never be the final reply");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- getPageAccessToken fails loudly (live report follow-up) -----------
+  // Live report: production logs showed getPageAccessToken resolving
+  // ("direct", truthy) and listPagePosts using it ("page"), yet Meta
+  // rejected the actual /posts read with a real permission error —
+  // manually generating a genuine Page token for the SAME page via Graph
+  // API Explorer worked immediately. Live Explorer bisection later
+  // confirmed the "direct" resolution (GET /{pageId}?fields=access_token)
+  // was never the problem — the real cause was listPagePosts's own field
+  // list (see api.js). This test covers the separate, independent bug
+  // fixed alongside that: when getPageAccessToken can't obtain a genuine
+  // token from ANY path, it used to return null and listPagePosts
+  // silently fell back to the broader user token
+  // (`pageToken || accessToken`) — exactly the "protective logic that
+  // assumes a case can't happen" pattern banned on this project. Fixed:
+  // getPageAccessToken now THROWS a named META_PAGE_TOKEN_UNAVAILABLE
+  // error instead, and that fallback is gone entirely.
+  await check("[Meta API] getPageAccessToken fails loudly — never silently falls back to the user token — when no genuine Page token can be obtained anywhere", async () => {
+    const userId = makeUser(`v2-page-token-unavailable-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], pageTokenUnavailable: true } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId);
+      assert.equal(snapshot.recentContent.facebookPosts.status, "fetch_failed", "must never silently succeed with an empty/wrong result when no genuine Page token exists — a real failure must surface as a real failure");
+      assert.match(snapshot.recentContent.facebookPosts.reason, /Could not obtain a Page access token/i, "the real, named reason must be surfaced, not a vague generic failure");
+      assert.match(snapshot.recentContent.facebookPosts.reason, /access_token/i, "must name which real lookups were actually tried, for diagnosability");
     } finally {
       restoreFetch();
     }
@@ -3410,7 +3465,7 @@ async function run() {
     connectWooCommerce(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
     const conversationId = `conv-${cryptoRandom()}`;
-    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] } }));
     let initial;
     try {
       initial = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
@@ -3427,7 +3482,7 @@ async function run() {
       "Do not ask me to choose unless the data is genuinely ambiguous.";
 
     mockFetch(scriptedFetch({
-      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
         // Exact live-bug shape: finalizes right after the snapshot,
@@ -3480,7 +3535,7 @@ async function run() {
       .run(conversationIdX, userId, agentId, "Test conversation", now, now);
 
     mockFetch(scriptedFetch({
-      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [toolCall("meta_expert_v2.build_strategy", baseStrategy()), finalText("Here is your recommended strategy.")],
     }));
     try {
@@ -3509,7 +3564,7 @@ async function run() {
     // asks to select creative.
     const userMessage = "Choose the exact best creative for this campaign from my recent Facebook/Instagram content and WooCommerce products.";
     mockFetch(scriptedFetch({
-      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] },
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
         finalText("I selected the Vitamin C Serum post as the creative."), // live-bug shape: no revise_strategy
@@ -3929,7 +3984,7 @@ async function run() {
     const userId = makeUser(`v2-creative-ambiguous-${stamp}@example.com`);
     connectMeta(userId);
     const secondPost = { id: "111_2", message: "Spring skincare routine tips", created_time: "2024-02-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
-    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT, secondPost] } }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT, secondPost] } }));
     try {
       const built = await buildStrategy({
         userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
@@ -4308,12 +4363,12 @@ async function run() {
     }
   });
 
-  await check("[V2 final-reply guard] a performance claim backed by REAL engagement data is never touched — no false positive", async () => {
+  await check("[V2 final-reply guard] a performance claim backed by present engagement data (synthetic fixture — see CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT's comment) is never touched — no false positive", async () => {
     const userId = makeUser(`v2-perfclaim-genuine-${stamp}@example.com`);
     connectMeta(userId);
     const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
     const conversationId = `conv-${cryptoRandom()}`;
-    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_ENGAGEMENT] } }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] } }));
     try {
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,

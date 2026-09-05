@@ -31,14 +31,34 @@ function describeNetworkError(err) {
   return chain;
 }
 
+// Redacts a token to its first/last 6 chars so a real outgoing request can
+// be logged and diffed against a known-good manual call (e.g. Graph API
+// Explorer) without ever writing the live secret to logs.
+function redactToken(token) {
+  if (typeof token !== "string" || token.length <= 12) return "[REDACTED]";
+  return `${token.slice(0, 6)}...${token.slice(-6)}`;
+}
+
 async function metaFetch(path, { accessToken, method = "GET", body }) {
   const url = new URL(`${BASE}${path}`);
   if (method === "GET") url.searchParams.set("access_token", accessToken);
+  const headers = { "content-type": "application/json" };
+  // Diagnostic (live bug: a page token proven working by hand in Graph API
+  // Explorer still hit Meta's real "(#10) requires pages_read_engagement
+  // or Page Public Content Access" error through this exact code path).
+  // Logs the REAL outgoing URL/headers this fetch() call is about to send
+  // — built from the same `url`/`headers` values, not a reconstruction —
+  // so it can be diffed field-for-field against a manual Explorer call.
+  // Token redacted to its first/last 6 chars; this file uses query-param
+  // auth only (no Authorization header exists to redact).
+  const loggableUrl = new URL(url);
+  if (loggableUrl.searchParams.has("access_token")) loggableUrl.searchParams.set("access_token", redactToken(loggableUrl.searchParams.get("access_token")));
+  logger.info("meta_api.outgoing_request", { method, url: loggableUrl.toString(), headers });
   let res;
   try {
     res = await fetch(url, {
       method,
-      headers: { "content-type": "application/json" },
+      headers,
       body: body ? JSON.stringify({ ...body, access_token: method !== "GET" ? accessToken : undefined }) : undefined,
     });
   } catch (err) {
@@ -201,12 +221,26 @@ export async function listPages(accessToken) {
 // requirement, not another instance of the Business Portfolio gap:
 // Meta exchanges a page-scoped token per Page, and content-reading edges
 // require it explicitly rather than accepting the broader user token.
-// /{pageId}?fields=access_token returns it directly for classically-
-// linked pages; Business Portfolio-owned pages need the same
-// owned_pages fallback as listPages(), requesting access_token instead
-// of category this time. Returns null (never throws) so callers can
-// fall back to the user token rather than hard-failing when neither
-// path has it — e.g. a page role that doesn't include content access.
+//
+// Live bug (user-reported, second investigation): production logs showed
+// this "direct" resolution succeeding (truthy access_token) and
+// listPagePosts still failing downstream with Meta's real "(#10)
+// requires pages_read_engagement or Page Public Content Access" error —
+// while manually generating a page token for the SAME page via Graph API
+// Explorer worked immediately. RESOLVED by live Explorer bisection: this
+// "direct" resolution (/{pageId}?fields=access_token) was never the
+// problem — a token obtained this exact way was proven to work, by hand,
+// against /{pageId}/posts. The real cause was listPagePosts requesting
+// fields Meta gates behind permissions this app doesn't fully have (see
+// that function's own comment). No change needed here.
+//
+// What IS fixed here, independent of that: the "never
+// silently fall back when a required credential can't be obtained" rule
+// (proven necessary for the currency symbol, false completion claims,
+// and goal substitution already this project) was being violated —
+// returning null let listPagePosts silently retry with the broader user
+// token. That fallback is gone; this now THROWS a named, distinct error
+// instead of returning null.
 // Never returned through a tool response — this is a live secret, kept
 // server-side only.
 export async function getPageAccessToken(accessToken, pageId) {
@@ -225,14 +259,14 @@ export async function getPageAccessToken(accessToken, pageId) {
       return match.access_token;
     }
   }
-  // Diagnostic (user-reported: "the Page has no eligible posts, or
-  // getPageAccessToken is returning nothing, or the fields parameter
-  // includes something the API rejects" — this is the second of those
-  // three, previously silent either way). businessesChecked distinguishes
-  // "no Business Portfolio to even check" (0) from "checked N, none had
-  // this page" (>0) — different real causes for the same null return.
-  logger.warn("meta_api.get_page_access_token", { pageId, resolution: "none_found", businessesChecked: (businesses.data || []).length });
-  return null;
+  // businessesChecked distinguishes "no Business Portfolio to even check"
+  // (0) from "checked N, none had this page" (>0) — different real
+  // causes for the same failure, both genuinely unrecoverable here.
+  const businessesChecked = (businesses.data || []).length;
+  logger.error("meta_api.get_page_access_token_failed", { pageId, businessesChecked });
+  const err = new Error(`Could not obtain a Page access token for Page ${pageId} — it wasn't found via /{pageId}?fields=access_token or any connected Business Portfolio (${businessesChecked} checked).`);
+  err.code = "META_PAGE_TOKEN_UNAVAILABLE";
+  throw err;
 }
 
 export async function createAdSet(accessToken, adAccountId, fields) {
@@ -279,12 +313,37 @@ export async function createAd(accessToken, adAccountId, fields) {
 // that points at an existing post (object_story_id) instead of uploading new
 // creative content. Requires pages_read_engagement in addition to
 // pages_show_list (which only lists which Pages exist, not their content).
-// likes.summary(true)/comments.summary(true)/shares are real counts
-// returned directly on the post object — no extra per-post call needed —
-// used by Meta Ads Expert V2's business snapshot (businessSnapshot.js) to
-// show REAL engagement numbers instead of letting the model guess at
-// "high engagement" from nothing.
+//
+// Root cause (confirmed by live Explorer bisection, same app/page/token,
+// v25.0): Meta rejects the ENTIRE call with "(#10) requires
+// pages_read_engagement or Page Public Content Access" if ANY requested
+// field is gated — it isn't all-or-nothing per permission, it's
+// all-or-nothing per REQUEST. `likes.summary(true)` needs
+// pages_read_engagement (which we DO have); `comments.summary(true)`
+// needs pages_read_user_content (which we do NOT have — not in this
+// app's OAuth SCOPES, not added via App Review; a separate future
+// decision, not a bug). Requesting engagement fields at all — even ones
+// we're actually entitled to — broke the whole post read. Fields below
+// are exactly what a bare Explorer `/{pageId}/posts` call (no `fields`
+// param) returns by default, proven working live for this same page.
+// Consequence (standing rule: no fabricated defaults for a field that
+// isn't fetched): businessSnapshot.js's normalizeContentItem() already
+// treats a missing likes/comments/shares key as "unavailable," not 0 —
+// so real engagement counts for Facebook Page posts are simply never
+// present again until pages_read_user_content is granted; nothing
+// downstream needs a code change to handle that, it already does.
 export async function listPagePosts(accessToken, pageId) {
+  // getPageAccessToken now THROWS (META_PAGE_TOKEN_UNAVAILABLE) instead
+  // of ever returning null — this call either gets a genuine Page token
+  // or never reaches the fetch below at all. Previously this fell back
+  // to the broader user token (`pageToken || accessToken`) whenever a
+  // Page token couldn't be obtained, which is exactly the "protective
+  // logic that assumes a case can't happen" pattern this project has
+  // banned project-wide — a fallback here would silently retry with a
+  // token that may be exactly what's causing the real failure, hiding it
+  // instead of surfacing it. credentialSource is now unconditionally
+  // "page" because there is no other path left to log — the label can no
+  // longer be wrong.
   const pageToken = await getPageAccessToken(accessToken, pageId);
   // Diagnostic (user-reported live failure: the model's own reply claimed
   // "a permissions issue" reading this Page's posts even though Meta's
@@ -294,12 +353,12 @@ export async function listPagePosts(accessToken, pageId) {
   // response payloads (executor.js) — a real failure is already fully
   // logged by metaFetch's own meta_api.request_failed (code/subcode/
   // message/error_user_msg/fbtrace_id); this adds the success path
-  // (previously silent) and which credential this call actually used.
-  // Deliberately named credentialSource, not "...Token..." — logger.js's
-  // redact() strips any field whose KEY matches /token/i regardless of
-  // its value, which would have silently hidden this exact diagnostic.
-  logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: pageToken ? "page" : "user" });
-  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media},likes.summary(true),comments.summary(true),shares`, { accessToken: pageToken || accessToken });
+  // (previously silent). Deliberately named credentialSource, not
+  // "...Token..." — logger.js's redact() strips any field whose KEY
+  // matches /token/i regardless of its value, which would have silently
+  // hidden this exact diagnostic.
+  logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: "page" });
+  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken: pageToken });
   logger.info("meta_api.list_page_posts.response", { pageId, postCount: (data.data || []).length, raw: data });
   return data.data || [];
 }
