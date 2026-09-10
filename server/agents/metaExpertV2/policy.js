@@ -75,16 +75,28 @@ export function verifyUserProvidedBudget(rawStrategy, mergedStrategy, userMessag
 
 // Round 35 (live bug — Meta error 100/3858720: a sales campaign whose
 // creative is an existing organic post needs a real destination URL, and
-// nothing ever asked for one). Whole-message-only, same discipline as
-// policy.js's BARE_APPROVAL_WORD_PATTERN below and creativeResolution.js's
-// PENDING_CREATIVE_AFFIRMATION_PATTERN — a suggested URL (the connected
-// store's, offered as a candidate, never trusted on its own — the store's
-// domain has changed at least once already) is only ever confirmed by an
-// affirmation that IS the entire reply, never a word used naturally
-// elsewhere in a longer message.
+// nothing ever asked for one).
+//
+// Round 36 fix (production deadlock): a real user routinely answers
+// several open questions in one message ("2, ye use the same url, budget
+// 600") — budget's USER_MESSAGE_BUDGET_PATTERN and creative's
+// matchCreativeCandidateId already tolerate this (they scan the whole
+// message for their signal), but this field's original affirmation check
+// required the ENTIRE message to be nothing but a bare word, so any
+// compound reply never matched and the question could never close.
+// Fixed the same way matchCreativeCandidateId layers its own matching:
+// an UNAMBIGUOUS phrase that specifically names reusing "the url/link" is
+// safe to recognize ANYWHERE in the message; a bare generic word (yes/
+// correct/right/...) still only counts when it IS the entire message —
+// embedding those would risk misreading a "yes" used naturally elsewhere
+// in a longer reply, the same reason BARE_APPROVAL_WORD_PATTERN and
+// creativeResolution.js's PENDING_CREATIVE_AFFIRMATION_PATTERN stay
+// whole-message-only.
 const URL_AFFIRMATION_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|use that|use it|that works|that one|that'?s right)[.!]?\s*$/i;
+const EMBEDDED_URL_REUSE_PATTERN = /\b(use (?:the )?same (?:url|link|website)|use that (?:url|link|website)|same (?:url|link|website)|that url|that link)\b/i;
 export function messageAffirmsSuggestedUrl(userMessage) {
-  return typeof userMessage === "string" && URL_AFFIRMATION_PATTERN.test(userMessage);
+  if (typeof userMessage !== "string") return false;
+  return URL_AFFIRMATION_PATTERN.test(userMessage) || EMBEDDED_URL_REUSE_PATTERN.test(userMessage);
 }
 
 // Case/protocol/trailing-slash insensitive, but still a real literal
@@ -103,24 +115,57 @@ function userMessageContainsUrl(userMessage, url) {
   return userMessage.toLowerCase().includes(normalizedTarget);
 }
 
+// Round 36 fix: an explicit http(s) URL typed anywhere in the message is
+// an unambiguous, never-invented signal on its own — lifted verbatim from
+// the user's own text, so it needs no suggestedUrl/store connection to be
+// trustworthy. Used by the orchestrator's auto-revise pre-loop to extract
+// a real candidate the same way deriveBudgetFromUserMessageIfMissing
+// extracts a number; verifyDestinationUrl below independently re-checks
+// whatever gets proposed against the SAME raw message before it's ever
+// trusted, so a wrong or partial extraction here can never ship on its
+// own say-so.
+const USER_MESSAGE_URL_PATTERN = /https?:\/\/[^\s,;()"'<>]+/i;
+export function extractUrlFromMessage(userMessage) {
+  if (typeof userMessage !== "string") return null;
+  const match = USER_MESSAGE_URL_PATTERN.exec(userMessage);
+  return match ? match[0].replace(/[.,;:!?]+$/, "") : null;
+}
+
 // Only fires when THIS call is the one actually asserting a destination_url
 // (checked against the RAW, pre-merge requestedChanges — same "explicit
-// this turn" signal verifyUserProvidedBudget/explicitAssetChanges use) —
-// a revision that silently carries an ALREADY-verified value forward
-// unchanged is never re-flagged just because this turn's message doesn't
-// happen to repeat it. A claim that doesn't independently verify is
-// cleared entirely (never partially trusted) — the caller's own
-// unresolved_questions requirement re-asks from there, exactly like a
-// downgraded USER_PROVIDED budget claim re-opens checkBudgetPolicy.
+// this turn" signal verifyUserProvidedBudget/explicitAssetChanges use).
+//
+// Round 36 fix (production deadlock): the model is instructed to omit
+// unchanged fields, but nothing stops it from re-asserting destination_url
+// on a LATER, unrelated call (bundled with an audience/budget change, or
+// just restating known state) — and the original version below treated
+// every such re-assertion as a brand-new, unverified claim, clearing an
+// ALREADY-CONFIRMED value to null the moment that turn's own message
+// didn't happen to repeat the URL or a fresh affirmation. That silently
+// undid a real, previously-verified answer and re-opened the identical
+// question forever — the exact deadlock reported in production (budget/
+// Pixel/creative all resolved on the same messages; destination_url never
+// moved). priorUrl (the prior STORED value — never trusted unless it
+// already passed this same function once) fixes this the same way
+// verifyUserProvidedBudget only ever downgrades budget_basis and never
+// wipes budget_daily itself: re-asserting the SAME already-verified value
+// is carried forward untouched, never re-flagged just because this turn's
+// message doesn't happen to repeat it. Only a call asserting a genuinely
+// DIFFERENT value still goes through full verification below, and a claim
+// that doesn't independently verify is cleared entirely (never partially
+// trusted) — the caller's own unresolved_questions requirement re-asks
+// from there, exactly like a downgraded USER_PROVIDED budget claim
+// re-opens checkBudgetPolicy.
 // suggestedUrl: the ONE candidate this codebase can ever propose on its
 // own (the connected store's URL) — accepted without the literal string
-// appearing in the message ONLY when the user's own words are an explicit
-// affirmation of exactly that suggestion; a manually-typed URL (the same
-// one, a different one, or a correction) always needs the literal
-// substring match instead.
-export function verifyDestinationUrl(rawStrategy, mergedStrategy, userMessage, suggestedUrl) {
+// appearing in the message ONLY when the user's own words affirm exactly
+// that suggestion (see messageAffirmsSuggestedUrl above); a manually-typed
+// URL (the same one, a different one, or a correction) always needs the
+// literal substring match instead.
+export function verifyDestinationUrl(rawStrategy, mergedStrategy, userMessage, suggestedUrl, priorUrl) {
   const claimed = rawStrategy.destination_url;
   if (typeof claimed !== "string" || !claimed.trim()) return mergedStrategy;
+  if (priorUrl && normalizeUrlForComparison(claimed) === normalizeUrlForComparison(priorUrl)) return mergedStrategy;
   const matchesSuggestionAndAffirmed = Boolean(suggestedUrl)
     && normalizeUrlForComparison(claimed) === normalizeUrlForComparison(suggestedUrl)
     && messageAffirmsSuggestedUrl(userMessage);

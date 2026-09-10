@@ -12,7 +12,7 @@ import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl } from "../agents/metaExpertV2/policy.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
@@ -1258,26 +1258,35 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // and nothing ever asked for one. Same fix shape as the budget/Pixel/
   // creative auto-revise blocks above — the model cannot be relied on to
   // reliably call revise_strategy for a plain-text answer to its own
-  // question. Deliberately narrow: only handles the single most common,
-  // safest case — an explicit whole-message affirmation ("yes") of the
-  // ONE candidate this codebase can ever suggest (the connected store's
-  // URL). A user typing a DIFFERENT/new URL in chat is left to the model
-  // to relay via revise_strategy's destination_url parameter, which
-  // strategyBuilder.js's verifyDestinationUrl (policy.js) then
-  // independently verifies against the raw message before trusting it —
-  // deliberately not attempting free-text URL extraction here, which
-  // would risk exactly the kind of unverified guess this whole fix exists
-  // to prevent.
+  // question.
+  //
+  // Round 36 fix (production deadlock): the original version only handled
+  // a bare whole-message affirmation ("yes") — a real user answering
+  // several open questions in one message ("2, ye use the same url,
+  // budget 600") never matched, so the field could never close. Now tries
+  // two signals, same layering as matchCreativeCandidateId: an explicit
+  // http(s) URL typed anywhere in the message (extractUrlFromMessage —
+  // never invented, lifted verbatim from the user's own text, works even
+  // with no store connected), then falls back to the suggested store URL
+  // when the message affirms reusing it (messageAffirmsSuggestedUrl, now
+  // itself broadened to recognize an unambiguous "use/same url/link"
+  // phrase anywhere in the message, not just as the entire reply).
+  // Whatever gets proposed here still passes through strategyBuilder.js's
+  // verifyDestinationUrl (policy.js), which independently re-checks it
+  // against this SAME raw message before it's ever trusted — this block
+  // can never ship a value on its own say-so.
   if (hasV2Tools && conversationId) {
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
     const openQuestion = activeStrategy?.strategy?.unresolved_questions?.find((q) => q.startsWith("This campaign needs a destination website URL"));
     const suggestedUrl = activeStrategy?.snapshot?.business?.storeUrl;
-    if (activeStrategy && openQuestion && suggestedUrl && messageAffirmsSuggestedUrl(userMessage)) {
+    const typedUrl = extractUrlFromMessage(userMessage);
+    const candidateUrl = typedUrl || (suggestedUrl && messageAffirmsSuggestedUrl(userMessage) ? suggestedUrl : null);
+    if (activeStrategy && openQuestion && candidateUrl) {
       try {
         const accessToken = requireValidToken(userId, "meta_ads");
         const revised = await reviseStrategyV2({
           userId, conversationId, accessToken, strategyId: activeStrategy.id,
-          requestedChanges: { destination_url: suggestedUrl },
+          requestedChanges: { destination_url: candidateUrl },
           userMessage,
         });
         if (revised.ok) {
@@ -1295,7 +1304,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             // note).
             conversationForModel = [
               ...conversationForModel.slice(0, lastIdx),
-              { ...last, content: `${last.content}\n\n[System note: this message's confirmed destination URL (${suggestedUrl}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} This message confirmed the URL ONLY — it is NOT approval to execute the campaign. Present the now-complete recommendation and wait for the user's separate, explicit approval before calling meta_expert_v2.execute_strategy.]` },
+              { ...last, content: `${last.content}\n\n[System note: this message's confirmed destination URL (${candidateUrl}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} This message confirmed the URL ONLY — it is NOT approval to execute the campaign. Present the now-complete recommendation and wait for the user's separate, explicit approval before calling meta_expert_v2.execute_strategy.]` },
             ];
           }
         } else {

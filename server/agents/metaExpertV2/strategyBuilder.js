@@ -376,7 +376,10 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // not the merged object, for the identical "this call's own assertion"
   // reason). Never silently ships a cached/suggested storeUrl the user
   // never actually confirmed — see the requirement block below.
-  normalized = verifyDestinationUrl(requestedChanges, normalized, userMessage, snapshot?.business?.storeUrl);
+  // Round 36 fix — pass the PRIOR stored value too, so a later call that
+  // merely re-asserts an already-verified destination_url (never touched
+  // by this turn's own message) doesn't get silently wiped back to null.
+  normalized = verifyDestinationUrl(requestedChanges, normalized, userMessage, snapshot?.business?.storeUrl, priorStored?.strategy?.destination_url);
 
   const priorResolved = priorStored
     ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }

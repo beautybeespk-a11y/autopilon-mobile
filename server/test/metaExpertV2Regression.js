@@ -4895,6 +4895,89 @@ async function run() {
     }
   });
 
+  await check("[Destination URL gate, round 36] the auto-revise pre-loop resolves an embedded reuse phrase inside a longer, multi-answer reply — same tolerance budget/creative candidate matching already has", async () => {
+    const userId = makeUser(`v2-desturl-embedded-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] }, wcProducts: [{ id: 1, name: "Serum", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/p/1/" }] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] },
+      chatResponses: [finalText("Great — I've saved that URL. Approve to proceed?")],
+    }));
+    try {
+      // Live production report, near-verbatim: an answer to several open
+      // questions bundled into one message. "yeah use the same url" is
+      // NOT a whole-message affirmation (URL_AFFIRMATION_PATTERN) — this
+      // must resolve via the embedded EMBEDDED_URL_REUSE_PATTERN instead.
+      const userMessage = "2, yeah use the same url, budget 600";
+      await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active.strategy.destination_url, "https://store.example.com", "an embedded 'use the same url' phrase inside a longer, multi-answer reply must resolve the field — not just a bare, isolated 'yes'");
+      assert.ok(!active.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must be cleared");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate, round 36] production deadlock: an already-verified destination_url survives a LATER revise_strategy call that re-asserts the same value on a turn whose own message never repeats it", async () => {
+    const userId = makeUser(`v2-desturl-deadlock-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: must genuinely be open first");
+
+      // Turn 1 — a real, independently-verified answer (the URL is
+      // literally present in this turn's own message).
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { destination_url: "https://beautybees.pk" },
+        userMessage: "Use https://beautybees.pk",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.strategy.destination_url, "https://beautybees.pk");
+      assert.ok(!answered.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: must be resolved after turn 1");
+
+      // Turn 2 — the exact production deadlock: a LATER call re-asserts
+      // the SAME already-verified destination_url (as a model restating
+      // known state alongside an unrelated change) on a turn whose own
+      // raw message contains neither the URL text nor any affirmation of
+      // it. Before the round-36 fix this silently wiped destination_url
+      // back to null and re-injected the identical question forever, even
+      // though nothing about the URL was ever actually in question again.
+      const laterRevision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { destination_url: "https://beautybees.pk", budget_daily: 700, budget_basis: "USER_PROVIDED" },
+        userMessage: "Actually make the budget 700/day",
+      });
+      assert.equal(laterRevision.ok, true, JSON.stringify(laterRevision.unresolved));
+      assert.equal(laterRevision.strategy.destination_url, "https://beautybees.pk", "re-asserting the SAME already-verified value on an unrelated turn must never wipe it — this is the exact production deadlock");
+      assert.ok(!laterRevision.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must stay pruned — it must never come back once genuinely resolved");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Executor CTA] a Meta rejection of the call_to_action/link surfaces with Meta's own real error message — never swallowed, never silently retried", async () => {
     const userId = makeUser(`v2-cta-rejected-${stamp}@example.com`);
     connectMeta(userId);
