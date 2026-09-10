@@ -9,7 +9,7 @@
 // another LLM attempt.
 import { gatherBusinessSnapshot, getStoreCountryForFallback } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
-import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatPrimaryTextQuestion } from "./creativeResolution.js";
+import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, toCreativeCandidateRefs } from "./creativeResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
@@ -387,10 +387,16 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // deliberately does NOT write back to the account-level defaults record
   // the way Pixel does — content isn't a stable identity.
   const priorCreative = priorStored?.resolvedAssets?.creative || null;
+  // Round 34 fix — a pick that was never independently verified against
+  // the user's own words (creativeResolution.js's pendingCreative) is
+  // read from its OWN separate stored field, never from resolvedAssets.
+  // creative — so it can only ever be promoted by a fresh affirmation
+  // inside resolveCreativeSelection, never by this reuse-verbatim lookup.
+  const priorPendingCreative = priorStored?.resolvedAssets?.pendingCreative || null;
   const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined;
   const creativeResolution = normalized.mode === "campaign"
-    ? resolveCreativeSelection({ strategy: normalized, snapshot, priorCreative, contentSelectorProvidedThisCall, userMessage })
-    : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false };
+    ? resolveCreativeSelection({ strategy: normalized, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage })
+    : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (creativeResolution.creativeError) {
     resolutionErrors.push({ field: "creative_strategy", message: creativeResolution.creativeError, code: "META_V2_CREATIVE_NOT_FOUND" });
   }
@@ -399,6 +405,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       conversationId, source: normalized.creative_strategy?.source, resolved: Boolean(creativeResolution.creative),
       ambiguousCount: creativeResolution.ambiguousCandidates.length, needsPrimaryTextQuestion: creativeResolution.needsPrimaryTextQuestion,
       unsupportedSource: creativeResolution.unsupportedSource, reusedFromPrior: !contentSelectorProvidedThisCall && Boolean(priorCreative),
+      pending: Boolean(creativeResolution.pendingCreative), pendingAffirmed: Boolean(priorPendingCreative) && Boolean(creativeResolution.creative) && !contentSelectorProvidedThisCall,
     });
   }
 
@@ -428,6 +435,10 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // always start with these exact phrases regardless of which real
   // candidates/product they name).
   const isCreativeCandidatesQuestion = (q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?");
+  // Round 34 fix — pendingCreative's confirmation question, same stable-
+  // prefix pruning discipline as the two above (see
+  // formatCreativeConfirmationQuestion, creativeResolution.js).
+  const isCreativeConfirmationQuestion = (q) => q.startsWith("To confirm — you'd like to use");
   const isPrimaryTextQuestion = (q) => q.startsWith('What ad text would you like for the "');
   if (normalized.unresolved_questions?.length) {
     normalized = {
@@ -436,6 +447,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
         if (q === "What daily budget would you like for this?") return normalized.budget_daily == null;
         if (q === "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?") return !resolved.pixelId;
         if (isCreativeCandidatesQuestion(q)) return creativeResolution.ambiguousCandidates.length > 0;
+        if (isCreativeConfirmationQuestion(q)) return Boolean(creativeResolution.pendingCreative);
         if (isPrimaryTextQuestion(q)) return creativeResolution.needsPrimaryTextQuestion;
         return true;
       }),
@@ -458,6 +470,20 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // silent "use the first one."
   if (creativeResolution.ambiguousCandidates.length > 0) {
     const question = formatCreativeCandidatesQuestion(normalized.creative_strategy?.source, creativeResolution.ambiguousCandidates);
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
+  // Round 34 fix — a pick that couldn't be independently verified against
+  // the user's own words (creativeResolution.js's pendingCreative) is
+  // never silently trusted as `creative`; it must be confirmed back to
+  // the user first, concretely enough (real caption excerpt + real post
+  // date) that a wrong guess is obvious at a glance. Same
+  // unresolved_questions/approval_required mechanism as every other open
+  // business question — execute_strategy stays blocked, and the
+  // orchestrator's final-reply gate (orchestrator/index.js) requires this
+  // question to actually reach the customer, not just get generated here.
+  if (creativeResolution.pendingCreative) {
+    const question = formatCreativeConfirmationQuestion(creativeResolution.pendingCreative.source, creativeResolution.pendingCreative.candidate);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
@@ -598,12 +624,17 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // just the id, exactly as the question invited ("reply with the number,
   // or describe which one").
   const creativeCandidateRefs = creativeResolution.ambiguousCandidates.length
-    ? creativeResolution.ambiguousCandidates.map((c) => ({
-        id: c.id,
-        label: (normalized.creative_strategy?.source === "PRODUCT_IMAGE" ? c.name : c.captionExcerpt) || null,
-      }))
+    ? toCreativeCandidateRefs(normalized.creative_strategy?.source, creativeResolution.ambiguousCandidates)
     : null;
-  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs };
+  // pendingCreative (round 34) is stored separately from `creative` and
+  // from `creativeCandidates` — it's a single unverified pick awaiting an
+  // explicit affirmation, not a list the auto-revise pre-loop should match
+  // plain-chat text against (that pre-loop only runs while resolvedAssets.
+  // creative is null AND creativeCandidates is populated; leaving
+  // creativeCandidates null while pending means the ONLY way to settle it
+  // is the dedicated affirmation check inside resolveCreativeSelection —
+  // never a re-guess).
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative };
   const recommendationText = formatRecommendation(normalized, names);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,

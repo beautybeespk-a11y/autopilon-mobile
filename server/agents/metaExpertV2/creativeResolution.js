@@ -66,6 +66,92 @@ export function userMessageContainsText(userMessage, text) {
   return normalize(userMessage).includes(normalize(text));
 }
 
+// Same {id, label} shape stored as resolvedAssets.creativeCandidates
+// (strategyBuilder.js) and consumed by matchCreativeCandidateId below —
+// centralized here so the STORED refs and an in-request verification
+// check (resolveCreativeSelection, further down) always derive "label"
+// identically and can never drift apart.
+export function toCreativeCandidateRefs(source, candidates) {
+  return candidates.map((c) => ({ id: c.id, label: (source === "PRODUCT_IMAGE" ? c.name : c.captionExcerpt) || null }));
+}
+
+// Matches a user's plain-chat reply against the REAL creative candidates a
+// creative-ambiguity question already showed — moved here from
+// orchestrator/index.js (round 34) so the SAME strict, literal matching
+// this function already did for the auto-revise pre-loop can also be used
+// to independently VERIFY a content_selector the MODEL supplies directly
+// as a tool parameter (see resolveCreativeSelection below) — closing the
+// live bug where a model-asserted confirmedId/position was trusted with
+// zero verification, unlike this function's own callers.
+//
+// CONFIRMED LIVE BUG (round 32): this only ever matched the full "(id
+// 5814, 2050)" string the question itself rendered — the id embedded in
+// prose. But the question's own closing line says "reply with the number,
+// or describe which one," and the rendered list shows numbers and names,
+// not raw ids. A bare "1", "1.", or the product name typed back verbatim
+// all fell through to null, so the auto-revise pre-loop never fired, the
+// creative question stayed open, and execute_strategy kept re-listing
+// every candidate. Extended to recognize four forms, in this order — the
+// first UNAMBIGUOUS match wins, same "never a guessed id" discipline as
+// the Pixel auto-revise's digit-run match:
+//   1. An exact real id — numeric ids (WooCommerce/Shopify product ids)
+//      matched as a standalone digit run, never a substring of a larger
+//      number; composite Facebook/Instagram ids ("pageId_postId") matched
+//      as a literal substring, safe since that's the exact string shown.
+//      2+ id matches (e.g. the message also contains an unrelated number
+//      like a budget amount that coincidentally equals another
+//      candidate's id) returns null rather than guessing between them.
+//   2. The candidate's own displayed label as a literal, case/whitespace-
+//      insensitive substring of the message (userMessageContainsText
+//      above — the identical non-fuzzy discipline already used for a
+//      user-supplied primaryText answer). 2+ label matches returns null.
+//   3. A list-position reference to the SAME order the question was built
+//      from — an explicit "N)" or "N." marker anywhere in the message
+//      (the trailing-period form excludes a decimal, e.g. "2.5", via the
+//      negative lookahead so a price/quantity is never misread as a
+//      pick), or — only when the ENTIRE message (trimmed, minus one
+//      trailing period) is just that number — a bare list number ("1").
+//      A bare number is deliberately NOT matched mid-sentence: a reply
+//      like "budget 600" must never be misread as picking candidate 600.
+export function matchCreativeCandidateId(userMessage, candidates) {
+  if (typeof userMessage !== "string" || !Array.isArray(candidates) || !candidates.length) return null;
+
+  const digitRuns = userMessage.match(/\d+/g) || [];
+  const idMatches = candidates.filter((c) => (/^\d+$/.test(c.id) ? digitRuns.includes(c.id) : userMessage.includes(c.id)));
+  if (idMatches.length === 1) return idMatches[0].id;
+  if (idMatches.length > 1) return null;
+
+  const labelMatches = candidates.filter((c) => userMessageContainsText(userMessage, c.label));
+  if (labelMatches.length === 1) return labelMatches[0].id;
+  if (labelMatches.length > 1) return null;
+
+  const explicitPosition = userMessage.match(/\b(\d+)(?:\)|\.(?!\d))/);
+  if (explicitPosition) {
+    const position = Number(explicitPosition[1]);
+    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
+  }
+
+  const bareNumber = userMessage.trim().replace(/\.$/, "");
+  if (/^\d+$/.test(bareNumber)) {
+    const position = Number(bareNumber);
+    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
+  }
+
+  return null;
+}
+
+// Whole-message-only, same discipline as policy.js's
+// BARE_APPROVAL_WORD_PATTERN (execute_strategy approval) — a pending
+// creative confirmation must never be promoted by an affirmation word
+// used naturally elsewhere in a longer reply, and never by anything other
+// than the user's own raw words (see resolveCreativeSelection's
+// pendingCreative handling — never a model-supplied selector merely
+// repeating the same id, never a later reuse-from-prior).
+const PENDING_CREATIVE_AFFIRMATION_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|that'?s (the )?right one|that one)[.!]?\s*$/i;
+export function messageAffirmsPendingCreative(userMessage) {
+  return typeof userMessage === "string" && PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage);
+}
+
 // Resolves the ad's primaryText for a PRODUCT_IMAGE creative. Two real
 // sources ONLY, checked in order — never model-authored copy (explicitly
 // out of scope this session):
@@ -86,18 +172,61 @@ function resolvePrimaryText(product, strategy, userMessage) {
   return { primaryText: null, source: null };
 }
 
+// Shared tail for every path that ends with a real, trusted `chosen`
+// candidate (a fresh pick that independently verified against the user's
+// own words, OR an affirmed pendingCreative being promoted) — the ONLY
+// place `creative` is ever constructed, so both callers get identical
+// PRODUCT_IMAGE/post-based shaping.
+function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty }) {
+  if (source === "PRODUCT_IMAGE") {
+    const { primaryText, source: primaryTextSource } = resolvePrimaryText(chosen, strategy, userMessage);
+    if (!primaryText) {
+      return { ...empty, needsPrimaryTextQuestion: true, resolvedProductForQuestion: chosen };
+    }
+    return { ...empty, creative: { source, productId: chosen.id, imageUrl: chosen.imageUrl, link: chosen.permalink, productName: chosen.name, primaryText, primaryTextSource } };
+  }
+  return { ...empty, creative: { source, contentId: chosen.id } };
+}
+
 // strategy: the normalized, merged strategy for THIS call (campaign mode
 // only — explicit_action already has its own resolveContentSelector in
 // strategyBuilder.js, untouched by this module).
 // priorCreative: the PRIOR strategy's resolvedAssets.creative (or null on
 // a fresh build) — the "already resolved, never re-derive" reuse case.
+// priorPendingCreative: the PRIOR strategy's resolvedAssets.pendingCreative
+// (or null) — a pick that was NEVER independently verified against the
+// user's own words, so it can only ever become `creative` through a fresh,
+// explicit affirmation this call (see the pendingCreative handling below).
+// It is a completely separate field from priorCreative/resolvedAssets.
+// creative — nothing ever copies a pending value into the reuse-verbatim
+// path above, so an unconfirmed pick can never re-enter through
+// reusedFromPrior on a later call, by construction.
 // contentSelectorProvidedThisCall: true when THIS call's raw (pre-merge)
 // requestedChanges actually included a content_selector object — the
 // signal that the user is explicitly (re-)picking creative this turn,
 // exactly analogous to explicitAssetChanges for Pixel/Page/AdAccount.
-export function resolveCreativeSelection({ strategy, snapshot, priorCreative, contentSelectorProvidedThisCall, userMessage }) {
+//
+// Live bug (round 34): a content_selector.confirmedId/position reaching
+// this function was trusted identically whether it came from the
+// orchestrator's auto-revise pre-loop (which independently verifies it
+// against the raw current-turn message via matchCreativeCandidateId
+// BEFORE ever constructing requestedChanges) or straight from the MODEL
+// as a build_strategy/revise_strategy tool parameter (never verified at
+// all — the model can assert any confirmedId/position it likes). A model
+// guess was silently saved as `creative`, identical in effect to a real
+// user answer, and then reused verbatim on every later call
+// (reusedFromPrior) — the user never confirmed which of 5 real posts was
+// meant. Fixed: ANY selector-driven pick (not just the auto-loop's) is
+// now independently re-verified here against the SAME userMessage using
+// the SAME strict matchCreativeCandidateId rules. A verified pick
+// resolves exactly as before. An unverified one becomes `pendingCreative`
+// instead — a real, distinct piece of question state — and can ONLY ever
+// be promoted to `creative` by an explicit affirmation in a LATER raw
+// userMessage (messageAffirmsPendingCreative above), never by a selector
+// merely repeating the same id/position again.
+export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage }) {
   const source = strategy.creative_strategy?.source;
-  const empty = { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false };
+  const empty = { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (strategy.mode === "explicit_action" || !source) return empty;
 
   if (OUT_OF_SCOPE_SOURCES.has(source)) {
@@ -107,12 +236,30 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, co
   // Reuse verbatim — the prior strategy already resolved a creative for
   // the SAME source and nothing this call explicitly asked to change.
   // Never re-derived through the candidate list again (the exact bug
-  // class fixed for Pixel — see this file's header comment).
+  // class fixed for Pixel — see this file's header comment). Only ever
+  // reads resolvedAssets.creative — a pendingCreative can never reach
+  // this branch, by construction (see priorPendingCreative comment above).
   if (!contentSelectorProvidedThisCall && priorCreative && priorCreative.source === source) {
-    return { creative: priorCreative, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false };
+    return { ...empty, creative: priorCreative };
   }
 
   const candidates = candidatesForSource(source, snapshot);
+
+  // A pendingCreative from a prior call can ONLY become `creative` via an
+  // explicit affirmation in THIS call's raw userMessage — never by a
+  // fresh content_selector merely echoing the same id/position back (that
+  // still goes through ordinary verification below, same as any other
+  // pick) and never silently. A non-affirming reply leaves it pending and
+  // re-surfaces the SAME confirmation question — never silently drops
+  // back to re-asking the full original candidate list, and never
+  // silently accepts a vague "ok"/no-reply as consent.
+  if (!contentSelectorProvidedThisCall && priorPendingCreative && priorPendingCreative.source === source) {
+    if (messageAffirmsPendingCreative(userMessage)) {
+      return finalizeChosenCreative({ source, chosen: priorPendingCreative.candidate, strategy, userMessage, empty });
+    }
+    return { ...empty, pendingCreative: priorPendingCreative };
+  }
+
   if (!candidates.length) {
     // EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST with zero usable content
     // is ALREADY hard-rejected, with a richer, actionable message, by
@@ -131,16 +278,19 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, co
 
   const selector = strategy.content_selector || {};
   let chosen = null;
+  let pickedViaSelector = false;
   if (typeof selector.confirmedId === "string" && selector.confirmedId) {
     chosen = candidates.find((c) => c.id === selector.confirmedId);
     if (!chosen) {
       return { ...empty, creativeError: `"${selector.confirmedId}" is not one of the real creative candidates already shown this conversation — refer to it by the id shown, or by position (the first, the second, ...).` };
     }
+    pickedViaSelector = true;
   } else if (Number.isInteger(selector.position) && selector.position > 0) {
     chosen = candidates[selector.position - 1];
     if (!chosen) {
       return { ...empty, creativeError: `There is no creative candidate at position ${selector.position} — only ${candidates.length} real candidate(s) are available.` };
     }
+    pickedViaSelector = true;
   } else if (candidates.length === 1) {
     chosen = candidates[0];
   } else {
@@ -151,18 +301,18 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, co
     return { ...empty, ambiguousCandidates: candidates };
   }
 
-  if (source === "PRODUCT_IMAGE") {
-    const { primaryText, source: primaryTextSource } = resolvePrimaryText(chosen, strategy, userMessage);
-    if (!primaryText) {
-      return { ...empty, needsPrimaryTextQuestion: true, ambiguousCandidates: [], creativeError: null, resolvedProductForQuestion: chosen };
+  // Independent verification (round 34) — see this function's header
+  // comment. Skipped only for the single-real-candidate auto-pick above
+  // (candidates.length === 1, pickedViaSelector stays false), which was
+  // never a guess in the first place — there was nothing else it could be.
+  if (pickedViaSelector) {
+    const verifiedId = matchCreativeCandidateId(userMessage, toCreativeCandidateRefs(source, candidates));
+    if (verifiedId !== chosen.id) {
+      return { ...empty, pendingCreative: { source, candidate: chosen } };
     }
-    return {
-      creative: { source, productId: chosen.id, imageUrl: chosen.imageUrl, link: chosen.permalink, productName: chosen.name, primaryText, primaryTextSource },
-      ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false,
-    };
   }
 
-  return { creative: { source, contentId: chosen.id }, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false };
+  return finalizeChosenCreative({ source, chosen, strategy, userMessage, empty });
 }
 
 // Deterministic, backend-authored candidate list — NEVER model text, so
@@ -186,6 +336,25 @@ export function formatCreativeCandidatesQuestion(source, candidates) {
     return `${n}) ${excerpt} (id ${c.id}, posted ${c.publishedDate || "unknown date"}, ${engagementNote})`;
   });
   return `Which ${label} should I use as the ad's creative? ${parts.join(" ")} — reply with the number, or describe which one.`;
+}
+
+// Round 34 fix — the confirmation asked when a pick couldn't be
+// independently verified against the user's own words (resolveCreativeSelection's
+// pendingCreative). Requirement: concrete enough that a WRONG guess is
+// obvious at a glance — real caption excerpt AND real post date, same
+// facts formatCreativeCandidatesQuestion already shows per-candidate, not
+// just an id or a generic "this post." Deliberately ends with the exact
+// same "as the ad's creative." phrase formatCreativeCandidatesQuestion's
+// question ends with (just "." instead of "?") — a single shared anchor
+// orchestrator/index.js's final-reply gate can check for either question
+// having actually reached the customer, regardless of which one applies.
+export function formatCreativeConfirmationQuestion(source, candidate) {
+  const label = { EXISTING_PAGE_POST: "Facebook post", EXISTING_INSTAGRAM_POST: "Instagram post", PRODUCT_IMAGE: "product" }[source] || "item";
+  if (source === "PRODUCT_IMAGE") {
+    return `To confirm — you'd like to use "${candidate.name}" (id ${candidate.id}${candidate.price ? `, ${candidate.price}` : ""}) as the ad's creative. Reply "yes" to confirm, or tell me which one you actually meant.`;
+  }
+  const excerpt = candidate.captionExcerpt ? `"${candidate.captionExcerpt}"` : "(no caption)";
+  return `To confirm — you'd like to use this ${label} as the ad's creative: ${excerpt} (posted ${candidate.publishedDate || "unknown date"}). Reply "yes" to confirm, or tell me which one you actually meant.`;
 }
 
 export function formatPrimaryTextQuestion(product) {

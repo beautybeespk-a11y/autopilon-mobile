@@ -4020,10 +4020,19 @@ async function run() {
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.ok(built.strategy.unresolved_questions.length, "must genuinely be ambiguous first");
 
-      // Answer: pick the second candidate explicitly.
+      // Answer: pick the second candidate explicitly. userMessage is "2."
+      // (an explicit list marker matchCreativeCandidateId recognizes),
+      // not a natural-language paraphrase like "Use the second one." —
+      // round 34 fix requires the raw userMessage to independently verify
+      // a selector-driven pick before it resolves directly; a paraphrase
+      // the strict matcher can't parse now becomes a pendingCreative
+      // needing one more confirmation turn instead (see the dedicated
+      // pendingCreative tests below). This test's own focus is reuse
+      // across a later revision, so it verifies directly to keep that
+      // in one step.
       const answered = await reviseStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
-        requestedChanges: { content_selector: { position: 2 } }, userMessage: "Use the second one.",
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
       assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
       assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "must resolve to the SPECIFIC candidate explicitly picked, id 111_2");
@@ -4040,6 +4049,279 @@ async function run() {
       assert.equal(laterRevision.ok, true, JSON.stringify(laterRevision.unresolved));
       assert.deepEqual(laterRevision.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "the already-resolved creative must be reused verbatim, never re-derived or re-asked, across an unrelated revision");
       assert.deepEqual(laterRevision.strategy.unresolved_questions, [], "must not silently reintroduce the already-answered question");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- pendingCreative: unverified selector confirmation (round 34) -------
+  // Live bug: build_strategy correctly asked which of 5 real Facebook
+  // posts to use — the user's actual reply ("pixel will be the one ending
+  // on 4129 and the budget will be 600/day") never answered it at all,
+  // yet the creative resolved anyway with no user input. Traced precisely
+  // against that literal string: matchCreativeCandidateId (creativeResolution.js)
+  // returns null for it — no id, no label, no "N)"/"N." marker, no bare
+  // number. So the resolution came from a content_selector the MODEL
+  // supplied directly as a tool parameter, trusted with zero verification.
+  // This test reproduces that exact shape directly against buildStrategy/
+  // reviseStrategy: a content_selector arrives with NOTHING in the raw
+  // userMessage corroborating it.
+  await check("[pendingCreative] a content_selector that doesn't independently verify against the raw userMessage never resolves `creative` — becomes a pendingCreative confirmation instead", async () => {
+    const userId = makeUser(`v2-pending-unverified-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "i want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "sanity: genuinely ambiguous first");
+
+      // The exact live-bug message — genuinely about pixel/budget, answers
+      // nothing about which post — with a model-supplied content_selector
+      // attached anyway (the shape the model itself produced live).
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative, null, "an unverified pick must NEVER resolve to `creative` — that's the exact live bug");
+      assert.ok(answered.resolved.pendingCreative, "the pick must be recorded as pending, not silently dropped");
+      assert.equal(answered.resolved.pendingCreative.candidate.id, "111_5", "the actual (unverified) pick is preserved so the confirmation question can name it concretely");
+      const question = answered.strategy.unresolved_questions.find((q) => q.startsWith("To confirm —"));
+      assert.ok(question, `a concrete confirmation question must be asked: ${JSON.stringify(answered.strategy.unresolved_questions)}`);
+      assert.match(question, /Post number 5/, "requirement: the confirmation must name the caption excerpt, concrete enough a wrong guess is obvious");
+      assert.match(question, /posted 2024-03-05/, "requirement: the confirmation must also name the real post date");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative] an explicit affirmation (\"yes\") — and ONLY an explicit affirmation — promotes a pendingCreative to `creative`", async () => {
+    const userId = makeUser(`v2-pending-affirm-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.ok, true, JSON.stringify(pending.unresolved));
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending, not resolved");
+
+      // A reply that neither affirms nor picks anything new — must stay
+      // pending, re-surfacing the SAME confirmation, never silently
+      // promoted and never silently dropped back to the full 5-way list.
+      const stillPending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "how does this all work?",
+      });
+      assert.equal(stillPending.ok, true, JSON.stringify(stillPending.unresolved));
+      assert.equal(stillPending.resolved.creative, null, "an unrelated reply must never promote a pendingCreative");
+      assert.ok(stillPending.resolved.pendingCreative, "must remain pending");
+      assert.ok(stillPending.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the SAME confirmation must re-surface");
+
+      // The actual, explicit affirmation — and ONLY this — promotes it.
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: stillPending.strategyId,
+        requestedChanges: {}, userMessage: "yes",
+      });
+      assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "an explicit affirmation must promote the exact pending pick");
+      assert.equal(confirmed.resolved.pendingCreative, null, "must be cleared once promoted");
+      assert.deepEqual(confirmed.strategy.unresolved_questions, [], "the confirmation question must clear once affirmed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative] a fresh, INDEPENDENTLY VERIFIED pick supersedes a still-open pendingCreative — the escape hatch still works without waiting for affirmation", async () => {
+    const userId = makeUser(`v2-pending-supersede-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+      assert.equal(pending.resolved.pendingCreative.candidate.id, "111_5");
+
+      // A DIFFERENT, genuinely verified pick this call (bare "2.") — must
+      // win outright, resolving to the NEW pick, never the stale pending
+      // guess from before.
+      const resolved = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
+      });
+      assert.equal(resolved.ok, true, JSON.stringify(resolved.unresolved));
+      assert.deepEqual(resolved.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a fresh, independently-verified pick must supersede the stale pendingCreative outright");
+      assert.equal(resolved.resolved.pendingCreative, null, "the superseded pendingCreative must be cleared, never left dangling");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative] never enters reusedFromPrior — an unrelated LATER revision with no fresh answer stays pending, never silently treated as already-resolved", async () => {
+    const userId = makeUser(`v2-pending-no-leak-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+
+      // An unrelated revision (budget only, no content_selector, no
+      // affirmation language) — the exact shape reusedFromPrior handles
+      // for an ALREADY-confirmed creative. Must NOT treat the pending
+      // guess as if it were already resolved.
+      const laterRevision = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: { budget_daily: 4000 }, userMessage: "Increase the budget to 4000.",
+      });
+      assert.equal(laterRevision.ok, true, JSON.stringify(laterRevision.unresolved));
+      assert.equal(laterRevision.resolved.creative, null, "a pendingCreative must never leak into resolvedAssets.creative via an unrelated revision — the exact mechanism the live bug relied on");
+      assert.ok(laterRevision.resolved.pendingCreative, "must remain pending across the unrelated revision");
+      assert.ok(laterRevision.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must still be open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Unresolved creative question must reach the customer (round 34) ---
+  // Live bug: build_strategy correctly computed a real unresolved_questions
+  // entry naming all 5 real Facebook posts — but the model's own final
+  // visible reply asked about pixel and budget (from the SAME bulleted
+  // list) and silently dropped the creative-pick bullet. Same nudge-then-
+  // deterministic-append shape as the unavailable-reason guard tests above.
+  await check("[V2 creative-question guard] a still-open creative question omitted from the model's final reply is nudged into being included", async () => {
+    const userId = makeUser(`v2-creative-question-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "i want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "sanity: genuinely ambiguous");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      chatResponses: [
+        // Exact live-bug shape: relays pixel/budget-style content, omits
+        // the creative-candidates question entirely.
+        finalText("Your Pixel and budget are all set. Let me know if there's anything else you'd like to adjust."),
+        finalText("Your Pixel and budget are all set. Which Facebook post should I use as the ad's creative? 1) \"Post number 1\" (id 111_1, posted 2024-03-01, no engagement data available) — reply with the number, or describe which one."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /as the ad's creative/i, `the still-open creative question must reach the customer: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[V2 creative-question guard] the creative question omitted even after the nudge is deterministically appended", async () => {
+    const userId = makeUser(`v2-creative-question-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "i want more sales on my website, use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      chatResponses: [
+        finalText("Your Pixel and budget are all set."),
+        finalText("Everything's ready whenever you are."),
+      ],
+    }));
+    try {
+      const userMessage = "Can you recap the plan?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /as the ad's creative/i, `the fail-safe append must still guarantee the open creative question reaches the customer: ${result.reply}`);
+      assert.match(result.reply, /111_\d/, "the appended question must name real candidates, never a generic placeholder");
     } finally {
       restoreFetch();
     }
@@ -4084,10 +4366,15 @@ async function run() {
 
     mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: twoProducts }));
     try {
-      // Answer the Facebook-post question: position 2.
+      // Answer the Facebook-post question: position 2. userMessage "2."
+      // (not a natural-language paraphrase — round 34 fix requires
+      // independent verification against the raw message to resolve
+      // directly; see this file's dedicated pendingCreative tests) so
+      // this test's actual focus — the source-switch protection below —
+      // starts from a genuinely resolved creative, not a pending one.
       const answered = await reviseStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
-        requestedChanges: { content_selector: { position: 2 } }, userMessage: "Use the second one.",
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
       assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
       assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "sanity: position 2 resolved against the Facebook post list");
@@ -4600,7 +4887,12 @@ async function run() {
 
     mockFetch(scriptedFetch({
       wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts,
-      chatResponses: [finalText("Which product would you like to use? Also, could you confirm the budget?")],
+      // Includes the real "...as the ad's creative?" phrasing (round 34's
+      // checkUnresolvedCreativeChoiceGate now requires it, or nudges/
+      // appends it deterministically) — this test's own focus is the
+      // decimal-number matcher below, not that gate, so the scripted
+      // reply is written to already satisfy it and keep this a single turn.
+      chatResponses: [finalText("Which product would you like to use as the ad's creative? Also, could you confirm the budget?")],
     }));
     try {
       const userMessage = "make it 2.5k per day";

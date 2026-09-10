@@ -16,7 +16,7 @@ import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
-import { userMessageContainsText } from "../agents/metaExpertV2/creativeResolution.js";
+import { matchCreativeCandidateId } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
@@ -250,6 +250,36 @@ function capturedUnavailableReason(activeStrategy) {
   return description.match(CAPTURED_UNAVAILABLE_REASON_PATTERN)?.[1] || null;
 }
 
+// Live bug (round 34): build_strategy correctly produced a real
+// unresolved_questions entry asking which of 5 real Facebook posts to use
+// (recommendationText embeds every unresolved question in one bulleted
+// list — see strategyBuilder.js's formatRecommendation) — but the model's
+// own final visible reply relayed the pixel and budget bullets from that
+// SAME list and silently dropped the creative-pick one. Same failure
+// class, same fix shape, as capturedUnavailableReason above: a structured
+// field being correctly computed doesn't stop the model's own free-text
+// final reply from selectively omitting part of it.
+//
+// checkUnresolvedCreativeChoiceGate reads the ALREADY-computed canonical
+// question straight from the stored strategy's own unresolved_questions
+// (strategyBuilder.js already built the exact right text once, with full
+// real candidate data — captions, dates, ids — never re-derived here from
+// the STORED creativeCandidates refs, which are only {id, label} and
+// can't reconstruct that text). CREATIVE_QUESTION_ANCHOR_PATTERN matches
+// either open-creative-question shape: a genuine multi-candidate
+// ambiguity (formatCreativeCandidatesQuestion) or a pendingCreative
+// confirmation (formatCreativeConfirmationQuestion, round 34's second
+// fix) — both formatters deliberately end with the same "...as the ad's
+// creative[.?]" phrase so one check covers either.
+const MAX_CREATIVE_QUESTION_NUDGES = 1;
+const CREATIVE_QUESTION_ANCHOR_PATTERN = /as the ad's creative[.?]/i;
+function checkUnresolvedCreativeChoiceGate(activeStrategy) {
+  if (!activeStrategy || activeStrategy.resolvedAssets?.creative != null) return null;
+  const questions = activeStrategy.strategy?.unresolved_questions;
+  if (!Array.isArray(questions)) return null;
+  return questions.find((q) => CREATIVE_QUESTION_ANCHOR_PATTERN.test(q)) || null;
+}
+
 const MAX_PERFORMANCE_CLAIM_NUDGES = 1;
 function activeCreativeHasRealEngagement(activeStrategy) {
   const creative = activeStrategy?.resolvedAssets?.creative;
@@ -261,69 +291,11 @@ function activeCreativeHasRealEngagement(activeStrategy) {
   return allContent.find((c) => c.id === creative.contentId)?.engagement?.status === "exists";
 }
 
-// Matches a user's plain-chat reply against the REAL creative candidates a
-// creative-ambiguity question already showed (resolvedAssets.
-// creativeCandidates — see creativeResolution.js/strategyBuilder.js: each
-// entry is { id, label }, label being the SAME display text
-// formatCreativeCandidatesQuestion already showed — the product name for
-// PRODUCT_IMAGE, or the post's caption excerpt otherwise).
-//
-// CONFIRMED LIVE BUG (round 32): this only ever matched the full "(id
-// 5814, 2050)" string the question itself rendered — the id embedded in
-// prose. But the question's own closing line says "reply with the number,
-// or describe which one," and the rendered list shows numbers and names,
-// not raw ids. A bare "1", "1.", or the product name typed back verbatim
-// all fell through to null, so the auto-revise pre-loop never fired, the
-// creative question stayed open, and execute_strategy kept re-listing
-// every candidate. Extended to recognize four forms, in this order — the
-// first UNAMBIGUOUS match wins, same "never a guessed id" discipline as
-// the Pixel auto-revise's digit-run match above:
-//   1. An exact real id — numeric ids (WooCommerce/Shopify product ids)
-//      matched as a standalone digit run, never a substring of a larger
-//      number; composite Facebook/Instagram ids ("pageId_postId") matched
-//      as a literal substring, safe since that's the exact string shown.
-//      2+ id matches (e.g. the message also contains an unrelated number
-//      like a budget amount that coincidentally equals another
-//      candidate's id) returns null rather than guessing between them.
-//   2. The candidate's own displayed label as a literal, case/whitespace-
-//      insensitive substring of the message (userMessageContainsText,
-//      creativeResolution.js — the identical non-fuzzy discipline already
-//      used for a user-supplied primaryText answer). 2+ label matches
-//      returns null.
-//   3. A list-position reference to the SAME order the question was built
-//      from — an explicit "N)" or "N." marker anywhere in the message
-//      (the trailing-period form excludes a decimal, e.g. "2.5", via the
-//      negative lookahead so a price/quantity is never misread as a
-//      pick), or — only when the ENTIRE message (trimmed, minus one
-//      trailing period) is just that number — a bare list number ("1").
-//      A bare number is deliberately NOT matched mid-sentence: a reply
-//      like "budget 600" must never be misread as picking candidate 600.
-function matchCreativeCandidateId(userMessage, candidates) {
-  if (typeof userMessage !== "string" || !Array.isArray(candidates) || !candidates.length) return null;
-
-  const digitRuns = userMessage.match(/\d+/g) || [];
-  const idMatches = candidates.filter((c) => (/^\d+$/.test(c.id) ? digitRuns.includes(c.id) : userMessage.includes(c.id)));
-  if (idMatches.length === 1) return idMatches[0].id;
-  if (idMatches.length > 1) return null;
-
-  const labelMatches = candidates.filter((c) => userMessageContainsText(userMessage, c.label));
-  if (labelMatches.length === 1) return labelMatches[0].id;
-  if (labelMatches.length > 1) return null;
-
-  const explicitPosition = userMessage.match(/\b(\d+)(?:\)|\.(?!\d))/);
-  if (explicitPosition) {
-    const position = Number(explicitPosition[1]);
-    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
-  }
-
-  const bareNumber = userMessage.trim().replace(/\.$/, "");
-  if (/^\d+$/.test(bareNumber)) {
-    const position = Number(bareNumber);
-    if (Number.isInteger(position) && position >= 1 && position <= candidates.length) return candidates[position - 1].id;
-  }
-
-  return null;
-}
+// matchCreativeCandidateId moved to creativeResolution.js (round 34) — it's
+// now also used INSIDE resolveCreativeSelection to independently verify a
+// model-supplied content_selector against the raw current-turn message
+// (see that module's header comment on resolveCreativeSelection for why),
+// not just here for the auto-revise pre-loop below. Imported above.
 
 // Issue 6 (live testing round 3): "Create the best campaign you recommend
 // for my business" led the model to call meta_expert.execute_campaign_plan
@@ -1024,6 +996,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let currencyNudges = 0;
   let performanceClaimNudges = 0;
   let unavailableReasonNudges = 0;
+  let creativeQuestionNudges = 0;
   // Set true the moment checkV2ExecutionApprovalGate blocks a real
   // execute_strategy attempt this turn (see round-29 fix in
   // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
@@ -1555,6 +1528,34 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // let an invented-sounding explanation reach the customer in place
         // of the specific one that was actually captured.
         decision.message = `${decision.message}\n\nSpecific reason: ${capturedReason}`;
+      }
+
+      // Round 34 fix — see checkUnresolvedCreativeChoiceGate above. A
+      // genuine open creative question (multi-candidate ambiguity, or a
+      // pendingCreative confirmation) must reach the customer, not just
+      // get computed and then silently dropped from the model's own
+      // paraphrase — same nudge-then-deterministic-append shape as every
+      // other final-reply guard on this page.
+      const unresolvedCreativeQuestion = hasV2Tools ? checkUnresolvedCreativeChoiceGate(activeStrategyForCurrency) : null;
+      if (unresolvedCreativeQuestion && typeof decision.message === "string" && !CREATIVE_QUESTION_ANCHOR_PATTERN.test(decision.message)) {
+        if (creativeQuestionNudges < MAX_CREATIVE_QUESTION_NUDGES) {
+          creativeQuestionNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `Your reply finalized without asking the still-open question about which creative to use. Rewrite your reply to include this exact question, verbatim: "${unresolvedCreativeQuestion}"`,
+            },
+          ];
+          continue;
+        }
+        // Nudge already used and the creative question is STILL missing —
+        // never let the reply go out implying everything is settled while
+        // a real, unanswered choice is still open (the same class of bug
+        // as execute_strategy proceeding on an unresolved ambiguity — this
+        // is the customer-facing half of that same rule).
+        decision.message = `${decision.message}\n\n${unresolvedCreativeQuestion}`;
       }
 
       trace[trace.length - 1].state = "done";
