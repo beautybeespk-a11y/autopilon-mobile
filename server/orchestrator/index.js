@@ -11,8 +11,8 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage } from "../agents/metaExpertV2/policy.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getExecutedAncestorStrategy } from "../agents/metaExpertV2/strategyStore.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
@@ -366,6 +366,29 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
       return `This strategy has ALREADY been executed — do not rebuild it, and do not call execute_strategy or build_strategy again for this. Campaign ID: ${alreadyExecuted.campaignId}. Ad Set ID: ${alreadyExecuted.adSetId}. The correct reply is to tell the user their campaign already exists (it's paused until they resume it in Meta Ads Manager) and share those two ids in plain language — never describe this as a technical issue or a problem that needs fixing.`;
     }
     return "No active strategy exists for this conversation yet. Call meta_expert_v2.build_strategy first (after meta_expert_v2.get_business_snapshot if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
+  }
+  // Round 37 fix (live production report: an unrelated targeting change
+  // after a campaign was already created lost the confirmed creative,
+  // since revise_strategy used to refuse to touch an EXECUTED strategy
+  // at all — see reviseStrategy's own comment, strategyBuilder.js). That
+  // refusal is now relaxed so the creative/budget/audience survive a
+  // revision — but the resulting strategy must NEVER be allowed to
+  // silently create a SECOND, real campaign via execute_strategy, since
+  // this app has no way to update the campaign that already exists (a
+  // separate, tracked gap). Checked FIRST, before the approval-language
+  // check below — an ordinary "approve" here would otherwise read as
+  // approving the generic recommendation, when what it's actually about
+  // to do is create an entirely separate campaign, which needs its own,
+  // explicit, unambiguous acknowledgment (messageAcknowledgesSeparateCampaign,
+  // policy.js — never a bare "approve"/"yes", the same words used for
+  // ordinary approval everywhere else). Deliberately NOT a dead end
+  // (learned from the destination-URL deadlock this codebase already had
+  // to fix once): the block message itself names BOTH real ways forward.
+  const executedAncestor = getExecutedAncestorStrategy(userId, active);
+  if (executedAncestor && !messageAcknowledgesSeparateCampaign(userMessage)) {
+    const campaignId = executedAncestor.executionResult?.campaignId;
+    const adSetId = executedAncestor.executionResult?.adSetId;
+    return `This revision is for a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — editing an existing campaign isn't supported yet, so execute_strategy is blocked here. Tell the user plainly, in these terms: this updates the recommendation, but the campaign already exists in Meta (share the Campaign ID) and editing it directly isn't supported yet — they can change it themselves in Meta Ads Manager, or explicitly ask you to create a SEPARATE, additional campaign with these updated settings if that's genuinely what they want. Never assume the second option from a bare "approve" alone — only call execute_strategy again once they've said so explicitly (e.g. "create a new campaign", "approve a separate campaign").`;
   }
   // Round 35 follow-up (real risk, confirmed by trace): the destination-
   // URL auto-revise pre-loop (orchestrator/index.js) can resolve the LAST

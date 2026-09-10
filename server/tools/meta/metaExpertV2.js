@@ -14,7 +14,7 @@ import { requireValidToken } from "../../integrations/manager.js";
 import { gatherBusinessSnapshot } from "../../agents/metaExpertV2/businessSnapshot.js";
 import { buildStrategy, reviseStrategy } from "../../agents/metaExpertV2/strategyBuilder.js";
 import { executeStrategy, rejectStrategy } from "../../agents/metaExpertV2/executor.js";
-import { getActiveStrategyForConversation } from "../../agents/metaExpertV2/strategyStore.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../../agents/metaExpertV2/strategyStore.js";
 import { INTERNAL_STRATEGY_SCHEMA } from "../../agents/metaExpertV2/strategySchema.js";
 import { assertV2RuntimeEnabled } from "../../agents/metaExpertV2/runtimeGate.js";
 
@@ -146,7 +146,21 @@ registerTool({
   requiresConfirmation: false,
   async execute(parameters, context) {
     assertV2RuntimeEnabled(context.userId);
-    const strategyId = parameters.strategyId || getActiveStrategyForConversation(context.userId, context.conversationId)?.id;
+    // Round 37 fix — getActiveStrategyForConversation only ever finds a
+    // proposed/approved strategy, so once one is executed this fell
+    // through to the "no active strategy" error below, whose own text
+    // sends the model to build_strategy — a from-scratch build that loses
+    // every previously-resolved field (see reviseStrategy's matching
+    // comment, strategyBuilder.js, for the full mechanism). Falling back
+    // to getMostRecentStrategyForConversation (no status filter) lets the
+    // model's ordinary "omit strategyId" behavior still find the executed
+    // strategy to revise from; reviseStrategy() itself is still the real
+    // gate on which statuses are actually revisable (now proposed/
+    // approved/executed), so a genuinely dead strategy (rejected/failed/
+    // superseded) surfaces its own honest rejection either way.
+    const strategyId = parameters.strategyId
+      || getActiveStrategyForConversation(context.userId, context.conversationId)?.id
+      || getMostRecentStrategyForConversation(context.userId, context.conversationId)?.id;
     if (!strategyId) {
       const err = new Error("No active strategy exists for this conversation to revise — call meta_expert_v2.build_strategy first.");
       err.code = "META_V2_STRATEGY_REQUIRED";
@@ -177,7 +191,13 @@ registerTool({
     // budget, so "the runtime flag is off" must block it from every angle,
     // not just the one the LLM happens to go through.
     assertV2RuntimeEnabled(context.userId);
-    return executeStrategy({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategyId: parameters.strategyId });
+    // userMessage threaded through (round 37) so executeStrategy's own
+    // defense-in-depth check for a revision-of-an-executed-strategy can
+    // recognize the SAME explicit "create a separate campaign" override
+    // checkV2ExecutionApprovalGate (orchestrator/index.js) already
+    // checked — without it, that override would pass the orchestrator's
+    // gate only to be unconditionally re-blocked here with no way through.
+    return executeStrategy({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategyId: parameters.strategyId, userMessage: context.userMessage });
   },
 });
 

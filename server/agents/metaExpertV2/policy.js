@@ -173,6 +173,25 @@ export function verifyDestinationUrl(rawStrategy, mergedStrategy, userMessage, s
   return { ...mergedStrategy, destination_url: null };
 }
 
+// Round 37 fix — a revision of an ALREADY-EXECUTED strategy (see
+// getExecutedAncestorStrategy, strategyStore.js) is blocked by default
+// from ever calling execute_strategy, since that would silently create a
+// SEPARATE, real second campaign rather than update the one that already
+// exists — but the block must offer a real way forward, not a dead end
+// (the destination-URL deadlock this codebase already had to fix once).
+// One of the two ways forward IS "go ahead and create the separate
+// campaign anyway" — genuinely reachable, but ONLY via an explicit,
+// unambiguous reference to a NEW/SEPARATE/SECOND/ANOTHER campaign, never
+// a bare "approve"/"yes" (the same generic words already used for
+// ordinary approval elsewhere — reusing them here would risk exactly the
+// kind of accidental-duplicate-spend collision round 36's
+// destinationUrlJustAutoConfirmedThisTurn fix exists to prevent, just
+// with a real campaign instead of a URL confirmation).
+const SEPARATE_CAMPAIGN_ACKNOWLEDGMENT_PATTERN = /\b(create|creating|make|making|go ahead with|start|starting)\b[^.!?]{0,40}\b(a\s+)?(separate|new|second|another|duplicate)\b[^.!?]{0,20}\bcampaign\b/i;
+export function messageAcknowledgesSeparateCampaign(userMessage) {
+  return typeof userMessage === "string" && SEPARATE_CAMPAIGN_ACKNOWLEDGMENT_PATTERN.test(userMessage);
+}
+
 // Step 4/5 — goal alignment. clearEcommerceWithPurchaseTracking: true only
 // when BOTH a real commerce platform is connected AND a Meta Pixel was
 // actually resolvable for this ad account — two independently-checkable

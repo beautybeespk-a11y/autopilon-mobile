@@ -18,8 +18,8 @@ import * as meta from "../../integrations/meta/api.js";
 import { getTool } from "../../tools/registry.js";
 import { buildTargeting } from "../../tools/meta/campaigns.js";
 import { publishEvent } from "../../automation/triggers.js";
-import { MAX_EXECUTABLE_DAILY_BUDGET } from "./policy.js";
-import { getStoredStrategy, getActiveStrategyForConversation, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
+import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign } from "./policy.js";
+import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 import { logger } from "../../config/logger.js";
 
@@ -555,7 +555,7 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
   return executionResult;
 }
 
-export async function executeStrategy({ userId, conversationId, accessToken, strategyId }) {
+export async function executeStrategy({ userId, conversationId, accessToken, strategyId, userMessage }) {
   // Runtime kill switch, checked FIRST and again here (defense in depth —
   // the tool wrapper in server/tools/meta/metaExpertV2.js already checks
   // this too) — this is the one call that spends real ad budget, so
@@ -599,6 +599,28 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   if (Array.isArray(stored.strategy.unresolved_questions) && stored.strategy.unresolved_questions.length > 0) {
     const err = new Error(`This strategy still has an unresolved question: "${stored.strategy.unresolved_questions[0]}" — build a revised strategy answering it before executing.`);
     err.code = "META_V2_UNRESOLVED_QUESTION";
+    throw err;
+  }
+
+  // Defense in depth — checkV2ExecutionApprovalGate in orchestrator/
+  // index.js already blocks this before the tool is even dispatched (same
+  // reasoning as the checks above: this function is also reachable
+  // directly). A strategy revising an ALREADY-EXECUTED one (see
+  // reviseStrategy, strategyBuilder.js, and getExecutedAncestorStrategy,
+  // strategyStore.js) must never silently create a SEPARATE, real second
+  // campaign — this app has no way to update the campaign that already
+  // exists. userMessage is threaded through from the tool wrapper
+  // (server/tools/meta/metaExpertV2.js) specifically so the SAME explicit
+  // "create a separate campaign" acknowledgment the orchestrator's gate
+  // already required is recognized here too — without it, a legitimately
+  // approved override would pass that gate only to be unconditionally
+  // re-blocked at this second layer with no way through.
+  const executedAncestor = getExecutedAncestorStrategy(userId, stored);
+  if (executedAncestor && !messageAcknowledgesSeparateCampaign(userMessage)) {
+    const campaignId = executedAncestor.executionResult?.campaignId;
+    const adSetId = executedAncestor.executionResult?.adSetId;
+    const err = new Error(`This strategy revises a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — editing an existing campaign isn't supported yet. You can change it directly in Meta Ads Manager, or explicitly ask to create a separate, additional campaign with these updated settings.`);
+    err.code = "META_V2_STRATEGY_REVISES_EXECUTED";
     throw err;
   }
 

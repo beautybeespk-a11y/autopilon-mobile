@@ -788,7 +788,27 @@ export async function reviseStrategy({ userId, conversationId, accessToken, stra
   if (!prior) {
     return { ok: false, unresolved: { field: "strategyId", issue: `strategyId "${strategyId}" does not match any strategy you own — it may be from a different conversation or doesn't exist.`, allIssues: [] } };
   }
-  if (!EXECUTABLE_STATUSES.has(prior.status)) {
+  // Round 37 fix (live production report: an unrelated targeting change
+  // after a campaign was already created re-opened the creative-candidate
+  // question — five real posts re-listed, even though one was already
+  // confirmed). Root cause: this function refused to revise an EXECUTED
+  // strategy at all, so the model's only path forward was build_strategy
+  // — a from-scratch build with priorStored always null, losing every
+  // previously-resolved field (creative included; reusedFromPrior/
+  // pendingCreative never got the chance to apply, since they only ever
+  // read from priorStored). 'executed' is now accepted here too, so the
+  // new revision row correctly carries the prior creative/resolvedAssets
+  // forward through the SAME, unmodified mergeForRevision/creativeResolution
+  // machinery every other revision already uses. This does NOT mean the
+  // resulting strategy can silently re-execute against Meta — a revision
+  // of an executed strategy is a NEW row (insertStrategy's supersede
+  // logic never touches the executed one, which stays exactly as it was)
+  // and execute_strategy on it is separately blocked by
+  // checkV2ExecutionApprovalGate (orchestrator/index.js) and
+  // executeStrategy's own defense-in-depth check (executor.js) — see
+  // getExecutedAncestorStrategy (strategyStore.js) — specifically so it
+  // can never silently create a SECOND real campaign.
+  if (!EXECUTABLE_STATUSES.has(prior.status) && prior.status !== "executed") {
     return { ok: false, unresolved: { field: "strategyId", issue: `This strategy is no longer active (status: ${prior.status}) and can't be revised.`, allIssues: [] } };
   }
   return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: strategyId, priorStored: prior, freshResearchRequired });

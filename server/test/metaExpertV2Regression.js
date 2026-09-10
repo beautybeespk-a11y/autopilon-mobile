@@ -2668,6 +2668,186 @@ async function run() {
     }
   });
 
+  // --- Revision of an EXECUTED strategy (round 37) ------------------------
+  // Live production report, exact reproduction: a campaign was created
+  // successfully (EXISTING_PAGE_POST, one of five real candidates already
+  // confirmed) — then "can you please change the gender to female and age
+  // limit should be 22-45" re-listed all five posts and asked again, even
+  // though nothing about the creative was mentioned. Root cause: revise_
+  // strategy refused to touch an EXECUTED strategy at all, so the model's
+  // only path forward was build_strategy — a from-scratch build with no
+  // memory of the prior creative. Fixed by letting revise_strategy operate
+  // on an executed strategy (creative/budget/audience correctly carried
+  // forward through the SAME reusedFromPrior machinery every other
+  // revision already uses) while separately, deterministically blocking
+  // execute_strategy from ever turning that into a SECOND real campaign.
+  const FIVE_CANDIDATE_POSTS = [
+    { id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-05T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/1" },
+    { id: "111_2", message: "Weekend sale, 20% off!", created_time: "2024-03-04T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2" },
+    { id: "111_3", message: "Behind the scenes at the studio", created_time: "2024-03-03T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/3" },
+    { id: "111_4", message: "Customer love — real reviews", created_time: "2024-03-02T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/4" },
+    { id: "111_5", message: "New arrivals this week", created_time: "2024-03-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/5" },
+  ];
+
+  await check("[Revision of executed strategy, round 37] an unrelated targeting change after execution does NOT re-open the already-confirmed creative — never re-lists the five candidates, never re-asks", async () => {
+    const userId = makeUser(`v2-revise-executed-creative-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: FIVE_CANDIDATE_POSTS, writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "ALL" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "sanity: must genuinely be ambiguous across all five first");
+
+      // The user picks and confirms one — the real, already-working flow.
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "3.",
+      });
+      assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" });
+      assert.deepEqual(confirmed.strategy.unresolved_questions, []);
+
+      // Approve and execute — the campaign is created for real.
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId, userMessage: "approve" });
+      assert.equal(executed.status, "PAUSED");
+      assert.ok(executed.adId, "the ad must actually be created for this to be a genuine post-execution scenario");
+      const campaignWritesBeforeRevision = writes.filter((w) => w.path.endsWith("/campaigns")).length;
+      assert.equal(campaignWritesBeforeRevision, 1);
+
+      // Exact live report: an unrelated targeting change, nothing about
+      // the creative in the message at all.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId,
+        requestedChanges: { gender: "FEMALE", age_min: 22, age_max: 45 },
+        userMessage: "can you please change the gender to female and age limit should be 22-45",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.strategy.gender, "FEMALE");
+      assert.equal(revised.strategy.age_min, 22);
+      assert.equal(revised.strategy.age_max, 45);
+      // The actual bug: the creative must survive, and the candidate
+      // question must never come back.
+      assert.deepEqual(revised.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "the already-confirmed creative must survive an unrelated targeting revision — never silently re-derived");
+      assert.ok(!revised.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), `the candidate question must NEVER come back for an unrelated change: ${JSON.stringify(revised.strategy.unresolved_questions)}`);
+      assert.equal(revised.resolved.creative.contentId, "111_3", "campaign mode's real content reference is resolved.creative.contentId — resolved.contentId itself is only ever populated for explicit_action mode");
+
+      // No second Meta call of any kind happened just from proposing this
+      // revision — only execute_strategy spends anything, and it wasn't
+      // called here.
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, campaignWritesBeforeRevision, "merely revising the recommendation must never itself touch Meta");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Revision of executed strategy, round 37] execute_strategy on the revision is blocked with the duplicate-campaign message — NOT the generic 'not approved' gate — and the message names both real ways forward", async () => {
+    const userId = makeUser(`v2-revise-executed-block-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: FIVE_CANDIDATE_POSTS, writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "ALL" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 1 } }, userMessage: "1.",
+      });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId, userMessage: "approve" });
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId,
+        requestedChanges: { gender: "FEMALE", age_min: 22, age_max: 45 },
+        userMessage: "can you please change the gender to female and age limit should be 22-45",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+
+      // The orchestrator-level gate — a bare "approve" must trigger the
+      // SPECIFIC duplicate-campaign message, never the generic "you
+      // haven't approved" one (that would tell the user the wrong thing
+      // entirely — they DID say approve).
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+      assert.ok(gate, "execute_strategy must be blocked here");
+      assert.doesNotMatch(gate, /has not explicitly approved/i, "must NOT be the generic approval-language gate — the user DID say approve; this is a different, specific problem");
+      assert.match(gate, new RegExp(executed.campaignId), "the block must name the REAL existing campaign id");
+      assert.match(gate, /editing an existing campaign isn'?t supported/i);
+      assert.match(gate, /Ads Manager/i, "must name the first real option: change it directly in Meta Ads Manager");
+      assert.match(gate, /separate/i, "must name the second real option: explicitly create a separate campaign");
+
+      // Defense in depth — the actual execute_strategy call, unchanged
+      // "approve" message, must be refused the same way, never reaching
+      // Meta a second time.
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId, userMessage: "approve" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_STRATEGY_REVISES_EXECUTED");
+          assert.match(err.message, new RegExp(executed.campaignId));
+          assert.match(err.message, /Ads Manager/i);
+          assert.match(err.message, /separate/i);
+          return true;
+        }
+      );
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 1, "the blocked attempt must never reach Meta — still only the one real campaign from before the revision");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Revision of executed strategy, round 37] an explicit, unambiguous request to create a separate campaign IS honored — the block is a real way forward, not a dead end", async () => {
+    const userId = makeUser(`v2-revise-executed-override-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: FIVE_CANDIDATE_POSTS, writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "ALL" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 1 } }, userMessage: "1.",
+      });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId, userMessage: "approve" });
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId,
+        requestedChanges: { gender: "FEMALE", age_min: 22, age_max: 45 },
+        userMessage: "can you please change the gender to female and age limit should be 22-45",
+      });
+
+      // A bare "yes"/"approve" must NOT unlock it (same discipline as
+      // round 36's destination-URL/approval collision — a generic word
+      // must never be read as consent to a real, separate spend decision).
+      const bareGate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "yes, approve it" });
+      assert.ok(bareGate, "a bare approval word must still be blocked — it never named a separate campaign");
+
+      // The explicit, unambiguous phrasing DOES clear the gate...
+      const overrideGate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "Yes, please go ahead and approve creating a separate new campaign with these settings." });
+      assert.equal(overrideGate, null, "an explicit, unambiguous request to create a separate campaign must be honored — the block must never be a dead end");
+
+      // ...and executeStrategy (with the SAME message threaded through)
+      // actually creates the second, real campaign.
+      const secondCampaign = await executeStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId,
+        userMessage: "Yes, please go ahead and approve creating a separate new campaign with these settings.",
+      });
+      assert.equal(secondCampaign.status, "PAUSED");
+      assert.notEqual(secondCampaign.campaignId, executed.campaignId, "must be a genuinely NEW, separate campaign, not the original one");
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 2, "exactly two real campaigns must now exist — the original, plus the explicitly-requested separate one");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[rollout] the V2 template is hidden from listTemplates() when the feature flag is disabled for this user", () => {
     const userId = makeUser(`rollout-hidden-${stamp}@example.com`);
     updateFlag("meta_expert_v2", { enabled: false });

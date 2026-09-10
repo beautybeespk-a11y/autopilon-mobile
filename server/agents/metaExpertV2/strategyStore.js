@@ -95,6 +95,35 @@ export function getMostRecentStrategyForConversation(userId, conversationId) {
   );
 }
 
+// Round 37 fix — a revision of an ALREADY-EXECUTED strategy is now
+// permitted (see reviseStrategy, strategyBuilder.js) specifically so the
+// creative/audience/budget already resolved on it survives an unrelated
+// targeting change instead of being silently re-derived from scratch.
+// That new revision row must never let execute_strategy silently create
+// a SECOND, real campaign in Meta — this is the shared lookup both
+// checkV2ExecutionApprovalGate (orchestrator/index.js, the pre-dispatch
+// gate) and executeStrategy's own defense-in-depth check (executor.js)
+// call to detect that case; lives here (not in either caller) because
+// both need it and neither may import from the other. Walks the
+// revisionOf chain, not just the immediate parent — a strategy can be
+// revised more than once after execution, and each new revision's own
+// revisionOf points at the PREVIOUS revision, not the original executed
+// row. Bounded to guard against a pathological/corrupted chain looping
+// forever; a real chain is never anywhere near this deep.
+const MAX_REVISION_CHAIN_WALK = 20;
+export function getExecutedAncestorStrategy(userId, strategy) {
+  let current = strategy;
+  let hops = 0;
+  while (current?.revisionOf && hops < MAX_REVISION_CHAIN_WALK) {
+    const parent = getStoredStrategy(userId, current.revisionOf);
+    if (!parent) return null;
+    if (parent.status === "executed") return parent;
+    current = parent;
+    hops++;
+  }
+  return null;
+}
+
 export function setStrategyStatus(strategyId, status) {
   db.prepare("UPDATE meta_v2_strategies SET status = ?, updatedAt = ? WHERE id = ?").run(status, new Date().toISOString(), strategyId);
 }
