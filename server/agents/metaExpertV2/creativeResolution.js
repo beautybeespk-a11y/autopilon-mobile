@@ -188,9 +188,19 @@ function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty }
   return { ...empty, creative: { source, contentId: chosen.id } };
 }
 
-// strategy: the normalized, merged strategy for THIS call (campaign mode
-// only — explicit_action already has its own resolveContentSelector in
-// strategyBuilder.js, untouched by this module).
+// strategy: the normalized, merged strategy for THIS call — genuinely
+// campaign mode, OR (round 37) strategyBuilder.js's caller passing a
+// SYNTHESIZED view of an explicit_action strategy (mode overridden to
+// "campaign", creative_strategy.source set to EXISTING_PAGE_POST/
+// EXISTING_INSTAGRAM_POST from the real action_type) so
+// BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST get the SAME candidate-list/
+// pendingCreative handling as campaign mode, rather than a second,
+// weaker implementation. The real, stored strategy's own mode/
+// creative_strategy are never touched — only the object passed into this
+// one call is synthetic. explicit_action's OTHER action types
+// (USE_ATTACHED_IMAGE/USE_ATTACHED_VIDEO) still resolve via
+// resolveContentSelector in strategyBuilder.js, untouched by this module
+// — they reference a specific chat attachment, never ambiguous.
 // priorCreative: the PRIOR strategy's resolvedAssets.creative (or null on
 // a fresh build) — the "already resolved, never re-derive" reuse case.
 // priorPendingCreative: the PRIOR strategy's resolvedAssets.pendingCreative
@@ -261,14 +271,22 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
   }
 
   if (!candidates.length) {
-    // EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST with zero usable content
-    // is ALREADY hard-rejected, with a richer, actionable message, by
+    // For a genuine campaign-mode strategy, EXISTING_PAGE_POST/
+    // EXISTING_INSTAGRAM_POST with zero usable content is ALREADY
+    // hard-rejected, with a richer, actionable message, by
     // checkCreativeSourceAvailabilityPolicy (policy.js) — deliberately not
     // duplicated here (a second, blander rejection for the same fact would
-    // just be noise). Only PRODUCT_IMAGE has no earlier check for this,
-    // since nothing previously required a real product image to exist at
-    // all — zero real candidates is a structural gap, not a question the
-    // user can answer by picking, so this is a genuine rejection here.
+    // just be noise). For the explicit_action synthetic case (round 37 —
+    // see this function's header comment), checkCreativeSourceAvailabilityPolicy
+    // never runs (it reads the REAL, un-synthesized strategy, whose
+    // creative_strategy genuinely stays unset) and its advice ("switch to
+    // PRODUCT_IMAGE") wouldn't make sense for a boost action anyway — the
+    // caller (strategyBuilder.js) detects this exact empty-result shape
+    // and raises its own, boost-appropriate message instead. Only
+    // PRODUCT_IMAGE has no earlier check for this, since nothing
+    // previously required a real product image to exist at all — zero
+    // real candidates is a structural gap, not a question the user can
+    // answer by picking, so this is a genuine rejection here.
     if (source !== "PRODUCT_IMAGE") return empty;
     return {
       ...empty,

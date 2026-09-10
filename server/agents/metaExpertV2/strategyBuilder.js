@@ -99,21 +99,20 @@ function resolveContentSelector(strategy, snapshot) {
   if (strategy.mode !== "explicit_action") return { contentId: null, contentError: null };
   const selector = strategy.content_selector || {};
   if (selector.attachedMediaRef) return { contentId: selector.attachedMediaRef, contentError: null };
-
-  const isInstagram = strategy.action_type === "BOOST_INSTAGRAM_POST";
-  const list = isInstagram ? snapshot?.recentContent?.instagramPosts?.items : snapshot?.recentContent?.facebookPosts?.items;
-  if (!Array.isArray(list) || !list.length) {
-    return { contentId: null, contentError: `No recent ${isInstagram ? "Instagram" : "Facebook"} posts were found to boost — check the connected ${isInstagram ? "Instagram account" : "Facebook Page"}.` };
-  }
-  if (selector.confirmedId) {
-    const match = list.find((item) => item.id === selector.confirmedId);
-    if (match) return { contentId: match.id, contentError: null };
-    return { contentId: null, contentError: `"${selector.confirmedId}" is not one of the recent posts this conversation already saw — refer to it by position (the most recent, the second-most-recent, ...) instead of an id.` };
-  }
-  const position = Number.isInteger(selector.position) && selector.position > 0 ? selector.position : 1;
-  const item = list[position - 1];
-  if (!item) return { contentId: null, contentError: `There is no post at position ${position} — only ${list.length} recent post(s) are available.` };
-  return { contentId: item.id, contentError: null };
+  // Round 37 fix (live production report: a boosted post was picked
+  // silently, no candidate list, no confirmation — five real posts
+  // available). BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST used to resolve
+  // here by defaulting content_selector.position to 1 whenever unset,
+  // with NO ambiguity handling and NO independent verification against
+  // the user's own words at all. They now go through the SAME
+  // resolveCreativeSelection (creativeResolution.js) candidate-list/
+  // pendingCreative pipeline campaign mode already uses — see the caller
+  // (runBuildOrRevise below), which synthesizes an EXISTING_PAGE_POST/
+  // EXISTING_INSTAGRAM_POST creative_strategy for exactly these two
+  // action types and folds the result's contentId in directly. This
+  // function is left with only the one case that's genuinely never
+  // ambiguous: a specific file the user attached in this chat.
+  return { contentId: null, contentError: null };
 }
 
 function objectiveLabel(objective) {
@@ -405,11 +404,52 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // inside resolveCreativeSelection, never by this reuse-verbatim lookup.
   const priorPendingCreative = priorStored?.resolvedAssets?.pendingCreative || null;
   const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined;
+  // Round 37 fix (live production report: explicit_action silently picked
+  // a creative with no confirmation — "I'll boost your most recent
+  // Facebook post" with five real candidates available, none asked
+  // about). BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST used to resolve
+  // their content through resolveContentSelector below, which had no
+  // ambiguity handling at all and never independently verified a
+  // model-supplied content_selector against the user's own words — the
+  // exact bug class round 34 already fixed for campaign mode. Rather
+  // than port that logic a second time, these two action types now go
+  // through the SAME resolveCreativeSelection (creativeResolution.js)
+  // candidate-list/pendingCreative pipeline campaign mode uses, by
+  // synthesizing the EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST
+  // creative_strategy shape that function expects (never stored on the
+  // real strategy — normalized.creative_strategy stays unset for
+  // explicit_action everywhere else, exactly as before). USE_ATTACHED_
+  // IMAGE/USE_ATTACHED_VIDEO reference a specific chat attachment, never
+  // ambiguous, and keep going through resolveContentSelector unchanged.
+  const explicitActionCreativeSource = normalized.mode === "explicit_action"
+    ? { BOOST_FACEBOOK_POST: "EXISTING_PAGE_POST", BOOST_INSTAGRAM_POST: "EXISTING_INSTAGRAM_POST" }[normalized.action_type] || null
+    : null;
   const creativeResolution = normalized.mode === "campaign"
     ? resolveCreativeSelection({ strategy: normalized, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage })
-    : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
+    : explicitActionCreativeSource
+      ? resolveCreativeSelection({
+          strategy: { ...normalized, mode: "campaign", creative_strategy: { source: explicitActionCreativeSource, description: normalized.business_goal || "" } },
+          snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage,
+        })
+      : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (creativeResolution.creativeError) {
     resolutionErrors.push({ field: "creative_strategy", message: creativeResolution.creativeError, code: "META_V2_CREATIVE_NOT_FOUND" });
+  }
+  // Preserves resolveContentSelector's old "no recent posts found" message
+  // for the zero-candidates case — resolveCreativeSelection deliberately
+  // returns no error there for EXISTING_PAGE_POST/EXISTING_INSTAGRAM_POST
+  // (its own comment: checkCreativeSourceAvailabilityPolicy already
+  // covers that for campaign mode, with campaign-mode-specific advice —
+  // "switch to PRODUCT_IMAGE" — that makes no sense for a boost action,
+  // so it's deliberately NOT reused here).
+  if (explicitActionCreativeSource && !creativeResolution.creative && !creativeResolution.ambiguousCandidates.length
+    && !creativeResolution.pendingCreative && !creativeResolution.creativeError) {
+    const isInstagram = explicitActionCreativeSource === "EXISTING_INSTAGRAM_POST";
+    resolutionErrors.push({
+      field: "content_selector",
+      message: `No recent ${isInstagram ? "Instagram" : "Facebook"} posts were found to boost — check the connected ${isInstagram ? "Instagram account" : "Facebook Page"}.`,
+      code: "META_V2_CONTENT_NOT_FOUND",
+    });
   }
   if (traceEnabled) {
     trace("creative resolution", {
@@ -493,8 +533,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // naming the real candidates (ids, captions/product names, real
   // engagement or an honest "no engagement data available"), never a
   // silent "use the first one."
+  // explicitActionCreativeSource stands in for normalized.creative_strategy?.
+  // source below wherever the question text needs to say "Facebook post"/
+  // "Instagram post" rather than a generic "item" — normalized.creative_strategy
+  // itself stays genuinely unset for explicit_action (see above).
+  const creativeQuestionSource = normalized.mode === "campaign" ? normalized.creative_strategy?.source : explicitActionCreativeSource;
   if (creativeResolution.ambiguousCandidates.length > 0) {
-    const question = formatCreativeCandidatesQuestion(normalized.creative_strategy?.source, creativeResolution.ambiguousCandidates);
+    const question = formatCreativeCandidatesQuestion(creativeQuestionSource, creativeResolution.ambiguousCandidates);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
@@ -508,6 +553,9 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // orchestrator's final-reply gate (orchestrator/index.js) requires this
   // question to actually reach the customer, not just get generated here.
   if (creativeResolution.pendingCreative) {
+    // .source here is always the real (possibly synthetic, for
+    // explicit_action) source resolveCreativeSelection itself resolved
+    // against — already correct without needing creativeQuestionSource.
     const question = formatCreativeConfirmationQuestion(creativeResolution.pendingCreative.source, creativeResolution.pendingCreative.candidate);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
@@ -559,7 +607,45 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
+  // Round 37 fix — explicit_action's BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST
+  // structurally cannot send a call_to_action/destination link at all
+  // today: meta.boost_post's object_story_id/object_story_spec creative
+  // (tools/meta/campaigns.js) has no such parameter, unlike attachCampaignCreative
+  // (executor.js, campaign mode). A sales/purchase-style objective on a
+  // boosted post would reach Meta and fail exactly the way live incident
+  // (round 37) did for campaign mode — Meta error 100/3858720, "Your
+  // campaign objective requires an external website URL." Refused here
+  // instead, as a genuine structural rejection (never a soft
+  // unresolved_questions ask — there's no answer that makes this work
+  // today; a real fix is tracked separately under the dispatch-
+  // unification project, #3). Checked against BOTH optimization_event and
+  // recommended_objective since explicit_action requires neither, so the
+  // model may have set only one. PURCHASE_LIKE_EVENTS itself isn't
+  // reimported here (policy.js already imports FROM strategySchema.js —
+  // importing back would cycle); the two-value list is small and stable
+  // enough to duplicate directly rather than restructure the module graph
+  // for it.
+  const explicitActionNeedsUnsupportedCta = normalized.mode === "explicit_action"
+    && ["BOOST_FACEBOOK_POST", "BOOST_INSTAGRAM_POST"].includes(normalized.action_type)
+    && (["PURCHASE", "ADD_TO_CART"].includes(normalized.optimization_event) || normalized.recommended_objective === "OUTCOME_SALES");
+  if (explicitActionNeedsUnsupportedCta) {
+    resolutionErrors.push({
+      field: "action_type",
+      message: `Boosting an existing post can't be set up for a Sales/Purchase objective yet — Meta requires a destination URL and call-to-action button for that objective, and this app can't attach one to a boosted post today. Build a full campaign strategy instead (mode: "campaign", creative_strategy.source EXISTING_PAGE_POST or EXISTING_INSTAGRAM_POST) — that path fully supports it — or keep this as a Traffic/Engagement boost if a simple boosted post is genuinely what's wanted.`,
+      code: "META_V2_EXPLICIT_ACTION_CTA_UNSUPPORTED",
+    });
+  }
+
+  // Round 37 fix — for BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST, contentId
+  // now comes from creativeResolution above (the unified pipeline) rather
+  // than resolveContentSelector's own (now-removed) list logic; see that
+  // function's own comment. resolveContentSelector still owns the one
+  // case that's genuinely never ambiguous: a specific file the user
+  // attached in chat (USE_ATTACHED_IMAGE/USE_ATTACHED_VIDEO).
   let { contentId, contentError } = resolveContentSelector(normalized, snapshot);
+  if (explicitActionCreativeSource && creativeResolution.creative) {
+    contentId = creativeResolution.creative.contentId;
+  }
   if (contentError) resolutionErrors.push({ field: "content_selector", message: contentError, code: "META_V2_CONTENT_NOT_FOUND" });
 
   const contextual = validateStrategyAgainstContext(normalized, {
@@ -665,7 +751,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // just the id, exactly as the question invited ("reply with the number,
   // or describe which one").
   const creativeCandidateRefs = creativeResolution.ambiguousCandidates.length
-    ? toCreativeCandidateRefs(normalized.creative_strategy?.source, creativeResolution.ambiguousCandidates)
+    ? toCreativeCandidateRefs(creativeQuestionSource, creativeResolution.ambiguousCandidates)
     : null;
   // pendingCreative (round 34) is stored separately from `creative` and
   // from `creativeCandidates` — it's a single unverified pick awaiting an

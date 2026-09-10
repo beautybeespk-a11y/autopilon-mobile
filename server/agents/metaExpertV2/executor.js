@@ -430,58 +430,107 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
 // Campaign + Ad Set first (Meta's structure requires it), then attaches
 // the actual creative via the SAME internal tools the explicit-action
 // chat flow already uses — called directly, never through LLM dispatch.
-// NOT converted to minor units like executeCampaignMode below — this path
-// creates its campaign directly via api.js (safe to convert) but the ad
-// set goes through the SHARED meta.create_ad_set tool (campaigns.js),
-// which V1 also dispatches directly and which enforces its own
-// assertBudgetWithinCap against MAX_EXECUTABLE_DAILY_BUDGET in MAJOR
-// units — feeding it an already-converted minor-unit number would trip
-// that cap falsely (e.g. 50000 minor units > a 10000-major-unit cap) or
-// require changing campaigns.js itself, which is shared V1 code this
-// rebuild must never touch. Left as a known, separately-flagged gap
-// rather than a half-fix that trades one currency bug for a new false
-// rejection.
-async function executeExplicitAction(stored, accessToken, userId, conversationId) {
+//
+// Round 37 fix (live production incident: Meta error 100/3858558, "budget
+// must be at least PKR250.00" — a PKR 600/day boost reached Meta
+// unconverted, read as PKR 6.00). Ad-set creation now goes through the
+// RAW meta.createAdSet primitive directly (same primitive
+// executeCampaignMode above already uses), not the registered
+// meta.create_ad_set TOOL (campaigns.js) — that tool's own
+// assertBudgetWithinCap checks the raw number against
+// MAX_EXECUTABLE_DAILY_BUDGET in MAJOR units, so handing it an
+// already-converted minor-unit number would trip that cap falsely.
+// Bypassing it is not a protection loss: executeStrategy's own shared
+// pre-check (dailyBudgetAtExecution > MAX_EXECUTABLE_DAILY_BUDGET, major
+// units, above, before EITHER mode dispatches) already enforces the
+// identical cap — campaign mode has never gone through the V1 tool's own
+// check either. campaigns.js itself is untouched by this fix; V1's own
+// direct callers of meta.create_ad_set/meta.boost_post/meta.create_image_ad
+// are unaffected.
+//
+// Bundled with the currency fix (never shipped separately — see round-37
+// discussion): fixing the units alone would let this request reach Meta
+// and spend under Campaign Budget Optimization (a campaign-level
+// dailyBudget was being sent to meta.createCampaign below), the exact
+// budget structure round 31 deliberately rejected for campaign mode
+// after it caused a real bid_amount rejection. No campaign-level budget
+// is sent here anymore, and isAdsetBudgetSharingEnabled is now declared
+// explicitly false (was previously omitted/left to Meta's default) —
+// budget lives ONLY on the ad set (ABO), mirroring executeCampaignMode
+// exactly. bid_strategy is set explicitly in code we control
+// (LOWEST_COST_WITHOUT_CAP) — the same value the now-bypassed V1 tool
+// already hardcoded, so this is not a behavior change, just made visible
+// here. optimization_goal stays hardcoded LINK_CLICKS for now — deriving
+// it from the real objective is a separate, tracked gap (dispatch-
+// unification plan, #7), not part of this fix.
+async function executeExplicitAction(stored, accessToken, userId, conversationId, currency) {
   const { strategy, resolvedAssets } = stored;
   const objective = strategy.recommended_objective || "OUTCOME_ENGAGEMENT";
-  const campaignParams = { name: `${strategy.business_goal} — ${objective}`, objective, dailyBudget: strategy.budget_daily, status: "PAUSED" };
+  // Round 37 defense-in-depth — mirrors the build-time refusal in
+  // strategyBuilder.js (explicitActionNeedsUnsupportedCta) so a strategy
+  // stored in 'proposed' before that check shipped can't slip through:
+  // BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST structurally cannot carry a
+  // call_to_action/destination link (meta.boost_post has no such
+  // parameter), so a sales/purchase-style objective here would reach Meta
+  // and fail with the same error 100/3858720 this whole fix exists to
+  // avoid. Refused before any Meta call, never attempted.
+  if (["BOOST_FACEBOOK_POST", "BOOST_INSTAGRAM_POST"].includes(strategy.action_type)
+    && (["PURCHASE", "ADD_TO_CART"].includes(strategy.optimization_event) || strategy.recommended_objective === "OUTCOME_SALES")) {
+    const err = new Error(`Boosting an existing post can't be set up for a Sales/Purchase objective yet — Meta requires a destination URL and call-to-action button for that objective, and this app can't attach one to a boosted post today. Build a full campaign strategy instead.`);
+    err.code = "META_V2_EXPLICIT_ACTION_CTA_UNSUPPORTED";
+    throw err;
+  }
+  const campaignParams = { name: `${strategy.business_goal} — ${objective}`, objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
   // Diagnostic logging (round 31) — see executeCampaignMode's matching log
   // lines above; kept here too so a live report is distinguishable by
   // which of the two modes actually dispatched (see the dispatch log in
   // executeStrategy below), not assumed from the conversation's shape.
-  logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: { name: campaignParams.name, objective: campaignParams.objective, status: campaignParams.status, daily_budget: campaignParams.dailyBudget, special_ad_categories: [] } });
+  logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: { name: campaignParams.name, objective: campaignParams.objective, status: campaignParams.status, is_adset_budget_sharing_enabled: campaignParams.isAdsetBudgetSharingEnabled, special_ad_categories: [] } });
   const campaign = await meta.createCampaign(accessToken, resolvedAssets.adAccountId, campaignParams);
   logger.info("meta_expert_v2.execute_strategy.explicit_action.campaign_response", { strategyId: stored.id, campaign });
   // Live gap (round 31) — same orphaned-campaign risk as executeCampaignMode
   // above: the campaign is already created by this point, and everything
-  // below it (the shared ad set tool, then the boost/create-image-ad call)
-  // can still fail. Best-effort cleanup on any failure past this point,
-  // same pattern: delete the campaign we just created, log the cleanup
+  // below it (ad set creation, then the boost/create-image-ad call) can
+  // still fail. Best-effort cleanup on any failure past this point, same
+  // pattern: delete the campaign we just created, log the cleanup
   // outcome, and always rethrow the ORIGINAL error — a cleanup failure
   // must never replace the real reason execution failed.
-  let adSetResult;
+  let adSet;
   let creativeResult;
   try {
-    const adSetTool = getTool("meta.create_ad_set");
-    const adSetToolParams = { adAccountId: resolvedAssets.adAccountId, campaignId: campaign.id, name: `${strategy.business_goal} — ad set`, dailyBudget: strategy.budget_daily, optimizationGoal: "LINK_CLICKS", billingEvent: "IMPRESSIONS", countries: strategy.countries || ["PK"] };
-    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_request", { strategyId: stored.id, params: adSetToolParams });
-    adSetResult = await adSetTool.execute(adSetToolParams, { userId, conversationId });
-    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_response", { strategyId: stored.id, adSetResult });
+    const adSetParams = {
+      name: `${strategy.business_goal} — ad set`,
+      campaign_id: campaign.id,
+      daily_budget: toMetaBudgetMinorUnits(strategy.budget_daily, currency),
+      billing_event: "IMPRESSIONS",
+      optimization_goal: "LINK_CLICKS",
+      bid_strategy: "LOWEST_COST_WITHOUT_CAP",
+      targeting: buildTargeting({ countries: strategy.countries || ["PK"] }),
+      status: "PAUSED",
+    };
+    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_request", { strategyId: stored.id, adAccountId: resolvedAssets.adAccountId, body: adSetParams });
+    adSet = await meta.createAdSet(accessToken, resolvedAssets.adAccountId, adSetParams);
+    logger.info("meta_expert_v2.execute_strategy.explicit_action.adset_response", { strategyId: stored.id, adSet });
+    // meta.create_ad_set's own execute() (campaigns.js) published this
+    // event as a side effect — bypassing that tool (see this function's
+    // header comment) means replicating the publish explicitly here, so
+    // ad_set_created automations don't silently stop firing.
+    publishEvent(userId, "meta_ads", "meta_ads_event", { eventSubtype: "ad_set_created", adSetId: adSet.id, campaignId: campaign.id, name: adSetParams.name });
 
     if (strategy.action_type === "BOOST_FACEBOOK_POST") {
       creativeResult = await getTool("meta.boost_post").execute(
-        { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, postId: resolvedAssets.contentId },
+        { adAccountId: resolvedAssets.adAccountId, adSetId: adSet.id, name: strategy.business_goal, postId: resolvedAssets.contentId },
         { userId, conversationId }
       );
     } else if (strategy.action_type === "BOOST_INSTAGRAM_POST") {
       creativeResult = await getTool("meta.boost_post").execute(
-        { adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, name: strategy.business_goal, instagramMediaId: resolvedAssets.contentId, pageId: resolvedAssets.pageId },
+        { adAccountId: resolvedAssets.adAccountId, adSetId: adSet.id, name: strategy.business_goal, instagramMediaId: resolvedAssets.contentId, pageId: resolvedAssets.pageId },
         { userId, conversationId }
       );
     } else if (strategy.action_type === "USE_ATTACHED_IMAGE") {
       creativeResult = await getTool("meta.create_image_ad").execute(
         {
-          adAccountId: resolvedAssets.adAccountId, adSetId: adSetResult.adSetId, pageId: resolvedAssets.pageId, name: strategy.business_goal,
+          adAccountId: resolvedAssets.adAccountId, adSetId: adSet.id, pageId: resolvedAssets.pageId, name: strategy.business_goal,
           imageReferenceId: resolvedAssets.contentId, primaryText: strategy.reasoning_summary, headline: strategy.business_goal, link: "",
         },
         { userId, conversationId }
@@ -501,7 +550,7 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
     throw err;
   }
 
-  const executionResult = { campaignId: campaign.id, adSetId: adSetResult.adSetId, adId: creativeResult.adId, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED" };
+  const executionResult = { campaignId: campaign.id, adSetId: adSet.id, adId: creativeResult.adId, adAccountId: resolvedAssets.adAccountId, pageId: resolvedAssets.pageId, status: "PAUSED" };
   publishEvent(userId, "meta_ads", "meta_ads_event", { eventSubtype: "ad_created", adId: creativeResult.adId, name: strategy.business_goal, source: "meta_expert_v2", format: "explicit_action" });
   return executionResult;
 }
@@ -592,7 +641,7 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     // report can be checked against the real dispatch instead of assumed.
     logger.info("meta_expert_v2.execute_strategy.dispatch", { strategyId: stored.id, mode: stored.mode, adAccountId: stored.resolvedAssets.adAccountId, adAccountCurrency: adAccount.currency });
     const executionResult = stored.mode === "explicit_action"
-      ? await executeExplicitAction(stored, accessToken, userId, conversationId)
+      ? await executeExplicitAction(stored, accessToken, userId, conversationId, adAccount.currency)
       : await executeCampaignMode(stored, accessToken, userId, adAccount.currency);
 
     markStrategyExecuted(stored.id, executionResult);

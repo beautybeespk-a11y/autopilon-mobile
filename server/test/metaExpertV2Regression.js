@@ -1212,7 +1212,13 @@ async function run() {
       chatResponses: [],
       metaOpts: {
         adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
-        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z" }],
+        // permalink_url required (round 37) — BOOST_FACEBOOK_POST now
+        // resolves via the SAME eligibleForPromotion-filtered candidate
+        // pool campaign mode's EXISTING_PAGE_POST uses (businessSnapshot.js:
+        // eligibleForPromotion = Boolean(permalink)) — unrelated to this
+        // test's own focus (reasoning_summary), but required for the post
+        // to count as a real candidate at all.
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
       },
     }));
     try {
@@ -1232,7 +1238,12 @@ async function run() {
         facebook_page: { ref: "default_facebook_page" },
         ad_account: { ref: "default_ad_account" },
       };
-      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post" });
+      // userMessage now names the real post's own caption (round 37 —
+      // BOOST_FACEBOOK_POST's position pick is independently verified
+      // against the raw message, same as campaign mode's EXISTING_PAGE_POST)
+      // so the ordinal position:1 pick actually verifies, unrelated to
+      // this test's own focus.
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
       assert.equal(result.ok, true, JSON.stringify(result.unresolved));
       assert.ok(result.strategy.reasoning_summary && result.strategy.reasoning_summary.trim(), "a real reasoning_summary must be derived, never left blank");
       assert.match(result.strategy.reasoning_summary, /Most recent Facebook Page post/, "the derived fallback must incorporate the strategy's own evidence_used, not be generic boilerplate");
@@ -2397,7 +2408,9 @@ async function run() {
       chatResponses: [],
       metaOpts: {
         adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
-        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z" }],
+        // permalink_url required (round 37) — see the matching comment on
+        // the other explicit_action test above.
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
       },
     }));
     try {
@@ -2417,7 +2430,12 @@ async function run() {
         facebook_page: { ref: "default_facebook_page" },
         ad_account: { ref: "default_ad_account" },
       };
-      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post" });
+      // userMessage names the real post's own caption (round 37 —
+      // independent verification, same as campaign mode) so the ordinal
+      // position:1 pick actually resolves to `creative`, not a pending
+      // confirmation — this test's whole point is asserting the resolved
+      // contentId and executing end-to-end.
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.equal(built.resolved.contentId, "111_999", "position 1 must resolve to the real, most-recent post id from the snapshot — never invented");
       assert.match(built.recommendationText, /boost your most recent Facebook post/i);
@@ -2427,6 +2445,224 @@ async function run() {
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
       assert.equal(executed.status, "PAUSED");
       assert.ok(executed.adId, "the boosted post ad must be created");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- explicit_action dispatch: currency + CBO/ABO (round 37) -----------
+  // Live production incident, exact reproduction: a PKR 600/day
+  // BOOST_FACEBOOK_POST reached Meta and was rejected — error 100/3858558,
+  // "To avoid zero results, your budget must be at least PKR250.00" — 600
+  // > 250, so the real cause was unit mismatch (600 read as PKR 6.00, no
+  // minor-unit conversion). Bundled with the CBO/ABO fix per the explicit
+  // requirement that shipping the currency fix alone (letting the request
+  // start succeeding) would silently reintroduce round 31's bid_amount
+  // failure the moment a campaign-level daily_budget turned CBO back on.
+  await check("[explicit_action execution, round 37] PKR 600/day BOOST_FACEBOOK_POST: the ad set carries the real converted minor-unit budget, the campaign carries none, and budget sharing is explicitly off", async () => {
+    const userId = makeUser(`v2-explicit-currency-abo-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+        writes,
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 600, budget_basis: "USER_PROVIDED", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach among an already-engaged audience.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals! Budget 600/day." });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+
+      const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.daily_budget, 60000, `PKR 600/day must reach Meta as 60000 minor units (600 * 100) — the exact fix for the live incident: ${JSON.stringify(adSetWrite?.body)}`);
+      assert.equal(campaignWrite?.body?.daily_budget, undefined, "the campaign must never carry its own daily_budget — that would silently turn CBO back on, the exact failure round 31 fixed for campaign mode");
+      assert.equal(campaignWrite?.body?.is_adset_budget_sharing_enabled, false, `budget sharing must be explicitly declared off, not left to Meta's default: ${JSON.stringify(campaignWrite?.body)}`);
+      assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "the ad set must send a real, deliberate bid_strategy needing no bid_amount");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Requirement: the ad_set_created automation event must actually fire —
+  // not just have a publishEvent call present in the code — since bypassing
+  // meta.create_ad_set's own execute() (which used to publish it as a side
+  // effect) is exactly the kind of change that can silently stop an
+  // automation trigger from firing. Verified against the real
+  // automation_events table, the same one publishEvent (automation/
+  // triggers.js) actually writes to.
+  await check("[explicit_action execution, round 37] the ad_set_created automation event actually fires (verified in automation_events, not just present in code)", async () => {
+    const userId = makeUser(`v2-explicit-adset-event-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach among an already-engaged audience.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+
+      const events = db.prepare("SELECT * FROM automation_events WHERE userId = ? AND eventType = ?").all(userId, "meta_ads_event");
+      const adSetCreatedEvent = events.find((e) => JSON.parse(e.payload).eventSubtype === "ad_set_created");
+      assert.ok(adSetCreatedEvent, `ad_set_created must actually be published to automation_events, not silently dropped when meta.create_ad_set's tool wrapper is bypassed: ${JSON.stringify(events)}`);
+      const payload = JSON.parse(adSetCreatedEvent.payload);
+      assert.equal(payload.adSetId, executed.adSetId, "the published event must reference the REAL created ad set id");
+      assert.equal(payload.campaignId, executed.campaignId, "the published event must reference the REAL created campaign id");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- explicit_action creative ambiguity (round 37) ----------------------
+  // Live production report: "I'll boost your most recent Facebook post"
+  // was said and executed with NO candidate list and NO confirmation, even
+  // though 5 real posts existed. Mirrors the existing campaign-mode
+  // "[Creative resolution] 2+ real Facebook post candidates" test exactly
+  // — same requirement, now also true for explicit_action.
+  await check("[explicit_action creative resolution, round 37] 2+ real Facebook post candidates, no explicit pick: a real question naming the real ids — never a silent 'boost the most recent one'", async () => {
+    const userId = makeUser(`v2-explicit-creative-ambiguous-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [
+          { id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-03T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/1" },
+          { id: "111_2", message: "Weekend sale, 20% off!", created_time: "2024-03-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2" },
+        ],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost one of my Facebook posts", action_type: "BOOST_FACEBOOK_POST",
+        // content_selector present (required structurally) but empty — no
+        // position/confirmedId — the exact live failure shape: nothing
+        // tells the backend which post, and nothing must silently default
+        // to "the most recent one."
+        content_selector: {},
+        budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting an existing organic post to extend its reach among an already-engaged audience.",
+        evidence_used: ["Facebook Page recent content"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost one of my Facebook posts" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const question = built.strategy.unresolved_questions.find((q) => q.startsWith("Which "));
+      assert.ok(question, `a real candidate-list question must be asked — never a silent pick: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+      assert.match(question, /Facebook post/i, "the question must correctly name it a Facebook post, not a generic 'item' (explicit_action's synthesized source must reach the question formatter)");
+      assert.match(question, /111_1/);
+      assert.match(question, /111_2/);
+      assert.equal(built.strategy.approval_required, true);
+      assert.equal(built.resolved.contentId, null, "no post must be silently chosen while genuinely ambiguous");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- explicit_action CTA-unsupported refusal (round 37, #3) -------------
+  // Required alongside #1/#2/#5: where explicit_action lacks a protection
+  // campaign mode has (a real destination-URL/call_to_action path — see
+  // round 35/36), it must FAIL rather than proceed silently. A
+  // BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST ad structurally cannot carry
+  // a call_to_action today (meta.boost_post has no such parameter) — a
+  // sales/purchase objective on one would reach Meta and fail exactly like
+  // the live incident this whole feature fixed for campaign mode (error
+  // 100/3858720). Refused here instead, at build time, before the user is
+  // ever shown an approvable recommendation.
+  await check("[explicit_action CTA-unsupported refusal, round 37] a BOOST_FACEBOOK_POST strategy with a Sales/Purchase objective is refused at build time with a clear, specific message — never silently approvable", async () => {
+    const userId = makeUser(`v2-explicit-cta-unsupported-build-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post to drive purchases", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, recommended_objective: "OUTCOME_SALES", optimization_event: "PURCHASE",
+        budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to drive purchases.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post to drive purchases" });
+      assert.equal(result.ok, false, "a boosted post structurally cannot support a Sales/Purchase objective today — this must be a real rejection, never a soft ask or a silent approval");
+      assert.match(result.unresolved.issue, /can't be set up for a Sales\/Purchase objective|destination URL and call-to-action/i, `the rejection must clearly explain WHY, not a generic/internal message: ${result.unresolved.issue}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[explicit_action CTA-unsupported refusal, round 37] defense in depth: a stale strategy stored BEFORE this check shipped is still refused at the actual execution call, never reaching Meta", async () => {
+    const userId = makeUser(`v2-explicit-cta-unsupported-exec-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+        writes,
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach among an already-engaged audience.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // Simulate a row stored BEFORE this fix shipped: a sales objective
+      // sitting on a BOOST_FACEBOOK_POST strategy that the (older) build
+      // path never would have refused — never going through the fixed
+      // build-time check at all.
+      const staleStrategy = { ...built.strategy, recommended_objective: "OUTCOME_SALES", optimization_event: "PURCHASE" };
+      db.prepare("UPDATE meta_v2_strategies SET strategyJson = ? WHERE id = ?").run(JSON.stringify(staleStrategy), built.strategyId);
+
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => {
+          assert.equal(err.code, "META_V2_EXPLICIT_ACTION_CTA_UNSUPPORTED");
+          assert.match(err.message, /can't be set up for a Sales\/Purchase objective/i);
+          return true;
+        }
+      );
+      assert.ok(!writes.some((w) => w.path.endsWith("/campaigns")), "a structurally-unsupported case must be refused before any Meta call, never attempted and cleaned up after");
     } finally {
       restoreFetch();
     }
@@ -3006,7 +3242,11 @@ async function run() {
       };
       const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost this specific post" });
       assert.equal(result.ok, false, "a post id that doesn't exist in the current snapshot must never be accepted");
-      assert.match(result.unresolved.issue, /not one of the recent posts/i);
+      // Round 37 — BOOST_FACEBOOK_POST's confirmedId check now goes
+      // through the SAME resolveCreativeSelection campaign mode uses, so
+      // the message is the one that pipeline produces (still an honest,
+      // specific "not a real candidate" rejection, just the unified wording).
+      assert.match(result.unresolved.issue, /not one of the real creative candidates/i);
     } finally {
       restoreFetch();
     }
