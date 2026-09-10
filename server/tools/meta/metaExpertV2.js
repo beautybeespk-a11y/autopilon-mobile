@@ -86,6 +86,7 @@ registerTool({
       budget_basis: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.budget_basis.enum, description: "USER_PROVIDED must be genuinely stated by the user this conversation — the backend independently verifies it against their actual message text and downgrades the claim if it can't." },
       bid_strategy: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.bid_strategy.enum },
       cta: { type: "string", enum: INTERNAL_STRATEGY_SCHEMA.properties.cta.enum },
+      destination_url: { type: "string", description: "The ad's real destination URL — ONLY transcribe this from the user's OWN words this turn (a URL they typed, or an explicit 'yes'/'use that' confirming a URL you already showed them). Never invent one, never assume the connected store's URL without asking first — the backend independently verifies this against their actual message text and clears an unconfirmed claim." },
       campaign_status: { type: "string", enum: ["PAUSED"] },
       reasoning_summary: { type: "string" },
       evidence_used: { type: "array", items: { type: "string" }, description: "Concrete facts actually pulled from the business snapshot — never a vague restatement, never a claim the snapshot didn't actually return." },

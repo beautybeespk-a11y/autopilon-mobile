@@ -213,6 +213,38 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
     throw new Error(`Unrecognized resolved creative source "${creative.source}".`);
   }
 
+  // Round 35 fix (live bug — Meta error 100/3858720: "Your campaign
+  // objective requires an external website URL. Select a call to action
+  // and enter a website URL in the ad creative section."). strategy.cta
+  // is ALWAYS resolved (a real field, real per-objective default — see
+  // strategySchema.js's CTA_DEFAULT_BY_OBJECTIVE) but was never read HERE
+  // for ANY source — every campaign this executor has ever created
+  // shipped with no call-to-action at all. Fixed once, after the source-
+  // specific branch above, so no future source can add itself without
+  // also going through this. Verified empirically against the live Meta
+  // API (v25.0): a top-level call_to_action IS accepted alongside a bare
+  // object_story_id — no object_story_spec.link_data restructuring
+  // needed — POSTing {object_story_id, call_to_action:{type:"SHOP_NOW",
+  // value:{link:...}}} to .../adcreatives returned a real creative id.
+  // destinationLink prefers creative.link (PRODUCT_IMAGE already has a
+  // real, resolved product permalink — unaffected by this fix) and falls
+  // back to strategy.destination_url (EXISTING_PAGE_POST/
+  // EXISTING_INSTAGRAM_POST have no inherent link — see policy.js's
+  // verifyDestinationUrl and strategyBuilder.js's needsDestinationUrl,
+  // which block execute_strategy from ever reaching here without one when
+  // the objective needs it). Never invented here — if both are null (an
+  // objective that doesn't need a link at all), the CTA is sent with no
+  // value, matching a CTA type that needs none (e.g. CONTACT_US).
+  // A CTA value Meta itself rejects surfaces as a normal thrown error from
+  // createAdCreative below — metaFetch (api.js) already preserves Meta's
+  // real message/code/subcode, and nothing here or in executeCampaignMode's
+  // caller catches-and-retries it; the campaign-cleanup catch below
+  // rethrows the ORIGINAL error unchanged after best-effort cleanup.
+  const destinationLink = creative.link || strategy.destination_url || null;
+  if (strategy.cta) {
+    creativeFields.call_to_action = { type: strategy.cta, value: destinationLink ? { link: destinationLink } : undefined };
+  }
+
   logger.info("meta_expert_v2.execute_strategy.creative_request", { strategyId: stored.id, adAccountId, body: creativeFields });
   const adCreative = await meta.createAdCreative(accessToken, adAccountId, creativeFields);
   logger.info("meta_expert_v2.execute_strategy.creative_response", { strategyId: stored.id, adCreative });

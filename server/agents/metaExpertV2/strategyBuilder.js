@@ -17,7 +17,7 @@ import {
   deriveCountriesFromLocationsIfMissing, deriveEmptyArrayFieldsIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
-  checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget,
+  checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget, verifyDestinationUrl,
   checkGoalAlignmentPolicy, checkLiteralGoalSubstitutionPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
@@ -370,6 +370,14 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const needsFreshSnapshot = !priorStored || freshResearchRequired === true;
   const snapshot = needsFreshSnapshot ? await gatherBusinessSnapshot(userId) : priorStored.snapshot;
 
+  // Round 35 fix — verify a claimed destination_url against the user's
+  // own current words before trusting it (same discipline as
+  // verifyUserProvidedBudget above; checked against the RAW requestedChanges,
+  // not the merged object, for the identical "this call's own assertion"
+  // reason). Never silently ships a cached/suggested storeUrl the user
+  // never actually confirmed — see the requirement block below.
+  normalized = verifyDestinationUrl(requestedChanges, normalized, userMessage, snapshot?.business?.storeUrl);
+
   const priorResolved = priorStored
     ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }
     : null;
@@ -440,6 +448,19 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // formatCreativeConfirmationQuestion, creativeResolution.js).
   const isCreativeConfirmationQuestion = (q) => q.startsWith("To confirm — you'd like to use");
   const isPrimaryTextQuestion = (q) => q.startsWith('What ad text would you like for the "');
+  // Round 35 fix (live bug — Meta error 100/3858720: "Your campaign
+  // objective requires an external website URL"). An existing Facebook/
+  // Instagram post carries no link of its own; a website-conversion
+  // objective needs one on the ad creative regardless. Computed here (not
+  // just at the injection block below) so the SAME condition can prune
+  // this question the moment it's no longer true, exactly like the Pixel-
+  // ambiguity/creative-candidates questions above.
+  const isDestinationUrlQuestion = (q) => q.startsWith("This campaign needs a destination website URL");
+  const needsDestinationUrl = normalized.mode === "campaign"
+    && PURCHASE_LIKE_EVENTS.has(normalized.optimization_event)
+    && normalized.conversion_location === "WEBSITE"
+    && ["EXISTING_PAGE_POST", "EXISTING_INSTAGRAM_POST"].includes(normalized.creative_strategy?.source)
+    && !normalized.destination_url;
   if (normalized.unresolved_questions?.length) {
     normalized = {
       ...normalized,
@@ -449,6 +470,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
         if (isCreativeCandidatesQuestion(q)) return creativeResolution.ambiguousCandidates.length > 0;
         if (isCreativeConfirmationQuestion(q)) return Boolean(creativeResolution.pendingCreative);
         if (isPrimaryTextQuestion(q)) return creativeResolution.needsPrimaryTextQuestion;
+        if (isDestinationUrlQuestion(q)) return needsDestinationUrl;
         return true;
       }),
     };
@@ -515,6 +537,22 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // action needs a real budget just as much as a full campaign).
   if (normalized.budget_daily == null) {
     const question = "What daily budget would you like for this?";
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
+  // Round 35 fix — see needsDestinationUrl above. snapshot.business.storeUrl
+  // (businessSnapshot.js, from the connected WooCommerce/Shopify store) is
+  // offered ONLY as a suggested candidate, never assumed — the user's own
+  // words must confirm it (verifyDestinationUrl above), same discipline as
+  // every other confirmable value in this pipeline. Deliberately no
+  // fallback to a hardcoded/cached domain: the store's own domain has
+  // changed before, so a stale value must never reach a real ad without
+  // being named back to the user first.
+  if (needsDestinationUrl) {
+    const suggestedUrl = snapshot?.business?.storeUrl;
+    const question = suggestedUrl
+      ? `This campaign needs a destination website URL for the ad (it'll show on the "${normalized.cta === "SHOP_NOW" ? "Shop Now" : "call-to-action"}" button) — your connected store's URL is ${suggestedUrl}. Should I use that, or a different one?`
+      : `This campaign needs a destination website URL for the ad's call-to-action button — what URL would you like it to link to?`;
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 

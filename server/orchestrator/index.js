@@ -12,7 +12,7 @@ import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS } from "../agents/metaExpertV2/policy.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
@@ -112,7 +112,7 @@ const MAX_NARRATION_NUDGES = 1;
 // it.
 const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|successfully executed|(campaign|strategy|ad ?set)\b.{0,30}\b(is now|has been|will be|was)\b.{0,25}\b(created|running|live|executing|executed|set ?up)\b|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
-function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn }) {
+function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   if (executeCalledThisTurn || reviseCalledThisTurn) return null;
   const claimsCompletion = EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message);
@@ -129,7 +129,12 @@ function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools,
   // reply that already explains what's blocking execution is left alone;
   // only a reply that actively CLAIMS completion (claimsCompletion) is
   // still caught, since that's dishonest regardless of what happened.
-  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage) && !executeGateBlockedThisTurn;
+  // Round 35 follow-up: also excluded via destinationUrlJustAutoConfirmedThisTurn
+  // — this SAME raw userMessage was already spent confirming the
+  // destination URL via the deterministic pre-loop above; it must never
+  // ALSO count as campaign-approval language pushing the model toward
+  // execute_strategy in the same turn (the real risk this fix closes).
+  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage) && !executeGateBlockedThisTurn && !destinationUrlJustAutoConfirmedThisTurn;
   if (!claimsCompletion && !approvedButNeverAttempted) return null;
   if (approvedButNeverAttempted && !claimsCompletion) {
     return 'The user just approved the active strategy in their current message, but meta_expert_v2.execute_strategy was never actually called this turn. Call it now with type "tool_call" — never tell the user the campaign is set up, created, executing, or running unless that tool call actually ran (it requires a separate confirmation step, so say that plainly if it comes back awaiting confirmation, never claim it already spent or executed).';
@@ -353,7 +358,7 @@ export function checkAlreadyExecutedV2Strategy({ userId, conversationId }) {
   return { strategyId: mostRecent.id, campaignId: mostRecent.executionResult.campaignId, adSetId: mostRecent.executionResult.adSetId };
 }
 
-export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage }) {
+export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn }) {
   const active = getActiveStrategyForConversation(userId, conversationId);
   if (!active) {
     const alreadyExecuted = checkAlreadyExecutedV2Strategy({ userId, conversationId });
@@ -361,6 +366,19 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
       return `This strategy has ALREADY been executed — do not rebuild it, and do not call execute_strategy or build_strategy again for this. Campaign ID: ${alreadyExecuted.campaignId}. Ad Set ID: ${alreadyExecuted.adSetId}. The correct reply is to tell the user their campaign already exists (it's paused until they resume it in Meta Ads Manager) and share those two ids in plain language — never describe this as a technical issue or a problem that needs fixing.`;
     }
     return "No active strategy exists for this conversation yet. Call meta_expert_v2.build_strategy first (after meta_expert_v2.get_business_snapshot if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
+  }
+  // Round 35 follow-up (real risk, confirmed by trace): the destination-
+  // URL auto-revise pre-loop (orchestrator/index.js) can resolve the LAST
+  // open question off a bare "yes" — the SAME raw userMessage
+  // messageIndicatesExecutionApprovalV2 below would otherwise read as
+  // campaign approval. Checked BEFORE that call, unconditionally — this
+  // is the real dispatch boundary (the nudge in
+  // checkExecutionClaimWithoutCallGate is advisory only; this is what
+  // actually decides whether real money gets spent), so it must hard-
+  // block here even if the model calls this tool anyway despite that
+  // nudge already being suppressed.
+  if (destinationUrlJustAutoConfirmedThisTurn) {
+    return "This message was just used to confirm the destination URL for this campaign — that confirmation has been saved, but it is NOT approval to execute the campaign, and execute_strategy has been blocked. Tell the user plainly: the URL is saved, the campaign has NOT been created yet, and they need to say \"approve\" (or similar) separately to actually launch it. Present the now-complete, updated recommendation and wait for that explicit, separate approval before calling execute_strategy again.";
   }
   if (!messageIndicatesExecutionApprovalV2(userMessage)) {
     return 'The user has not explicitly approved the current strategy in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
@@ -1003,6 +1021,19 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // genuinely never tried" from "the model tried, got a clear pre-check
   // reason, and is now honestly relaying it."
   let executeGateBlockedThisTurn = false;
+  // Round 35 follow-up (real risk, confirmed by trace, not hypothetical):
+  // the destination-URL auto-revise pre-loop below can resolve the LAST
+  // open question using a bare "yes" — the SAME raw userMessage that
+  // messageIndicatesExecutionApprovalV2 (checkExecutionClaimWithoutCallGate
+  // and checkV2ExecutionApprovalGate) independently reads as campaign
+  // approval. Compounded, a "yes" meant only to confirm a URL could
+  // silently launch a real campaign in the same turn — the user meant one
+  // thing and got a live campaign. Set true ONLY when that pre-loop
+  // actually auto-confirmed the URL via affirmation this turn; threaded
+  // into both gates below so THIS SAME message can never also approve
+  // execution — a separate, later "approve" is required once the model
+  // re-presents the now-complete recommendation.
+  let destinationUrlJustAutoConfirmedThisTurn = false;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
@@ -1222,6 +1253,60 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     }
   }
 
+  // Live bug (round 35 — Meta error 100/3858720): an existing-post sales
+  // campaign needs a real destination URL for the ad's call-to-action,
+  // and nothing ever asked for one. Same fix shape as the budget/Pixel/
+  // creative auto-revise blocks above — the model cannot be relied on to
+  // reliably call revise_strategy for a plain-text answer to its own
+  // question. Deliberately narrow: only handles the single most common,
+  // safest case — an explicit whole-message affirmation ("yes") of the
+  // ONE candidate this codebase can ever suggest (the connected store's
+  // URL). A user typing a DIFFERENT/new URL in chat is left to the model
+  // to relay via revise_strategy's destination_url parameter, which
+  // strategyBuilder.js's verifyDestinationUrl (policy.js) then
+  // independently verifies against the raw message before trusting it —
+  // deliberately not attempting free-text URL extraction here, which
+  // would risk exactly the kind of unverified guess this whole fix exists
+  // to prevent.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const openQuestion = activeStrategy?.strategy?.unresolved_questions?.find((q) => q.startsWith("This campaign needs a destination website URL"));
+    const suggestedUrl = activeStrategy?.snapshot?.business?.storeUrl;
+    if (activeStrategy && openQuestion && suggestedUrl && messageAffirmsSuggestedUrl(userMessage)) {
+      try {
+        const accessToken = requireValidToken(userId, "meta_ads");
+        const revised = await reviseStrategyV2({
+          userId, conversationId, accessToken, strategyId: activeStrategy.id,
+          requestedChanges: { destination_url: suggestedUrl },
+          userMessage,
+        });
+        if (revised.ok) {
+          destinationUrlJustAutoConfirmedThisTurn = true;
+          trace.push(traceStep("tool", "Auto-saved the destination URL you just confirmed (meta_expert_v2.revise_strategy)", "done"));
+          toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+          const lastIdx = conversationForModel.length - 1;
+          const last = conversationForModel[lastIdx];
+          if (last?.role === "user" && typeof last.content === "string") {
+            // Deliberately does NOT say "you may now call execute_strategy"
+            // — this message's affirmation was spent confirming the URL,
+            // never doubles as campaign approval (see
+            // destinationUrlJustAutoConfirmedThisTurn below, which backend-
+            // enforces this regardless of what the model does with this
+            // note).
+            conversationForModel = [
+              ...conversationForModel.slice(0, lastIdx),
+              { ...last, content: `${last.content}\n\n[System note: this message's confirmed destination URL (${suggestedUrl}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} This message confirmed the URL ONLY — it is NOT approval to execute the campaign. Present the now-complete recommendation and wait for the user's separate, explicit approval before calling meta_expert_v2.execute_strategy.]` },
+            ];
+          }
+        } else {
+          v2Trace("auto-revise destination_url failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+        }
+      } catch (err) {
+        v2Trace("auto-revise destination_url failed (error)", { conversationId, error: err.message });
+      }
+    }
+  }
+
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
     const completion = await chatComplete({
@@ -1308,7 +1393,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
             executeCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) > 0,
             reviseCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0,
-            executeGateBlockedThisTurn,
+            executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn,
           })
         : null;
       if (executionClaimGateMessage && executionClaimNudges < MAX_EXECUTION_CLAIM_NUDGES) {
@@ -1708,7 +1793,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // active strategy yet, or no approval language) doesn't consume
         // the once-per-turn dispatch budget, only a genuine execution
         // attempt that reaches runTool() below does.
-        const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage });
+        const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn });
         if (gateError) {
           outcome = { status: "failed", error: gateError };
           executeGateBlockedThisTurn = true;

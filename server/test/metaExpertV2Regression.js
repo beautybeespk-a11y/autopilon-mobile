@@ -3227,14 +3227,21 @@ async function run() {
     try {
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_INSTAGRAM_POST", description: "Use the recent Instagram post." } }),
-        userMessage: "I want more sales on my website",
+        // destination_url is required for a sales/PURCHASE + existing-post
+        // creative (round 35's destination-URL gate) — supplied and
+        // verified here (the raw userMessage literally contains it) since
+        // this test's own focus is the instagram_user_id field, not that
+        // gate; see the dedicated destination-URL tests elsewhere.
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_INSTAGRAM_POST", description: "Use the recent Instagram post." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
 
       const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite?.body?.call_to_action?.type, "SHOP_NOW", "round 35: call_to_action must now be sent for every source, including EXISTING_INSTAGRAM_POST");
+      assert.equal(creativeWrite?.body?.call_to_action?.value?.link, "https://example.com");
       assert.equal(creativeWrite?.body?.object_story_spec?.instagram_user_id, "ig_acct_1");
       assert.equal(creativeWrite?.body?.instagram_actor_id, undefined, "instagram_actor_id was deprecated in Marketing API v22.0 and must never be sent");
       assert.equal(creativeWrite?.body?.object_story_spec?.source_instagram_media_id, "179999999");
@@ -3969,8 +3976,13 @@ async function run() {
     try {
       const built = await buildStrategy({
         userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post about the Vitamin C Serum." } }),
-        userMessage: "I want more sales on my website",
+        // destination_url supplied+verified (round 35's destination-URL
+        // gate, unrelated to this test's actual focus — see baseStrategy's
+        // default OUTCOME_SALES/PURCHASE/WEBSITE) so the only open
+        // question this test observes is genuinely about creative
+        // resolution, not the separate URL requirement.
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post about the Vitamin C Serum." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.deepEqual(built.strategy.unresolved_questions, [], "a single real candidate must auto-resolve, never ask");
@@ -4012,10 +4024,14 @@ async function run() {
     mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST, secondPost] } }));
     let built;
     try {
+      // destination_url supplied+verified up front (round 35's destination-
+      // URL gate, unrelated to this test's actual focus on creative-pick
+      // persistence) so the only unresolved_questions entry exercised
+      // below is genuinely the creative-candidate one.
       built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." } }),
-        userMessage: "I want more sales on my website",
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.ok(built.strategy.unresolved_questions.length, "must genuinely be ambiguous first");
@@ -4117,10 +4133,14 @@ async function run() {
     mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
     let built;
     try {
+      // destination_url supplied+verified up front (round 35's destination-
+      // URL gate, unrelated to this test's actual focus on pendingCreative
+      // affirmation) so the final unresolved_questions assertion below
+      // reflects only the creative confirmation, not a second open question.
       built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
-        userMessage: "use one of my facebook page posts as the ad",
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
 
@@ -4461,10 +4481,15 @@ async function run() {
     const originalInfo = logger.info;
     logger.info = (message, context) => { loggedInfos.push({ message, context }); };
     try {
+      // destination_url supplied+verified up front — round 35's live bug
+      // (Meta error 100/3858720) was exactly this scenario: an OUTCOME_SALES
+      // /PURCHASE campaign attaching an EXISTING_PAGE_POST creative with no
+      // link/CTA. Confirmed live against Meta's real API that a top-level
+      // call_to_action IS accepted alongside a bare object_story_id.
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
-        userMessage: "I want more sales on my website",
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://beautybees.pk" }),
+        userMessage: "I want more sales on my website, link it to https://beautybees.pk",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
@@ -4477,6 +4502,10 @@ async function run() {
 
       const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
       assert.equal(creativeWrite?.body?.object_story_id, "111_1", "the real, resolved post id must be sent to Meta — never invented");
+      // Round 35: the exact fix for the live bug — call_to_action must be
+      // sent alongside object_story_id, using the confirmed destination_url.
+      assert.equal(creativeWrite?.body?.call_to_action?.type, "SHOP_NOW");
+      assert.equal(creativeWrite?.body?.call_to_action?.value?.link, "https://beautybees.pk");
       const adWrite = writes.find((w) => w.path.endsWith("/ads"));
       assert.equal(adWrite?.body?.status, "PAUSED");
       assert.equal(adWrite?.body?.creative?.creative_id, executed.creativeId);
@@ -4525,6 +4554,11 @@ async function run() {
       assert.equal(creativeWrite.body.object_story_spec.link_data.message, "A brightening serum with 15% Vitamin C for daily use.", "primaryText in the real request must be the product's own real description");
       assert.equal(creativeWrite.body.object_story_spec.link_data.name, "Vitamin C Serum");
       assert.equal(creativeWrite.body.object_story_spec.link_data.link, "https://store.example.com/product/vitamin-c-serum/");
+      // Round 35: call_to_action must now be sent for every source,
+      // including PRODUCT_IMAGE (which never needed destination_url — it
+      // already has a real link via creative.link, used directly here).
+      assert.equal(creativeWrite.body.call_to_action?.type, "SHOP_NOW");
+      assert.equal(creativeWrite.body.call_to_action?.value?.link, "https://store.example.com/product/vitamin-c-serum/");
     } finally {
       restoreFetch();
     }
@@ -4566,8 +4600,8 @@ async function run() {
     try {
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
-        userMessage: "I want more sales on my website",
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
@@ -4593,8 +4627,8 @@ async function run() {
     try {
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
-        userMessage: "I want more sales on my website",
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
     } finally {
@@ -4611,6 +4645,290 @@ async function run() {
         () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: getActiveStrategyForConversation(userId, conversationId).id }),
         /verification failed/i
       );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Destination URL gate (round 35) -------------------------------
+  // Live bug: execute_strategy reached Meta for real and was rejected —
+  // Meta error 100/3858720, "Your campaign objective requires an external
+  // website URL. Select a call to action and enter a website URL in the
+  // ad creative section." An OUTCOME_SALES/PURCHASE campaign whose
+  // creative is an existing organic post (no inherent link) needs a real
+  // destination URL. Never invented: the connected store's URL is only
+  // ever offered as a suggested candidate, confirmed by the user's own
+  // words — the store's domain has changed at least once already
+  // (beautybees.store -> beautybees.pk), so a cached value must never
+  // ship silently in an ad meant to send real traffic.
+  await check("[Destination URL gate] a sales/PURCHASE campaign with an existing-page-post creative and no destination_url gets a real question suggesting the connected store's URL", async () => {
+    const userId = makeUser(`v2-desturl-suggest-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] }, wcProducts: [{ id: 1, name: "Serum", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/p/1/" }] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const question = built.strategy.unresolved_questions.find((q) => q.startsWith("This campaign needs a destination website URL"));
+      assert.ok(question, `a real destination-URL question must be asked: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+      assert.match(question, /https:\/\/store\.example\.com/, "the connected store's REAL url must be suggested — never invented, never omitted");
+      assert.equal(built.strategy.approval_required, true);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] no store connected: asks for a URL directly, with no invented suggestion", async () => {
+    const userId = makeUser(`v2-desturl-nostore-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const question = built.strategy.unresolved_questions.find((q) => q.startsWith("This campaign needs a destination website URL"));
+      assert.ok(question, "a real destination-URL question must still be asked with no store connected");
+      assert.doesNotMatch(question, /https?:\/\//, "with no real store URL to suggest, nothing invented must appear — a plain, open ask only");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] PRODUCT_IMAGE is exempt — it already has a real link, no question asked even for a sales/PURCHASE objective", async () => {
+    const userId = makeUser(`v2-desturl-productimage-exempt-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(!built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), `PRODUCT_IMAGE already has creative.link — must never be asked: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] a non-conversion objective is exempt — no question even with an existing-post creative", async () => {
+    const userId = makeUser(`v2-desturl-engagement-exempt-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], posts: [CREATIVE_TEST_POST] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({
+          recommended_objective: "OUTCOME_ENGAGEMENT", optimization_event: "LINK_CLICKS", conversion_location: "WEBSITE", cta: "LEARN_MORE",
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." },
+        }),
+        userMessage: "I want more engagement on my recent post",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(!built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), `an engagement objective genuinely doesn't need a destination link: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] a URL the user literally typed is verified and accepted directly", async () => {
+    const userId = makeUser(`v2-desturl-typed-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: must genuinely need one first");
+
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { destination_url: "https://beautybees.pk" },
+        userMessage: "Use https://beautybees.pk please.",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.strategy.destination_url, "https://beautybees.pk", "a URL literally present in the user's own message must be accepted");
+      assert.ok(!answered.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must clear once a verified URL is set");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] a destination_url the model claims WITHOUT it appearing in the user's own message is never trusted — cleared, question stays open", async () => {
+    const userId = makeUser(`v2-desturl-unverified-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      // The model asserts a destination_url on its own initiative — the
+      // user's actual message never mentioned any URL at all. Same live-
+      // bug shape as the creative pendingCreative fix: a model-supplied
+      // claim is never trusted without independent verification.
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { destination_url: "https://beautybees.store" },
+        userMessage: "Sounds good, go ahead.",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.strategy.destination_url, null, "an unverified model claim must be cleared, never silently trusted — especially a possibly-stale domain");
+      assert.ok(answered.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must stay open, never silently answered");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] the auto-revise pre-loop: an explicit 'yes' confirms the suggested store URL before the model's turn", async () => {
+    const userId = makeUser(`v2-desturl-autorevise-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] }, wcProducts: [{ id: 1, name: "Serum", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/p/1/" }] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] },
+      chatResponses: [finalText("Great — I've saved that URL. Approve to proceed?")],
+    }));
+    try {
+      // "use that" — affirms the SUGGESTED URL specifically (matches
+      // URL_AFFIRMATION_PATTERN, policy.js). A bare "yes" here ALSO
+      // happens to read as campaign-approval language
+      // (messageIndicatesExecutionApprovalV2) — round 35's follow-up fix
+      // (destinationUrlJustAutoConfirmedThisTurn) specifically stops that
+      // SAME message from also approving execution; see the dedicated
+      // test right below this one for that exact scenario.
+      const userMessage = "use that";
+      await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active.strategy.destination_url, "https://store.example.com", "an explicit affirmation must deterministically confirm the suggested store URL BEFORE the model's turn — never left to the model's own relay");
+      assert.ok(!active.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must be cleared");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Destination URL gate] a bare 'yes' confirms the URL but must NEVER also approve execution — the campaign is not created, and the reply says so plainly", async () => {
+    const userId = makeUser(`v2-desturl-yes-not-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], writes }, wcProducts: [{ id: 1, name: "Serum", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/p/1/" }] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: must genuinely be the last open question");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], writes },
+      // The model tries execute_strategy anyway — simulating a model that
+      // (despite the system note explicitly saying this message is NOT
+      // approval) still reads "yes" as approval on its own. Proves the
+      // HARD backend block (checkV2ExecutionApprovalGate), not just the
+      // advisory nudge — real safety can't depend on the model behaving.
+      chatResponses: [
+        toolCall("meta_expert_v2.execute_strategy", {}),
+        finalText("Got it — I've saved your confirmed destination URL. The campaign hasn't been created yet — just say \"approve\" whenever you're ready to launch it."),
+      ],
+    }));
+    try {
+      const userMessage = "yes";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active.strategy.destination_url, "https://store.example.com", "the URL confirmation itself must still go through");
+      assert.ok(!active.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the URL question must be cleared");
+
+      // The real safety property: no campaign was actually created.
+      assert.ok(!writes.some((w) => w.path.endsWith("/campaigns")), `a bare 'yes' confirming the URL must NEVER also launch a real campaign: ${JSON.stringify(writes)}`);
+      assert.equal(active.status, "proposed", "the strategy must remain unexecuted — 'approved'/'executed' would mean it actually ran");
+
+      // Requirement: the reply must make it obvious what happened — a
+      // user who said "yes" and sees no explanation would assume it failed.
+      assert.doesNotMatch(result.reply, /is now|has been created|is running|is live/i, "must never claim the campaign was created");
+      assert.match(result.reply, /hasn'?t been created|not.{0,15}created|say ["“]?approve/i, `the reply must plainly say the campaign is NOT created and name what to do next: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Executor CTA] a Meta rejection of the call_to_action/link surfaces with Meta's own real error message — never swallowed, never silently retried", async () => {
+    const userId = makeUser(`v2-cta-rejected-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST],
+        writes,
+        // Simulates Meta genuinely rejecting the call_to_action/link combination
+        // this fix now sends — a real, specific Meta error, distinct from a
+        // generic failure, so this test proves it reaches the caller verbatim.
+        writeError: { pathSuffix: "/adcreatives", status: 400, error: { message: "Invalid call_to_action type for this destination.", code: 100, error_subcode: 3858721 }, failWhen: (body) => Boolean(body.call_to_action) },
+      },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => {
+          assert.equal(err.code, 100);
+          assert.equal(err.subcode, 3858721);
+          assert.match(err.message, /Invalid call_to_action type for this destination/, "Meta's own real message must reach the caller verbatim — never a generic/swallowed replacement");
+          return true;
+        }
+      );
+      const creativeWrites = writes.filter((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrites.length, 1, "a rejected creative call must never be silently retried");
     } finally {
       restoreFetch();
     }

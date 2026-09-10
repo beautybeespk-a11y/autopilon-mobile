@@ -61,6 +61,10 @@
       "type": "string",
       "enum": ["SHOP_NOW", "LEARN_MORE", "SIGN_UP", "DOWNLOAD", "CONTACT_US", "GET_QUOTE", "SUBSCRIBE", "BOOK_TRAVEL", "APPLY_NOW"]
     },
+    "destination_url": {
+      "type": ["string", "null"],
+      "description": "The ad's real destination website URL, required when the creative has no inherent link of its own (an existing Facebook/Instagram post) and the objective needs one (a website-conversion campaign). Never invented — only ever a value the user has actually confirmed this conversation, verified against their own raw words by the backend. Omit/null when not yet resolved; the backend asks for it as a real unresolved_questions entry."
+    },
     "campaign_status": { "type": "string", "enum": ["PAUSED"] },
     "reasoning_summary": { "type": "string" },
     "evidence_used": {
