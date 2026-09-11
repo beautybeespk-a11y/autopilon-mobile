@@ -1936,6 +1936,108 @@ async function run() {
     }
   });
 
+  // --- Pixel name lost on reuse (round 42) ---------------------------------
+  // Live bug: production logs showed resolvedPixelId correctly set
+  // ("1241102478031429"), pixelAmbiguous: false, usablePixelForSelectedAdAccount:
+  // true — resolution was completely healthy — yet the summary printed
+  // "Pixel: (none)". Root cause: the Pixel's display name was only ever
+  // computed on a FRESH resolution (nameFrom(available, pixelId)); the
+  // REUSE branch (priorResolved.pixelId && adAccountReused — the branch
+  // every revision after the first takes) set resolved.pixelId but never
+  // carried names.pixelName forward at all, unlike the matching ad_account/
+  // facebook_page reuse branches which both already did. Compounded by
+  // priorResolved itself (strategyBuilder.js) never including pixelName in
+  // the object it builds from the prior row, so there was nothing to carry
+  // even if the reuse branch had tried.
+  await check("[Pixel name reuse, round 42] a Pixel resolved on the FIRST build still shows its real name in the summary on a LATER, unrelated revision — not \"(none)\"", async () => {
+    const userId = makeUser(`v2-pixelname-reuse-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1241102478031429", name: "Working Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ pixel: { ref: "1241102478031429" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.match(built.recommendationText, /Pixel: Working Pixel/, "sanity: the FIRST build must show the real name");
+
+      // An unrelated revision — audience only, never touches the Pixel —
+      // takes the REUSE branch (priorResolved.pixelId && adAccountReused),
+      // the exact shape the live bug hit.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        // age_min/age_max differ from baseStrategy's own defaults (21-44) —
+        // gender is deliberately omitted since baseStrategy already
+        // defaults to FEMALE (checkRevisionSubstantive correctly rejects a
+        // requestedChanges field that doesn't actually change).
+        requestedChanges: { age_min: 25, age_max: 40, audience_reasoning: "Narrowing to the store's actual customer base." },
+        userMessage: "narrow the audience to 25-40",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.resolved.pixelId, "1241102478031429", "sanity: resolution itself must still be correct");
+      assert.match(revised.recommendationText, /Pixel: Working Pixel/, "the real Pixel name must survive a later, unrelated revision — not fall back to \"(none)\" just because the Pixel was reused rather than freshly resolved");
+      assert.doesNotMatch(revised.recommendationText, /Pixel: \(none\)/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Never deny a resolved value in the summary (round 42) --------------
+  // Requirement: a summary line must never print "(none)"/"(not resolved)"
+  // when an id IS genuinely resolved — with silent per-user defaults, this
+  // summary is the only place a wrong value becomes visible, and a summary
+  // line that denies a resolved value is worse than an ugly one. Applied as
+  // defense-in-depth independent of the reuse-branch fix above: even a
+  // genuinely FRESH resolution whose name lookup comes back empty (Meta
+  // returning no `name` field, a possible real-world shape) must fall back
+  // to the raw id, never a value-denying placeholder.
+  await check("[summary never denies a resolved value, round 42] a Pixel resolved with no real NAME available from Meta shows its id, never \"(none)\"", async () => {
+    const userId = makeUser(`v2-pixel-noname-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // Meta's own listPixels response with no `name` field — nameFrom must
+    // return null here, exercising the fallback on a FRESH resolution.
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1241102478031429" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ pixel: { ref: "1241102478031429" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, "1241102478031429", "sanity: resolution must still succeed with no name available");
+      assert.match(built.recommendationText, /Pixel: 1241102478031429/, "a resolved id with no available name must be shown AS the id, never denied");
+      assert.doesNotMatch(built.recommendationText, /Pixel: \(none\)/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[summary never denies a resolved value, round 42] the same rule applies to Ad Account — a resolved id with no available name shows the id, never \"(not resolved)\"", async () => {
+    const userId = makeUser(`v2-adaccount-noname-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy(),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.adAccountId, "act_1", "sanity: resolution must still succeed with no name available");
+      assert.match(built.recommendationText, /Ad Account: act_1/, "a resolved id with no available name must be shown AS the id, never denied");
+      assert.doesNotMatch(built.recommendationText, /Ad Account: \(not resolved\)/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Objective/optimization_event/promoted_object validation (round 31) --
   // Explicit request: rather than fixing one Meta-rejected field per round,
   // validate the whole combination before sending and fail with a clear

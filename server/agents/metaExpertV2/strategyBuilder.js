@@ -171,7 +171,21 @@ function formatGoalAlignmentNote(strategy) {
   return parts.join(" ");
 }
 
-function formatRecommendation(strategy, names) {
+// Round 42 fix — live bug (see the pixelName carry-forward fixes above):
+// when a display NAME lookup fails for any reason, the summary line must
+// never claim the field is unresolved/none if a real id WAS actually
+// resolved — a wrong-looking id is still honest and visible; "(none)"/
+// "(not resolved)" actively denies a value the customer needed to see
+// before approving. Falls back to the emptyLabel only when there's truly
+// no id either. Applied to Ad Account/Facebook Page/Pixel — the three
+// summary lines that show a resolved NAME with an id behind it.
+// Destination URL doesn't share this shape (it displays the raw value
+// itself, no separate name/id split), so it's untouched.
+function assetSummaryValue(name, id, emptyLabel) {
+  return name || id || emptyLabel;
+}
+
+function formatRecommendation(strategy, names, resolved) {
   if (strategy.mode === "explicit_action") {
     const actionLabel = {
       BOOST_FACEBOOK_POST: "boost your most recent Facebook post",
@@ -188,9 +202,9 @@ function formatRecommendation(strategy, names) {
     const lines = [
       `I'll ${actionLabel}.`,
       ``,
-      `Ad Account: ${names.adAccountName || "(not resolved)"}`,
-      `Facebook Page: ${names.pageName || "(not resolved)"}`,
-      `Pixel: ${names.pixelName || "(none)"}`,
+      `Ad Account: ${assetSummaryValue(names.adAccountName, resolved?.adAccountId, "(not resolved)")}`,
+      `Facebook Page: ${assetSummaryValue(names.pageName, resolved?.pageId, "(not resolved)")}`,
+      `Pixel: ${assetSummaryValue(names.pixelName, resolved?.pixelId, "(none)")}`,
       `Destination URL: ${strategy.destination_url || "(not set)"}`,
       `Budget: ${budgetLine}`,
       `Status: Paused (won't spend until you approve)`,
@@ -229,9 +243,9 @@ function formatRecommendation(strategy, names) {
     // about — this summary is the only place a stale/wrong default
     // becomes visible before approval, so Ad Account/Pixel/Destination URL
     // always appear here, not just when freshly resolved this turn.
-    `Ad Account: ${names.adAccountName || "(not resolved)"}`,
-    `Facebook Page: ${names.pageName || "(not resolved)"}`,
-    `Pixel: ${names.pixelName || "(none)"}`,
+    `Ad Account: ${assetSummaryValue(names.adAccountName, resolved?.adAccountId, "(not resolved)")}`,
+    `Facebook Page: ${assetSummaryValue(names.pageName, resolved?.pageId, "(not resolved)")}`,
+    `Pixel: ${assetSummaryValue(names.pixelName, resolved?.pixelId, "(none)")}`,
     `Destination URL: ${strategy.destination_url || "(not set)"}`,
   );
   if (names.instagramUsername) lines.push(`Instagram: @${names.instagramUsername}`);
@@ -438,8 +452,16 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     learnConnectionDefault(userId, "meta_ads", "destinationUrl", normalized.destination_url);
   }
 
+  // Round 42 fix — live bug: pixelName was missing from this object (every
+  // other reused asset's display name — adAccountName, pageName — was
+  // already carried forward here), so a revision that reused an
+  // already-resolved Pixel via priorResolved (assetResolution.js's own
+  // reuse branch — the common case after the FIRST turn that resolves it)
+  // never had a name to carry, and the summary fell back to "(none)" even
+  // though resolvedPixelId was genuinely set. Resolution itself was never
+  // wrong — only this display value was lost on every subsequent turn.
   const priorResolved = priorStored
-    ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }
+    ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, pixelName: priorStored.resolvedAssets.pixelName, catalogId: priorStored.resolvedAssets.catalogId }
     : null;
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
     await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot, userMessage });
@@ -850,7 +872,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // is the dedicated affirmation check inside resolveCreativeSelection —
   // never a re-guess).
   const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative };
-  const recommendationText = formatRecommendation(normalized, names);
+  const recommendationText = formatRecommendation(normalized, names, resolved);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
     resolved: resolvedForStorage, names, snapshotVersion: snapshot.version, snapshot, recommendationText, revisionOf,

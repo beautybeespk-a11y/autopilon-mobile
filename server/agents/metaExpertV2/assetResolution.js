@@ -148,7 +148,15 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
   let availablePixels = [];
   if ((strategy.pixel || PURCHASE_LIKE_EVENTS.has(strategy.optimization_event) || strategy.mode === "explicit_action") && resolved.adAccountId) {
     if (priorResolved?.pixelId && adAccountReused && !explicitAssetChanges.has("pixel")) {
+      // Round 42 fix — live bug: this branch set resolved.pixelId but
+      // never carried the display name forward at all, unlike the
+      // matching ad_account/facebook_page reuse branches above (which both
+      // already do `names.xName = priorResolved.xName || null`). Every
+      // revision after the FIRST one that resolves a Pixel takes this
+      // branch, so the summary showed "Pixel: (none)" on every turn past
+      // the first even though resolution was completely correct.
       resolved.pixelId = priorResolved.pixelId;
+      names.pixelName = priorResolved.pixelName || null;
     } else {
       try {
         // Round 31 fixed "revise_strategy never gets called for a plain-
