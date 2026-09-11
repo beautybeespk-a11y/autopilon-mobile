@@ -460,9 +460,28 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
 // exactly. bid_strategy is set explicitly in code we control
 // (LOWEST_COST_WITHOUT_CAP) — the same value the now-bypassed V1 tool
 // already hardcoded, so this is not a behavior change, just made visible
-// here. optimization_goal stays hardcoded LINK_CLICKS for now — deriving
-// it from the real objective is a separate, tracked gap (dispatch-
-// unification plan, #7), not part of this fix.
+// here. optimization_goal was hardcoded LINK_CLICKS unconditionally until
+// round 39 — deriving it from the real objective/optimization_event
+// remains a separate, tracked gap (dispatch-unification plan, #7); what
+// round 39 fixes is narrower: BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST's
+// object_story_id creative reuses an EXISTING post, which usually has no
+// link of its own, so requesting LINK_CLICKS optimization on it fails at
+// Meta with error 100/1815520 ("the link in this ad is either missing or
+// invalid for Link Click Ads optimization") the moment the boosted post
+// happens to be a plain photo/text post — see explicitActionOptimizationGoal
+// below.
+function explicitActionOptimizationGoal(actionType) {
+  // A boosted existing post (object_story_id creative) structurally has no
+  // link field at all (see explicitActionNeedsUnsupportedCta's matching
+  // comment, strategyBuilder.js) — POST_ENGAGEMENT is Meta's own correct
+  // goal for this shape (exactly what Meta's own "Boost Post" UI defaults
+  // to), and never requires a link to exist. USE_ATTACHED_IMAGE/
+  // USE_ATTACHED_VIDEO create a genuinely NEW ad via meta.create_image_ad/
+  // meta.create_video_ad with a real link (see the destination_url refusal
+  // in strategyBuilder.js, round 39) — LINK_CLICKS is the correct goal
+  // there, unchanged from before.
+  return ["BOOST_FACEBOOK_POST", "BOOST_INSTAGRAM_POST"].includes(actionType) ? "POST_ENGAGEMENT" : "LINK_CLICKS";
+}
 async function executeExplicitAction(stored, accessToken, userId, conversationId, currency) {
   const { strategy, resolvedAssets } = stored;
   const objective = strategy.recommended_objective || "OUTCOME_ENGAGEMENT";
@@ -503,7 +522,7 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
       campaign_id: campaign.id,
       daily_budget: toMetaBudgetMinorUnits(strategy.budget_daily, currency),
       billing_event: "IMPRESSIONS",
-      optimization_goal: "LINK_CLICKS",
+      optimization_goal: explicitActionOptimizationGoal(strategy.action_type),
       bid_strategy: "LOWEST_COST_WITHOUT_CAP",
       targeting: buildTargeting({ countries: strategy.countries || ["PK"] }),
       status: "PAUSED",
@@ -528,10 +547,17 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
         { userId, conversationId }
       );
     } else if (strategy.action_type === "USE_ATTACHED_IMAGE") {
+      // Round 39 fix — link: "" (unconditional) previously reached Meta
+      // and failed alongside the LINK_CLICKS/POST_ENGAGEMENT gap above
+      // (error 100/1815520). strategy.destination_url is now a REQUIRED,
+      // build-time-verified real URL for this action_type (see the
+      // explicitActionAttachedMediaNeedsLink refusal, strategyBuilder.js,
+      // round 39) — reaching execution at all means it's already a real,
+      // user-confirmed value, never a guess made here.
       creativeResult = await getTool("meta.create_image_ad").execute(
         {
           adAccountId: resolvedAssets.adAccountId, adSetId: adSet.id, pageId: resolvedAssets.pageId, name: strategy.business_goal,
-          imageReferenceId: resolvedAssets.contentId, primaryText: strategy.reasoning_summary, headline: strategy.business_goal, link: "",
+          imageReferenceId: resolvedAssets.contentId, primaryText: strategy.reasoning_summary, headline: strategy.business_goal, link: strategy.destination_url,
         },
         { userId, conversationId }
       );

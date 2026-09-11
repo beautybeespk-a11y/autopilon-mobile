@@ -23,6 +23,7 @@ import {
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
   checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
+  checkExplicitActionModeMisroutePolicy,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
@@ -636,6 +637,36 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     });
   }
 
+  // Round 39 fix — companion to explicitActionNeedsUnsupportedCta above,
+  // same "genuine structural rejection, never a soft unresolved_questions
+  // ask" discipline, but the opposite direction: USE_ATTACHED_IMAGE/
+  // USE_ATTACHED_VIDEO create a REAL new ad via meta.create_image_ad/
+  // meta.create_video_ad (campaigns.js), whose own creative payload
+  // structurally REQUIRES a real link — unlike BOOST_FACEBOOK_POST/
+  // BOOST_INSTAGRAM_POST's object_story_id creative, which has no link
+  // field at all. Executor previously sent link: "" unconditionally for
+  // this case (live gap — Meta error 100/1815520, "the link in this ad is
+  // either missing or invalid for Link Click Ads optimization"), since
+  // explicit_action mode never collects a destination_url anywhere.
+  // Deliberately does NOT add a destination_url question/pre-loop here
+  // (that machinery is campaign-mode-only and already deployed/working) —
+  // destination_url is a general, mode-agnostic schema field the model
+  // can already set on any build_strategy call, so this only READS it: if
+  // the model already supplied a real one this turn, honor it (executor.js
+  // now uses strategy.destination_url as the real link instead of "");
+  // otherwise refuse before ever reaching Meta, same as the CTA-unsupported
+  // case above.
+  const explicitActionAttachedMediaNeedsLink = normalized.mode === "explicit_action"
+    && ["USE_ATTACHED_IMAGE", "USE_ATTACHED_VIDEO"].includes(normalized.action_type)
+    && !normalized.destination_url;
+  if (explicitActionAttachedMediaNeedsLink) {
+    resolutionErrors.push({
+      field: "destination_url",
+      message: `Using an attached ${normalized.action_type === "USE_ATTACHED_VIDEO" ? "video" : "image"} as an ad requires a real destination URL for the ad's link — none was given. Ask the user what URL this ad should link to, then set destination_url from their own words and rebuild.`,
+      code: "META_V2_EXPLICIT_ACTION_LINK_REQUIRED",
+    });
+  }
+
   // Round 37 fix — for BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST, contentId
   // now comes from creativeResolution above (the unified pipeline) rather
   // than resolveContentSelector's own (now-removed) list logic; see that
@@ -676,7 +707,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // repairs below it doesn't need to be gated behind baseChecksClean.
   normalized = repairCreativeDescriptionForUnavailableLiteralSource(normalized, userMessage, snapshot);
 
-  const goalErrors = [...checkGoalAlignmentPolicy(normalized, businessSignals), ...checkLiteralGoalSubstitutionPolicy(normalized, userMessage)];
+  const goalErrors = [...checkGoalAlignmentPolicy(normalized, businessSignals), ...checkLiteralGoalSubstitutionPolicy(normalized, userMessage), ...checkExplicitActionModeMisroutePolicy(normalized, userMessage)];
   let salesConsistencyErrors = checkSalesConsistencyPolicy(normalized);
   let creativeGroundingErrors = checkCreativeGroundingPolicy(normalized, snapshot);
   // NOT eligible for the text-only auto-repair below — which specific

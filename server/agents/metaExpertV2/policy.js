@@ -247,6 +247,72 @@ export function checkLiteralGoalSubstitutionPolicy(strategy, userMessage) {
   return errors;
 }
 
+// Live incident (round 39): "create a website purchases campaign using
+// one of my facebook page posts as the creative" was built with mode:
+// "explicit_action" (action_type BOOST_FACEBOOK_POST) instead of mode:
+// "campaign" — the model's own tool-parameter choice, with nothing in
+// code ever validating it (see metaExpertV2.js's tool schema — mode is a
+// plain enum with a prompt-only description of when to use each). explicit_
+// action structurally has no audience/objective/destination-URL fields at
+// all (see that tool's own description) and its two boost action types
+// (BOOST_FACEBOOK_POST/BOOST_INSTAGRAM_POST) can't carry a link/CTA at all
+// (explicitActionNeedsUnsupportedCta, strategyBuilder.js) — a request
+// naming a real conversion objective was pushed down a path structurally
+// incapable of representing it, then failed downstream at Meta (error
+// 100/1815520 — LINK_CLICKS optimization on a post with no link) instead
+// of being caught here.
+//
+// Two independent signals, either rejects:
+//  - the RAW userMessage naming the request itself as a campaign/
+//    conversion ask (EXPLICIT_ACTION_MISROUTE_PHRASE below) — never
+//    strategy.business_goal (the model's own paraphrase of the request),
+//    same discipline as LITERAL_SALES_WORDS above.
+//  - the model's OWN structured fields already naming a conversion
+//    objective (optimization_event/conversion_location/recommended_
+//    objective) despite mode being explicit_action — covers the case
+//    where the model set these correctly but still picked the wrong mode.
+//
+// EXPLICIT_ACTION_MISROUTE_PHRASE is deliberately narrower than
+// LITERAL_SALES_WORDS above: a loose single-word list ("sale") matches
+// "boost my post about our summer sale" exactly as readily as a genuine
+// "build me a sales campaign" ask — the two are indistinguishable by word
+// alone, and bouncing the first back wastes a retry on the most ordinary
+// boost phrasing there is. Restricted instead to phrasing that only makes
+// sense as an instruction about what to BUILD: the word "campaign" itself,
+// the named objective phrase "website/online purchases" (the live
+// incident's own wording), or a verb explicitly directed at a conversion
+// outcome ("drive/get/generate/increase/grow sales/purchases/conversions/
+// leads/sign-ups").
+//
+// KNOWN REMAINING GAP (documented deliberately, not attempted — same
+// discipline as the primaryTextAnswer compound-message gap in
+// orchestrator/index.js): a request that names audience/targeting intent
+// without also naming a conversion objective or the word "campaign" — e.g.
+// "boost my latest post to women 18-35 in Lahore" — still isn't caught
+// here. There's no regex that reliably distinguishes a targeting
+// instruction from ordinary descriptive prose about the post/audience
+// without real false-positive risk, unlike "campaign" or a conversion
+// verb+noun pair, which only ever appear as requests, never as content
+// description. Left as a known gap for whoever hits it in production
+// next.
+const EXPLICIT_ACTION_MISROUTE_PHRASE = /\bcampaigns?\b|\b(website|online)\s+purchases?\b|\b(drive|get|generate|increase|grow)\s+(sales|purchases|conversions|leads|sign[\s-]?ups?)\b/i;
+const EXPLICIT_ACTION_STRUCTURED_CONVERSION_EVENTS = new Set(["PURCHASE", "ADD_TO_CART", "LEAD", "COMPLETE_REGISTRATION"]);
+export function checkExplicitActionModeMisroutePolicy(strategy, userMessage) {
+  const errors = [];
+  if (strategy.mode !== "explicit_action") return errors;
+  const namesConversionRequest = typeof userMessage === "string" && EXPLICIT_ACTION_MISROUTE_PHRASE.test(userMessage);
+  const structuredConversionSignal = EXPLICIT_ACTION_STRUCTURED_CONVERSION_EVENTS.has(strategy.optimization_event)
+    || strategy.conversion_location === "WEBSITE"
+    || ["OUTCOME_SALES", "OUTCOME_LEADS"].includes(strategy.recommended_objective);
+  if (!namesConversionRequest && !structuredConversionSignal) return errors;
+  errors.push({
+    field: "mode",
+    message: `This request names a conversion objective or campaign ask ("campaign", a conversion goal like sales/purchases/leads, or a matching optimization_event/conversion_location/recommended_objective already set) — explicit_action mode has no audience, objective, or destination-URL fields at all and cannot represent that. Rebuild this as mode: "campaign" instead, with the matching recommended_objective/optimization_event/conversion_location and full targeting — never explicit_action — whenever the request names what the ad should convert into, not just which single existing post/image/video to boost.`,
+    code: "META_V2_EXPLICIT_ACTION_MODE_MISROUTE",
+  });
+  return errors;
+}
+
 // Step 5 — Sales consistency: an OUTCOME_SALES recommendation must reason
 // about purchases/CPA/ROAS/conversion volume/revenue, never reach/
 // engagement/cheap clicks as the primary framing. A loose, deliberately

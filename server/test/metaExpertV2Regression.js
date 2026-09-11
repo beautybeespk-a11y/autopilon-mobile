@@ -2668,6 +2668,214 @@ async function run() {
     }
   });
 
+  // --- explicit_action mode misroute (round 39) ----------------------------
+  // Live production report: "create a website purchases campaign using one
+  // of my facebook page posts as the creative" was built with mode:
+  // "explicit_action" (action_type BOOST_FACEBOOK_POST) instead of mode:
+  // "campaign" — nothing in code ever validated the model's own tool-
+  // parameter choice. explicit_action has no audience/objective/
+  // destination-URL fields at all, so the request's real conversion intent
+  // ("website purchases") was silently dropped, and execution failed at
+  // Meta (error 100/1815520) instead of being caught here.
+  await check("[explicit_action mode misroute, round 39] a request naming a conversion objective (\"website purchases campaign\") is refused when built as mode: explicit_action — never silently approved down a path with no audience/objective/destination fields", async () => {
+    const userId = makeUser(`v2-explicit-misroute-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "Website purchases via existing post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy,
+        userMessage: "create a website purchases campaign using one of my facebook page posts as the creative",
+      });
+      assert.equal(result.ok, false, "explicit_action mode must never be silently accepted when the request itself names a conversion/campaign ask");
+      assert.equal(result.unresolved.field, "mode");
+      assert.match(result.unresolved.issue, /mode: "campaign"/i, `the rejection must tell the model to rebuild as mode: campaign: ${result.unresolved.issue}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Tightened per explicit feedback: the FIRST version of this check used a
+  // loose word list ("sale", "purchase", ...) that matched the POST's own
+  // subject just as readily as the user's actual request — "boost my post
+  // about our summer sale" would have been bounced, wasting a retry on the
+  // most ordinary boost phrasing there is. This is the regression guard for
+  // that tightening: a conversion word describing CONTENT, with no
+  // "campaign"/conversion-verb-phrase attached to the request itself, and
+  // no structured conversion field set, must build clean.
+  await check("[explicit_action mode misroute, round 39] \"boost my post about our summer sale\" is NOT rejected — a conversion word describing the POST's own content, not the request, must never bounce the most ordinary boost phrasing", async () => {
+    const userId = makeUser(`v2-explicit-misroute-fp-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "Summer sale, 20% off!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my post about our summer sale", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy,
+        userMessage: "boost my post about our summer sale",
+      });
+      assert.equal(result.ok, true, `an ordinary boost mentioning "sale" as the POST's own subject must never be bounced: ${JSON.stringify(result.unresolved)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[explicit_action mode misroute, round 39] the model's OWN structured fields (recommended_objective: OUTCOME_LEADS) trigger the same refusal even with neutral request wording — never relies on raw text alone", async () => {
+    const userId = makeUser(`v2-explicit-misroute-structured-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, recommended_objective: "OUTCOME_LEADS",
+        budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      // OUTCOME_LEADS is deliberately outside explicitActionNeedsUnsupportedCta's
+      // own check (PURCHASE/ADD_TO_CART/OUTCOME_SALES only) — isolates this
+      // test to the NEW check alone, never the pre-existing CTA-unsupported one.
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy,
+        userMessage: "boost my latest Facebook post",
+      });
+      assert.equal(result.ok, false, "OUTCOME_LEADS is a real conversion objective explicit_action can't represent, regardless of what the raw message says");
+      assert.equal(result.unresolved.field, "mode");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- explicit_action optimization_goal (round 39) ------------------------
+  // Companion fix, same live incident: BOOST_FACEBOOK_POST's object_story_id
+  // creative reuses an EXISTING post, which usually has no link of its own —
+  // requesting LINK_CLICKS optimization on it (previously hardcoded
+  // unconditionally) fails at Meta with error 100/1815520 the moment the
+  // boosted post is a plain photo/text post, exactly what happened here.
+  await check("[explicit_action optimization_goal, round 39] boosting a plain Facebook post no longer requests LINK_CLICKS — Meta error 100/1815520 (\"the link in this ad is either missing or invalid\") is now structurally impossible for this action type", async () => {
+    const userId = makeUser(`v2-explicit-optgoal-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+        posts: [{ id: "111_999", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/999" }],
+        writes,
+      },
+    }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "boost my latest Facebook post", action_type: "BOOST_FACEBOOK_POST",
+        content_selector: { position: 1 }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Boosting the most recent organic post to extend its reach among an already-engaged audience.",
+        evidence_used: ["Most recent Facebook Page post"], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+
+      const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
+      assert.equal(adSetWrite?.body?.optimization_goal, "POST_ENGAGEMENT", `a boosted existing post has no link of its own — LINK_CLICKS optimization would fail at Meta the exact way the live incident did: ${JSON.stringify(adSetWrite?.body)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- explicit_action USE_ATTACHED_IMAGE link requirement (round 39) -----
+  // Companion gap in the same incident class: USE_ATTACHED_IMAGE creates a
+  // REAL new ad via meta.create_image_ad, whose own creative payload
+  // structurally requires a real link — unlike BOOST_FACEBOOK_POST/
+  // BOOST_INSTAGRAM_POST's object_story_id creative, which has none.
+  // Executor previously sent link: "" unconditionally, since explicit_action
+  // mode never collected a destination_url anywhere. Fixed with the same
+  // "genuine structural rejection" discipline as explicitActionNeedsUnsupportedCta
+  // above, reusing the general (mode-agnostic) destination_url field rather
+  // than touching the campaign-mode-only destination_url question/pre-loop
+  // machinery (deployed and working, out of scope for this fix).
+  await check("[explicit_action USE_ATTACHED_IMAGE link requirement, round 39] no destination_url given — refused at build time, never reaches Meta with an empty link", async () => {
+    const userId = makeUser(`v2-explicit-attached-nolink-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] } }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "use this photo as an ad", action_type: "USE_ATTACHED_IMAGE",
+        content_selector: { attachedMediaRef: "img_ref_1" }, budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Using the attached photo as a single-image ad.",
+        evidence_used: [], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "use this photo as an ad" });
+      assert.equal(result.ok, false, "USE_ATTACHED_IMAGE structurally requires a real destination link — must be refused, never silently sent as an empty string");
+      assert.equal(result.unresolved.field, "destination_url");
+      assert.match(result.unresolved.issue, /destination URL/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[explicit_action USE_ATTACHED_IMAGE link requirement, round 39] a real, user-confirmed destination_url is honored — builds successfully and the real URL (never an empty string) is what execution will read as the ad's link", async () => {
+    const userId = makeUser(`v2-explicit-attached-link-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] } }));
+    try {
+      const strategy = {
+        mode: "explicit_action", business_goal: "use this photo as an ad", action_type: "USE_ATTACHED_IMAGE",
+        content_selector: { attachedMediaRef: "img_ref_1" }, destination_url: "https://example.com/summer-sale",
+        budget_daily: 1000, budget_basis: "HEURISTIC_STARTING_TEST", campaign_status: "PAUSED",
+        reasoning_summary: "Using the attached photo as a single-image ad.",
+        evidence_used: [], assumptions: [], unresolved_questions: [], approval_required: true,
+        facebook_page: { ref: "default_facebook_page" }, ad_account: { ref: "default_ad_account" },
+      };
+      const result = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy,
+        userMessage: "use this photo as an ad, link it to https://example.com/summer-sale",
+      });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.equal(result.strategy.destination_url, "https://example.com/summer-sale", "the real, user-confirmed URL must be exactly what's stored — this is what executeExplicitAction now sends as `link` instead of the old hardcoded empty string");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Revision of an EXECUTED strategy (round 37) ------------------------
   // Live production report, exact reproduction: a campaign was created
   // successfully (EXISTING_PAGE_POST, one of five real candidates already
