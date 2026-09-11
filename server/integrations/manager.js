@@ -172,6 +172,43 @@ export function updateConnectionMeta(userId, provider, patch) {
   return nextMeta;
 }
 
+// Round 40 — the single, shared write path for every "learned from chat"
+// per-user default (Meta ad account/Page/Pixel/destination URL — see
+// assetResolution.js and strategyBuilder.js's metaExpertV2 callers; the ONE
+// trusted mechanism, previously duplicated ad hoc for Pixel only). Callers
+// are expected to have ALREADY independently verified the value against the
+// user's own raw message (policy.js's userMessageConfirmsAssetChoice/
+// userMessageContainsUrl) before ever reaching this function — this
+// function's own job is narrower and just as important: never let a chat
+// confirmation overwrite a default that already exists.
+//
+// DOCUMENTED DESIGN DECISION, not an accident: because this never
+// overwrites an existing value for `field`, a default can only ever be
+// LEARNED from chat ONCE — the first time it's genuinely confirmed with
+// nothing already stored. Changing an already-learned default afterward
+// requires the explicit settings routes (routes/metaAuth.js's
+// /default-ad-account, /default-page, /default-pixel — destination_url has
+// no settings-route equivalent yet, so once learned it can only be changed
+// there by clearing it directly). This is deliberate: bootstrapping a
+// default from an ordinary conversation is safe because it only ever fills
+// an empty slot, but silently REPLACING a standing default from a chat
+// message would mean an offhand mention in an unrelated conversation could
+// permanently redirect every future campaign — exactly the class of
+// silent-mutation risk this whole feature exists to avoid. Changing a
+// default once set is a deliberate action, so it goes through a deliberate
+// (settings-route) action.
+export function learnConnectionDefault(userId, provider, field, value) {
+  try {
+    const conn = getConnection(userId, provider);
+    const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
+    if (currentDefaults[field]) return false; // an existing default is never silently overwritten from chat
+    updateConnectionMeta(userId, provider, { defaults: { ...currentDefaults, [field]: value } });
+    return true;
+  } catch {
+    return false; // best-effort — the caller's own result is already final either way; only the learning is skipped
+  }
+}
+
 // Live bug: this cleared accessToken/refreshToken/tokenExpiresAt but left
 // the `meta` column untouched — for WooCommerce, `meta.consumerKey` (the
 // other half of the REST API credential pair; `consumerSecret` is what's

@@ -23,7 +23,8 @@ import { resolvePageId } from "../../tools/shared/metaPageId.js";
 import { resolvePixelId } from "../../tools/shared/metaPixelId.js";
 import { resolveCatalogId } from "../../tools/shared/metaCatalogId.js";
 import { PURCHASE_LIKE_EVENTS } from "./strategySchema.js";
-import { getConnection, updateConnectionMeta } from "../../integrations/manager.js";
+import { learnConnectionDefault } from "../../integrations/manager.js";
+import { userMessageConfirmsAssetChoice } from "./policy.js";
 
 const SEMANTIC_REFS = new Set(["default_ad_account", "default_facebook_page", "default_instagram_identity", "default_pixel", "default_catalog"]);
 
@@ -59,9 +60,16 @@ function currencyFrom(list, id) {
 // says the user asked to change it THIS turn, in which case it falls
 // through to the normal NEW-strategy resolution order below (explicit >
 // saved default > single > ask).
-export async function resolveStrategyAssets(strategy, { userId, accessToken, priorResolved = null, explicitAssetChanges = new Set(), snapshot = null }) {
+// userMessage (round 40) — the raw text of the turn that's resolving these
+// assets, used ONLY to independently verify a value before it's ever
+// LEARNED as a per-user default (see the write-back blocks below and
+// policy.js's userMessageConfirmsAssetChoice) — never used for resolution
+// itself, which stays exactly as it was. Optional and additive: any
+// existing caller that omits it just never learns a default from that
+// call, resolution is otherwise unaffected.
+export async function resolveStrategyAssets(strategy, { userId, accessToken, priorResolved = null, explicitAssetChanges = new Set(), snapshot = null, userMessage = null }) {
   const resolved = { adAccountId: null, pageId: null, instagramId: null, pixelId: null, catalogId: null };
-  const names = { adAccountName: null, adAccountCurrency: null, pageName: null, instagramUsername: null };
+  const names = { adAccountName: null, adAccountCurrency: null, pageName: null, instagramUsername: null, pixelName: null };
   const resolutionErrors = [];
 
   let adAccountReused = false;
@@ -77,6 +85,23 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
       const accounts = snapshot?.metaAssets?.adAccounts?.items || (await meta.listAdAccounts(accessToken).catch(() => []));
       names.adAccountName = nameFrom(accounts, resolved.adAccountId);
       names.adAccountCurrency = currencyFrom(accounts, resolved.adAccountId);
+      // Round 40 — same shared, verified write path as Pixel above. Scope
+      // note (deliberate, out of scope this round): resolveAdAccountId
+      // throws on genuine ambiguity (2+ connected, no usable default)
+      // rather than returning a soft, storable candidate list the way
+      // resolvePixelId does — there is no strategy row to attach a
+      // deterministic pre-loop to when that happens (a failed build_strategy
+      // is never persisted, per this file's own header and strategyStore.js's
+      // comment), so an ambiguity-recovery reply can't be auto-learned here
+      // the way a Pixel answer can. This write-back only ever fires on an
+      // explicit, already-successfully-resolved id — until ambiguity
+      // recovery is redesigned (its own round, its own testing), a genuinely
+      // ambiguous ad account can only pick up a default via the explicit
+      // settings route (routes/metaAuth.js's /default-ad-account).
+      if (explicitId && resolved.adAccountId && !priorResolved?.adAccountId && userId
+        && userMessageConfirmsAssetChoice(userMessage, { id: resolved.adAccountId, name: names.adAccountName })) {
+        learnConnectionDefault(userId, "meta_ads", "adAccountId", resolved.adAccountId);
+      }
     } catch (err) {
       resolutionErrors.push({ field: "ad_account", message: err.message, code: err.code });
     }
@@ -93,6 +118,15 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
       resolved.pageId = await resolvePageId({ accessToken, providedPageId: explicitId, userId });
       const pages = snapshot?.metaAssets?.pages?.items || (await meta.listPages(accessToken).catch(() => []));
       names.pageName = nameFrom(pages, resolved.pageId);
+      // Round 40 — same shared, verified write path and same ambiguity-
+      // recovery scope note as ad_account above (resolvePageId also throws
+      // on genuine ambiguity rather than storing a soft candidate list) —
+      // out of scope this round; a genuinely ambiguous Page can only pick
+      // up a default via /default-page until that's redesigned.
+      if (explicitId && resolved.pageId && !priorResolved?.pageId && userId
+        && userMessageConfirmsAssetChoice(userMessage, { id: resolved.pageId, name: names.pageName })) {
+        learnConnectionDefault(userId, "meta_ads", "pageId", resolved.pageId);
+      }
     } catch (err) {
       resolutionErrors.push({ field: "facebook_page", message: err.message, code: err.code });
     }
@@ -157,6 +191,7 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
         const { pixelId, available } = await resolvePixelId({ accessToken, adAccountId: resolved.adAccountId, providedPixelId: explicitId, userId });
         resolved.pixelId = pixelId;
         availablePixels = available;
+        names.pixelName = nameFrom(available, pixelId);
         // Live design fix (round 31, user's own diagnosis): the connection-
         // level Default Pixel (integrations.meta_ads.defaults.pixelId —
         // the SAME record resolvePixelId already reads at priority 2,
@@ -176,19 +211,28 @@ export async function resolveStrategyAssets(strategy, { userId, accessToken, pri
         // just because a strategy is reusing it (priorResolved.pixelId
         // already truthy takes the reuse branch above, never reaching
         // here) or picking a different one for one specific campaign
-        // while a default remains set.
-        if (explicitId && pixelId && !priorResolved?.pixelId && userId) {
-          try {
-            const conn = getConnection(userId, "meta_ads");
-            const currentDefaults = JSON.parse(conn?.meta || "{}").defaults || {};
-            if (currentDefaults.pixelId !== pixelId) {
-              updateConnectionMeta(userId, "meta_ads", { defaults: { ...currentDefaults, pixelId } });
-            }
-          } catch {
-            // Best-effort — the strategy's own resolution above already
-            // succeeded regardless; only the "never ask again" durability
-            // is lost if this fails, not this strategy's correctness.
-          }
+        // while a default remains set (learnConnectionDefault's own
+        // never-overwrite rule enforces this a second, independent way).
+        //
+        // Round 40 — retrofitted onto the shared, verified write path
+        // (policy.js/manager.js) instead of writing directly: explicitId
+        // being truthy has ALWAYS meant "explicitAssetChanges declared
+        // this field," but explicitAssetChanges is ALSO a plain,
+        // model-settable tool parameter with no independent check against
+        // what the user actually typed — a model that sets it on an
+        // ordinary call (trusting only the tool description's prose) could
+        // always reach this exact write, the same shape as the original
+        // round-14/33 wrong-pixel incident. userMessageConfirmsAssetChoice
+        // re-verifies the id against THIS turn's raw message independently
+        // of who the caller was or why explicitId is set — the
+        // deterministic pre-loop's own digit-run match already satisfies
+        // this trivially (it only ever calls with a digit it just matched),
+        // so the legitimate path is unaffected; only a caller with no real
+        // grounds in the user's own words is now blocked from teaching a
+        // default, without touching this strategy's own resolution at all
+        // (resolved.pixelId above already succeeded regardless).
+        if (explicitId && pixelId && !priorResolved?.pixelId && userId && userMessageConfirmsAssetChoice(userMessage, { id: pixelId, name: names.pixelName })) {
+          learnConnectionDefault(userId, "meta_ads", "pixelId", pixelId);
         }
       } catch (err) {
         resolutionErrors.push({ field: "pixel", message: err.message, code: err.code });

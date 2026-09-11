@@ -23,10 +23,11 @@ import {
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
   checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
-  checkExplicitActionModeMisroutePolicy,
+  checkExplicitActionModeMisroutePolicy, userMessageContainsUrl,
 } from "./policy.js";
 import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
+import { getConnection, learnConnectionDefault } from "../../integrations/manager.js";
 
 const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"];
 
@@ -179,10 +180,18 @@ function formatRecommendation(strategy, names) {
       USE_ATTACHED_VIDEO: "run the video you attached as an ad",
     }[strategy.action_type] || "run this as an ad";
     const budgetLine = formatBudgetLine(strategy, names);
+    // Round 40 — per-user defaults (ad account/Page/Pixel/destination URL)
+    // are used SILENTLY, never asked about again once learned — visibility
+    // in this summary is the only thing standing between a stale/wrong
+    // default and an approved campaign built on it, so all four always
+    // appear here, not just when freshly resolved this turn.
     const lines = [
       `I'll ${actionLabel}.`,
       ``,
+      `Ad Account: ${names.adAccountName || "(not resolved)"}`,
       `Facebook Page: ${names.pageName || "(not resolved)"}`,
+      `Pixel: ${names.pixelName || "(none)"}`,
+      `Destination URL: ${strategy.destination_url || "(not set)"}`,
       `Budget: ${budgetLine}`,
       `Status: Paused (won't spend until you approve)`,
       ``,
@@ -216,7 +225,14 @@ function formatRecommendation(strategy, names) {
     `Optimization: ${strategy.optimization_event.replace(/_/g, " ").toLowerCase()}`,
     `Creative: ${strategy.creative_strategy.description}`,
     `Budget: ${budgetLine}`,
+    // Round 40 — per-user defaults are used SILENTLY and never re-asked
+    // about — this summary is the only place a stale/wrong default
+    // becomes visible before approval, so Ad Account/Pixel/Destination URL
+    // always appear here, not just when freshly resolved this turn.
+    `Ad Account: ${names.adAccountName || "(not resolved)"}`,
     `Facebook Page: ${names.pageName || "(not resolved)"}`,
+    `Pixel: ${names.pixelName || "(none)"}`,
+    `Destination URL: ${strategy.destination_url || "(not set)"}`,
   );
   if (names.instagramUsername) lines.push(`Instagram: @${names.instagramUsername}`);
   lines.push(`Status: Paused (won't spend until you approve)`);
@@ -381,11 +397,52 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // by this turn's own message) doesn't get silently wiped back to null.
   normalized = verifyDestinationUrl(requestedChanges, normalized, userMessage, snapshot?.business?.storeUrl, priorStored?.strategy?.destination_url);
 
+  // Round 40 — per-user default destination URL. "Confirmed this turn"
+  // means THIS call's own requestedChanges actually claimed a
+  // destination_url (never a value merely carried forward from a prior
+  // revision via mergeForRevision's generic "any key present overrides"
+  // spread, which would otherwise make an old, already-resolved value
+  // look like a fresh confirmation on every later revision) AND it
+  // survived verifyDestinationUrl above unchanged.
+  const destinationUrlConfirmedThisTurn = typeof requestedChanges.destination_url === "string"
+    && requestedChanges.destination_url.trim() && normalized.destination_url === requestedChanges.destination_url;
+
+  // Read: applied ONLY when nothing was confirmed or carried forward this
+  // call (normalized.destination_url still empty) — an explicit or
+  // re-confirmed value from the user's own words this turn always wins
+  // over a stored default, never the reverse (same priority order as the
+  // Meta-asset resolvers: explicit > saved default). Always visible
+  // afterward via the new "Destination URL" summary line below, so a
+  // wrong stored default surfaces before approval rather than silently
+  // producing a broken campaign — there's no live "does this still exist"
+  // check possible for a URL the way there is for a Pixel/Page/ad account,
+  // so visibility IS the safety net here.
+  if (!normalized.destination_url && userId) {
+    const conn = getConnection(userId, "meta_ads");
+    const savedDefaultUrl = JSON.parse(conn?.meta || "{}").defaults?.destinationUrl || null;
+    if (savedDefaultUrl) normalized = { ...normalized, destination_url: savedDefaultUrl };
+  }
+
+  // Write: same shared, independently-verified path as ad account/Page/
+  // Pixel (assetResolution.js) — a value is only ever LEARNED as a lasting
+  // default when it's independently found, literally, in THIS turn's raw
+  // message (userMessageContainsUrl — the exact same literal-substring
+  // check verifyDestinationUrl itself already applies for a manually-typed
+  // URL), never just because verifyDestinationUrl above already accepted
+  // it. That acceptance also allows an AFFIRMED SUGGESTION match ("yes,
+  // use that" confirming the store's own URL) with no literal URL in the
+  // message to re-check — accepted as a deliberate, narrower scope call
+  // this round: that one confirmation shape doesn't teach a default, the
+  // campaign itself is entirely unaffected either way.
+  if (destinationUrlConfirmedThisTurn && userId && userMessageContainsUrl(userMessage, normalized.destination_url)) {
+    learnConnectionDefault(userId, "meta_ads", "destinationUrl", normalized.destination_url);
+  }
+
   const priorResolved = priorStored
     ? { adAccountId: priorStored.resolvedAssets.adAccountId, adAccountName: priorStored.resolvedAssets.adAccountName, adAccountCurrency: priorStored.resolvedAssets.adAccountCurrency, pageId: priorStored.resolvedAssets.pageId, pageName: priorStored.resolvedAssets.pageName, instagramId: priorStored.resolvedAssets.instagramId, instagramUsername: priorStored.resolvedAssets.instagramUsername, pixelId: priorStored.resolvedAssets.pixelId, catalogId: priorStored.resolvedAssets.catalogId }
     : null;
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
-    await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot });
+    await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot, userMessage });
 
   // Creative selection (Phase 1 follow-up: attach a real ad, not just a
   // Campaign + Ad Set) — same resolution shape as Pixel above: explicit

@@ -108,11 +108,55 @@ function normalizeUrlForComparison(url) {
   const trimmed = url.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
   return trimmed || null;
 }
-function userMessageContainsUrl(userMessage, url) {
+// Exported (round 40) — the per-user-defaults feature (below) reuses this
+// exact literal-substring check to decide whether a resolved destination_url
+// is safe to LEARN as a lasting default, same discipline as everywhere else
+// a value gets persisted from a chat message: never fuzzy, never the
+// model's own claim, only what the user's raw words actually contain.
+export function userMessageContainsUrl(userMessage, url) {
   if (typeof userMessage !== "string") return false;
   const normalizedTarget = normalizeUrlForComparison(url);
   if (!normalizedTarget) return false;
   return userMessage.toLowerCase().includes(normalizedTarget);
+}
+
+// Round 40 — per-user Meta defaults (ad account, Facebook Page, Pixel,
+// destination URL). Live incident this exists to prevent from happening a
+// SECOND time, at 4x the blast radius: a model-supplied Pixel id was once
+// written as the permanent account-level default with no real user
+// confirmation (round 14/33), so every campaign built afterward silently
+// pointed at the wrong dataset. The fix at the time was scoped to pixel
+// only, and relied on ONE trusted caller (the orchestrator's own
+// deterministic pre-loop) always being the thing that set
+// explicitAssetChanges — but explicitAssetChanges is ALSO a plain,
+// model-settable tool parameter (metaExpertV2.js), passed straight through
+// to the resolver with no independent verification against what the user
+// actually typed. A model that sets it on an ordinary tool call — trusting
+// only the tool description's prose ("ONLY when the user's own words...")
+// — has always been able to reach the exact same write path. That's a
+// prompt instruction standing in for a deterministic gate, which round 38's
+// own design principle already named as the thing that must never happen.
+//
+// userMessageConfirmsAssetChoice is the independent re-check applied at
+// EVERY default-write point (ad account/page/pixel — see
+// assetResolution.js — and destination_url — see strategyBuilder.js),
+// regardless of which caller resolved the value or why: a value is only
+// ever LEARNED as a lasting default when it is independently found, in
+// this exact turn's raw message, either as its real numeric id (a digit
+// run — same discipline as the pixel auto-revise pre-loop's own matcher)
+// or as its real, Meta-confirmed name (a case-insensitive substring — same
+// looseness resolvePageId's own findPageByName already applies when
+// resolving, not just when persisting). This is stricter than one-time
+// resolution trust (unchanged, out of scope here) — appropriate, since a
+// default silently affects every FUTURE conversation, not just this one.
+export function userMessageConfirmsAssetChoice(userMessage, { id, name } = {}) {
+  if (typeof userMessage !== "string") return false;
+  if (id) {
+    const digitRuns = userMessage.match(/\d+/g) || [];
+    if (digitRuns.includes(String(id).replace(/^act_/, ""))) return true;
+  }
+  if (typeof name === "string" && name.trim() && userMessage.toLowerCase().includes(name.trim().toLowerCase())) return true;
+  return false;
 }
 
 // Round 36 fix: an explicit http(s) URL typed anywhere in the message is

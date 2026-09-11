@@ -1690,6 +1690,252 @@ async function run() {
     }
   });
 
+  // --- Per-user Meta defaults, verification-at-persist (round 40) ---------
+  // Feature: ad account/Facebook Page/Pixel/destination URL are LEARNED
+  // silently from a genuinely user-confirmed choice and reused on later
+  // conversations without asking again — but the write step itself is the
+  // primary deliverable here, not the feature surface: explicitAssetChanges
+  // has always been a plain, model-settable tool parameter with no
+  // independent check against what the user actually typed (see the
+  // existing test above, "a Pixel ref WITH explicitAssetChanges... still
+  // resolves and saves the account default" — that test's own userMessage
+  // happens to contain the id, which is why it still passes unmodified
+  // here). A model that sets the flag WITHOUT genuine grounds has always
+  // been able to reach the same write path a genuine user confirmation
+  // does — the exact round-14/33 wrong-pixel incident shape, now closed
+  // for all four fields via userMessageConfirmsAssetChoice/
+  // userMessageContainsUrl (policy.js), applied independently of the
+  // caller at every write point (assetResolution.js, strategyBuilder.js).
+  await check("[per-user defaults, round 40] a model-declared explicitAssetChanges: [\"pixel\"] with NO grounds in the user's own message resolves the strategy fine but does NOT learn a default — the exact round-14/33 incident shape, now closed", async () => {
+    const userId = makeUser(`v2-defaults-pixel-gap-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, null, "sanity: genuinely ambiguous going into the revision below");
+
+      // The model declares explicitAssetChanges itself (nothing stops it
+      // structurally — see policy.js's round-40 comment) but the user's
+      // own message this turn says nothing about a Pixel at all — no
+      // digit, no name, nothing to independently verify against.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { pixel: { ref: "1241102478031429" } },
+        explicitAssetChanges: ["pixel"],
+        userMessage: "sounds good, let's move forward",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.resolved.pixelId, "1241102478031429", "resolution itself is UNCHANGED — explicitAssetChanges still honors the model's declared ref for THIS strategy; verification only gates whether it's LEARNED as a default, never whether the campaign proceeds");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults || {};
+      assert.equal(savedDefaults.pixelId, undefined, "must NOT be saved as the account-level Default Pixel — the raw message gave no independent grounds to trust this as a real user confirmation");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] Ad Account: an explicit, raw-message-verified pick is learned as the default and a FRESH conversation auto-resolves it with no ambiguity", async () => {
+    const userId = makeUser(`v2-defaults-adaccount-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "Main Ads", currency: "PKR" }, { id: "act_2", name: "Secondary Ads", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "900000000000001", name: "Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ ad_account: { ref: "act_2" }, budget_daily: 500 }),
+        explicitAssetChanges: ["ad_account"],
+        userMessage: "use ad account act_2 for this",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.adAccountId, "act_2");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.adAccountId, "act_2", "an explicit, raw-message-confirmed ad account choice must be learned as the default");
+
+      const freshBuild = await buildStrategy({
+        userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website",
+      });
+      assert.equal(freshBuild.ok, true, JSON.stringify(freshBuild.unresolved));
+      assert.equal(freshBuild.resolved.adAccountId, "act_2", "a brand-new conversation must auto-resolve the saved Default Ad Account — never re-ask for the same account");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] Ad Account: the same gap closed as Pixel — a declared explicitAssetChanges with no grounds in the raw message resolves the strategy but does not learn a default", async () => {
+    const userId = makeUser(`v2-defaults-adaccount-gap-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "Main Ads", currency: "PKR" }, { id: "act_2", name: "Secondary Ads", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "900000000000001", name: "Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ ad_account: { ref: "act_2" }, budget_daily: 500 }),
+        explicitAssetChanges: ["ad_account"],
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.adAccountId, "act_2", "resolution is unaffected — only the learning is gated");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults || {};
+      assert.equal(savedDefaults.adAccountId, undefined, "must not be learned — nothing in the raw message names act_2 or 'Secondary Ads'");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] Facebook Page: an explicit pick confirmed by NAME (not just digit) in the raw message is learned as the default", async () => {
+    const userId = makeUser(`v2-defaults-page-name-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "Careonabudget.pk" }, { id: "222", name: "Beautybeespk" }], pixels: [{ id: "900000000000001", name: "Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ facebook_page: { ref: "222" }, budget_daily: 500 }),
+        explicitAssetChanges: ["facebook_page"],
+        userMessage: "use my Beautybeespk page for this one",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pageId, "222");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.pageId, "222", "the Page's real NAME appearing in the raw message is independent grounds enough to learn it, same looseness resolvePageId's own name-match already applies when resolving");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] a default is only ever LEARNED once — a later, different explicit choice is honored for that one campaign but never overwrites the stored default (documented decision: change it only via the settings route)", async () => {
+    const userId = makeUser(`v2-defaults-never-overwrite-${stamp}@example.com`);
+    connectMeta(userId);
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "1111111111111", name: "Pixel A" }, { id: "1241102478031429", name: "Pixel B" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const firstConversationId = `conv-${cryptoRandom()}`;
+      const firstBuilt = await buildStrategy({ userId, conversationId: firstConversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      const firstRevised = await reviseStrategy({
+        userId, conversationId: firstConversationId, accessToken: `fake-meta-token-${userId}`, strategyId: firstBuilt.strategyId,
+        requestedChanges: { pixel: { ref: "1241102478031429" } }, explicitAssetChanges: ["pixel"],
+        userMessage: "Pixel ID: 1241102478031429",
+      });
+      assert.equal(firstRevised.ok, true, JSON.stringify(firstRevised.unresolved));
+      assert.equal(JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults?.pixelId, "1241102478031429", "sanity: the first Pixel must be learned as the default");
+
+      // A SECOND, brand-new conversation explicitly names the OTHER real
+      // Pixel — genuinely verified against this turn's own raw message —
+      // for a one-off campaign that needs a different one.
+      const secondConversationId = `conv-${cryptoRandom()}`;
+      const secondBuilt = await buildStrategy({ userId, conversationId: secondConversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      const secondRevised = await reviseStrategy({
+        userId, conversationId: secondConversationId, accessToken: `fake-meta-token-${userId}`, strategyId: secondBuilt.strategyId,
+        requestedChanges: { pixel: { ref: "1111111111111" } }, explicitAssetChanges: ["pixel"],
+        userMessage: "actually for this one use Pixel ID: 1111111111111",
+      });
+      assert.equal(secondRevised.ok, true, JSON.stringify(secondRevised.unresolved));
+      assert.equal(secondRevised.resolved.pixelId, "1111111111111", "the override must win for THIS campaign — an explicit choice in the message always beats the stored default");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.pixelId, "1241102478031429", "the stored default must be completely UNCHANGED by the one-off override — naming a different Pixel for one campaign must never silently redirect every future one");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] Destination URL: a literally-typed, confirmed URL is learned and silently reused (never asked again) on a fresh conversation", async () => {
+    const userId = makeUser(`v2-defaults-url-${stamp}@example.com`);
+    connectMeta(userId);
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "900000000000001", name: "Pixel" }], posts: [{ id: "111_1", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/1" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const conversationId = `conv-${cryptoRandom()}`;
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the most recent Facebook post." }, destination_url: "https://example.com/shop", content_selector: { position: 1 } }),
+        userMessage: "I want more sales on my website, link it to https://example.com/shop",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy.destination_url, "https://example.com/shop");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults;
+      assert.equal(savedDefaults?.destinationUrl, "https://example.com/shop", "a literally-typed, verified URL must be learned as the default destination URL");
+
+      // A brand-new conversation, no destination_url claimed at all this
+      // time — must be silently auto-applied, never re-asked, and must be
+      // VISIBLE in the summary so a wrong default is never invisible.
+      const freshConversationId = `conv-${cryptoRandom()}`;
+      const freshBuild = await buildStrategy({
+        userId, conversationId: freshConversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the most recent Facebook post." }, content_selector: { position: 1 } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(freshBuild.ok, true, JSON.stringify(freshBuild.unresolved));
+      assert.equal(freshBuild.strategy.destination_url, "https://example.com/shop", "the saved default destination URL must be silently auto-applied — never re-asked for the same account");
+      assert.ok(!freshBuild.strategy.unresolved_questions?.some((q) => q.startsWith("This campaign needs a destination website URL")), "the destination-URL question must never fire once a default silently satisfies it");
+      assert.match(freshBuild.recommendationText, /Destination URL: https:\/\/example\.com\/shop/, "the applied default must be visible in the summary before approval — this is the only safety net for a URL, which has no live existence check the way a Pixel/Page/ad account does");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] Destination URL: confirming the store's SUGGESTED url by a bare affirmation (\"yes\") is accepted for the campaign but deliberately NOT learned as a default this round", async () => {
+    const userId = makeUser(`v2-defaults-url-affirmed-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "900000000000001", name: "Pixel" }], posts: [{ id: "111_1", message: "New arrivals!", created_time: "2026-01-01T00:00:00Z", permalink_url: "https://facebook.com/111/posts/1" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the most recent Facebook post." }, destination_url: "https://store.example.com", content_selector: { position: 1 } }),
+        // messageAffirmsSuggestedUrl requires the WHOLE message to be just
+        // the affirmation (URL_AFFIRMATION_PATTERN is fully anchored) — a
+        // bare "yes" is the exact shape that accepts a suggested URL
+        // without the literal URL text appearing anywhere in the message.
+        userMessage: "yes",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy.destination_url, "https://store.example.com", "the affirmed suggestion must still resolve the campaign correctly — verification only gates LEARNING, never the campaign itself");
+
+      const savedDefaults = JSON.parse(getConnection(userId, "meta_ads").meta || "{}").defaults || {};
+      assert.equal(savedDefaults.destinationUrl, undefined, "an affirmation with no literal URL in the raw message must not teach a default this round — accepted, documented scope narrowing");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[per-user defaults, round 40] all four fields appear in the recommendation summary, visible before approval", async () => {
+    const userId = makeUser(`v2-defaults-summary-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "Main Ads", currency: "PKR" }], pages: [{ id: "111", name: "Beautybeespk" }], pixels: [{ id: "1241102478031429", name: "Working Pixel" }] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ pixel: { ref: "1241102478031429" }, destination_url: "https://example.com/shop" }),
+        userMessage: "I want more sales on my website, link it to https://example.com/shop",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.match(built.recommendationText, /Ad Account: Main Ads/);
+      assert.match(built.recommendationText, /Facebook Page: Beautybeespk/);
+      assert.match(built.recommendationText, /Pixel: Working Pixel/);
+      assert.match(built.recommendationText, /Destination URL: https:\/\/example\.com\/shop/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Objective/optimization_event/promoted_object validation (round 31) --
   // Explicit request: rather than fixing one Meta-rejected field per round,
   // validate the whole combination before sending and fail with a clear
