@@ -497,7 +497,41 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // creative — so it can only ever be promoted by a fresh affirmation
   // inside resolveCreativeSelection, never by this reuse-verbatim lookup.
   const priorPendingCreative = priorStored?.resolvedAssets?.pendingCreative || null;
-  const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined;
+  // Round 44 fix — live bug: a confirmed creative re-opened its
+  // confirmation question after a later, completely UNRELATED revision
+  // (e.g. "change the gender to female and age to 22-45"). Traced to this
+  // exact line: contentSelectorProvidedThisCall only ever checked whether
+  // requestedChanges.content_selector was PRESENT, never whether it
+  // actually differed from what was already resolved. A model that
+  // restates content_selector verbatim while revising something else
+  // entirely (a very ordinary thing for a model to do — it isn't told to
+  // omit it the way it's told to omit unchanged identity-asset fields)
+  // made this line true, which discards resolveCreativeSelection's
+  // reuse-verbatim protection (creativeResolution.js) and routes back
+  // through full re-verification against THIS turn's raw message — which,
+  // being about gender/age, never mentions the post, so the already-
+  // confirmed pick fails verification and reverts to pendingCreative. The
+  // exact same class of bug round 11 already fixed for ad_account/
+  // facebook_page/pixel (mergeForRevision above, ASSET_FIELDS) — "a
+  // revision meant to only change audience/budget silently reassigned the
+  // ad account and Page because the model happened to restate them" — but
+  // content_selector was deliberately left out of that protection (round
+  // 33: "it has no single stable identity of its own... its meaning
+  // depends entirely on WHICH list it's resolved against"), which is true
+  // for INTERPRETING a selector but doesn't hold for asking "is this
+  // actually a new answer" — a selector that is byte-for-byte identical to
+  // what's already stored can never mean something different this turn.
+  // Compared against the PRIOR STRATEGY ROW's own content_selector (never
+  // the resolved creative itself, which has already been translated into a
+  // different shape) — same JSON.stringify deep-equality discipline
+  // diffAgainstPrior already uses (round 38, the build_strategy redirect)
+  // — so only a genuinely different selector value counts as "provided
+  // this call"; an identical restatement is treated exactly like omitting
+  // it, which is what lets the reuse-verbatim branch below apply.
+  const contentSelectorRestatedIdentically = requestedChanges?.content_selector !== undefined
+    && priorStored?.strategy?.content_selector !== undefined
+    && JSON.stringify(requestedChanges.content_selector) === JSON.stringify(priorStored.strategy.content_selector);
+  const contentSelectorProvidedThisCall = requestedChanges?.content_selector !== undefined && !contentSelectorRestatedIdentically;
   // Round 37 fix (live production report: explicit_action silently picked
   // a creative with no confirmation — "I'll boost your most recent
   // Facebook post" with five real candidates available, none asked

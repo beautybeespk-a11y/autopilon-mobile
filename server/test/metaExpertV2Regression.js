@@ -5687,6 +5687,106 @@ async function run() {
     }
   });
 
+  // --- Confirmed creative re-opens on an unrelated revision (round 44) ----
+  // Live bug: a user confirms a Facebook post as the creative, then asks a
+  // completely UNRELATED change ("change the gender to female and age to
+  // 22-45") — the confirmation question re-opens, even though it was
+  // already answered. Traced (via direct reproduction, not just code
+  // reading) to contentSelectorProvidedThisCall: it only ever checked
+  // whether requestedChanges.content_selector was PRESENT, never whether
+  // it actually differed from what was already confirmed. A model
+  // restating content_selector verbatim while revising something else
+  // entirely — an ordinary thing for a model to do, since nothing tells it
+  // to omit content_selector the way it's told to omit unchanged identity-
+  // asset fields — discarded resolveCreativeSelection's reuse-verbatim
+  // protection and routed back through full re-verification against THIS
+  // turn's raw message, which never mentions the post at all. Same bug
+  // class round 11 already fixed for ad_account/facebook_page/pixel
+  // (mergeForRevision's ASSET_FIELDS protection) — "an answered question
+  // stays answered" failing at the exact same kind of boundary.
+  await check("[creative reuse across unrelated revision, round 44] a confirmed creative survives an unrelated revision even when the model redundantly restates the IDENTICAL content_selector", async () => {
+    const userId = makeUser(`v2-creative-reuse-restated-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } }, userMessage: "use post 5",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "yes",
+      });
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "sanity: the creative must be confirmed going into the turn below");
+      assert.deepEqual(confirmed.strategy.unresolved_questions, [], "sanity: no open question going into the turn below");
+
+      // The exact live shape: an UNRELATED revision that ALSO redundantly
+      // restates the same content_selector the model believes is already
+      // correct — never mentions the post in its own raw message at all.
+      const unrelated = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId,
+        requestedChanges: { age_min: 22, age_max: 45, audience_reasoning: "Narrowing to the store's actual customer base.", content_selector: { position: 5 } },
+        userMessage: "change the gender to female and age to 22-45",
+      });
+      assert.equal(unrelated.ok, true, JSON.stringify(unrelated.unresolved));
+      assert.deepEqual(unrelated.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the already-confirmed creative must survive an unrelated revision, not revert to pendingCreative just because content_selector was redundantly restated");
+      assert.equal(unrelated.resolved.pendingCreative, null);
+      assert.deepEqual(unrelated.strategy.unresolved_questions, [], "the confirmation question must NOT re-open");
+      assert.equal(unrelated.strategy.age_min, 22, "sanity: the actually-requested change must still take effect");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[creative reuse across unrelated revision, round 44] a GENUINELY different, message-verified content_selector still updates the creative — the fix doesn't swallow real re-picks", async () => {
+    const userId = makeUser(`v2-creative-reuse-genuine-change-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } }, userMessage: "use post 5",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "yes",
+      });
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "sanity");
+
+      // A DIFFERENT position, explicitly and verifiably named in the raw
+      // message this turn — must still resolve to the NEW pick, not be
+      // blocked by the round 44 fix.
+      const changed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "actually use 2.",
+      });
+      assert.equal(changed.ok, true, JSON.stringify(changed.unresolved));
+      assert.deepEqual(changed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a genuinely different, message-verified pick must still take effect");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Unresolved creative question must reach the customer (round 34) ---
   // Live bug: build_strategy correctly computed a real unresolved_questions
   // entry naming all 5 real Facebook posts — but the model's own final
