@@ -5350,6 +5350,183 @@ async function run() {
     }
   });
 
+  // --- pendingCreative compound-message affirmation (round 41) ------------
+  // Live production deadlock: three questions (creative, budget,
+  // destination URL) were asked in one turn; the user answered all three
+  // in one message ("yes same post and the budget will be 800/day and yes
+  // use the same url"). Budget and destination URL resolved (their own
+  // matchers already scan the whole message) — the creative did not,
+  // because messageAffirmsPendingCreative was whole-message-only. The user
+  // then said "approve" three times and deadlocked: not in the affirmation
+  // word list, read as execution approval, hit the unresolved-question
+  // block, looped. Same bug class as round 36's destination_url fix,
+  // applied here the same way: an unambiguous phrase naming the post/
+  // creative is now recognized anywhere in the message.
+  await check("[pendingCreative compound message, round 41] all three answers in ONE message (creative + budget + destination URL) resolve all three — the exact live production shape", async () => {
+    const userId = makeUser(`v2-pending-compound-${stamp}@example.com`);
+    connectMeta(userId);
+    // "yes use the same url" affirms the store's own SUGGESTED URL
+    // (messageAffirmsSuggestedUrl) — needs a real connected store to
+    // suggest one from, same as the live incident's own account shape.
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let pending;
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, budget_daily: null }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // Reach the SAME three-way-open state the live incident had: budget,
+      // pendingCreative, AND destination_url all still open going into the
+      // compound-message turn below.
+      pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "use post 5",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going into the turn below");
+      assert.equal(pending.strategy.budget_daily, null, "sanity: budget must still be open too");
+      assert.ok(pending.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: destination URL must still be open too");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      // Live-bug shape: the model just narrates, with ZERO tool calls — if
+      // any of the three deterministic pre-loops fails to fire, this mock
+      // would need a second scripted response it never gets.
+      chatResponses: [finalText("Got it — noted all three, updating the strategy now.")],
+    }));
+    try {
+      const userMessage = "yes same post and the budget will be 800/day and yes use the same url";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revisions = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revisions.length >= 1, `at least one real auto-revise must dispatch: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the pending pick must actually be promoted to `creative` — this is the exact field that stayed stuck in production");
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "pendingCreative must be cleared once promoted");
+      assert.equal(active?.strategy.budget_daily, 800, "budget must also resolve from the SAME compound message");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —") || q.startsWith("This campaign needs a destination website URL")), `no question from this compound message should remain open: ${JSON.stringify(active?.strategy.unresolved_questions)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative compound message, round 41] an embedded phrase naming the post (\"use the same post\") resolves it WITHOUT being the whole message", async () => {
+    const userId = makeUser(`v2-pending-embedded-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "use post 3",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist");
+
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "sounds great, use the same post for this one too",
+      });
+      assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "an embedded, subject-naming phrase must confirm the pending creative even though it's not the whole message");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative compound message, round 41] an UNRELATED message containing \"yes\" mid-sentence does NOT confirm the pending creative — the false-positive guard", async () => {
+    const userId = makeUser(`v2-pending-false-positive-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "use post 2",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist");
+
+      // "yes" appears in this message, but not as a bare whole-message
+      // affirmation and not naming the post/creative — must NOT confirm.
+      const unrelated = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "yes, I know the budget is already set, but can you double check the targeting age range?",
+      });
+      assert.equal(unrelated.ok, true, JSON.stringify(unrelated.unresolved));
+      assert.equal(unrelated.resolved.creative, null, "an unrelated 'yes' embedded mid-sentence must never confirm the pending creative");
+      assert.ok(unrelated.resolved.pendingCreative, "the pending creative must remain pending, not silently promoted");
+      assert.ok(unrelated.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must remain open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- "approve" while a creative is pending must name the real word (round 41) --
+  // Live incident continuation: once the creative failed to resolve, the
+  // user said "approve" three times and got the generic unresolved-
+  // question block — real approval language, but never told the user
+  // "approve" specifically doesn't answer THIS question. Special-cased so
+  // the model gets an actionable message instead of a dead end.
+  await check("[pendingCreative approve-trap message, round 41] \"approve\" while a creative is pending is refused with a message naming the actual required word, not the generic block", async () => {
+    const userId = makeUser(`v2-pending-approve-trap-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 1 } }, userMessage: "use post 1",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist");
+
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+      assert.ok(gate, "execute_strategy must still be blocked — the creative was never actually confirmed");
+      assert.match(gate, /"approve" only confirms EXECUTION/, `the message must plainly say "approve" doesn't answer THIS question, not just repeat the generic block: ${gate}`);
+      assert.match(gate, /use that post/, "the message must name an actual example word/phrase the user can say");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Unresolved creative question must reach the customer (round 34) ---
   // Live bug: build_strategy correctly computed a real unresolved_questions
   // entry naming all 5 real Facebook posts — but the model's own final

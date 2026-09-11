@@ -458,6 +458,29 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   // anywhere in strategyBuilder.js, add its matching auto-revise pre-loop
   // in this file in the SAME change — never as a follow-up.
   if (Array.isArray(active.strategy.unresolved_questions) && active.strategy.unresolved_questions.length > 0) {
+    // Round 41 fix — live incident: the user said "approve" three times
+    // while a pendingCreative confirmation was the actual open question.
+    // "approve" is real approval language (messageIndicatesExecutionApprovalV2),
+    // so it never even reached this generic block as a confusing non-answer
+    // — it reached checkV2ExecutionApprovalGate's OWN earlier
+    // pendingCreativeJustAutoConfirmedThisTurn check, found it false (this
+    // message never auto-confirmed anything), and fell through to here,
+    // which named the open question but never said WHY "approve" didn't
+    // already answer it. A gate with no deterministic way to satisfy it is
+    // a trap (see the design principle above) — this is the narrower
+    // version of that trap: a gate that IS satisfiable, but never tells
+    // the user which word actually satisfies it, so a real, repeated,
+    // good-faith answer ("approve") keeps failing silently. Special-cased
+    // to pendingCreative specifically (checked against the same
+    // resolvedAssets.pendingCreative field the pendingCreative pre-loop
+    // itself reads, above) rather than rewriting this message for every
+    // unresolved_questions type — the other fields' own pre-loops already
+    // resolve a genuine answer before this gate is ever reached, so this
+    // exact confusion is unique to pendingCreative's affirmation-vs-
+    // approval overlap.
+    if (active.resolvedAssets?.pendingCreative) {
+      return `This strategy still has an unresolved question that must be answered first: "${active.strategy.unresolved_questions[0]}" — "approve" only confirms EXECUTION, it does NOT confirm the creative. Ask the user to explicitly confirm the creative itself first (e.g. "yes", "use that post", "correct"), which will save it via meta_expert_v2.revise_strategy — only then call execute_strategy again with a separate approval.`;
+    }
     return `This strategy still has an unresolved question that must be answered first: "${active.strategy.unresolved_questions[0]}" — ask the user for that specific answer, then call meta_expert_v2.revise_strategy with the answer before calling execute_strategy again.`;
   }
   return null;

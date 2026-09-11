@@ -140,16 +140,41 @@ export function matchCreativeCandidateId(userMessage, candidates) {
   return null;
 }
 
-// Whole-message-only, same discipline as policy.js's
-// BARE_APPROVAL_WORD_PATTERN (execute_strategy approval) — a pending
-// creative confirmation must never be promoted by an affirmation word
-// used naturally elsewhere in a longer reply, and never by anything other
-// than the user's own raw words (see resolveCreativeSelection's
-// pendingCreative handling — never a model-supplied selector merely
-// repeating the same id, never a later reuse-from-prior).
+// Round 41 fix (production deadlock, same class as round 36's
+// destination_url fix): a real user routinely answers several open
+// questions in one message ("yes same post and the budget will be
+// 800/day and yes use the same url") — budget's USER_MESSAGE_BUDGET_PATTERN,
+// creative-candidate's matchCreativeCandidateId, and destination_url's
+// EMBEDDED_URL_REUSE_PATTERN (policy.js) all already tolerate this (they
+// scan the whole message for their own signal), but this field's
+// affirmation check required the ENTIRE message to be nothing but a bare
+// word, so a compound reply never matched, the pendingCreative stayed
+// open, and a follow-up "approve" — not in this pattern at all — hit the
+// unresolved-question block and looped forever.
+//
+// Fixed the same way EMBEDDED_URL_REUSE_PATTERN layers its own matching:
+// an UNAMBIGUOUS phrase that specifically names reusing "the post/
+// creative" is safe to recognize ANYWHERE in the message — it has its own
+// subject, so it can't plausibly be mistaken for something unrelated the
+// way a bare "yes" could. The bare generic words below stay
+// whole-message-only for exactly that reason: embedding those would risk
+// misreading a "yes" used naturally elsewhere in a longer reply, never by
+// anything other than the user's own raw words (see
+// resolveCreativeSelection's pendingCreative handling — never a
+// model-supplied selector merely repeating the same id, never a later
+// reuse-from-prior).
+//
+// Accepted, documented residual risk (same as round 36's for the URL
+// phrases): "use that post"/"same post" could in principle appear in a
+// message that isn't actually confirming the creative. Not a new
+// exposure — the identical tradeoff round 36 already made for
+// EMBEDDED_URL_REUSE_PATTERN, and the alternative is the whole-message-only
+// bug this round exists to fix.
 const PENDING_CREATIVE_AFFIRMATION_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|that'?s (the )?right one|that one)[.!]?\s*$/i;
+const EMBEDDED_CREATIVE_REUSE_PATTERN = /\b(use (?:the )?same (?:post|creative|image|photo|reel|video)|use that (?:post|creative|image|photo|reel|video)|same (?:post|creative|image|photo|reel|video)|that post|that creative)\b/i;
 export function messageAffirmsPendingCreative(userMessage) {
-  return typeof userMessage === "string" && PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage);
+  if (typeof userMessage !== "string") return false;
+  return PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage) || EMBEDDED_CREATIVE_REUSE_PATTERN.test(userMessage);
 }
 
 // Resolves the ad's primaryText for a PRODUCT_IMAGE creative. Two real

@@ -89,9 +89,16 @@ export function verifyUserProvidedBudget(rawStrategy, mergedStrategy, userMessag
 // safe to recognize ANYWHERE in the message; a bare generic word (yes/
 // correct/right/...) still only counts when it IS the entire message —
 // embedding those would risk misreading a "yes" used naturally elsewhere
-// in a longer reply, the same reason BARE_APPROVAL_WORD_PATTERN and
-// creativeResolution.js's PENDING_CREATIVE_AFFIRMATION_PATTERN stay
-// whole-message-only.
+// in a longer reply, the same reason BARE_APPROVAL_WORD_PATTERN stays
+// whole-message-only. (Round 41: creativeResolution.js's
+// messageAffirmsPendingCreative was cited here too, as an example of a
+// matcher deliberately staying whole-message-only — that was wrong in
+// practice, not just in citation: it hit the identical compound-message
+// deadlock this comment describes, and was widened with the same
+// EMBEDDED_URL_REUSE_PATTERN-shaped fix. Its own bare-word fallback still
+// stays whole-message-only for the same reason BARE_APPROVAL_WORD_PATTERN
+// does — only the "it never widens" claim was stale, not the discipline
+// itself.)
 const URL_AFFIRMATION_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|use that|use it|that works|that one|that'?s right)[.!]?\s*$/i;
 const EMBEDDED_URL_REUSE_PATTERN = /\b(use (?:the )?same (?:url|link|website)|use that (?:url|link|website)|same (?:url|link|website)|that url|that link)\b/i;
 export function messageAffirmsSuggestedUrl(userMessage) {
