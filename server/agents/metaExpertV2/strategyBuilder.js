@@ -181,7 +181,21 @@ function formatGoalAlignmentNote(strategy) {
 // summary lines that show a resolved NAME with an id behind it.
 // Destination URL doesn't share this shape (it displays the raw value
 // itself, no separate name/id split), so it's untouched.
+//
+// Round 43 fix — live bug: a name is arbitrary user text set in Meta's own
+// UI (Events Manager, Page settings) and can be anything, including a
+// duplicate of another field entirely — a production Pixel was literally
+// named after the store's own URL ("https://beautybees.pk/"), making the
+// Pixel and Destination URL summary lines show the identical string with
+// the actual Pixel id nowhere visible. Two connected Pages with
+// near-identical names (Beautybeespk / BeautyBees.pk) have the same
+// problem. The id is what's actually unique and identifiable; the name is
+// just a label. Shown together whenever both are known — name first
+// (still the more human-readable lead) with the id alongside for real
+// disambiguation, never the id alone dropping the name a user actually
+// recognizes.
 function assetSummaryValue(name, id, emptyLabel) {
+  if (name && id) return `${name} (${id})`;
   return name || id || emptyLabel;
 }
 

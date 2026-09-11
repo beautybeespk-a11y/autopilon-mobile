@@ -2038,6 +2038,64 @@ async function run() {
     }
   });
 
+  // --- Name+id shown together, never just a duplicate-looking name (round 43) --
+  // Live bug: a production Pixel was literally named after the store's own
+  // URL in Meta's Events Manager ("https://beautybees.pk/") — the Pixel and
+  // Destination URL summary lines showed the IDENTICAL string, and the
+  // actual Pixel id (what's genuinely unique) was nowhere visible. A name
+  // is arbitrary user text set in Meta's own UI and can be anything,
+  // including a duplicate of another field entirely — only the id actually
+  // identifies the asset. Same reasoning applies to Facebook Page: two
+  // connected Pages with near-identical names (Beautybeespk/BeautyBees.pk)
+  // are indistinguishable by name alone.
+  await check("[summary shows name AND id, round 43] a Pixel named after the store's own URL no longer collides with the Destination URL line — both name and id are shown", async () => {
+    const userId = makeUser(`v2-pixel-name-collides-url-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = {
+      adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }],
+      pixels: [{ id: "1241102478031429", name: "https://beautybees.pk/" }],
+    };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ pixel: { ref: "1241102478031429" }, destination_url: "https://beautybees.pk/" }),
+        userMessage: "I want more sales on my website, link it to https://beautybees.pk/",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pixelId, "1241102478031429");
+      assert.match(built.recommendationText, /Pixel: https:\/\/beautybees\.pk\/ \(1241102478031429\)/, "the Pixel line must show the real id alongside the name, not just the name that happens to collide with the URL");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[summary shows name AND id, round 43] Facebook Page: two near-identical Page names are only distinguishable with the id shown too", async () => {
+    const userId = makeUser(`v2-page-name-similar-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const metaOpts = {
+      adAccounts: [{ id: "act_1", name: "A" }],
+      pages: [{ id: "111", name: "Beautybeespk" }, { id: "222", name: "BeautyBees.pk" }],
+      pixels: [{ id: "px1", name: "Pixel" }],
+    };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ facebook_page: { ref: "222" } }),
+        explicitAssetChanges: ["facebook_page"],
+        userMessage: "use page id 222",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.pageId, "222");
+      assert.match(built.recommendationText, /Facebook Page: BeautyBees\.pk \(222\)/, "the resolved Page's id must be shown alongside its near-identical name so it's distinguishable from the OTHER similarly-named connected Page");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Objective/optimization_event/promoted_object validation (round 31) --
   // Explicit request: rather than fixing one Meta-rejected field per round,
   // validate the whole combination before sending and fail with a clear
