@@ -24,7 +24,7 @@ import {
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
   checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
 } from "./policy.js";
-import { insertStrategy, getStoredStrategy, EXECUTABLE_STATUSES } from "./strategyStore.js";
+import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
 
 const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"];
@@ -779,7 +779,59 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   return { ok: true, strategyId: stored.id, recommendationText, strategy: normalized, resolved: resolvedForStorage };
 }
 
+// Round 38 fix (the actual "rebuild blast radius" bug — round 34's and
+// round 36's investigations both traced their deadlock to the SAME root:
+// once the model gets stuck on an unresolved question it can't reliably
+// answer via revise_strategy, it eventually calls build_strategy instead,
+// which has always meant priorStored: null — a genuinely from-scratch
+// strategy that silently discards every field already resolved on the
+// conversation's active strategy (budget, creative, destination_url, the
+// resolved Pixel — all of it, in one call). Deterministic pre-loops (see
+// orchestrator/index.js) reduce how OFTEN the model needs to fall back
+// like this; this fix is what makes the fallback itself harmless. An
+// answered question stays answered until the user changes it — never
+// "if the model behaves," which is the property those pre-loops alone
+// cannot guarantee (they only ever cover ONE turn's answer to ONE
+// question; nothing stopped the model from discarding all of them at
+// once via the wrong tool).
+//
+// Only compares WHAT THE MODEL ACTUALLY SUBMITTED against what's already
+// stored (diffAgainstPrior below) — never passes the model's full,
+// freshly-restated object straight into the revision merge. That
+// distinction matters: build_strategy's own calling convention is
+// "restate the complete strategy" (unlike revise_strategy's "send ONLY
+// what's changing"), so treating every restated field as an explicit
+// "the user asked to reconsider this" claim would trip
+// checkRevisionSubstantive (policy.js) on every field the model
+// faithfully repeats unchanged — breaking build_strategy's normal
+// operation, not fixing anything. Diffing first means only genuine
+// changes ever reach the merge/policy pipeline; everything else is
+// inherited from the prior row through the exact same mergeForRevision
+// spread (and its ASSET_FIELDS/content_selector protections) a real
+// revise_strategy call already goes through, untouched.
+function diffAgainstPrior(fullStrategy, priorStrategy) {
+  const changes = {};
+  for (const [key, value] of Object.entries(fullStrategy || {})) {
+    if (JSON.stringify(value) !== JSON.stringify(priorStrategy?.[key])) changes[key] = value;
+  }
+  return changes;
+}
+
 export async function buildStrategy({ userId, conversationId, accessToken, strategy, userMessage, explicitAssetChanges }) {
+  // getMostRecentStrategyForConversation (no status filter) — the same
+  // lookup the revise_strategy tool wrapper falls back to (round 37) —
+  // so build_strategy and revise_strategy agree on what "the active
+  // strategy for this conversation" means, regardless of which one the
+  // model happens to call. Only proposed/approved/executed rows are
+  // treated as live context to preserve; rejected/failed strategies have
+  // nothing worth carrying forward, so a genuinely fresh build is correct
+  // there (and 'superseded' can never be the MOST RECENT row for a
+  // conversation by construction — something newer superseded it).
+  const priorStored = conversationId ? getMostRecentStrategyForConversation(userId, conversationId) : null;
+  if (priorStored && (EXECUTABLE_STATUSES.has(priorStored.status) || priorStored.status === "executed")) {
+    const requestedChanges = diffAgainstPrior(strategy, priorStored.strategy);
+    return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: priorStored.id, priorStored, freshResearchRequired: true });
+  }
   return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges: strategy, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: null, priorStored: null, freshResearchRequired: true });
 }
 

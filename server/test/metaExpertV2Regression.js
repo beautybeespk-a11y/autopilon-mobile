@@ -2848,6 +2848,159 @@ async function run() {
     }
   });
 
+  // --- build_strategy redirect / rebuild blast radius (round 38) ----------
+  // The deeper bug behind round 34's and round 36's deadlocks: once the
+  // model gets stuck on an unresolved question it can't reliably answer via
+  // revise_strategy, it eventually calls build_strategy instead — which
+  // always meant priorStored: null, silently discarding every field
+  // already resolved on the conversation (budget, creative, the resolved
+  // Pixel, all of it) in one call. Deterministic pre-loops reduce how OFTEN
+  // that happens; this fix is what makes the fallback itself harmless: a
+  // fresh build_strategy call now transparently redirects into the SAME
+  // revision machinery whenever the conversation already has resolvable
+  // context, regardless of which tool the model believed it was calling.
+  await check("[build_strategy redirect, round 38] a fresh build_strategy call for a conversation with an already-resolved creative and budget does NOT discard them — the model's tool choice no longer matters", async () => {
+    const userId = makeUser(`v2-rebuild-redirect-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: FIVE_CANDIDATE_POSTS } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "ALL", budget_daily: 600, budget_basis: "USER_PROVIDED" }),
+        userMessage: "I want more sales on my website, link it to https://example.com, budget 600/day",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "3.",
+      });
+      assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" });
+      assert.equal(confirmed.strategy.budget_daily, 600);
+
+      // The live-bug shape: instead of revise_strategy, the model calls
+      // build_strategy AGAIN for the same conversation — a full, freshly
+      // restated strategy object per build_strategy's own calling
+      // convention, changing ONLY gender/age (mirroring the exact
+      // production report), never mentioning content_selector or budget.
+      // budget_daily/budget_basis destructured OUT entirely — baseStrategy()
+      // always fills a default (3000) otherwise, which would make this a
+      // genuine, intentional change rather than the omission being tested.
+      const { budget_daily: _omittedBudget, budget_basis: _omittedBasis, ...rebuildStrategy } = baseStrategy({
+        creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "FEMALE", age_min: 22, age_max: 45,
+      });
+      const rebuilt = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: rebuildStrategy,
+        userMessage: "can you please change the gender to female and age limit should be 22-45",
+      });
+      assert.equal(rebuilt.ok, true, JSON.stringify(rebuilt.unresolved));
+      assert.equal(rebuilt.strategy.gender, "FEMALE");
+      assert.equal(rebuilt.strategy.age_min, 22);
+      assert.equal(rebuilt.strategy.age_max, 45);
+      // The actual fix: neither field the rebuild omitted was discarded.
+      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "the already-confirmed creative must survive a build_strategy call, not just a revise_strategy call");
+      assert.equal(rebuilt.strategy.budget_daily, 600, "the already-given budget must survive a build_strategy call too");
+      assert.ok(!rebuilt.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the candidate question must never come back");
+      const rebuiltRow = getStoredStrategy(userId, rebuilt.strategyId);
+      assert.equal(rebuiltRow.revisionOf, confirmed.strategyId, "the build_strategy call must genuinely have redirected into a revision of the prior strategy, not coincidentally preserved fields some other way");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[build_strategy redirect, round 38] composes with round 37's duplicate-campaign gate — redirecting into a revision of an EXECUTED strategy still blocks execute_strategy the same way a real revise_strategy call would", async () => {
+    const userId = makeUser(`v2-rebuild-redirect-executed-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: FIVE_CANDIDATE_POSTS, writes } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "ALL" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 1 } }, userMessage: "1.",
+      });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: confirmed.strategyId, userMessage: "approve" });
+
+      // Instead of revise_strategy, the model calls build_strategy again —
+      // must redirect into a revision of the EXECUTED strategy, exactly
+      // like a real revise_strategy call already does (round 37).
+      const rebuilt = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com", gender: "FEMALE", age_min: 22, age_max: 45 }),
+        userMessage: "can you please change the gender to female and age limit should be 22-45",
+      });
+      assert.equal(rebuilt.ok, true, JSON.stringify(rebuilt.unresolved));
+      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" }, "the creative must survive here too");
+
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+      assert.ok(gate, "execute_strategy must be blocked — this strategy revises an already-executed campaign");
+      assert.match(gate, new RegExp(executed.campaignId), "the block must name the REAL existing campaign id, same as the revise_strategy path");
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 1, "no second campaign must be created just from the rebuild");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[build_strategy redirect, round 38] a REJECTED first build never redirects — the next build_strategy call is still a genuine fresh build", async () => {
+    const userId = makeUser(`v2-rebuild-redirect-rejected-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      // Deliberately incomplete — guaranteed structural rejection, so
+      // nothing is ever stored for this conversation.
+      const rejected = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: {}, userMessage: "I want more sales to my website" });
+      assert.equal(rejected.ok, false);
+
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy(), userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const storedRow = getStoredStrategy(userId, built.strategyId);
+      assert.equal(storedRow.revisionOf, null, "a build_strategy call with nothing real stored yet must remain a genuine fresh build, never redirected");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[build_strategy redirect, round 38] the redirect never spuriously rejects a rebuild that restates every OTHER field identically — checkRevisionSubstantive only ever sees genuine changes", async () => {
+    const userId = makeUser(`v2-rebuild-redirect-substantive-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 600, budget_basis: "USER_PROVIDED" }), userMessage: "I want more sales on my website, budget 600/day",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      // build_strategy's OWN calling convention — restate the COMPLETE
+      // strategy — with every field identical to what's already stored
+      // except budget_daily. If the redirect fed this whole object
+      // through unfiltered, checkRevisionSubstantive would reject it for
+      // every one of the many unchanged fields (gender, locations,
+      // targeting_approach, ...) — this proves the diff step prevents
+      // that: only budget_daily is a real change, so only it should ever
+      // reach checkRevisionSubstantive.
+      const rebuilt = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 900, budget_basis: "USER_PROVIDED" }), userMessage: "actually make it 900/day",
+      });
+      assert.equal(rebuilt.ok, true, JSON.stringify(rebuilt.unresolved));
+      assert.equal(rebuilt.strategy.budget_daily, 900);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[rollout] the V2 template is hidden from listTemplates() when the feature flag is disabled for this user", () => {
     const userId = makeUser(`rollout-hidden-${stamp}@example.com`);
     updateFlag("meta_expert_v2", { enabled: false });
@@ -4676,6 +4829,68 @@ async function run() {
       assert.equal(laterRevision.resolved.creative, null, "a pendingCreative must never leak into resolvedAssets.creative via an unrelated revision — the exact mechanism the live bug relied on");
       assert.ok(laterRevision.resolved.pendingCreative, "must remain pending across the unrelated revision");
       assert.ok(laterRevision.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must still be open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- pendingCreative deterministic pre-loop (round 38) ------------------
+  // Live production deadlock: the user replied "yes" THREE separate times
+  // to a pendingCreative confirmation question — the exact word
+  // messageAffirmsPendingCreative accepts — and it never resolved, because
+  // (unlike every sibling field) nothing deterministically relayed the
+  // affirmation into revise_strategy; it depended entirely on the model
+  // choosing to call it. Mirrors the Pixel/budget no-tool-call tests above
+  // exactly: the model produces ZERO tool calls, yet the pendingCreative
+  // must still resolve for real via the deterministic auto-revise.
+  await check("[pendingCreative pre-loop, round 38] a bare 'yes' resolves the pendingCreative deterministically even when the model never calls revise_strategy at all — just narrates and would otherwise re-ask forever", async () => {
+    const userId = makeUser(`v2-pending-auto-revise-no-tool-call-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let pending;
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // Same unverified-pick shape as the pendingCreative tests above —
+      // this is how a real strategy actually reaches the pending state.
+      pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going into the turn below");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      // Live-bug shape: the model just narrates, with ZERO tool calls. If
+      // the auto-revise didn't already resolve this before the model's
+      // turn, this mock would need a second scripted response it never gets.
+      chatResponses: [finalText("Great, I've confirmed that post as the creative.")],
+    }));
+    try {
+      const userMessage = "yes";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revise, `the auto-revise must dispatch a REAL revise_strategy call even though the model never called any tool itself: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the pending pick must actually be promoted to `creative` in storage, not just narrated");
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "pendingCreative must be cleared once promoted");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must be cleared");
     } finally {
       restoreFetch();
     }

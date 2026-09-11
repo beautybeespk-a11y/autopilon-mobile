@@ -59,9 +59,22 @@ export function getActiveStrategyForConversation(userId, conversationId) {
     trace("getActiveStrategyForConversation: called with no conversationId", { userId });
     return null;
   }
+  // Round 38 fix (found while chasing an intermittent test failure — a
+  // real, reproducible bug, not just a test artifact): createdAt is
+  // millisecond-resolution (new Date().toISOString()), and two rows for
+  // the same conversation can legitimately share the same millisecond —
+  // build_strategy immediately followed by revise_strategy, both fast,
+  // synchronous, in-process calls, is exactly the shape that produces
+  // this. Without a tiebreaker, "ORDER BY createdAt DESC" has no defined
+  // order between tied rows — SQLite can return EITHER one, and did:
+  // caught returning the OLDER (now-superseded) row instead of the
+  // actually-most-recent one. rowid (SQLite's own implicit, monotonically
+  // increasing insert-order column — real here since `id` is a TEXT
+  // primary key, never aliased to rowid) is a reliable secondary sort key
+  // that createdAt alone can never be.
   const found = row(
     db.prepare(
-      "SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? AND status IN ('proposed','approved') ORDER BY createdAt DESC LIMIT 1"
+      "SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? AND status IN ('proposed','approved') ORDER BY createdAt DESC, rowid DESC LIMIT 1"
     ).get(userId, conversationId)
   );
   // TEMPORARY diagnostic (live bug: creative revision gate can't find the
@@ -90,8 +103,15 @@ export function getActiveStrategyForConversation(userId, conversationId) {
 // strategy for this conversation, in whatever state it's actually in."
 export function getMostRecentStrategyForConversation(userId, conversationId) {
   if (!conversationId) return null;
+  // Round 38 fix — same rowid tiebreaker as getActiveStrategyForConversation
+  // above, for the identical reason (see that function's comment). This
+  // one matters even more here: round 38's build_strategy redirect and
+  // round 37's revise_strategy fallback both rely on this to find the
+  // genuinely most recent strategy — a millisecond createdAt tie
+  // returning the wrong (older) row here would silently resurrect a
+  // stale/superseded strategy's fields instead of the real current ones.
   return row(
-    db.prepare("SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? ORDER BY createdAt DESC LIMIT 1").get(userId, conversationId)
+    db.prepare("SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? ORDER BY createdAt DESC, rowid DESC LIMIT 1").get(userId, conversationId)
   );
 }
 
@@ -154,7 +174,10 @@ export function markStrategyRejected(strategyId) {
 // Not called from any production code path; exists for direct invocation
 // during an investigation (see the node one-liner in the incident notes).
 export function listRecentStrategiesForUser(userId, limit = 10) {
+  // Round 38 — same rowid tiebreaker as the functions above, so a
+  // millisecond createdAt tie never makes an investigation's "most
+  // recent first" ordering misleading.
   return db
-    .prepare("SELECT id, conversationId, status, createdAt, updatedAt, revisionOf FROM meta_v2_strategies WHERE userId = ? ORDER BY createdAt DESC LIMIT ?")
+    .prepare("SELECT id, conversationId, status, createdAt, updatedAt, revisionOf FROM meta_v2_strategies WHERE userId = ? ORDER BY createdAt DESC, rowid DESC LIMIT ?")
     .all(userId, limit);
 }

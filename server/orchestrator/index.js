@@ -16,7 +16,7 @@ import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
-import { matchCreativeCandidateId } from "../agents/metaExpertV2/creativeResolution.js";
+import { matchCreativeCandidateId, messageAffirmsPendingCreative } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
@@ -112,7 +112,7 @@ const MAX_NARRATION_NUDGES = 1;
 // it.
 const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|successfully executed|(campaign|strategy|ad ?set)\b.{0,30}\b(is now|has been|will be|was)\b.{0,25}\b(created|running|live|executing|executed|set ?up)\b|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
-function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn }) {
+function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   if (executeCalledThisTurn || reviseCalledThisTurn) return null;
   const claimsCompletion = EXECUTION_CLAIM_WITHOUT_CALL_PATTERN.test(decision.message);
@@ -134,7 +134,11 @@ function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools,
   // destination URL via the deterministic pre-loop above; it must never
   // ALSO count as campaign-approval language pushing the model toward
   // execute_strategy in the same turn (the real risk this fix closes).
-  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage) && !executeGateBlockedThisTurn && !destinationUrlJustAutoConfirmedThisTurn;
+  // Round 38: same exclusion for pendingCreativeJustAutoConfirmedThisTurn
+  // — messageAffirmsPendingCreative's own trigger words overlap directly
+  // with approval language ("yes" satisfies both), unlike budget/Pixel/
+  // creative-candidate's own signals.
+  const approvedButNeverAttempted = hasActiveV2Strategy && messageIndicatesExecutionApprovalV2(userMessage) && !executeGateBlockedThisTurn && !destinationUrlJustAutoConfirmedThisTurn && !pendingCreativeJustAutoConfirmedThisTurn;
   if (!claimsCompletion && !approvedButNeverAttempted) return null;
   if (approvedButNeverAttempted && !claimsCompletion) {
     return 'The user just approved the active strategy in their current message, but meta_expert_v2.execute_strategy was never actually called this turn. Call it now with type "tool_call" — never tell the user the campaign is set up, created, executing, or running unless that tool call actually ran (it requires a separate confirmation step, so say that plainly if it comes back awaiting confirmation, never claim it already spent or executed).';
@@ -358,7 +362,7 @@ export function checkAlreadyExecutedV2Strategy({ userId, conversationId }) {
   return { strategyId: mostRecent.id, campaignId: mostRecent.executionResult.campaignId, adSetId: mostRecent.executionResult.adSetId };
 }
 
-export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn }) {
+export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn }) {
   const active = getActiveStrategyForConversation(userId, conversationId);
   if (!active) {
     const alreadyExecuted = checkAlreadyExecutedV2Strategy({ userId, conversationId });
@@ -403,6 +407,13 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   if (destinationUrlJustAutoConfirmedThisTurn) {
     return "This message was just used to confirm the destination URL for this campaign — that confirmation has been saved, but it is NOT approval to execute the campaign, and execute_strategy has been blocked. Tell the user plainly: the URL is saved, the campaign has NOT been created yet, and they need to say \"approve\" (or similar) separately to actually launch it. Present the now-complete, updated recommendation and wait for that explicit, separate approval before calling execute_strategy again.";
   }
+  // Round 38 (same risk, discovered for pendingCreative this time —
+  // see pendingCreativeJustAutoConfirmedThisTurn's own declaration
+  // comment above): a bare "yes" confirming the pending creative must
+  // never ALSO count as campaign approval in the same turn.
+  if (pendingCreativeJustAutoConfirmedThisTurn) {
+    return "This message was just used to confirm the pending creative for this campaign — that confirmation has been saved, but it is NOT approval to execute the campaign, and execute_strategy has been blocked. Tell the user plainly: the creative is confirmed, the campaign has NOT been created yet, and they need to say \"approve\" (or similar) separately to actually launch it. Present the now-complete, updated recommendation and wait for that explicit, separate approval before calling execute_strategy again.";
+  }
   if (!messageIndicatesExecutionApprovalV2(userMessage)) {
     return 'The user has not explicitly approved the current strategy in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
   }
@@ -433,6 +444,19 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   // unresolved_questions entry means a genuine business decision is still
   // open regardless of what the user's message says — "approve" cannot
   // answer a question it never addressed.
+  //
+  // Design principle (written down after shipping the same trap twice —
+  // destination_url, round 36; pendingCreative, round 38): any field that
+  // can appear in unresolved_questions and block execute_strategy HERE
+  // must have a deterministic resolution path — one of the auto-revise
+  // pre-loops above, not just a model-facing question the model is
+  // trusted to relay correctly. A gate with no deterministic way to
+  // satisfy it is not a safety check, it's a trap: the model asks
+  // correctly, the user answers correctly (verbatim, repeatedly), and
+  // nothing moves — the exact shape of both live incidents this comment
+  // is named after. Before adding a NEW unresolved_questions entry
+  // anywhere in strategyBuilder.js, add its matching auto-revise pre-loop
+  // in this file in the SAME change — never as a follow-up.
   if (Array.isArray(active.strategy.unresolved_questions) && active.strategy.unresolved_questions.length > 0) {
     return `This strategy still has an unresolved question that must be answered first: "${active.strategy.unresolved_questions[0]}" — ask the user for that specific answer, then call meta_expert_v2.revise_strategy with the answer before calling execute_strategy again.`;
   }
@@ -1057,6 +1081,27 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // execution — a separate, later "approve" is required once the model
   // re-presents the now-complete recommendation.
   let destinationUrlJustAutoConfirmedThisTurn = false;
+  // Round 38 — same exact risk destinationUrlJustAutoConfirmedThisTurn
+  // exists for, now also true for pendingCreative: messageAffirmsPendingCreative's
+  // own trigger words ("yes", "correct", "confirmed", ...) overlap
+  // directly with messageIndicatesExecutionApprovalV2's — unlike budget/
+  // Pixel/creative-candidate's own trigger signals (a number, an id, a
+  // list marker), which never look like approval language on their own.
+  // Discovered by this round's own regression test failing with "chat
+  // mock exhausted" — the exact same failure shape round 36's original
+  // destination_url fix caught — confirming a bare "yes" confirming the
+  // pending creative was ALSO being read as campaign approval in the same
+  // turn before this flag existed.
+  let pendingCreativeJustAutoConfirmedThisTurn = false;
+  // Round 38 — set true by any deterministic auto-revise pre-loop below
+  // that actually matches and saves something THIS turn (budget/Pixel/
+  // creative-candidate/pendingCreative/destination_url). Read by the
+  // primaryTextAnswer pre-loop (the last one in this section, deliberately)
+  // to avoid capturing the WHOLE raw message as literal ad copy when part
+  // of that same message was already claimed by something else — see its
+  // own comment for why a compound message beyond that narrow check is a
+  // documented, remaining gap rather than something this flag fully solves.
+  let otherFieldAutoRevisedThisTurn = false;
   const MAX_MALFORMED_NUDGES = 1;
   const hasMetaExpertTools = availableTools.some((t) => t.name?.startsWith("meta_expert.") || t.name?.startsWith("meta_expert_v2."));
   const hasV2Tools = availableTools.some((t) => t.name?.startsWith("meta_expert_v2."));
@@ -1107,6 +1152,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             userMessage,
           });
           if (revised.ok) {
+            otherFieldAutoRevisedThisTurn = true;
             trace.push(traceStep("tool", "Auto-saved the budget you just gave (meta_expert_v2.revise_strategy)", "done"));
             toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
             // Appended to the LAST user turn (never pushed as a separate
@@ -1205,6 +1251,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             userMessage,
           });
           if (revised.ok) {
+            otherFieldAutoRevisedThisTurn = true;
             trace.push(traceStep("tool", "Auto-saved the Pixel you just chose (meta_expert_v2.revise_strategy)", "done"));
             toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
             const lastIdx = conversationForModel.length - 1;
@@ -1249,6 +1296,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             userMessage,
           });
           if (revised.ok) {
+            otherFieldAutoRevisedThisTurn = true;
             trace.push(traceStep("tool", "Auto-saved the creative you just chose (meta_expert_v2.revise_strategy)", "done"));
             toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
             // Same append-in-place pattern as the budget/Pixel auto-revise
@@ -1272,6 +1320,76 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         } catch (err) {
           v2Trace("auto-revise creative failed (error)", { conversationId, error: err.message });
         }
+      }
+    }
+  }
+
+  // Round 38 fix (production deadlock, same shape as round 36's
+  // destination_url deadlock): a live report showed the user replying
+  // "yes" three separate times to a pendingCreative confirmation question
+  // — the exact word messageAffirmsPendingCreative accepts — and it never
+  // resolved. Root cause: unlike the ambiguous-candidate-list case
+  // directly above (which HAS this deterministic pre-loop), pendingCreative
+  // promotion only ever happened inside resolveCreativeSelection
+  // (creativeResolution.js), itself only reachable when build_strategy/
+  // revise_strategy is actually CALLED — there was no equivalent of this
+  // pre-loop for it at all, so promotion was entirely dependent on the
+  // model choosing to call revise_strategy for a bare "yes." Same fix
+  // shape as every pre-loop in this section: BEFORE the model's turn, if
+  // the active strategy has a genuinely pending (picked-but-unverified)
+  // creative and the user's CURRENT message affirms it
+  // (messageAffirmsPendingCreative — whole-message-only, same discipline
+  // as its siblings), call revise_strategy directly.
+  //
+  // requestedChanges is deliberately {} — resolveCreativeSelection's own
+  // promotion path (creativeResolution.js) only requires
+  // contentSelectorProvidedThisCall to be false (true here, since {} has
+  // no content_selector key) and a matching priorPendingCreative; it
+  // doesn't need any field to actually change. checkRevisionSubstantive
+  // (policy.js) is safe with an empty object too — it only flags fields
+  // requestedChanges explicitly names, so {} can never trip it.
+  //
+  // Design principle (see the fuller version of this comment at
+  // checkV2ExecutionApprovalGate's unresolved_questions check below, the
+  // actual gate this exists to keep satisfiable): any field that can
+  // block execute_strategy MUST have a deterministic resolution path — a
+  // gate with no deterministic way to satisfy it is a trap, and we have
+  // now shipped that trap twice (destination_url, round 36; this one).
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const pendingCreative = activeStrategy?.resolvedAssets?.pendingCreative;
+    if (activeStrategy && pendingCreative && messageAffirmsPendingCreative(userMessage)) {
+      try {
+        const accessToken = requireValidToken(userId, "meta_ads");
+        const revised = await reviseStrategyV2({
+          userId, conversationId, accessToken, strategyId: activeStrategy.id,
+          requestedChanges: {}, userMessage,
+        });
+        if (revised.ok) {
+          otherFieldAutoRevisedThisTurn = true;
+          pendingCreativeJustAutoConfirmedThisTurn = true;
+          trace.push(traceStep("tool", "Auto-confirmed the creative you just approved (meta_expert_v2.revise_strategy)", "done"));
+          toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+          const lastIdx = conversationForModel.length - 1;
+          const last = conversationForModel[lastIdx];
+          if (last?.role === "user" && typeof last.content === "string") {
+            // Deliberately does NOT say "you may now call execute_strategy"
+            // — this message's affirmation was spent confirming the
+            // creative, never doubles as campaign approval (see
+            // pendingCreativeJustAutoConfirmedThisTurn below, which
+            // backend-enforces this regardless of what the model does
+            // with this note — same discipline as the destination_url
+            // pre-loop's own note above).
+            conversationForModel = [
+              ...conversationForModel.slice(0, lastIdx),
+              { ...last, content: `${last.content}\n\n[System note: this message's confirmation of the pending creative has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} This message confirmed the CREATIVE ONLY — it is NOT approval to execute the campaign. Present the now-complete recommendation and wait for the user's separate, explicit approval before calling meta_expert_v2.execute_strategy.]` },
+            ];
+          }
+        } else {
+          v2Trace("auto-revise pendingCreative failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+        }
+      } catch (err) {
+        v2Trace("auto-revise pendingCreative failed (error)", { conversationId, error: err.message });
       }
     }
   }
@@ -1314,6 +1432,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         });
         if (revised.ok) {
           destinationUrlJustAutoConfirmedThisTurn = true;
+          otherFieldAutoRevisedThisTurn = true;
           trace.push(traceStep("tool", "Auto-saved the destination URL you just confirmed (meta_expert_v2.revise_strategy)", "done"));
           toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
           const lastIdx = conversationForModel.length - 1;
@@ -1335,6 +1454,83 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         }
       } catch (err) {
         v2Trace("auto-revise destination_url failed (error)", { conversationId, error: err.message });
+      }
+    }
+  }
+
+  // Round 38 fix (same class as pendingCreative above — a PRODUCT_IMAGE
+  // ad with no real product description needs the user's own ad copy,
+  // and nothing deterministically relayed it; entirely model-dependent
+  // until now). Deliberately placed LAST in this pre-loop section (after
+  // budget/Pixel/creative/pendingCreative/destination_url have already
+  // had a chance to run and update otherFieldAutoRevisedThisTurn) — this
+  // is the one pre-loop with no narrow signal to match against: the
+  // question is genuinely open-ended free text, so the answer IS
+  // whatever the user typed, verbatim (see the tool description in
+  // tools/meta/metaExpertV2.js: "transcribe EXACTLY what the user typed
+  // ... never write or improve it yourself"). That means it can't
+  // independently recognize which PART of a message is meant for it the
+  // way a digit or URL can.
+  //
+  // Scoped narrowly to keep that safe: only fires when the primaryText
+  // question is the strategy's ONLY currently open question (re-read
+  // fresh here, after every earlier pre-loop this turn already ran —
+  // so "600/day, ad text: Get glowing skin today!" still resolves BOTH
+  // correctly: the budget pre-loop above claims "600" and sets
+  // otherFieldAutoRevisedThisTurn, budget's own question closes, and by
+  // the time this block re-reads the active strategy, budget's question
+  // is already gone from unresolved_questions), and only when
+  // otherFieldAutoRevisedThisTurn is still false (nothing else claimed
+  // part of THIS message) — a genuinely compound message that mixes free
+  // text with another field's answer in the SAME turn still can't be
+  // safely split (there's no reliable, non-fuzzy way to know where the ad
+  // copy starts and the other answer ends), so it correctly falls back to
+  // model-dependent for that one case. KNOWN REMAINING GAP, left
+  // deliberately rather than silently: primaryText open ALONGSIDE another
+  // question that this exact message ALSO tries to answer in one breath
+  // will still depend on the model calling revise_strategy correctly. A
+  // real fix would need an explicit convention (e.g. requiring the ad
+  // copy to be quoted, or asking this question in strict isolation from
+  // every other open question) — not built here; flagged for whoever
+  // hits it in production next, per the design principle below.
+  //
+  // Approval language and the pendingCreative bare-affirmation words are
+  // excluded — "approve" or "yes" alone is never genuine ad copy, and
+  // treating it as such would ship nonsense text to a real ad.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const questions = activeStrategy?.strategy?.unresolved_questions;
+    const needsPrimaryTextOnly = Array.isArray(questions) && questions.length === 1
+      && questions[0].startsWith('What ad text would you like for the "');
+    const trimmedMessage = typeof userMessage === "string" ? userMessage.trim() : "";
+    if (
+      activeStrategy && needsPrimaryTextOnly && !otherFieldAutoRevisedThisTurn && trimmedMessage
+      && !messageIndicatesExecutionApprovalV2(userMessage) && !messageAffirmsPendingCreative(userMessage)
+    ) {
+      try {
+        const accessToken = requireValidToken(userId, "meta_ads");
+        const revised = await reviseStrategyV2({
+          userId, conversationId, accessToken, strategyId: activeStrategy.id,
+          requestedChanges: { content_selector: { primaryTextAnswer: trimmedMessage } },
+          userMessage,
+        });
+        if (revised.ok) {
+          otherFieldAutoRevisedThisTurn = true;
+          trace.push(traceStep("tool", "Auto-saved the ad text you just gave (meta_expert_v2.revise_strategy)", "done"));
+          toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+          const lastIdx = conversationForModel.length - 1;
+          const last = conversationForModel[lastIdx];
+          if (last?.role === "user" && typeof last.content === "string") {
+            conversationForModel = [
+              ...conversationForModel.slice(0, lastIdx),
+              { ...last, content: `${last.content}\n\n[System note: this message's ad text has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+            ];
+          }
+        } else {
+          v2Trace("auto-revise primaryTextAnswer failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+        }
+      } catch (err) {
+        v2Trace("auto-revise primaryTextAnswer failed (error)", { conversationId, error: err.message });
       }
     }
   }
@@ -1425,7 +1621,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             hasActiveV2Strategy: Boolean(getActiveStrategyForConversation(userId, conversationId)),
             executeCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) > 0,
             reviseCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0,
-            executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn,
+            executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn,
           })
         : null;
       if (executionClaimGateMessage && executionClaimNudges < MAX_EXECUTION_CLAIM_NUDGES) {
@@ -1825,7 +2021,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // active strategy yet, or no approval language) doesn't consume
         // the once-per-turn dispatch budget, only a genuine execution
         // attempt that reaches runTool() below does.
-        const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn });
+        const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn });
         if (gateError) {
           outcome = { status: "failed", error: gateError };
           executeGateBlockedThisTurn = true;
