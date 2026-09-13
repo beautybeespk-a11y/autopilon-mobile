@@ -53,7 +53,11 @@ function currencyMinorUnitMultiplier(currencyCode) {
   if (typeof currencyCode !== "string" || !currencyCode) return 100;
   return META_ZERO_DECIMAL_CURRENCIES.has(currencyCode.toUpperCase()) ? 1 : 100;
 }
-function toMetaBudgetMinorUnits(majorAmount, currencyCode) {
+// Exported (round 45) — campaignEditor.js's live ad-set budget edit reuses
+// this exact conversion rather than re-deriving it; the "edit an existing
+// campaign" feature must never become a way around the same minor-unit/cap
+// discipline creation already enforces.
+export function toMetaBudgetMinorUnits(majorAmount, currencyCode) {
   if (typeof majorAmount !== "number" || !Number.isFinite(majorAmount)) return majorAmount;
   return Math.round(majorAmount * currencyMinorUnitMultiplier(currencyCode));
 }
@@ -151,7 +155,11 @@ function validateCampaignFieldCombination(strategy, resolvedAssets, targeting) {
 // future strategy genuinely wants broad/automatic audience expansion,
 // that must become a real field on the strategy schema the user sees and
 // approves, never a value hardcoded here without their knowledge.
-function buildV2Targeting(strategy) {
+// Exported (round 45) — campaignEditor.js's live ad-set audience edit
+// reuses this exact targeting construction (same advantage_audience: 0
+// discipline, never left to Meta's own expansion default) rather than
+// re-deriving it independently.
+export function buildV2Targeting(strategy) {
   return {
     ...buildTargeting({ countries: strategy.countries, ageMin: strategy.age_min, ageMax: strategy.age_max, gender: strategy.gender === "ALL" ? undefined : strategy.gender?.toLowerCase() }),
     targeting_automation: { advantage_audience: 0 },
@@ -589,6 +597,22 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   // the flag being off right now.
   assertV2RuntimeEnabled(userId);
   const stored = loadExecutable(userId, conversationId, strategyId);
+
+  // Round 45 — a campaign_edit row (campaignEditor.js) is structurally NOT
+  // a campaign/explicit_action strategy at all (no recommended_objective,
+  // no creative_strategy, budget/audience changes live under
+  // strategy.requestedChanges, not top-level) — every check below this
+  // point would either throw a confusing, wrong-sounding error against it
+  // (e.g. "no daily budget set" for a budget-only edit that never touches
+  // audience) or, worse, silently misinterpret its fields. Refused here,
+  // structurally and by name, before any of that: campaign_edit rows are
+  // only ever applied via meta_expert_v2.apply_campaign_edit
+  // (campaignEditor.js), never execute_strategy.
+  if (stored.strategy.mode === "campaign_edit") {
+    const err = new Error("This is a campaign EDIT proposal, not a new strategy to execute — call meta_expert_v2.apply_campaign_edit instead.");
+    err.code = "META_V2_WRONG_EXECUTION_TOOL";
+    throw err;
+  }
 
   // Defense in depth — checkV2ExecutionApprovalGate in orchestrator/
   // index.js already blocks this before the tool is even dispatched, but

@@ -486,6 +486,30 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   return null;
 }
 
+// Round 45 (edit-an-existing-campaign feature) — the SAME explicit-
+// approval-this-turn discipline as checkV2ExecutionApprovalGate above,
+// checked BEFORE meta_expert_v2.apply_campaign_edit is ever dispatched —
+// a live ad set update is exactly as real a mutation as execute_strategy's
+// campaign creation, and must never be implied. Deliberately a separate,
+// new function rather than extending checkV2ExecutionApprovalGate itself:
+// that gate's own unresolved_questions/pendingCreative/destinationUrl
+// checks are specific to a CAMPAIGN strategy's shape and don't apply to a
+// campaign_edit row at all (no creative, no destination_url, no Pixel —
+// see campaignEditor.js's own validation, which rejects those fields
+// outright before a campaign_edit row can even be proposed). Only fires
+// when the active strategy for this conversation genuinely IS a pending
+// campaign_edit proposal — never interferes with an ordinary campaign
+// strategy's own approval flow, which checkV2ExecutionApprovalGate above
+// still owns entirely, untouched.
+export function checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage }) {
+  const active = getActiveStrategyForConversation(userId, conversationId);
+  if (!active || active.strategy?.mode !== "campaign_edit") return null;
+  if (!messageIndicatesExecutionApprovalV2(userMessage)) {
+    return 'The user has not explicitly approved this campaign edit in their latest message. Present (or re-present) the proposed changes and wait for clear approval language (e.g. "approve", "proceed", "yes, apply it") before calling meta_expert_v2.apply_campaign_edit.';
+  }
+  return null;
+}
+
 // CONFIRMED LIVE BUG (V2 live testing): "I want more sales to my website"
 // led the model to call meta_expert_v2.build_strategy repeatedly within
 // the same turn until MAX_STEPS was hit and the user saw the generic
@@ -2048,6 +2072,15 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         if (gateError) {
           outcome = { status: "failed", error: gateError };
           executeGateBlockedThisTurn = true;
+        }
+      } else if (call.toolName === "meta_expert_v2.apply_campaign_edit") {
+        // Round 45 — same shape as the execute_strategy gate immediately
+        // above: a gate-blocked attempt here doesn't consume the once-per-
+        // turn dispatch budget, only a genuine apply attempt that reaches
+        // runTool() below does.
+        const editGateError = checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage });
+        if (editGateError) {
+          outcome = { status: "failed", error: editGateError };
         }
       } else if (call.toolName === "meta_expert.create_campaign_plan") {
         const gate = checkCreatePlanRetryGate({

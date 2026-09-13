@@ -115,6 +115,24 @@ export function getMostRecentStrategyForConversation(userId, conversationId) {
   );
 }
 
+// Round 45 (edit-an-existing-campaign feature, campaignEditor.js) — the
+// default target when a campaign edit doesn't name a specific strategyId:
+// "the most recent campaign THIS conversation actually created in Meta."
+// Deliberately a direct status='executed' filter, never
+// getExecutedAncestorStrategy's revisionOf-walk below — that function
+// assumes its INPUT is already one hop past the executed row (it checks
+// `current.revisionOf`'s parent, never `current` itself), so feeding it
+// the most-recent row when that row IS already the executed one would
+// walk straight past it to whatever it was revised FROM instead. This is
+// a plain, direct lookup: newest row with status='executed', full stop —
+// same rowid tiebreaker discipline as every other lookup in this file.
+export function getMostRecentExecutedStrategyForConversation(userId, conversationId) {
+  if (!conversationId) return null;
+  return row(
+    db.prepare("SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? AND status = 'executed' ORDER BY createdAt DESC, rowid DESC LIMIT 1").get(userId, conversationId)
+  );
+}
+
 // Round 37 fix — a revision of an ALREADY-EXECUTED strategy is now
 // permitted (see reviseStrategy, strategyBuilder.js) specifically so the
 // creative/audience/budget already resolved on it survives an unrelated

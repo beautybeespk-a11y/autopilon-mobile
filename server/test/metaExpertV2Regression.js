@@ -24,11 +24,12 @@ const { saveConnection, updateConnectionMeta, getConnection } = await import("..
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
+const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
 const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection } = await import("../agents/metaExpertV2/creativeResolution.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate } = await import("../orchestrator/agentLibrary.js");
@@ -98,6 +99,21 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
       // succeed naturally, exactly like the real API would.
       if (writeError && path.endsWith(writeError.pathSuffix) && (!writeError.failWhen || writeError.failWhen(writeBody))) {
         return jsonResponse({ error: writeError.error }, writeError.status || 400);
+      }
+      // Round 45 (edit-an-existing-campaign feature) — a bare POST /{id}
+      // (updateAdSet/updateCampaign/setCampaignStatus — api.js's real
+      // "POST to the object's own node updates it" convention) to an id
+      // this mock already created is an in-place UPDATE, merged into that
+      // SAME record — never a new one. Previously every write fell
+      // through to the generic "always create a new record" branch below,
+      // which never let a real update-then-read-back round trip be tested
+      // at all. Matches Meta's real response shape for this kind of call
+      // ({success:true}, not an id).
+      const updateMatch = path.match(/^\/(\d+)$/);
+      if (updateMatch && recordsById.has(updateMatch[1])) {
+        const existing = recordsById.get(updateMatch[1]);
+        recordsById.set(updateMatch[1], { path: existing.path, body: { ...existing.body, ...writeBody } });
+        return jsonResponse({ success: true });
       }
       const newId = String(nextId++);
       recordsById.set(newId, { path, body: writeBody });
@@ -276,11 +292,16 @@ async function run() {
   console.log("Meta Ads Expert V2 regression suite\n");
 
   // --- Step 9: raw-tool isolation (structural + dynamic) ------------------
-  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 4 V2 tools — no raw meta.* mutation tools", () => {
+  // Round 45 — grew from 4 to 6 tools (propose_campaign_edit/
+  // apply_campaign_edit, the edit-an-existing-campaign feature) — the
+  // actual isolation property this test protects (no raw meta.*
+  // mutation tool ever reaches a V2-only agent) is unchanged; only the
+  // real, intended V2 tool count grew.
+  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 6 V2 tools — no raw meta.* mutation tools", () => {
     const names = listToolsForSkills(["meta_expert_v2"]).map((t) => t.name);
     assert.deepEqual(names.sort(), [
-      "meta_expert_v2.build_strategy", "meta_expert_v2.execute_strategy",
-      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.revise_strategy",
+      "meta_expert_v2.apply_campaign_edit", "meta_expert_v2.build_strategy", "meta_expert_v2.execute_strategy",
+      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.revise_strategy",
     ]);
   });
 
@@ -6827,6 +6848,471 @@ async function run() {
       const updated = getActiveStrategyForConversation(userId, conversationId);
       assert.equal(updated.resolvedAssets.creative, null, `a decimal must never resolve the creative: ${JSON.stringify(updated.resolvedAssets.creative)}`);
       assert.ok(updated.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the creative question must remain open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Editing an existing campaign (round 45) -----------------------------
+  // Replaces the round-37 placeholder ("editing an existing campaign isn't
+  // supported yet") for budget and audience — the only two strategy fields
+  // that ever actually reach Meta's real ad set. Two-step flow:
+  // propose_campaign_edit (a real 'proposed' row, mode: "campaign_edit")
+  // then apply_campaign_edit (its own explicit approval gate, live
+  // read-back before AND after, per-field drift refusal, no-op guard,
+  // verbatim Meta errors). See campaignEditor.js for the full design.
+  async function buildAndExecuteCampaign(userId, conversationId, strategyOverrides = {}) {
+    const built = await buildStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      strategy: baseStrategy(strategyOverrides), userMessage: "I want more sales on my website",
+    });
+    assert.equal(built.ok, true, `test setup: build failed — ${JSON.stringify(built.unresolved)}`);
+    const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+    return { built, executed };
+  }
+  function editMetaOpts(writes) {
+    return { adAccounts: [{ id: "act_1", name: "A", currency: "USD" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes };
+  }
+
+  await check("[campaign edit, round 45] propose + explicit approval + apply a BUDGET change updates the real ad set and reads back verified", async () => {
+    const userId = makeUser(`v2-edit-budget-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      assert.equal(executed.status, "PAUSED");
+
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      assert.equal(proposed.ok, true, JSON.stringify(proposed.unresolved));
+      assert.match(proposed.recommendationText, /Budget: 20\/day → 35\/day/);
+      assert.match(proposed.recommendationText, new RegExp(`Campaign ID: ${executed.campaignId}`));
+
+      assert.ok(checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage: "not yet, hold on" }), "must be blocked without explicit approval language");
+      assert.equal(checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage: "approve" }), null, "explicit approval must clear the gate");
+
+      const applied = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve",
+      });
+      assert.equal(applied.appliedChanges.budget_daily, 35);
+
+      const adSetWrite = writes.filter((w) => w.path === `/${executed.adSetId}`).pop();
+      assert.ok(adSetWrite, "an in-place update write to the real ad set's own id must have happened");
+      assert.equal(adSetWrite.body.daily_budget, 3500, "budget must go through the same minor-unit conversion as creation (35 * 100)");
+      assert.equal(adSetWrite.body.status, undefined, "status must never be touched — the campaign stays paused, never resumed as a side effect");
+      assert.equal(adSetWrite.body.targeting, undefined, "a budget-only edit must never also resend targeting");
+
+      const finalRow = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(finalRow.status, "executed");
+      assert.equal(finalRow.executionResult.appliedChanges.budget_daily, 35);
+      assert.equal(finalRow.executionResult.previousLiveValues.budget_daily, 20);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] an AUDIENCE change merges onto the LIVE targeting, never the app's own stale record — an untouched dimension a human changed independently survives", async () => {
+    const userId = makeUser(`v2-edit-audience-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { gender: "FEMALE", age_min: 21, age_max: 44, countries: ["PK"] });
+
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { gender: "ALL" }, userMessage: "open this up to all genders",
+      });
+      assert.equal(proposed.ok, true, JSON.stringify(proposed.unresolved));
+      assert.match(proposed.recommendationText, /Gender: FEMALE → ALL/);
+
+      // Simulate a human independently widening the countries directly in
+      // Ads Manager — a dimension THIS edit never asked to touch. Applied
+      // via a raw update call through the SAME mock (its in-place-merge
+      // logic — see scriptedFetch's own comment), exactly like a real
+      // Ads Manager edit would land on the same live object.
+      await fetch(`https://graph.facebook.com/v25.0/${executed.adSetId}`, {
+        method: "POST",
+        body: JSON.stringify({ targeting: { geo_locations: { countries: ["PK", "US"] }, age_min: 21, age_max: 44, genders: [2], targeting_automation: { advantage_audience: 0 } } }),
+      });
+
+      const applied = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve",
+      });
+      assert.equal(applied.appliedChanges.gender, "ALL");
+
+      const adSetWrite = writes.filter((w) => w.path === `/${executed.adSetId}` && w.body.targeting).pop();
+      assert.ok(adSetWrite, "a targeting update write must have happened");
+      assert.deepEqual([...adSetWrite.body.targeting.geo_locations.countries].sort(), ["PK", "US"], "the human's independently-changed countries must be preserved exactly, never reverted to this app's own stale ['PK'] record");
+      assert.equal(adSetWrite.body.targeting.genders, undefined, "ALL genders means no genders field at all, matching buildV2Targeting's own convention");
+      assert.equal(adSetWrite.body.daily_budget, undefined, "an audience-only edit must never also resend budget");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] creative fields are refused outright, never stored as a proposal", async () => {
+    const userId = makeUser(`v2-edit-creative-refused-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId);
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { creative_strategy: { source: "PRODUCT_IMAGE", description: "x" } },
+        userMessage: "change the ad image",
+      });
+      assert.equal(proposed.ok, false);
+      assert.match(proposed.unresolved.issue, /Meta ad creatives are effectively immutable/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] an unknown field is refused, and a no-op (values already match) is refused, neither is silently accepted", async () => {
+    const userId = makeUser(`v2-edit-unknown-noop-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+
+      const unknown = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { bid_strategy: "LOWEST_COST_WITH_BID_CAP" }, userMessage: "change the bid strategy",
+      });
+      assert.equal(unknown.ok, false);
+      assert.match(unknown.unresolved.issue, /can't be edited on an existing campaign yet/i);
+
+      const noOp = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 20 }, userMessage: "keep the budget at 20/day",
+      });
+      assert.equal(noOp.ok, false);
+      assert.match(noOp.unresolved.issue, /already match/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] a daily budget above the executable cap is refused at propose time", async () => {
+    const userId = makeUser(`v2-edit-budget-cap-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 999999 }, userMessage: "change the budget to 999999/day",
+      });
+      assert.equal(proposed.ok, false);
+      assert.match(proposed.unresolved.issue, /exceeds the maximum executable daily budget/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] apply is refused without explicit approval language, even when a proposal exists", async () => {
+    const userId = makeUser(`v2-edit-no-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "sounds good, thanks" }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] a BUDGET drift (human changed it in Ads Manager) refuses and names the live value — an audience-only edit is NOT blocked by the same drift", async () => {
+    const userId = makeUser(`v2-edit-budget-drift-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20, gender: "FEMALE" });
+      const proposedBudget = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+
+      // Simulate a human directly changing the LIVE budget in Ads Manager.
+      await fetch(`https://graph.facebook.com/v25.0/${executed.adSetId}`, { method: "POST", body: JSON.stringify({ daily_budget: 9999 }) });
+
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposedBudget.strategyId, userMessage: "approve" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_EDIT_DRIFT_BUDGET");
+          assert.match(err.message, /9999/, "the error must name the actual current live value");
+          return true;
+        }
+      );
+
+      // The audience edit never touches budget — the SAME drift must not
+      // block it (per-field, not blanket). Proposed AFTER the budget edit
+      // above is already terminal ('failed') — two proposals live at once
+      // in the same conversation would otherwise supersede each other via
+      // insertStrategy's own existing one-live-proposal-per-conversation
+      // rule (correct, pre-existing behavior; not what this test is
+      // about), so this deliberately proposes it fresh once the first is
+      // already resolved.
+      const proposedAudience = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { gender: "ALL" }, userMessage: "open this up to all genders",
+      });
+      const appliedAudience = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposedAudience.strategyId, userMessage: "approve",
+      });
+      assert.equal(appliedAudience.appliedChanges.gender, "ALL");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] an AUDIENCE drift (human changed it in Ads Manager) refuses and names the live value — a budget-only edit is NOT blocked by the same drift", async () => {
+    const userId = makeUser(`v2-edit-audience-drift-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20, age_min: 21, age_max: 44 });
+      const proposedAudience = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { age_min: 25 }, userMessage: "change the minimum age to 25",
+      });
+
+      // Simulate a human directly widening the live age range in Ads Manager.
+      await fetch(`https://graph.facebook.com/v25.0/${executed.adSetId}`, { method: "POST", body: JSON.stringify({ targeting: { geo_locations: { countries: ["PK"] }, age_min: 18, age_max: 44, targeting_automation: { advantage_audience: 0 } } }) });
+
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposedAudience.strategyId, userMessage: "approve" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_EDIT_DRIFT_AUDIENCE");
+          assert.match(err.message, /18/, "the error must name the actual current live value");
+          return true;
+        }
+      );
+
+      // The budget edit never touches audience — the SAME drift must not
+      // block it (per-field, not blanket). Proposed AFTER the audience
+      // edit above is already terminal ('failed') — see the matching
+      // comment in the budget-drift test above for why.
+      const proposedBudget = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 40 }, userMessage: "change the budget to 40/day",
+      });
+      const appliedBudget = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposedBudget.strategyId, userMessage: "approve",
+      });
+      assert.equal(appliedBudget.appliedChanges.budget_daily, 40);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] the campaign must be PAUSED immediately before applying — refused if it was resumed since the edit was proposed, never resumed as a side effect", async () => {
+    const userId = makeUser(`v2-edit-campaign-resumed-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+
+      // Simulate the user resuming the campaign directly in Ads Manager.
+      await fetch(`https://graph.facebook.com/v25.0/${executed.campaignId}`, { method: "POST", body: JSON.stringify({ status: "ACTIVE" }) });
+
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve" }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_CAMPAIGN_NOT_PAUSED"); return true; }
+      );
+      const adSetWrite = writes.filter((w) => w.path === `/${executed.adSetId}` && (w.body.daily_budget !== undefined || w.body.targeting)).pop();
+      assert.ok(!adSetWrite, "the ad set must never be touched once the campaign is found not paused");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] Meta's own rejection surfaces verbatim on the update call — never swallowed, never retried", async () => {
+    const userId = makeUser(`v2-edit-meta-error-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    let executed, proposed;
+    // Build/execute/propose under a NORMAL mock first — a writeError
+    // scoped broadly enough to hit the update call would also hit
+    // campaign/ad-set CREATION (both are POSTs too), so the error is only
+    // introduced once the real adSetId is known, via a mock swap (same
+    // technique as the read-back-verification-failure test above).
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    try {
+      ({ executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 }));
+      proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+    } finally {
+      restoreFetch();
+    }
+    // A bespoke mock (not scriptedFetch's own stateful recordsById, which
+    // would start EMPTY on a fresh router instance and lose the
+    // already-created campaign/ad set) — serves the known-good read-backs
+    // for the ids created above, but rejects the update call itself with
+    // Meta's own real-shaped error.
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method === "GET" && path === `/${executed.adSetId}`) {
+        return { ok: true, status: 200, json: async () => ({ id: executed.adSetId, status: "PAUSED", daily_budget: 2000, targeting: { geo_locations: { countries: ["PK"] }, age_min: 21, age_max: 44 } }) };
+      }
+      if (method === "GET" && path === `/${executed.campaignId}`) {
+        return { ok: true, status: 200, json: async () => ({ id: executed.campaignId, status: "PAUSED" }) };
+      }
+      if (method === "GET" && path === "/me/adaccounts") {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: "act_1", name: "A", currency: "USD" }] }) };
+      }
+      if (method !== "GET" && path === `/${executed.adSetId}`) {
+        return { ok: false, status: 400, json: async () => ({ error: { message: "(#100) Invalid parameter for ad set update" } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    });
+    try {
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve" }),
+        (err) => {
+          assert.match(err.message, /Invalid parameter for ad set update/, `Meta's real error text must reach the caller verbatim: ${err.message}`);
+          return true;
+        }
+      );
+      const finalRow = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(finalRow.status, "failed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] a failed read-back verification after the update is treated as unverified, never assumed successful", async () => {
+    const userId = makeUser(`v2-edit-verify-fail-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts(writes) }));
+    let proposed, executed;
+    try {
+      ({ executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 }));
+      proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+    } finally {
+      restoreFetch();
+    }
+    // A second mock whose update call silently no-ops (simulating Meta
+    // accepting the call but the read-back never actually reflecting it) —
+    // the SAME adSetId, but its own in-place-merge is bypassed by
+    // returning the update response without ever updating recordsById.
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if ((options.method || "GET") === "GET" && path === `/${executed.adSetId}`) {
+        return { ok: true, status: 200, json: async () => ({ id: executed.adSetId, status: "PAUSED", daily_budget: 2000, targeting: { geo_locations: { countries: ["PK"] }, age_min: 21, age_max: 44 } }) };
+      }
+      if ((options.method || "GET") === "GET" && path === `/${executed.campaignId}`) {
+        return { ok: true, status: 200, json: async () => ({ id: executed.campaignId, status: "PAUSED" }) };
+      }
+      if ((options.method || "GET") === "GET" && path === "/me/adaccounts") {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: "act_1", name: "A", currency: "USD" }] }) };
+      }
+      if ((options.method || "GET") !== "GET") return { ok: true, status: 200, json: async () => ({ success: true }) };
+      return { ok: true, status: 200, json: async () => ({ data: [] }) };
+    });
+    try {
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve" }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_VERIFY_FAILED"); assert.match(err.message, /read-back/i); return true; }
+      );
+      const finalRow = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(finalRow.status, "failed", "must never be marked executed when the read-back never confirms it");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] execute_strategy refuses a campaign_edit row by name, and apply_campaign_edit refuses a real campaign strategy by name — the two tools are never interchangeable", async () => {
+    const userId = makeUser(`v2-edit-wrong-tool-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      const { built } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId }),
+        (err) => { assert.equal(err.code, "META_V2_WRONG_EXECUTION_TOOL"); return true; }
+      );
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
+        (err) => { assert.equal(err.code, "META_V2_WRONG_APPLY_TOOL"); return true; }
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 45] targetStrategyId defaults to the most recent EXECUTED campaign for this conversation, and an explicit id naming a never-executed strategy is refused", async () => {
+    const userId = makeUser(`v2-edit-target-resolution-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      const { executed, built } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+
+      const defaulted = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      assert.equal(defaulted.ok, true, JSON.stringify(defaulted.unresolved));
+      assert.match(defaulted.recommendationText, new RegExp(`Campaign ID: ${executed.campaignId}`));
+
+      const neverExecutedBuild = await buildStrategy({
+        userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website",
+      });
+      assert.equal(neverExecutedBuild.ok, true);
+
+      await assert.rejects(
+        () => proposeCampaignEdit({
+          userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+          targetStrategyId: neverExecutedBuild.strategyId, requestedChanges: { budget_daily: 35 }, userMessage: "edit that one",
+        }),
+        (err) => { assert.equal(err.code, "META_V2_STRATEGY_NOT_EXECUTED"); return true; }
+      );
     } finally {
       restoreFetch();
     }

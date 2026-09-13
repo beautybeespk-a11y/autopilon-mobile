@@ -435,6 +435,28 @@ export async function getAdSet(accessToken, adSetId) {
   return metaFetch(`/${adSetId}?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,targeting`, { accessToken });
 }
 
+// Round 45 (edit-an-existing-campaign feature, campaignEditor.js) — single-
+// entity campaign read, the exact "re-verify the campaign still exists and
+// is still paused, immediately before applying anything" check that
+// feature requires. listCampaigns already exists for the bulk case; this
+// is its single-entity equivalent, same relationship getAdAccount has to
+// listAdAccounts above.
+export async function getCampaign(accessToken, campaignId) {
+  return metaFetch(`/${campaignId}?fields=id,name,status,objective`, { accessToken });
+}
+
+// Round 45 (edit-an-existing-campaign feature) — ad sets only ever had a
+// create primitive (createAdSet above); updating one already-live follows
+// the exact same convention updateCampaign above already established
+// (Meta's real API: POST to the object's own id node updates it) — never
+// through the registered meta.create_ad_set TOOL (campaigns.js), which
+// this feature must not touch (V1's own primitives stay untouched). The
+// caller is responsible for sending ONLY the fields actually changing —
+// this is a thin, honest wrapper, not a merge/diff of its own.
+export async function updateAdSet(accessToken, adSetId, fields) {
+  return metaFetch(`/${adSetId}`, { accessToken, method: "POST", body: fields });
+}
+
 export async function getAd(accessToken, adId) {
   return metaFetch(`/${adId}?fields=id,name,status,adset_id,campaign_id,creative`, { accessToken });
 }

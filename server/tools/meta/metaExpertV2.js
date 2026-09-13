@@ -1,5 +1,7 @@
-// Meta Ads Expert V2 — the ONLY four tools this agent's LLM can see (Step
-// 9). Registered under category "meta_expert_v2" — an agent installed
+// Meta Ads Expert V2 — the ONLY tools this agent's LLM can see: the
+// original four (Step 9) plus propose_campaign_edit/apply_campaign_edit
+// (round 45, editing an existing campaign). Registered under category
+// "meta_expert_v2" — an agent installed
 // from the "Meta Ads Manager V2" template (server/orchestrator/
 // agentLibrary.js) has ONLY this skill enabled, never "meta_ads" (the raw
 // mutation tools' category) — so listToolsForSkills() (server/tools/
@@ -14,7 +16,8 @@ import { requireValidToken } from "../../integrations/manager.js";
 import { gatherBusinessSnapshot } from "../../agents/metaExpertV2/businessSnapshot.js";
 import { buildStrategy, reviseStrategy } from "../../agents/metaExpertV2/strategyBuilder.js";
 import { executeStrategy, rejectStrategy } from "../../agents/metaExpertV2/executor.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation } from "../../agents/metaExpertV2/strategyStore.js";
+import { proposeCampaignEdit, applyCampaignEdit } from "../../agents/metaExpertV2/campaignEditor.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, markStrategyRejected } from "../../agents/metaExpertV2/strategyStore.js";
 import { INTERNAL_STRATEGY_SCHEMA } from "../../agents/metaExpertV2/strategySchema.js";
 import { assertV2RuntimeEnabled } from "../../agents/metaExpertV2/runtimeGate.js";
 
@@ -203,4 +206,70 @@ registerTool({
 
 registerOnRejectedHandler("meta_expert_v2.execute_strategy", async (parameters, { userId, conversationId }) => {
   rejectStrategy(userId, conversationId, parameters.strategyId);
+});
+
+// Round 45 — editing an EXISTING, already-executed campaign. Replaces the
+// round-37 placeholder (execute_strategy/executor.js's
+// META_V2_STRATEGY_REVISES_EXECUTED refusal, "editing an existing campaign
+// isn't supported yet" — still fully in place, this is additive alongside
+// it) for the one thing that placeholder always pointed users away from:
+// budget and audience changes on a campaign that's already live in Meta.
+// Two-step, same shape as build_strategy -> execute_strategy: propose the
+// diff, get a SEPARATE explicit approval, then apply it. See
+// campaignEditor.js for the full flow (live read-back before AND after
+// applying, per-field drift refusal, no-op guard, verbatim Meta errors).
+registerTool({
+  name: "meta_expert_v2.propose_campaign_edit",
+  description:
+    "Proposes a change to the budget and/or audience (gender, age range, countries) of a campaign that's ALREADY been created in Meta (via execute_strategy). This does NOT change anything in Meta yet — it computes the diff against what's actually live, stores it, and returns a plain-language summary for the user to approve. NEVER for a creative change — Meta ad creatives are effectively immutable once live, so a creative change needs a brand-new campaign, not an edit; refuse those requests and suggest building a new strategy instead. targetStrategyId is optional — omit it to target the most recent campaign THIS conversation created. requestedChanges may include ONLY: budget_daily (a number), gender (ALL/MALE/FEMALE), age_min, age_max, countries (ISO 3166-1 alpha-2 codes). Only include the fields actually changing.",
+  category: "meta_expert_v2",
+  parameters: {
+    type: "object",
+    properties: {
+      targetStrategyId: { type: "string", description: "Optional — the id of the EXECUTED strategy whose live campaign should be edited. Omit to target the most recent one this conversation created." },
+      requestedChanges: {
+        type: "object",
+        description: "Only budget_daily/gender/age_min/age_max/countries — never a creative field.",
+        properties: {
+          budget_daily: { type: "number" },
+          gender: { type: "string", enum: ["ALL", "MALE", "FEMALE"] },
+          age_min: { type: "number" },
+          age_max: { type: "number" },
+          countries: { type: "array", items: { type: "string" } },
+        },
+      },
+    },
+    required: [],
+  },
+  requiredPermissions: ["meta.read"],
+  requiresConfirmation: false,
+  async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
+    const result = await proposeCampaignEdit({
+      userId: context.userId, conversationId: context.conversationId, accessToken: token(context),
+      targetStrategyId: parameters.targetStrategyId, requestedChanges: parameters.requestedChanges || {}, userMessage: context.userMessage,
+    });
+    if (!result.ok) return { valid: false, issue: result.unresolved.issue, field: result.unresolved.field, allIssues: result.unresolved.allIssues };
+    return { valid: true, strategyId: result.strategyId, recommendationText: result.recommendationText };
+  },
+});
+
+registerTool({
+  name: "meta_expert_v2.apply_campaign_edit",
+  description:
+    "Applies a previously proposed, user-APPROVED campaign edit (see propose_campaign_edit) to the real, live Meta ad set. Re-verifies the campaign and ad set are still exactly what the edit was proposed against before applying anything — if a human changed the SAME field(s) directly in Ads Manager since, this is refused rather than silently overwritten (a different field they didn't ask to change is never a reason to refuse). The campaign always stays PAUSED — this never resumes it. Only call this after the user has EXPLICITLY approved THIS edit in their own words this turn ('approve', 'yes, apply it') — the backend enforces this and blocks the call otherwise. strategyId is optional — omit it to use the current active campaign-edit proposal for this conversation.",
+  category: "meta_expert_v2",
+  parameters: { type: "object", properties: { strategyId: { type: "string", description: "Optional — omit to use the current active campaign edit proposal." } }, required: [] },
+  requiredPermissions: ["meta.write"],
+  requiresConfirmation: true,
+  async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
+    return applyCampaignEdit({ userId: context.userId, conversationId: context.conversationId, accessToken: token(context), strategyId: parameters.strategyId, userMessage: context.userMessage });
+  },
+});
+
+registerOnRejectedHandler("meta_expert_v2.apply_campaign_edit", async (parameters, { userId, conversationId }) => {
+  const active = parameters.strategyId ? null : getActiveStrategyForConversation(userId, conversationId);
+  const strategyId = parameters.strategyId || active?.id;
+  if (strategyId) markStrategyRejected(strategyId);
 });
