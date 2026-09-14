@@ -229,11 +229,26 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   // for ANY source — every campaign this executor has ever created
   // shipped with no call-to-action at all. Fixed once, after the source-
   // specific branch above, so no future source can add itself without
-  // also going through this. Verified empirically against the live Meta
-  // API (v25.0): a top-level call_to_action IS accepted alongside a bare
-  // object_story_id — no object_story_spec.link_data restructuring
-  // needed — POSTing {object_story_id, call_to_action:{type:"SHOP_NOW",
-  // value:{link:...}}} to .../adcreatives returned a real creative id.
+  // also going through this.
+  //
+  // Round 46 correction — placement varies by source, presence does not.
+  // Verified empirically against the live Meta API (v25.0): a top-level
+  // call_to_action IS accepted alongside a bare object_story_id
+  // (EXISTING_PAGE_POST) — POSTing {object_story_id,
+  // call_to_action:{type:"SHOP_NOW", value:{link:...}}} to .../adcreatives
+  // returned a real creative id. But for a link_data creative
+  // (PRODUCT_IMAGE), that same top-level placement was REJECTED outright
+  // by Meta (error 100/2238146) — not silently ignored; execution failed
+  // before the ad was ever created, so no PRODUCT_IMAGE ad has shipped
+  // with a missing or broken CTA. Nesting call_to_action inside
+  // object_story_spec.link_data instead returned a real creative id.
+  // EXISTING_INSTAGRAM_POST has never been verified against live Meta
+  // either way — left at its pre-existing top-level placement rather than
+  // guessed at; the read-back check below now actually inspects
+  // call_to_action for every source, so a wrong placement there will
+  // surface as a real, loud verification failure instead of silently
+  // passing.
+  //
   // destinationLink prefers creative.link (PRODUCT_IMAGE already has a
   // real, resolved product permalink — unaffected by this fix) and falls
   // back to strategy.destination_url (EXISTING_PAGE_POST/
@@ -250,7 +265,12 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   // rethrows the ORIGINAL error unchanged after best-effort cleanup.
   const destinationLink = creative.link || strategy.destination_url || null;
   if (strategy.cta) {
-    creativeFields.call_to_action = { type: strategy.cta, value: destinationLink ? { link: destinationLink } : undefined };
+    const callToAction = { type: strategy.cta, value: destinationLink ? { link: destinationLink } : undefined };
+    if (creative.source === "PRODUCT_IMAGE") {
+      creativeFields.object_story_spec.link_data.call_to_action = callToAction;
+    } else {
+      creativeFields.call_to_action = callToAction;
+    }
   }
 
   logger.info("meta_expert_v2.execute_strategy.creative_request", { strategyId: stored.id, adAccountId, body: creativeFields });
@@ -280,6 +300,22 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   }
   if (creative.source === "PRODUCT_IMAGE" && verifyCreative.object_story_spec?.link_data?.link !== creative.link) {
     throw new Error(`Creative verification failed: readback link (${verifyCreative.object_story_spec?.link_data?.link}) does not match the resolved product link (${creative.link}).`);
+  }
+  // Round 46 — the read-back previously inspected nothing about
+  // call_to_action for any source; that gap is exactly how the
+  // PRODUCT_IMAGE placement bug above (top-level, rejected by Meta with
+  // error 100/2238146 for link_data creatives) could have gone unverified
+  // even after a fix landed. Checked for every source now, not just
+  // PRODUCT_IMAGE — EXISTING_INSTAGRAM_POST's top-level placement has
+  // never been verified against live Meta either, and this is how that
+  // gets found out rather than assumed.
+  if (strategy.cta) {
+    const verifyCtaType = creative.source === "PRODUCT_IMAGE"
+      ? verifyCreative.object_story_spec?.link_data?.call_to_action?.type
+      : verifyCreative.call_to_action?.type;
+    if (verifyCtaType !== strategy.cta) {
+      throw new Error(`Creative verification failed: readback call_to_action (${verifyCtaType || "none"}) does not match the requested CTA (${strategy.cta}).`);
+    }
   }
   logger.info("meta_expert_v2.execute_strategy.readback_verify", { strategyId: stored.id, adId: ad.id, creativeId: adCreative.id, verifiedAgainstPlan: true });
 

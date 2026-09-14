@@ -152,7 +152,15 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
         return jsonResponse({ id, name: record.body.name, status: record.body.status, adset_id: corruptAdReadback ? "0000000000000" : record.body.adset_id, campaign_id: adSetRecord?.body?.campaign_id || null, creative: { id: record.body.creative?.creative_id } });
       }
       if (record.path.endsWith("/adcreatives")) {
-        return jsonResponse({ id, name: record.body.name, object_story_id: record.body.object_story_id || null, object_story_spec: record.body.object_story_spec || null });
+        // Round 46 — call_to_action now echoed back too (previously
+        // dropped here), reflecting exactly what was actually POSTed:
+        // top-level for object_story_id/EXISTING_INSTAGRAM_POST creatives,
+        // or nested inside object_story_spec.link_data for PRODUCT_IMAGE —
+        // whichever the real request body actually carried. Needed so the
+        // executor's own read-back verification (executor.js) is tested
+        // against a real echo, not a mock that silently strips the field
+        // the bug was about in the first place.
+        return jsonResponse({ id, name: record.body.name, object_story_id: record.body.object_story_id || null, object_story_spec: record.body.object_story_spec || null, call_to_action: record.body.call_to_action || null });
       }
       if (record.path.endsWith("/adsets")) return jsonResponse({ id, ...record.body });
       if (record.path.endsWith("/campaigns")) return jsonResponse({ id, ...record.body });
@@ -6104,8 +6112,13 @@ async function run() {
       // Round 35: call_to_action must now be sent for every source,
       // including PRODUCT_IMAGE (which never needed destination_url — it
       // already has a real link via creative.link, used directly here).
-      assert.equal(creativeWrite.body.call_to_action?.type, "SHOP_NOW");
-      assert.equal(creativeWrite.body.call_to_action?.value?.link, "https://store.example.com/product/vitamin-c-serum/");
+      // Round 46 correction: for a link_data creative, Meta REJECTS a
+      // top-level call_to_action (error 100/2238146, verified live) — it
+      // must be nested inside object_story_spec.link_data instead. A
+      // top-level call_to_action must NOT be sent at all for this source.
+      assert.equal(creativeWrite.body.call_to_action, undefined, "PRODUCT_IMAGE must never send a top-level call_to_action — Meta rejects it for link_data creatives");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.call_to_action?.type, "SHOP_NOW");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.call_to_action?.value?.link, "https://store.example.com/product/vitamin-c-serum/");
     } finally {
       restoreFetch();
     }
@@ -6559,6 +6572,91 @@ async function run() {
       );
       const creativeWrites = writes.filter((w) => w.path.endsWith("/adcreatives"));
       assert.equal(creativeWrites.length, 1, "a rejected creative call must never be silently retried");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Executor CTA, round 46] Meta's real rejection of a top-level call_to_action on a link_data (PRODUCT_IMAGE) creative surfaces verbatim — this is how the wrong placement was originally found, not silent acceptance", async () => {
+    const userId = makeUser(`v2-cta-linkdata-rejected-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        writes,
+        // Real Meta behavior (verified live, v25.0): a top-level
+        // call_to_action next to object_story_spec.link_data is REJECTED
+        // outright with error 100/2238146 — not silently ignored. This
+        // test exists to lock in the fix: as long as the executor nests
+        // call_to_action inside link_data for PRODUCT_IMAGE (as it now
+        // does), this simulated rejection is never triggered at all.
+        writeError: { pathSuffix: "/adcreatives", status: 400, error: { message: "Invalid parameter", code: 100, error_subcode: 2238146 }, failWhen: (body) => Boolean(body.call_to_action) },
+      },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "PRODUCT_IMAGE", description: "Product image ad featuring the Vitamin C Serum" } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite.body.call_to_action, undefined, "the fix means no top-level call_to_action is ever sent for PRODUCT_IMAGE, so the simulated rejection above is never actually hit");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.call_to_action?.type, "SHOP_NOW");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Executor CTA, round 46] the read-back now actually verifies call_to_action for every source — a mismatch between what was sent and what Meta reports is a real, loud failure, never a silent pass", async () => {
+    const userId = makeUser(`v2-cta-readback-mismatch-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST],
+      },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      // Simulate the create call succeeding but Meta's own read-back
+      // reporting a DIFFERENT call_to_action than what was sent — the
+      // exact class of gap that let the PRODUCT_IMAGE placement bug ship
+      // unverified before this round: the read-back previously never
+      // looked at call_to_action at all, for any source.
+      const originalFetchForThisTest = global.fetch;
+      mockFetch(async (url, options = {}) => {
+        const res = await originalFetchForThisTest(url, options);
+        const u = new URL(url);
+        const path = u.pathname.replace(/^\/v[\d.]+/, "");
+        if ((options.method || "GET") === "GET" && /^\/\d+$/.test(path)) {
+          const body = await res.json();
+          if (body.object_story_id) return jsonResponse({ ...body, call_to_action: { type: "LEARN_MORE" } });
+          return jsonResponse(body);
+        }
+        return res;
+      });
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => {
+          assert.match(err.message, /readback call_to_action \(LEARN_MORE\) does not match the requested CTA \(SHOP_NOW\)/, `must name both the mismatched readback value and the requested one: ${err.message}`);
+          return true;
+        }
+      );
     } finally {
       restoreFetch();
     }
