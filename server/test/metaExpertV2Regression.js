@@ -22,6 +22,7 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
+const { gatherPerformanceBreakdown } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
@@ -87,6 +88,17 @@ function metaRouter({
   // on the next call — proves meta.listCampaigns (api.js) actually follows
   // it rather than just trusting a bigger single page.
   campaignInsights = {}, campaignsPageSize = null,
+  // Round 53 (Phase 3A) — campaignDetails: campaignId -> {id, name, status,
+  // objective, account_id}, for meta.getCampaign's single-entity lookup.
+  // adSetRoster/adRoster: the FULL account-scoped list (meta.listAdSets/
+  // listAds — round 50's first real callers), filtered client-side by
+  // campaign_id in performanceBreakdown.js, exactly like the real account
+  // these were verified against. adSetLevelInsights/adLevelInsights:
+  // campaignId -> array of real per-entity insight rows (one per ad set/
+  // ad that had activity — an entity with none is simply absent from the
+  // array, matching Meta's own confirmed-live behavior of returning no
+  // row at all rather than a zeroed one).
+  campaignDetails = {}, adSetRoster = [], adRoster = [], adSetLevelInsights = {}, adLevelInsights = {},
 } = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
@@ -156,6 +168,11 @@ function metaRouter({
       const page = pages.find((p) => p.id === pageFieldsMatch[1]);
       return jsonResponse(page && !pageTokenUnavailable ? { access_token: `fake-page-token-${page.id}` } : {});
     }
+    // Round 53 (Phase 3A) — meta.getCampaign's single-entity lookup
+    // (/{campaignId}?fields=id,name,status,objective,account_id).
+    if (pageFieldsMatch && campaignDetails[pageFieldsMatch[1]]) {
+      return jsonResponse(campaignDetails[pageFieldsMatch[1]]);
+    }
     if (pageFieldsMatch && recordsById.has(pageFieldsMatch[1])) {
       const id = pageFieldsMatch[1];
       const record = recordsById.get(id);
@@ -184,6 +201,12 @@ function metaRouter({
     }
     if (path.endsWith("/adspixels")) return jsonResponse({ data: pixels });
     if (path.endsWith("/product_catalogs")) return jsonResponse({ data: catalogs });
+    // Round 53 (Phase 3A) — meta.listAdSets/listAds' first real callers
+    // (performanceBreakdown.js), account-scoped list reads. Distinct from
+    // the single-id write-echo path above (which matches an all-digits
+    // path, never one ending in the literal "/adsets"/"/ads").
+    if (path.endsWith("/adsets")) return jsonResponse({ data: adSetRoster });
+    if (path.endsWith("/ads")) return jsonResponse({ data: adRoster });
     if (path.endsWith("/campaigns")) {
       // Round 49 — real pagination when campaignsPageSize is set: returns
       // one page plus a genuine paging.next cursor (an opaque __page_offset
@@ -202,6 +225,15 @@ function metaRouter({
     }
     if (path.endsWith("/insights")) {
       const campaignId = path.split("/")[1];
+      // Round 53 (Phase 3A) — level=adset/level=ad route to their own
+      // per-entity fixtures (an array of real rows, one per entity that
+      // had activity — an entity with none is simply absent, matching
+      // Meta's own confirmed-live behavior). level=campaign or no level
+      // (every pre-existing caller/test) keeps the original single-row
+      // behavior untouched.
+      const level = u.searchParams.get("level");
+      if (level === "adset") return jsonResponse({ data: adSetLevelInsights[campaignId] || [] });
+      if (level === "ad") return jsonResponse({ data: adLevelInsights[campaignId] || [] });
       const row = campaignInsights[campaignId] || { impressions: "1000", clicks: "40", spend: "120", ctr: "4", cpc: "3", cpm: "12", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "150" }], cost_per_action_type: [{ action_type: "purchase", value: "15" }], purchase_roas: [{ action_type: "omni_purchase", value: "2.4" }] };
       return jsonResponse({ data: [row] });
     }
@@ -337,15 +369,16 @@ async function run() {
 
   // --- Step 9: raw-tool isolation (structural + dynamic) ------------------
   // Round 45 — grew from 4 to 6 tools (propose_campaign_edit/
-  // apply_campaign_edit, the edit-an-existing-campaign feature) — the
-  // actual isolation property this test protects (no raw meta.*
+  // apply_campaign_edit, the edit-an-existing-campaign feature). Round 53
+  // (Phase 3A) — grew from 6 to 7 (get_performance_breakdown, read-only).
+  // The actual isolation property this test protects (no raw meta.*
   // mutation tool ever reaches a V2-only agent) is unchanged; only the
   // real, intended V2 tool count grew.
-  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 6 V2 tools — no raw meta.* mutation tools", () => {
+  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 7 V2 tools — no raw meta.* mutation tools", () => {
     const names = listToolsForSkills(["meta_expert_v2"]).map((t) => t.name);
     assert.deepEqual(names.sort(), [
       "meta_expert_v2.apply_campaign_edit", "meta_expert_v2.build_strategy", "meta_expert_v2.execute_strategy",
-      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.revise_strategy",
+      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.revise_strategy",
     ]);
   });
 
@@ -6964,6 +6997,257 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Phase 3A: granular performance reads (round 53) --------------------
+  // get_business_snapshot gives an account-level rollup; this answers "how
+  // is campaign X doing," "which ad set is spending the most / converting
+  // worst," and "how did last week compare to the week before" — real
+  // per-ad-set/per-ad numbers, blended from totals, never averaged. Reading
+  // and presenting only — no diagnosis, no recommendations, no actions.
+  const CAMPAIGN_ID = "120252639174780717"; // the real campaign id verified live in Explorer
+  function perfCampaignDetails(overrides = {}) {
+    return { [CAMPAIGN_ID]: { id: CAMPAIGN_ID, name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1", ...overrides } };
+  }
+
+  await check("[Performance breakdown, round 53] ad set/ad rates are blended from each entity's OWN totals — a cross-entity unweighted mean (round 49's exact old bug) never appears anywhere in the output", async () => {
+    // Reuses round 49's own live-verified proof numbers: two entities with
+    // spend 4630.24/1108.56 and purchases 8/1 — an unweighted mean of
+    // their two CPAs would report 843.67 (the confirmed-wrong old value).
+    // Each entity's OWN correct CPA (578.78 and 1108.56) must be what's
+    // actually reported, and 843.67 must never appear anywhere — not on
+    // an entity, not as some derived "combined" number this round could
+    // have reintroduced at a new level.
+    const adSetRoster = [
+      { id: "as1", name: "Ad Set A", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Ad Set B", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        { adset_id: "as1", adset_name: "Ad Set A", campaign_id: CAMPAIGN_ID, campaign_name: "Real Campaign", spend: "4630.24", clicks: "200", impressions: "10000", reach: "8000", frequency: "1.25", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "2000" }], date_start: "2026-10-01", date_stop: "2026-10-07" },
+        { adset_id: "as2", adset_name: "Ad Set B", campaign_id: CAMPAIGN_ID, campaign_name: "Real Campaign", spend: "1108.56", clicks: "50", impressions: "3000", reach: "2500", frequency: "1.2", actions: [{ action_type: "purchase", value: "1" }], action_values: [{ action_type: "purchase", value: "500" }], date_start: "2026-10-01", date_stop: "2026-10-07" },
+      ],
+    };
+    // A campaign-level total deliberately NOT derivable from any
+    // sum/average of the two ad sets above — proves campaignSummary comes
+    // from its OWN authoritative Meta call, never computed from the
+    // children.
+    const campaignInsights = { [CAMPAIGN_ID]: { spend: "6000", clicks: "300", impressions: "15000", reach: "11000", frequency: "1.3", actions: [{ action_type: "purchase", value: "10" }], action_values: [{ action_type: "purchase", value: "3000" }], date_start: "2026-10-01", date_stop: "2026-10-07" } };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, campaignInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const a = result.adSets.find((a) => a.id === "as1");
+      const b = result.adSets.find((a) => a.id === "as2");
+      assert.equal(a.totals.spend, 4630.24);
+      assert.equal(a.totals.purchases, 8);
+      assert.equal(Math.round(a.rates.cpa * 100) / 100, 578.78, `Ad Set A's own CPA must be correct: ${a.rates.cpa}`);
+      assert.equal(b.totals.spend, 1108.56);
+      assert.equal(b.totals.purchases, 1);
+      assert.equal(b.rates.cpa, 1108.56, `Ad Set B's own CPA must be correct: ${b.rates.cpa}`);
+
+      const serialized = JSON.stringify(result);
+      assert.ok(!serialized.includes("843.6") && !/843\.67/.test(serialized), `the old unweighted-mean value must never appear anywhere in the output: ${serialized}`);
+
+      assert.equal(result.campaignSummary.totals.spend, 6000, "the campaign summary must come from its own authoritative call, never derived from the ad sets");
+      assert.equal(result.campaignSummary.totals.purchases, 10);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] the double-counting trap: web_in_store_purchase and omni_purchase both reporting 8 (the SAME purchases under two action types) must extract as 8, never summed to 16", async () => {
+    // The exact live-verified shape from Explorer: actions returned
+    // web_in_store_purchase 8, omni_purchase 8, link_click 168,
+    // initiate_checkout 17 — the first two are the SAME real purchases
+    // reported under two action types, not 16 distinct purchases.
+    const adSetRoster = [{ id: "as1", name: "Ad Set A", status: "ACTIVE", campaign_id: CAMPAIGN_ID }];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [{
+        adset_id: "as1", adset_name: "Ad Set A", campaign_id: CAMPAIGN_ID, campaign_name: "Real Campaign",
+        spend: "500", clicks: "168", impressions: "5000", reach: "4000", frequency: "1.1",
+        actions: [
+          { action_type: "web_in_store_purchase", value: "8" },
+          { action_type: "omni_purchase", value: "8" },
+          { action_type: "link_click", value: "168" },
+          { action_type: "initiate_checkout", value: "17" },
+        ],
+        action_values: [{ action_type: "omni_purchase", value: "1000" }],
+        date_start: "2026-10-01", date_stop: "2026-10-07",
+      }],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const a = result.adSets.find((a) => a.id === "as1");
+      assert.equal(a.totals.purchases, 8, `purchases must be extracted as ONE canonical value (8), never summed across duplicate action types: got ${a.totals.purchases}`);
+      assert.equal(a.rates.cpa, 500 / 8, "CPA must be computed against the real 8 purchases, not a doubled 16");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] an ad set/ad with no insights row at all is reported as noActivityInRange, never silently omitted and never implied to have spent zero", async () => {
+    // The exact live-verified shape: 9 real ad sets, only the 1 active one
+    // returns a row for a 7-day window; the 8 paused ones are absent
+    // entirely from the insights response, but still real ad sets.
+    const adSetRoster = [
+      { id: "as1", name: "Active Ad Set", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      ...Array.from({ length: 8 }, (_, i) => ({ id: `paused${i + 1}`, name: `Paused Ad Set ${i + 1}`, status: "PAUSED", campaign_id: CAMPAIGN_ID })),
+      { id: "other-campaign-adset", name: "Unrelated", status: "ACTIVE", campaign_id: "999999" },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [{ adset_id: "as1", adset_name: "Active Ad Set", campaign_id: CAMPAIGN_ID, campaign_name: "Real Campaign", spend: "300", clicks: "40", impressions: "2000", reach: "1800", frequency: "1.1", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" }],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      assert.equal(result.adSets.length, 9, "only the 9 real ad sets under THIS campaign — the unrelated campaign's ad set must not leak in");
+      const active = result.adSets.find((a) => a.id === "as1");
+      assert.equal(active.noActivityInRange, false);
+      assert.equal(active.totals.spend, 300);
+      const paused = result.adSets.filter((a) => a.id.startsWith("paused"));
+      assert.equal(paused.length, 8);
+      for (const p of paused) {
+        assert.equal(p.noActivityInRange, true, `a paused ad set with no insights row must be marked noActivityInRange: ${JSON.stringify(p)}`);
+        assert.equal(p.totals, null, "no totals must ever be invented for an entity Meta reported no activity for");
+        assert.equal(p.rates, null);
+        assert.equal(p.status, "PAUSED", "the real status must still come from the roster, even with no activity");
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] date range: defaults to last_7d, states the REAL resolved dates Meta returned, and a custom since/until uses time_range instead", async () => {
+    const campaignInsights = { [CAMPAIGN_ID]: { spend: "100", clicks: "10", impressions: "1000", reach: "900", frequency: "1.1", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" } };
+    let lastInsightsUrl = null;
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path.endsWith("/insights")) {
+        lastInsightsUrl = u.toString();
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [campaignInsights[CAMPAIGN_ID]] });
+      }
+      if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      assert.ok(lastInsightsUrl.includes("date_preset=last_7d"), `no explicit date range must default to last_7d: ${lastInsightsUrl}`);
+      assert.equal(result.dateRange.resolvedSince, "2026-10-01", "the REAL resolved start date (Meta's own date_start) must be reported, never just the preset string");
+      assert.equal(result.dateRange.resolvedUntil, "2026-10-07");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path.endsWith("/insights")) {
+        lastInsightsUrl = u.toString();
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [campaignInsights[CAMPAIGN_ID]] });
+      }
+      if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, since: "2026-10-01", until: "2026-10-07" });
+      assert.ok(lastInsightsUrl.includes("time_range="), `an explicit since/until must use time_range, not date_preset: ${lastInsightsUrl}`);
+      assert.ok(!lastInsightsUrl.includes("date_preset="), `date_preset must not also be sent when a custom range is given: ${lastInsightsUrl}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] topAdSetsBySpend/worstAdSetsByCpa are plain sorts of real numbers — scoped to entities that actually had activity, never a verdict", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "Big Spender", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Small Spender", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as3", name: "No Purchases", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as4", name: "No Activity", status: "PAUSED", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        { adset_id: "as1", adset_name: "Big Spender", campaign_id: CAMPAIGN_ID, spend: "900", clicks: "100", impressions: "9000", reach: "8000", frequency: "1.1", actions: [{ action_type: "purchase", value: "3" }], action_values: [{ action_type: "purchase", value: "600" }], date_start: "2026-10-01", date_stop: "2026-10-07" },
+        { adset_id: "as2", adset_name: "Small Spender", campaign_id: CAMPAIGN_ID, spend: "100", clicks: "20", impressions: "1000", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "500" }], date_start: "2026-10-01", date_stop: "2026-10-07" },
+        { adset_id: "as3", adset_name: "No Purchases", campaign_id: CAMPAIGN_ID, spend: "50", clicks: "10", impressions: "500", reach: "400", frequency: "1.1", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      assert.deepEqual(result.topAdSetsBySpend.map((a) => a.id), ["as1", "as2", "as3"], "must be sorted by real spend, descending");
+      // as1's CPA (900/3=300) is worse (higher) than as2's (100/5=20) —
+      // as3 has no purchases at all (cpa null) and must be excluded
+      // entirely, never ranked as "worst" with an invented number.
+      assert.deepEqual(result.worstAdSetsByCpa.map((a) => a.id), ["as1", "as2"], "an entity with no real CPA must never be ranked");
+      assert.ok(!result.worstAdSetsByCpa.some((a) => a.id === "as4"), "a no-activity entity must never appear in a performance sort");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] compareToPriorPeriod fetches the immediately preceding window of equal length and computes plain percent deltas — never a verdict", async () => {
+    const campaignInsights = {}; // unused — this test provides its own routing
+    let capturedInsightsUrls = [];
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        capturedInsightsUrls.push(u.toString());
+        // First campaign-level call = current period; second = the prior
+        // period the comparison logic asks for after seeing the real
+        // resolved dates from the first.
+        if (capturedInsightsUrls.length === 1) {
+          return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "9000", frequency: "1.1", actions: [{ action_type: "purchase", value: "10" }], action_values: [{ action_type: "purchase", value: "2000" }], date_start: "2026-10-08", date_stop: "2026-10-14" }] });
+        }
+        assert.ok(u.toString().includes("time_range="), "the prior-period call must ask for an explicit range, computed from the current period's REAL resolved dates");
+        return jsonResponse({ data: [{ spend: "500", clicks: "50", impressions: "5000", reach: "4500", frequency: "1.1", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "1000" }], date_start: "2026-10-01", date_stop: "2026-10-07" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, since: "2026-10-08", until: "2026-10-14", compareToPriorPeriod: true });
+      assert.ok(result.comparison, "a comparison must be returned");
+      assert.equal(result.comparison.priorRange.since, "2026-10-01", "the prior window must immediately precede the current one, same length (7 days)");
+      assert.equal(result.comparison.priorRange.until, "2026-10-07");
+      assert.equal(result.comparison.prior.totals.spend, 500);
+      assert.equal(result.comparison.deltas.spendPct, 100, "spend doubled (500 -> 1000) must read as a plain +100%, never a judgment");
+    } finally {
+      restoreFetch();
+    }
+
+    // Current period itself has no activity — nothing real to compare
+    // FROM, so the comparison must say so rather than inventing a prior
+    // call against dates that don't exist.
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      if (path.endsWith("/insights")) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const noActivityResult = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, compareToPriorPeriod: true });
+      assert.equal(noActivityResult.comparison.unavailable, true, "no activity in the current range must make the comparison itself unavailable, never a fabricated prior-period fetch");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 53] campaignId is required — Phase 3A is scoped to one specific campaign, never an unverified account-wide breakdown", async () => {
+    await assert.rejects(() => gatherPerformanceBreakdown("fake-token", {}), /campaignId is required/);
   });
 
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {

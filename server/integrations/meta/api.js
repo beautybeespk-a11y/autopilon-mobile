@@ -523,8 +523,14 @@ export async function getAdSet(accessToken, adSetId) {
 // feature requires. listCampaigns already exists for the bulk case; this
 // is its single-entity equivalent, same relationship getAdAccount has to
 // listAdAccounts above.
+//
+// Round 53 — account_id added (purely additive: an extra field no
+// existing caller reads is harmless) so performanceBreakdown.js can
+// cross-reference listAdSets/listAds (account-scoped, not campaign-
+// scoped) against this one campaign, without a second single-entity
+// lookup just to get the account id.
 export async function getCampaign(accessToken, campaignId) {
-  return metaFetch(`/${campaignId}?fields=id,name,status,objective`, { accessToken });
+  return metaFetch(`/${campaignId}?fields=id,name,status,objective,account_id`, { accessToken });
 }
 
 // Round 45 (edit-an-existing-campaign feature) — ad sets only ever had a
@@ -575,6 +581,85 @@ export async function listAdSets(accessToken, adAccountId) {
 // case, never a bounded/recent sample.
 export async function listAds(accessToken, adAccountId) {
   return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/ads?fields=id,name,status,adset_id,campaign_id,creative&limit=100`, accessToken);
+}
+
+// --- Phase 3A: granular performance reads (round 53) ----------------------
+// Campaign -> ad set -> ad, over a date range. Read-only, no diagnosis —
+// see performanceBreakdown.js (metaExpertV2) for the caller that shapes
+// this into blended rates + raw totals.
+//
+// Verified live (Graph API Explorer, v25.0, real campaign
+// 120252639174780717) rather than assumed:
+//   - /{campaignId}/insights?level=adset and ?level=ad each return ONE
+//     ROW PER ENTITY directly — not one call per ad set/ad. This is why
+//     these three functions need no MAX_x_FOR_INSIGHTS-style per-entity
+//     cap the way the account-level rollup does (businessSnapshot.js,
+//     round 49) — each is a single call (paginated the normal way, see
+//     metaFetchAllPages), regardless of how many ad sets/ads exist.
+//   - date_start/date_stop DO come back when requested in `fields` — the
+//     REAL resolved dates for a relative date_preset like "last_7d".
+//     Always request and surface these; never just echo the preset
+//     string back as if it were a fact about which dates were used.
+//   - time_range={"since":"...","until":"..."} works as a query param for
+//     a custom range, same as date_preset.
+//   - An entity with NO activity in the requested range returns NO ROW AT
+//     ALL — of 9 real ad sets, the 8 paused ones were silently absent
+//     from a 7-day window; only the 1 active one came back. "Missing from
+//     this call's results" and "had zero spend" are different facts —
+//     callers must cross-reference the real complete roster (listAdSets/
+//     listAds above) to tell them apart, never assume silence means zero.
+const PERFORMANCE_BREAKDOWN_FIELDS = "impressions,clicks,spend,ctr,cpc,cpm,reach,frequency,actions,action_values,cost_per_action_type,purchase_roas,date_start,date_stop";
+
+function buildDateRangeQuery({ since, until, datePreset } = {}) {
+  if (since && until) return `time_range=${encodeURIComponent(JSON.stringify({ since, until }))}`;
+  return `date_preset=${encodeURIComponent(datePreset || "last_7d")}`;
+}
+
+// Same purchases/revenue/cpa/roas extraction getCampaignInsights already
+// uses above (extractActionValue/PURCHASE_ACTION_TYPES) — reused
+// verbatim, not reimplemented, specifically so a double-counting bug
+// (e.g. summing web_in_store_purchase AND omni_purchase, which Meta can
+// report as two action types for the SAME purchases) can't be introduced
+// at this new level. Confirmed live: extractActionValue's find() already
+// picks exactly ONE canonical action type and never sums multiple — this
+// is reused, not re-derived, so that stays true here too.
+function extractInsightsRow(row) {
+  return {
+    ...row,
+    purchases: extractActionValue(row.actions),
+    revenue: extractActionValue(row.action_values),
+    cpa: extractActionValue(row.cost_per_action_type),
+    roas: Array.isArray(row.purchase_roas) && row.purchase_roas[0] ? Number(row.purchase_roas[0].value) : null,
+  };
+}
+
+// getCampaign (round 45, above — now carrying account_id too) supplies
+// the campaign's own id/name/status/objective/account_id; account_id is
+// what lets performanceBreakdown.js cross-reference the complete ad
+// set/ad roster (listAdSets/listAds are account-scoped, not campaign-
+// scoped) against which ad sets/ads had no activity row at all.
+export async function getCampaignLevelInsights(accessToken, campaignId, dateParams) {
+  const rows = await metaFetchAllPages(
+    `/${campaignId}/insights?level=campaign&fields=${PERFORMANCE_BREAKDOWN_FIELDS}&limit=100&${buildDateRangeQuery(dateParams)}`,
+    accessToken
+  );
+  return rows.map(extractInsightsRow);
+}
+
+export async function getAdSetLevelInsights(accessToken, campaignId, dateParams) {
+  const rows = await metaFetchAllPages(
+    `/${campaignId}/insights?level=adset&fields=adset_id,adset_name,campaign_id,campaign_name,${PERFORMANCE_BREAKDOWN_FIELDS}&limit=100&${buildDateRangeQuery(dateParams)}`,
+    accessToken
+  );
+  return rows.map(extractInsightsRow);
+}
+
+export async function getAdLevelInsights(accessToken, campaignId, dateParams) {
+  const rows = await metaFetchAllPages(
+    `/${campaignId}/insights?level=ad&fields=ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,${PERFORMANCE_BREAKDOWN_FIELDS}&limit=100&${buildDateRangeQuery(dateParams)}`,
+    accessToken
+  );
+  return rows.map(extractInsightsRow);
 }
 
 // --- Carousel creative support --------------------------------------------
