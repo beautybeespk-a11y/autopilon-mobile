@@ -11,7 +11,7 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getExecutedAncestorStrategy } from "../agents/metaExpertV2/strategyStore.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy } from "../agents/metaExpertV2/strategyStore.js";
 import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
@@ -145,6 +145,52 @@ function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools,
   }
   return 'Your reply claims the strategy is being executed, revised, updated, or set up, but neither meta_expert_v2.revise_strategy nor meta_expert_v2.execute_strategy was actually called this turn — nothing happened. If you now have what you need (e.g. a budget the user just gave you, or explicit approval), call the real tool now with type "tool_call" instead of describing it as done. Never describe an action as executing/created/updated/running/set up unless the matching tool call actually ran and succeeded this turn.';
 }
+
+// Round 47 (live production bug): "change the campaign budget to 750/day"
+// after a campaign was already created got a "final" reply presenting the
+// new number and asking for approval — with NO meta_expert_v2.
+// propose_campaign_edit call behind it. Nothing in this file (or in
+// revise_strategy/execute_strategy's own tool descriptions) ever steered
+// the model toward the campaign_edit tools once a campaign is already
+// live in Meta — the model's tool choice, unassisted, decided whether the
+// edit worked, exactly the thing that must never be true. The user then
+// approved that fabricated recommendation; the NEXT turn's
+// execute_strategy call hit checkAlreadyExecutedV2Strategy's dead end
+// (nothing to execute — no propose_campaign_edit row had ever been
+// created), so the approval did nothing.
+// checkExecutionClaimWithoutCallGate above already solves the sibling
+// problem for the ORIGINAL build->execute flow, but its trigger
+// (hasActiveV2Strategy — proposed/approved only) structurally cannot see
+// this state: once a campaign is executed, there IS no active strategy,
+// so that gate never engages. This is a separate function, not a branch
+// added to that one, because the remedy tool is different
+// (propose_campaign_edit, not execute_strategy/revise_strategy) and the
+// state it fires on is the opposite (no active strategy, not "one
+// exists").
+// Same structural-trigger philosophy as checkExecutionClaimWithoutCallGate's
+// approvedButNeverAttempted case: never trust exact wording alone to catch
+// every phrasing of "here's your new budget, approve?" — trigger off
+// STATE instead. A "final" reply, in a conversation whose most recent
+// real strategy is EXECUTED and nothing is currently proposed, that
+// itself uses approval-soliciting language is exactly this bug regardless
+// of which field it claims to change — messageIndicatesExecutionApprovalV2
+// is reused here against the MODEL's OWN text (not the user's), which is
+// a repurposing of that function but a sound one: a genuine recommendation
+// asking "shall I proceed?"/"reply approve to apply this" necessarily
+// contains the same approval vocabulary that function already matches.
+// propose_campaign_edit/apply_campaign_edit having run this turn is
+// excluded, so a reply that correctly already proposed (or applied) a
+// real edit is left alone.
+function checkPostExecutionChangeWithoutEditCallGate({ decision, hasV2Tools, hasActiveV2Strategy, mostRecentExecutedV2Strategy, proposeEditCalledThisTurn, applyEditCalledThisTurn }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  if (hasActiveV2Strategy || !mostRecentExecutedV2Strategy) return null;
+  if (proposeEditCalledThisTurn || applyEditCalledThisTurn) return null;
+  if (!messageIndicatesExecutionApprovalV2(decision.message)) return null;
+  const campaignId = mostRecentExecutedV2Strategy.executionResult?.campaignId;
+  const adSetId = mostRecentExecutedV2Strategy.executionResult?.adSetId;
+  return `Your reply presents a change to a campaign that's already live in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) and asks for approval, but meta_expert_v2.propose_campaign_edit was never actually called this turn — nothing was computed or saved, so approving this would do nothing. If the request is a budget and/or audience (gender, age range, countries) change, call meta_expert_v2.propose_campaign_edit now with the real requestedChanges instead of describing the change in prose. If it's a creative change, tell the user that isn't supported on an existing campaign — building a new campaign is the way to change the creative.`;
+}
+const MAX_POST_EXECUTION_CHANGE_NUDGES = 1;
 
 // A hard output boundary against internal data reaching the user — not
 // just an instruction (buildSystemPrompt() below already tells the model
@@ -356,6 +402,18 @@ export function checkExecutionApprovalGate({ userId, conversationId, userMessage
 // to the model as a generic "error" gives it room to improvise a
 // different-sounding reaction each time, which is exactly what happened
 // here. Returns the real ids so the caller never has to re-derive them.
+//
+// Round 47 — named once and reused by every "your campaign already
+// exists" message below (this function's own two call sites), so the
+// capability is described identically wherever it's mentioned. Before
+// round 45 this was accurate as "resume it in Ads Manager when you're
+// ready to spend" — round 45 added a real, supported way to change budget
+// and audience without ever leaving the conversation, and leaving the old
+// wording in place meant a live "change the budget" request dead-ended
+// with Ads Manager as if it were the only option. Named after the real
+// capability, with Ads Manager mentioned second (only for actually
+// resuming spend), not instead of it.
+const POST_EXECUTION_EDIT_CAPABILITY_TEXT = "ask to change its budget or audience (gender, age range, countries) and I'll set that up as a real edit for you to approve — Ads Manager is only needed to resume it when you're ready to spend";
 export function checkAlreadyExecutedV2Strategy({ userId, conversationId }) {
   const mostRecent = getMostRecentStrategyForConversation(userId, conversationId);
   if (mostRecent?.status !== "executed" || !mostRecent.executionResult) return null;
@@ -367,7 +425,7 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   if (!active) {
     const alreadyExecuted = checkAlreadyExecutedV2Strategy({ userId, conversationId });
     if (alreadyExecuted) {
-      return `This strategy has ALREADY been executed — do not rebuild it, and do not call execute_strategy or build_strategy again for this. Campaign ID: ${alreadyExecuted.campaignId}. Ad Set ID: ${alreadyExecuted.adSetId}. The correct reply is to tell the user their campaign already exists (it's paused until they resume it in Meta Ads Manager) and share those two ids in plain language — never describe this as a technical issue or a problem that needs fixing.`;
+      return `This strategy has ALREADY been executed — do not rebuild it, and do not call execute_strategy or build_strategy again for this. Campaign ID: ${alreadyExecuted.campaignId}. Ad Set ID: ${alreadyExecuted.adSetId}. The correct reply is to tell the user their campaign already exists, share those two ids in plain language, and tell them they can ${POST_EXECUTION_EDIT_CAPABILITY_TEXT} — never describe this as a technical issue or a problem that needs fixing. If the user's current message is already asking for a budget or audience change, call meta_expert_v2.propose_campaign_edit now instead of just describing this.`;
     }
     return "No active strategy exists for this conversation yet. Call meta_expert_v2.build_strategy first (after meta_expert_v2.get_business_snapshot if you haven't already), present the recommendation to the user, and only call this tool once they've explicitly approved it.";
   }
@@ -388,11 +446,36 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   // ordinary approval everywhere else). Deliberately NOT a dead end
   // (learned from the destination-URL deadlock this codebase already had
   // to fix once): the block message itself names BOTH real ways forward.
+  // Round 47 fix — this block used to say "editing an existing campaign
+  // isn't supported yet" unconditionally, which stopped being true the
+  // moment round 45 shipped meta_expert_v2.propose_campaign_edit/
+  // apply_campaign_edit. A false statement in a gate that steers tool
+  // selection is worse than the missing feature it used to describe (it
+  // actively points the model AWAY from the tool that would work), so
+  // this now names the real path instead of refusing outright. Auto-
+  // routing an ordinary revision's changed fields into a real
+  // propose_campaign_edit call is a separate, later round (a genuine
+  // design question — see campaignEditor.js's EDITABLE_FIELDS for what's
+  // even in scope) — this only fixes the message, so the model is at
+  // least told the truth about which tool to reach for.
   const executedAncestor = getExecutedAncestorStrategy(userId, active);
-  if (executedAncestor && !messageAcknowledgesSeparateCampaign(userMessage)) {
+  if (executedAncestor) {
     const campaignId = executedAncestor.executionResult?.campaignId;
     const adSetId = executedAncestor.executionResult?.adSetId;
-    return `This revision is for a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — editing an existing campaign isn't supported yet, so execute_strategy is blocked here. Tell the user plainly, in these terms: this updates the recommendation, but the campaign already exists in Meta (share the Campaign ID) and editing it directly isn't supported yet — they can change it themselves in Meta Ads Manager, or explicitly ask you to create a SEPARATE, additional campaign with these updated settings if that's genuinely what they want. Never assume the second option from a bare "approve" alone — only call execute_strategy again once they've said so explicitly (e.g. "create a new campaign", "approve a separate campaign").`;
+    // active IS ITSELF a campaign_edit proposal (see campaignEditor.js) —
+    // execute_strategy can structurally never apply it (executor.js's own
+    // META_V2_WRONG_EXECUTION_TOOL guard would also catch this, but
+    // blocking it here first lets the model self-correct within the same
+    // turn instead of burning a real tool call on a guaranteed rejection).
+    // Unconditional — unlike the ordinary-revision case below,
+    // messageAcknowledgesSeparateCampaign has no bearing here: there is no
+    // "separate campaign" reading of executing an edit proposal.
+    if (active.strategy?.mode === "campaign_edit") {
+      return `This is a campaign EDIT proposal (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}), not a new strategy to execute — meta_expert_v2.execute_strategy can never apply it. Call meta_expert_v2.apply_campaign_edit instead, once the user has explicitly approved this edit in their current message.`;
+    }
+    if (!messageAcknowledgesSeparateCampaign(userMessage)) {
+      return `This revision is for a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — execute_strategy is blocked here, since running it would create a SECOND, real campaign rather than update the one that exists. Tell the user plainly, in these terms: this updates the recommendation, but the campaign already exists in Meta (share the Campaign ID). If the change is to budget and/or audience (gender, age range, countries), call meta_expert_v2.propose_campaign_edit with those same changes instead — that's the real, supported way to apply this to the live campaign. If the change is to the creative, that's not supported here; they can change it directly in Meta Ads Manager, or explicitly ask you to create a SEPARATE, additional campaign with these updated settings if that's genuinely what they want. Never assume the separate-campaign option from a bare "approve" alone — only call execute_strategy again once they've said so explicitly (e.g. "create a new campaign", "approve a separate campaign").`;
+    }
   }
   // Round 35 follow-up (real risk, confirmed by trace): the destination-
   // URL auto-revise pre-loop (orchestrator/index.js) can resolve the LAST
@@ -1105,6 +1188,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let staleAnswerNudges = 0;
   let creativeRevisionNudges = 0;
   let executionClaimNudges = 0;
+  let postExecutionChangeNudges = 0;
   let currencyNudges = 0;
   let performanceClaimNudges = 0;
   let unavailableReasonNudges = 0;
@@ -1692,6 +1776,46 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace, toolResults, usage: usageTotals,
         };
       }
+      // Round 47 — see checkPostExecutionChangeWithoutEditCallGate above.
+      // getMostRecentExecutedStrategyForConversation is only actually
+      // fetched when there's no active strategy (the gate itself also
+      // checks hasActiveV2Strategy, but computing this first avoids an
+      // extra DB lookup on the common "there's an active strategy" path).
+      const activeV2StrategyForEditGate = hasV2Tools ? getActiveStrategyForConversation(userId, conversationId) : null;
+      const mostRecentExecutedV2Strategy = hasV2Tools && !activeV2StrategyForEditGate
+        ? getMostRecentExecutedStrategyForConversation(userId, conversationId)
+        : null;
+      const postExecutionChangeGateMessage = checkPostExecutionChangeWithoutEditCallGate({
+        decision, hasV2Tools,
+        hasActiveV2Strategy: Boolean(activeV2StrategyForEditGate),
+        mostRecentExecutedV2Strategy,
+        proposeEditCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.propose_campaign_edit") || 0) > 0,
+        applyEditCalledThisTurn: (v2ToolCallCounts.get("meta_expert_v2.apply_campaign_edit") || 0) > 0,
+      });
+      if (postExecutionChangeGateMessage && postExecutionChangeNudges < MAX_POST_EXECUTION_CHANGE_NUDGES) {
+        postExecutionChangeNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: postExecutionChangeGateMessage },
+        ];
+        continue;
+      }
+      if (postExecutionChangeGateMessage) {
+        // Nudge already used and it STILL presented an unbacked change as
+        // approvable — never let this reach the customer. Fail safe with
+        // an honest reply that names the real capability (round-45's
+        // campaign edit) rather than a dead end or a fabricated
+        // confirmation — the same "a dead end that doesn't point anywhere
+        // is how the destination_url deadlock felt" reasoning applies here.
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Presented an unbacked campaign change as approvable — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I wasn't able to actually set that up yet — changing the budget or audience (gender, age range, countries) on a campaign that's already live is supported, so just tell me again what you'd like changed and I'll set up a real edit for you to approve.",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
       // Round 13 (live testing): only fires on the FIRST model decision of
       // this turn — once stepsRun > 0, a tool HAS already been called this
       // turn, so the model is answering from fresh data, not memory.
@@ -2058,7 +2182,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace.push(traceStep("completed", "Campaign already exists — nothing to execute.", "done"));
           if (planId) setPlanStatus(planId, "completed");
           return {
-            reply: `Your campaign is already live — Campaign ID: ${alreadyExecuted.campaignId}, Ad Set ID: ${alreadyExecuted.adSetId}. It's currently paused; resume it in Meta Ads Manager whenever you're ready to spend.`,
+            reply: `Your campaign is already live — Campaign ID: ${alreadyExecuted.campaignId}, Ad Set ID: ${alreadyExecuted.adSetId}. It's currently paused — you can ${POST_EXECUTION_EDIT_CAPABILITY_TEXT}.`,
             trace, toolResults, usage: usageTotals,
           };
         }

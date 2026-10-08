@@ -2714,6 +2714,18 @@ async function run() {
       assert.ok(result.reply.includes(adSetId), `the reply must name the real, original ad set id: ${result.reply}`);
       assert.match(result.reply, /already/i, `the reply must identify this as already done, not a fresh execution: ${result.reply}`);
       assert.doesNotMatch(result.reply, /technical issue|rebuild|let me do that again/i, "the reply must never suggest rebuilding/re-executing, even in wording");
+      // Round 47 fix — this used to say ONLY "resume it in Meta Ads
+      // Manager whenever you're ready to spend," implying that's the only
+      // way forward. Round 45 added a real, supported way to change
+      // budget/audience without leaving the conversation; the real
+      // capability must be named, and named BEFORE Ads Manager (which is
+      // now scoped correctly to "resume when ready to spend," not implied
+      // to be the only lever available).
+      assert.match(result.reply, /budget or audience/i, "must name the real edit capability, not just point at Ads Manager");
+      assert.ok(
+        result.reply.toLowerCase().indexOf("budget or audience") < result.reply.toLowerCase().indexOf("ads manager"),
+        `the real capability must be named before Ads Manager, not instead of it: ${result.reply}`
+      );
     } finally {
       restoreFetch();
     }
@@ -3421,8 +3433,12 @@ async function run() {
       assert.ok(gate, "execute_strategy must be blocked here");
       assert.doesNotMatch(gate, /has not explicitly approved/i, "must NOT be the generic approval-language gate — the user DID say approve; this is a different, specific problem");
       assert.match(gate, new RegExp(executed.campaignId), "the block must name the REAL existing campaign id");
-      assert.match(gate, /editing an existing campaign isn'?t supported/i);
-      assert.match(gate, /Ads Manager/i, "must name the first real option: change it directly in Meta Ads Manager");
+      // Round 47 fix: "editing an existing campaign isn't supported yet"
+      // stopped being true once round 45 shipped propose_campaign_edit —
+      // the gate must now name that real tool instead of refusing outright.
+      assert.doesNotMatch(gate, /isn'?t supported yet/i, "must never claim editing isn't supported — that's false since round 45");
+      assert.match(gate, /propose_campaign_edit/, "must name the real, supported tool for a budget/audience change");
+      assert.match(gate, /Ads Manager/i, "must still name Ads Manager as the option for a creative change specifically");
       assert.match(gate, /separate/i, "must name the second real option: explicitly create a separate campaign");
 
       // Defense in depth — the actual execute_strategy call, unchanged
@@ -6657,6 +6673,121 @@ async function run() {
           return true;
         }
       );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Post-execution change routing (round 47) -----------------------------
+  // Live bug: "change the campaign budget to 750/day" after a campaign was
+  // already created got a "final" reply presenting PKR 750 and asking for
+  // approval — with NO meta_expert_v2.propose_campaign_edit call behind it.
+  // The trace showed only execute_strategy; the user's approval on the NEXT
+  // turn hit checkAlreadyExecutedV2Strategy's dead end ("Campaign already
+  // exists — nothing to execute"), so the approval did nothing. Nothing in
+  // this codebase steered the model toward the edit tools once a campaign
+  // was already live — its own tool choice decided whether the edit
+  // worked, which must never be true. See
+  // checkPostExecutionChangeWithoutEditCallGate, orchestrator/index.js.
+  await check("[Post-execution change gate, round 47] a 'final' reply presenting a budget change on an already-executed campaign, with NO propose_campaign_edit call, is nudged into actually calling it — the exact live bug", async () => {
+    const userId = makeUser(`v2-postexec-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        // Live-bug shape: presents a new number, asks for approval, calls NO
+        // tool. Deliberately avoids NARRATION_WITHOUT_ACTION's trigger words
+        // ("I'll", "let me", etc., orchestrator/index.js) — this must be
+        // caught by checkPostExecutionChangeWithoutEditCallGate specifically,
+        // not by the pre-existing narration guard for an unrelated reason.
+        finalText("The recommended new daily budget is PKR 35/day — shall I proceed with this change?"),
+        toolCall("meta_expert_v2.propose_campaign_edit", { requestedChanges: { budget_daily: 35 } }),
+        finalText("I've proposed updating your budget to PKR 35/day — say \"approve\" when you'd like me to apply it."),
+      ],
+    }));
+    try {
+      const userMessage = "change the budget to 35/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const toolNames = result.toolResults.map((r) => r.toolName);
+      assert.ok(toolNames.includes("meta_expert_v2.propose_campaign_edit"), `the nudge must force a real propose_campaign_edit call: ${JSON.stringify(toolNames)}`);
+      assert.doesNotMatch(result.reply, /shall I proceed with this change\?$/, "the unbacked claim must never be the final reply");
+      assert.match(result.reply, /proposed updating your budget/i);
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.strategy.mode, "campaign_edit", "a REAL campaign_edit proposal must now exist in storage, not just narrated");
+      assert.equal(active?.strategy.requestedChanges.budget_daily, 35);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Post-execution change gate, round 47] the SAME unbacked change claim repeated even after the nudge hard-stops with an HONEST fallback naming the real edit capability — never a dead end", async () => {
+    const userId = makeUser(`v2-postexec-hardstop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [
+        // Same deliberate avoidance of NARRATION_WITHOUT_ACTION's trigger
+        // words as the nudge test above.
+        finalText("The recommended new daily budget is PKR 35/day — shall I proceed with this change?"),
+        finalText("The recommended new daily budget shown above is PKR 35/day — please approve to confirm this change."), // still no tool call after the nudge
+      ],
+    }));
+    try {
+      const userMessage = "change the budget to 35/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.toolResults.length, 0, `no real tool ever ran — the fabricated claim must never reach the customer either: ${JSON.stringify(result.toolResults)}`);
+      assert.doesNotMatch(result.reply, /PKR 35\/day/, "the fabricated number must never reach the customer as if it were real");
+      assert.match(result.reply, /budget or audience/i, "the fallback must name the real, supported capability — a dead end that doesn't point anywhere is exactly the destination_url deadlock this must avoid repeating");
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active, null, "nothing must have been silently proposed or saved");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Post-execution change gate, round 47] once a REAL campaign_edit proposal exists, execute_strategy is blocked with the CORRECT redirect (call apply_campaign_edit), never the stale 'editing isn't supported' message", async () => {
+    const userId = makeUser(`v2-postexec-wrongtool-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      assert.equal(proposed.ok, true, JSON.stringify(proposed.unresolved));
+
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+      assert.ok(gate, "execute_strategy must be blocked here — this active strategy is a campaign_edit proposal");
+      assert.match(gate, /apply_campaign_edit/, "must redirect to the correct tool");
+      assert.doesNotMatch(gate, /isn'?t supported yet/i, "must never claim editing isn't supported — a real edit proposal exists");
+      assert.match(gate, new RegExp(executed.campaignId), "must name the real campaign id");
     } finally {
       restoreFetch();
     }

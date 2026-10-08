@@ -705,7 +705,17 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   if (executedAncestor && !messageAcknowledgesSeparateCampaign(userMessage)) {
     const campaignId = executedAncestor.executionResult?.campaignId;
     const adSetId = executedAncestor.executionResult?.adSetId;
-    const err = new Error(`This strategy revises a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — editing an existing campaign isn't supported yet. You can change it directly in Meta Ads Manager, or explicitly ask to create a separate, additional campaign with these updated settings.`);
+    // Round 47 fix — this used to say "editing an existing campaign isn't
+    // supported yet," which stopped being true once round 45 shipped
+    // meta_expert_v2.propose_campaign_edit/apply_campaign_edit. Same
+    // reasoning as the orchestrator's own checkV2ExecutionApprovalGate fix
+    // (orchestrator/index.js): a false statement in a defense-in-depth
+    // check that steers tool selection is worse than the missing feature
+    // it used to describe. stored.strategy.mode is never "campaign_edit"
+    // here — that's refused earlier, by name, at the top of this function
+    // — so this only ever fires for an ORDINARY revision, never a genuine
+    // edit proposal.
+    const err = new Error(`This strategy revises a campaign that has ALREADY been created in Meta (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId}) — execute_strategy would create a SECOND, real campaign rather than update the one that exists. If the change is to budget and/or audience (gender, age range, countries), call meta_expert_v2.propose_campaign_edit with those same changes instead — that's the real, supported way to apply this to the live campaign. If the change is to the creative, that's not supported here; change it directly in Meta Ads Manager, or explicitly ask to create a separate, additional campaign with these updated settings if that's genuinely what's wanted.`);
     err.code = "META_V2_STRATEGY_REVISES_EXECUTED";
     throw err;
   }
