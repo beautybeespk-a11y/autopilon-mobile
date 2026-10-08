@@ -375,6 +375,36 @@ export function messageAffirmsPendingCreative(userMessage) {
   return PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage) || EMBEDDED_CREATIVE_REUSE_PATTERN.test(userMessage);
 }
 
+// Round 51 fix (live production report: a user asked "can you list the
+// facebook recent post to select ad creatives" while a pendingCreative
+// confirmation was open — not an affirmation, not a pick repeating the
+// stored candidate, genuinely a request to see the other options. Nothing
+// recognized it: messageAffirmsPendingCreative only matches affirmation
+// words, so the orchestrator pre-loop that promotes pendingCreative (round
+// 38) never fired, and nothing else re-opens the real candidate list once
+// pendingCreative is set (see resolveCreativeSelection's priorPendingCreative
+// branch below — a non-affirming reply just hands the SAME pendingCreative
+// straight back). The model re-presented the identical single post.
+//
+// Same two-tier discipline as messageAffirmsPendingCreative/
+// EMBEDDED_CREATIVE_REUSE_PATTERN above: EMBEDDED_CREATIVE_LIST_REQUEST_
+// PATTERN names its own subject (post/creative/candidate/image, or an
+// explicit "a different X"/"none of these") specifically enough that it
+// can't plausibly mean something else, so it's safe to match ANYWHERE in
+// the message — this is what actually catches the real transcript phrase
+// above ("list the facebook recent post" — a full sentence, never a bare
+// standalone reply). BARE_CREATIVE_LIST_REQUEST_PATTERN covers the
+// generic phrasings ("show me the options") that have no subject of their
+// own and could mean almost anything embedded in a longer message, so
+// those stay whole-message-only, exactly like PENDING_CREATIVE_AFFIRMATION_
+// PATTERN's bare "yes" above.
+const EMBEDDED_CREATIVE_LIST_REQUEST_PATTERN = /\b(list|show(?: me)?|see|view)\b[\s\S]{0,30}\b(posts?|creatives?|candidates?|images?)\b|\b(pick|choose|use) a different (post|one|image|creative|video|reel)\b|\bnone of (these|those)\b/i;
+const BARE_CREATIVE_LIST_REQUEST_PATTERN = /^\s*(show me (the )?(options|choices)|what are my (options|choices)|(can i )?see (the )?(options|choices|list)|something else)[.?!]?\s*$/i;
+export function messageRequestsCreativeOptionsList(userMessage) {
+  if (typeof userMessage !== "string") return false;
+  return EMBEDDED_CREATIVE_LIST_REQUEST_PATTERN.test(userMessage) || BARE_CREATIVE_LIST_REQUEST_PATTERN.test(userMessage);
+}
+
 // Resolves the ad's primaryText for a PRODUCT_IMAGE creative. Two real
 // sources ONLY, checked in order — never model-authored copy (explicitly
 // out of scope this session):
@@ -559,7 +589,11 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
   if (pickedViaSelector) {
     const verifiedId = matchCreativeCandidateId(userMessage, toCreativeCandidateRefs(source, candidates));
     if (verifiedId !== chosen.id) {
-      return { ...empty, pendingCreative: { source, candidate: chosen } };
+      // Round 51 — totalCandidates carried through so formatCreativeConfirmationQuestion
+      // can offer a "see the other N" escape hatch (see its own comment).
+      // candidates.length is always >= 2 here: candidates.length === 1
+      // auto-picks above without ever setting pickedViaSelector.
+      return { ...empty, pendingCreative: { source, candidate: chosen, totalCandidates: candidates.length } };
     }
   }
 
@@ -599,13 +633,27 @@ export function formatCreativeCandidatesQuestion(source, candidates) {
 // question ends with (just "." instead of "?") — a single shared anchor
 // orchestrator/index.js's final-reply gate can check for either question
 // having actually reached the customer, regardless of which one applies.
-export function formatCreativeConfirmationQuestion(source, candidate) {
+// Round 51 — totalCandidates (resolveCreativeSelection's pendingCreative.
+// totalCandidates) gates an escape-hatch sentence naming the real count of
+// OTHER candidates: on a single-candidate account there ARE no others to
+// see (and that case never reaches pendingCreative at all — see
+// resolveCreativeSelection's candidates.length === 1 auto-pick, which never
+// sets pickedViaSelector), so the sentence would be nonsense there;
+// omitted unless totalCandidates >= 2. messageRequestsCreativeOptionsList
+// (above) is what the user's reply is actually matched against — this
+// sentence exists only so the user discovers that reply is possible
+// without having to guess the right words themselves (the live bug this
+// round fixes).
+export function formatCreativeConfirmationQuestion(source, candidate, totalCandidates) {
   const label = { EXISTING_PAGE_POST: "Facebook post", EXISTING_INSTAGRAM_POST: "Instagram post", PRODUCT_IMAGE: "product" }[source] || "item";
+  const seeOthers = Number.isInteger(totalCandidates) && totalCandidates >= 2
+    ? ` Reply "yes" to confirm, say "show me the other options" to see all ${totalCandidates} real candidates, or tell me which one you actually meant.`
+    : ` Reply "yes" to confirm, or tell me which one you actually meant.`;
   if (source === "PRODUCT_IMAGE") {
-    return `To confirm — you'd like to use "${candidate.name}" (id ${candidate.id}${candidate.price ? `, ${candidate.price}` : ""}) as the ad's creative. Reply "yes" to confirm, or tell me which one you actually meant.`;
+    return `To confirm — you'd like to use "${candidate.name}" (id ${candidate.id}${candidate.price ? `, ${candidate.price}` : ""}) as the ad's creative.${seeOthers}`;
   }
   const excerpt = candidate.captionExcerpt ? `"${candidate.captionExcerpt}"` : "(no caption)";
-  return `To confirm — you'd like to use this ${label} as the ad's creative: ${excerpt} (posted ${candidate.publishedDate || "unknown date"}). Reply "yes" to confirm, or tell me which one you actually meant.`;
+  return `To confirm — you'd like to use this ${label} as the ad's creative: ${excerpt} (posted ${candidate.publishedDate || "unknown date"}).${seeOthers}`;
 }
 
 export function formatPrimaryTextQuestion(product) {

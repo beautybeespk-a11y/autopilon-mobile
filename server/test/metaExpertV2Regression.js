@@ -28,7 +28,7 @@ const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
 const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
-const { resolveCreativeSelection } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion } = await import("../agents/metaExpertV2/creativeResolution.js");
 const { validateStrategyStructure } = await import("../agents/metaExpertV2/strategySchema.js");
 const { logger } = await import("../config/logger.js");
 const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, orchestrate } = await import("../orchestrator/index.js");
@@ -5589,6 +5589,178 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- pendingCreative "show me the options" reopen (round 51) ------------
+  // Live production report: the agent proposed one post as pendingCreative;
+  // the user replied "can you list the facebook recent post to select ad
+  // creatives" — not an affirmation, not a fresh verified pick, genuinely a
+  // request to see the other candidates. Nothing recognized it, so the
+  // SAME single post was re-presented and the request was never consumed.
+  await check("[messageRequestsCreativeOptionsList, round 51] the EXACT literal transcript message that exposed the bug must match", () => {
+    assert.ok(
+      messageRequestsCreativeOptionsList("can you list the facebook recent post to select ad creatives"),
+      "the real user message from the production transcript must be recognized as a request to see the options",
+    );
+  });
+
+  await check("[messageRequestsCreativeOptionsList, round 51] other real phrasings match; approval/affirmation/unrelated language never does", () => {
+    for (const m of [
+      "show me the options",
+      "what are my choices",
+      "see the list",
+      "can you show me other instagram posts",
+      "none of these work for me",
+      "use a different post please",
+      "I want to see other posts",
+    ]) {
+      assert.ok(messageRequestsCreativeOptionsList(m), `expected a match: "${m}"`);
+    }
+    // Must never fire on approval language, the pendingCreative affirmation
+    // words themselves, or a genuinely unrelated revision — firing here
+    // would mean the two pre-loops race or a real approval gets diverted
+    // into re-listing candidates instead of executing.
+    for (const m of ["approve it", "run it", "yes", "that one", "ok", "change the gender to female and age to 22-45", "use the same post"]) {
+      assert.ok(!messageRequestsCreativeOptionsList(m), `expected NO match: "${m}"`);
+    }
+  });
+
+  await check("[pendingCreative options reopen, round 51] resolveCreativeSelection: clearing content_selector to {} re-derives the full candidate list instead of re-confirming the stale single pick", async () => {
+    const userId = makeUser(`v2-pending-reopen-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      // Same unverified-guess shape as the round 34 tests above — the way
+      // a real strategy reaches pendingCreative with a single candidate.
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+      assert.equal(pending.resolved.pendingCreative.candidate.id, "111_5");
+      assert.equal(pending.resolved.pendingCreative.totalCandidates, 5, "the real candidate count must be carried on the pendingCreative so the confirmation question can offer the escape hatch");
+
+      // The literal transcript message, with content_selector cleared to
+      // {} — exactly what the new orchestrator pre-loop sends (see
+      // orchestrator/index.js's round 51 block). Must land in the genuine
+      // ambiguous-candidates branch, not re-confirm the stale single pick.
+      const reopened = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: { content_selector: {} },
+        userMessage: "can you list the facebook recent post to select ad creatives",
+      });
+      assert.equal(reopened.ok, true, JSON.stringify(reopened.unresolved));
+      assert.equal(reopened.resolved.creative, null, "sanity: still not resolved — a list request is never a pick");
+      assert.equal(reopened.resolved.pendingCreative, null, "the stale single pick must be cleared, not re-asked");
+      assert.equal(reopened.resolved.creativeCandidates?.length, 5, "the FULL real candidate list must be re-derived");
+      const listQuestion = reopened.strategy.unresolved_questions.find((q) => q.startsWith("Which "));
+      assert.ok(listQuestion, `the full candidate-list question must be asked, not the single-post confirmation: ${JSON.stringify(reopened.strategy.unresolved_questions)}`);
+      assert.ok(!reopened.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the single-pick confirmation question must be gone");
+      for (let n = 1; n <= 5; n++) assert.match(listQuestion, new RegExp(`Post number ${n}`), `all 5 real posts must be named: ${listQuestion}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative options reopen pre-loop, round 51] the EXACT literal transcript message auto-reopens the full candidate list even when the model never calls revise_strategy itself — just re-narrates the single pick", async () => {
+    const userId = makeUser(`v2-pending-reopen-pre-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let pending;
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going into the turn below — this reproduces the agent having already proposed one post");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      // The literal transcript message itself names "facebook"/"post"
+      // closely enough that it also independently trips this file's own
+      // pre-existing checkCreativeRevisionRequiredGate (a genuinely separate
+      // mechanism, unrelated to this round's fix — it backend-forces ANY
+      // creative-selection-sounding message to make the MODEL itself call
+      // revise_strategy before finalizing, specifically because
+      // v2ToolCallCounts — what that gate checks — is only ever incremented
+      // by the model's OWN tool calls, never by a deterministic pre-loop
+      // auto-revise like this round's). So a real model turn here looks
+      // like two steps: a (now-redundant, since the pre-loop already did
+      // the real work) revise_strategy call to satisfy that gate, then the
+      // final reply — matching the production transcript's own shape
+      // ("the agent called get_business_snapshot and revise_strategy").
+      // What actually matters for THIS round's fix is asserted below
+      // directly against stored state, independent of this model-turn
+      // shape: the pre-loop must have already reopened the full list
+      // BEFORE the model's first turn, regardless of what the model then
+      // redundantly does with it.
+      chatResponses: [
+        toolCall("meta_expert_v2.revise_strategy", {}),
+        finalText("Here are your real recent Facebook posts — which one should I use as the ad's creative?"),
+      ],
+    }));
+    try {
+      const userMessage = "can you list the facebook recent post to select ad creatives";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revises = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revises.length >= 1, `the auto-revise must dispatch a REAL revise_strategy call before the model's own turn: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "the stale single pick must be cleared");
+      assert.equal(active?.resolvedAssets.creative, null, "a list request must never resolve to a pick");
+      assert.equal(active?.resolvedAssets.creativeCandidates?.length, 5, "the full real candidate list must be reopened in storage, not just narrated");
+      assert.ok(active?.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the full candidate-list question must now be the open question");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the single-post confirmation must be gone, not just supplemented");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- formatCreativeConfirmationQuestion escape hatch (round 51) ---------
+  await check("[formatCreativeConfirmationQuestion, round 51] offers the \"see the other options\" escape hatch only when 2+ real candidates actually exist", () => {
+    const candidate = { id: "111_5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05" };
+    const withOthers = formatCreativeConfirmationQuestion("EXISTING_PAGE_POST", candidate, 5);
+    assert.match(withOthers, /show me the other options/i, `must name the escape hatch: ${withOthers}`);
+    assert.match(withOthers, /all 5 real candidates/i, `must state the real count: ${withOthers}`);
+
+    // A single-candidate account never actually reaches pendingCreative
+    // (resolveCreativeSelection auto-picks it without ever setting
+    // pickedViaSelector — see that function's own comment), but the
+    // formatter itself must still degrade safely if ever called with no
+    // real "others" to offer, rather than claim "all 1 real candidates."
+    const noOthers = formatCreativeConfirmationQuestion("EXISTING_PAGE_POST", candidate, undefined);
+    assert.ok(!/show me the other options/i.test(noOthers), `must NOT offer a nonsense escape hatch with no totalCandidates: ${noOthers}`);
+    assert.ok(!/show me the other options/i.test(formatCreativeConfirmationQuestion("EXISTING_PAGE_POST", candidate, 1)), "must NOT offer the escape hatch for a count of 1 either");
   });
 
   // --- pendingCreative compound-message affirmation (round 41) ------------

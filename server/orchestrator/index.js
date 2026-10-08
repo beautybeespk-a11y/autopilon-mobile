@@ -16,7 +16,7 @@ import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
-import { matchCreativeCandidateId, messageAffirmsPendingCreative } from "../agents/metaExpertV2/creativeResolution.js";
+import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
@@ -1521,6 +1521,72 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         }
       } catch (err) {
         v2Trace("auto-revise pendingCreative failed (error)", { conversationId, error: err.message });
+      }
+    }
+  }
+
+  // Round 51 fix (live production report): a user asked "can you list the
+  // facebook recent post to select ad creatives" while a pendingCreative
+  // confirmation was open (the single-post confirmation ABOVE this block
+  // promotes/handles). That message is not an affirmation
+  // (messageAffirmsPendingCreative), so the block above never fires — and
+  // nothing else existed to re-open the real candidate list. The model
+  // called get_business_snapshot and revise_strategy but never resent a
+  // fresh content_selector, so resolveCreativeSelection's priorPendingCreative
+  // branch (creativeResolution.js) just handed the SAME single candidate
+  // back, and the same confirmation question was re-asked verbatim. Same
+  // fix shape as every pre-loop in this section: BEFORE the model's turn,
+  // if the active strategy has a pendingCreative and the user's CURRENT
+  // message asks to see the options (messageRequestsCreativeOptionsList —
+  // whole-message generic phrases, or an embedded, unambiguous phrase
+  // naming post/creative/candidate/image — see that function's own
+  // comment), call revise_strategy with content_selector explicitly
+  // cleared to {} (an empty object, not omitted and NOT null —
+  // validateStrategyStructure, strategySchema.js, hard-requires
+  // content_selector to be a real object for an explicit_action strategy
+  // regardless of action_type, so null would fail BOOST_FACEBOOK_POST/
+  // BOOST_INSTAGRAM_POST's structural validation outright; {} satisfies
+  // that check while still carrying no confirmedId/position, read
+  // identically to null by resolveCreativeSelection's own `|| {}` fallback)
+  // so mergeForRevision never carries the stale guessed selector forward
+  // and resolveCreativeSelection re-derives against the real candidate
+  // list — landing in its genuine-ambiguity branch (2+ real candidates, no
+  // selector) rather than the pendingCreative branch, exactly the question
+  // the user actually asked for.
+  //
+  // !messageAffirmsPendingCreative(userMessage) guards against the (already
+  // impossible, by this file's own pattern design — see messageRequestsCreativeOptionsList's
+  // header comment confirming no overlap) case of a message matching both;
+  // kept explicit rather than relying on pattern disjointness alone, same
+  // layering discipline destination_url/pendingCreative's own pre-loops use
+  // elsewhere in this section.
+  if (hasV2Tools && conversationId) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const pendingCreative = activeStrategy?.resolvedAssets?.pendingCreative;
+    if (activeStrategy && pendingCreative && !messageAffirmsPendingCreative(userMessage) && messageRequestsCreativeOptionsList(userMessage)) {
+      try {
+        const accessToken = requireValidToken(userId, "meta_ads");
+        const revised = await reviseStrategyV2({
+          userId, conversationId, accessToken, strategyId: activeStrategy.id,
+          requestedChanges: { content_selector: {} }, userMessage,
+        });
+        if (revised.ok) {
+          otherFieldAutoRevisedThisTurn = true;
+          trace.push(traceStep("tool", "Auto-reopened the creative candidate list you asked to see (meta_expert_v2.revise_strategy)", "done"));
+          toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+          const lastIdx = conversationForModel.length - 1;
+          const last = conversationForModel[lastIdx];
+          if (last?.role === "user" && typeof last.content === "string") {
+            conversationForModel = [
+              ...conversationForModel.slice(0, lastIdx),
+              { ...last, content: `${last.content}\n\n[System note: this message asked to see the creative options — the full real candidate list has already been re-opened via revise_strategy, replacing the single pending pick. Updated recommendation: ${revised.recommendationText} Present this full candidate list to the user now — do NOT re-present only the previously pending single post.]` },
+            ];
+          }
+        } else {
+          v2Trace("auto-revise creative options list reopen failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+        }
+      } catch (err) {
+        v2Trace("auto-revise creative options list reopen failed (error)", { conversationId, error: err.message });
       }
     }
   }

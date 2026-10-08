@@ -700,7 +700,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     // .source here is always the real (possibly synthetic, for
     // explicit_action) source resolveCreativeSelection itself resolved
     // against — already correct without needing creativeQuestionSource.
-    const question = formatCreativeConfirmationQuestion(creativeResolution.pendingCreative.source, creativeResolution.pendingCreative.candidate);
+    const question = formatCreativeConfirmationQuestion(creativeResolution.pendingCreative.source, creativeResolution.pendingCreative.candidate, creativeResolution.pendingCreative.totalCandidates);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
