@@ -22,6 +22,7 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
+const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
@@ -71,7 +72,22 @@ function mockFetch(handler) { global.fetch = handler; }
 function restoreFetch() { global.fetch = originalFetch; }
 function jsonResponse(body, status = 200) { return { ok: status < 400, status, json: async () => body }; }
 
-function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false, pageTokenUnavailable = false, writes = [], writeError = null, corruptAdReadback = false } = {}) {
+function metaRouter({
+  adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false,
+  pageTokenUnavailable = false, writes = [], writeError = null, corruptAdReadback = false,
+  // Round 49 — campaignInsights: real Meta shape per campaign id ({impressions,
+  // clicks, spend, reach, actions, action_values, ...}), so a multi-campaign
+  // blended-rollup test can give each campaign its OWN real numbers instead
+  // of every campaign silently sharing the one hardcoded insights response
+  // below (which is exactly how an unweighted-mean bug could go untested —
+  // every "campaign" in every prior test had identical numbers, so averaging
+  // vs. blending never had a chance to produce different answers).
+  // campaignsPageSize: when set, paginates the campaigns list response into
+  // real pages with a genuine paging.next cursor the mock itself understands
+  // on the next call — proves meta.listCampaigns (api.js) actually follows
+  // it rather than just trusting a bigger single page.
+  campaignInsights = {}, campaignsPageSize = null,
+} = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
   // later read-back GET (meta.getAd/getAdCreative/getAdSet — the creative-
@@ -168,8 +184,27 @@ function metaRouter({ adAccounts = [], pages = [], igByPageId = {}, pixels = [],
     }
     if (path.endsWith("/adspixels")) return jsonResponse({ data: pixels });
     if (path.endsWith("/product_catalogs")) return jsonResponse({ data: catalogs });
-    if (path.endsWith("/campaigns")) return jsonResponse({ data: campaigns });
-    if (path.endsWith("/insights")) return jsonResponse({ data: [{ impressions: "1000", clicks: "40", spend: "120", ctr: "4", cpc: "3", cpm: "12", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "8" }], cost_per_action_type: [{ action_type: "purchase", value: "15" }], purchase_roas: [{ action_type: "omni_purchase", value: "2.4" }] }] });
+    if (path.endsWith("/campaigns")) {
+      // Round 49 — real pagination when campaignsPageSize is set: returns
+      // one page plus a genuine paging.next cursor (an opaque __page_offset
+      // query param THIS mock itself reads back on the next call, not a
+      // real Meta cursor format — the point is only that listCampaigns
+      // actually follows whatever Meta gives it, not that this mock
+      // reproduces Meta's own cursor encoding).
+      if (campaignsPageSize) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const pageItems = campaigns.slice(offset, offset + campaignsPageSize);
+        const nextOffset = offset + campaignsPageSize;
+        const hasMore = nextOffset < campaigns.length;
+        return jsonResponse({ data: pageItems, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${nextOffset}&access_token=fake` } : undefined });
+      }
+      return jsonResponse({ data: campaigns });
+    }
+    if (path.endsWith("/insights")) {
+      const campaignId = path.split("/")[1];
+      const row = campaignInsights[campaignId] || { impressions: "1000", clicks: "40", spend: "120", ctr: "4", cpc: "3", cpm: "12", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "150" }], cost_per_action_type: [{ action_type: "purchase", value: "15" }], purchase_roas: [{ action_type: "omni_purchase", value: "2.4" }] };
+      return jsonResponse({ data: [row] });
+    }
     // postsError simulates a real Meta API failure (e.g. a transient error
     // or a revoked permission) for the Page-posts fetch specifically —
     // distinct from "not_connected"/empty, matching businessSnapshot.js's
@@ -6246,6 +6281,133 @@ async function run() {
       assert.ok(productsRequestUrl, "the Shopify products endpoint must actually be called");
       const parsed = new URL(productsRequestUrl);
       assert.equal(parsed.searchParams.get("order"), "created_at desc");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Meta performance rollup: blended, not averaged (round 49) ----------
+  // Live bug, verified against a real Meta account: get_business_snapshot
+  // reported account-level CPA 844, ROAS 7.91, CTR 6.45% against real
+  // blended values of CPA 638, ROAS 9.99, CTR 5.31% — root cause was an
+  // UNWEIGHTED MEAN of each campaign's own rate instead of totals-based
+  // blending (cpa/roas/ctr/cpm/cpc/frequency all had this bug, not just
+  // the three a live account happened to expose it for). See
+  // gatherMetaHistory, businessSnapshot.js, for the full fix.
+  await check("[Meta performance rollup, round 49] blended CPA/ROAS/CTR (and the raw totals behind them) match the live-verified values — an unweighted mean of per-campaign rates would report the old, wrong numbers instead", async () => {
+    const userId = makeUser(`v2-rollup-blended-${stamp}@example.com`);
+    connectMeta(userId);
+    const campaigns = [
+      { id: "c1", name: "Campaign A", status: "ACTIVE", objective: "OUTCOME_SALES" },
+      { id: "c2", name: "Campaign B", status: "PAUSED", objective: "OUTCOME_SALES" },
+    ];
+    // Reconstructs the live bug report's own two-campaign proof: spend
+    // 4630.24 (CPA 578.78 -> exactly 8 purchases) and spend 1108.56 (CPA
+    // 1108.56 -> exactly 1 purchase). Revenue is back-computed from
+    // spend*roas (the exact relationship Meta's own per-campaign ROAS is
+    // defined by — 4630.24*11.304 and 1108.56*4.509). Impressions/clicks
+    // are reconstructed to reproduce the reported per-campaign CTRs
+    // (3.70%/9.20%) and the verified blended CTR (5.31%) — the exact live
+    // impression counts aren't known, only the ratios.
+    const campaignInsights = {
+      c1: {
+        impressions: "100000", clicks: "3700", spend: "4630.24", reach: "90000",
+        actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "52340.23" }],
+        cost_per_action_type: [{ action_type: "purchase", value: "578.78" }], purchase_roas: [{ action_type: "omni_purchase", value: "11.304" }],
+      },
+      c2: {
+        impressions: "41388", clicks: "3808", spend: "1108.56", reach: "40000",
+        actions: [{ action_type: "purchase", value: "1" }], action_values: [{ action_type: "purchase", value: "4998.30" }],
+        cost_per_action_type: [{ action_type: "purchase", value: "1108.56" }], purchase_roas: [{ action_type: "omni_purchase", value: "4.509" }],
+      },
+    };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], campaigns, campaignInsights } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId);
+      const { metaHistory } = snapshot;
+      assert.equal(metaHistory.status, "exists");
+      assert.equal(metaHistory.campaignCount, 2);
+
+      // The real, verified blended values — sum the numerators and
+      // denominators, then divide ONCE.
+      assert.ok(Math.abs(metaHistory.cpa - 637.64) < 0.01, `blended CPA must be Σspend/Σpurchases ≈ 637.64 (rounds to the verified 638): got ${metaHistory.cpa}`);
+      assert.equal(Math.round(metaHistory.cpa), 638);
+      assert.ok(Math.abs(metaHistory.roas - 9.99) < 0.01, `blended ROAS must be Σrevenue/Σspend ≈ 9.99: got ${metaHistory.roas}`);
+      assert.ok(Math.abs(metaHistory.ctr - 5.31) < 0.02, `blended CTR must be Σclicks/Σimpressions ≈ 5.31%: got ${metaHistory.ctr}`);
+
+      // The exact WRONG numbers this live bug actually shipped — an
+      // unweighted mean of (578.78+1108.56)/2=843.67→844,
+      // (11.304+4.509)/2=7.907→7.91, (3.70%+9.20%)/2=6.45%. A regression
+      // back to averaging per-campaign rates would reproduce these
+      // exactly, not the verified values asserted above — this is the
+      // "fails loudly" proof the unequal-spend fixture exists for.
+      assert.notEqual(Math.round(metaHistory.cpa), 844, "must never reproduce the old unweighted-mean CPA");
+      assert.notEqual(Math.round(metaHistory.roas * 100) / 100, 7.91, "must never reproduce the old unweighted-mean ROAS");
+      assert.notEqual(Math.round(metaHistory.ctr * 100) / 100, 6.45, "must never reproduce the old unweighted-mean CTR");
+
+      // Round 49 — the raw totals every rate above was computed from. A
+      // rate with no visible denominator is how the original bug went
+      // unnoticed this long.
+      assert.ok(Math.abs(metaHistory.totals.spend - 5738.80) < 0.01);
+      assert.equal(metaHistory.totals.clicks, 7508);
+      assert.equal(metaHistory.totals.impressions, 141388);
+      assert.equal(metaHistory.totals.reach, 130000);
+      assert.equal(metaHistory.totals.purchases, 9);
+      assert.ok(Math.abs(metaHistory.totals.revenue - 57338.53) < 0.5);
+
+      assert.equal(metaHistory.insightsCoverage.campaignsWithInsights, 2);
+      assert.equal(metaHistory.insightsCoverage.totalCampaigns, 2);
+      assert.equal(metaHistory.insightsCoverage.capped, false);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta performance rollup, round 49] MAX_CAMPAIGNS_FOR_INSIGHTS caps real API calls, but insightsCoverage reports the TRUE total and that the cap was hit — never silently looks complete", async () => {
+    const userId = makeUser(`v2-rollup-cap-${stamp}@example.com`);
+    connectMeta(userId);
+    const campaigns = Array.from({ length: 27 }, (_, i) => ({ id: `c${i + 1}`, name: `Campaign ${i + 1}`, status: i === 0 ? "ACTIVE" : "PAUSED", objective: "OUTCOME_SALES" }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], campaigns } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId);
+      const { metaHistory } = snapshot;
+      assert.equal(metaHistory.campaignCount, 27, "the real total campaign count must be reported, never capped");
+      assert.equal(metaHistory.insightsCoverage.totalCampaigns, 27);
+      assert.equal(metaHistory.insightsCoverage.campaignsChecked, 25, "only MAX_CAMPAIGNS_FOR_INSIGHTS campaigns ever get a real getCampaignInsights call");
+      assert.equal(metaHistory.insightsCoverage.capped, true, "must say the cap was hit — never silently look complete");
+      assert.equal(metaHistory.insightsCoverage.campaignsWithInsights, 25, "every checked campaign in this fixture has usable insights (the shared default mock row)");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta performance rollup, round 49] zero purchases/clicks/impressions/reach never produce NaN or Infinity — a rate is null when its real denominator is zero", async () => {
+    const userId = makeUser(`v2-rollup-zero-denom-${stamp}@example.com`);
+    connectMeta(userId);
+    const campaigns = [{ id: "c1", name: "Campaign A", status: "ACTIVE", objective: "OUTCOME_TRAFFIC" }];
+    const campaignInsights = { c1: { impressions: "0", clicks: "0", spend: "0", reach: "0", actions: [], action_values: [], cost_per_action_type: [], purchase_roas: [] } };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], campaigns, campaignInsights } }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId);
+      const { metaHistory } = snapshot;
+      for (const field of ["cpa", "roas", "ctr", "cpm", "cpc", "frequency"]) {
+        assert.equal(metaHistory[field], null, `${field} must be null (never NaN/Infinity) when its real denominator is zero`);
+      }
+      assert.equal(metaHistory.totals.spend, 0);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta API, round 49] listCampaigns follows Meta's own paging.next cursor — a page boundary must never silently drop campaigns (the exact live bug: 9 real campaigns, only 8 returned)", async () => {
+    const userId = makeUser(`v2-campaigns-pagination-${stamp}@example.com`);
+    connectMeta(userId);
+    const campaigns = Array.from({ length: 9 }, (_, i) => ({ id: `c${i + 1}`, name: `Campaign ${i + 1}`, status: i === 0 ? "ACTIVE" : "PAUSED" }));
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], campaigns, campaignsPageSize: 5 }));
+    try {
+      const result = await meta.listCampaigns(`fake-meta-token-${userId}`, "act_1");
+      assert.equal(result.length, 9, `must follow paging.next past the first page (5) to get all 9: got ${result.length}`);
+      assert.deepEqual(result.map((c) => c.id), campaigns.map((c) => c.id));
     } finally {
       restoreFetch();
     }

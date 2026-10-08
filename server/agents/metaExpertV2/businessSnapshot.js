@@ -27,7 +27,21 @@ import * as shopify from "../../integrations/shopify/api.js";
 import { trace } from "./diagnostics.js";
 
 const MAX_PRODUCTS = 12;
-const MAX_CAMPAIGNS_FOR_INSIGHTS = 3;
+// Round 49 (live bug) — was 3, which is the SAME bug class as the
+// unweighted-mean rollup below wearing a different hat: a blended figure
+// computed from only 3 of a real account's campaigns is wrong in exactly
+// the way that fix addresses, and it fails silently on exactly the
+// accounts that matter most (a customer with more campaigns than this
+// session's own test account). Raised to 25 — generous enough to fully
+// cover the large majority of real small-business ad accounts in one
+// snapshot call, while still bounding worst-case latency/rate-limit
+// exposure (25 sequential getCampaignInsights calls, worst case) for an
+// agency-scale account with hundreds of campaigns. Not a claim that 25 is
+// always enough — see insightsCoverage on gatherMetaHistory's return
+// value below: when the real campaign count exceeds this cap, the
+// rollup says so explicitly (campaignsChecked/totalCampaigns/capped)
+// rather than silently reporting a number that looks complete.
+const MAX_CAMPAIGNS_FOR_INSIGHTS = 25;
 const MAX_RECENT_CONTENT = 5;
 
 // Every external call in this file goes through here — one source's
@@ -337,36 +351,71 @@ async function gatherMetaAssets(userId, accessToken, conn) {
   };
 }
 
+// Round 49 (live bug, verified against a real Meta account): every rate
+// below used to be an UNWEIGHTED MEAN of each campaign's own rate
+// (avg("cpa"), avg("roas"), etc.) — mathematically wrong the moment
+// spend differs between campaigns, since a rate is never the average of
+// rates when the denominators differ. Two campaigns with spend 4630.24
+// and 1108.56 produced a reported CPA of 844 against a real blended value
+// of 638 — proof: (578.78 + 1108.56) / 2 = 843.67 (the old, wrong math)
+// vs the real total spend / total purchases. Every one of these six
+// fields is a rate with a per-campaign denominator that can differ
+// (spend, impressions, clicks, reach), so every one of them had this same
+// bug, not just the three a live account happened to expose it for.
+// Fixed uniformly: sum the real numerators and denominators across every
+// campaign actually examined, then divide ONCE — never average an
+// already-divided number a second time. totals (below) exposes the exact
+// raw sums every rate was computed from, since a rate shown with no
+// visible denominator is how the original bug went unnoticed this long.
+function blendedRate(numerator, denominator, multiplier = 1) {
+  return denominator > 0 ? (numerator / denominator) * multiplier : null;
+}
+
+const EMPTY_METRICS = { recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, totals: null };
+
 async function gatherMetaHistory(userId, accessToken, primaryAdAccountId) {
   if (!primaryAdAccountId) {
-    return { status: "not_connected", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "not_connected", items: [] } };
+    return { status: "not_connected", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, ...EMPTY_METRICS, insightsCoverage: null, bestPerformingCampaigns: { status: "not_connected", items: [] } };
   }
+  // Round 49 — meta.listCampaigns now follows Meta's own paging.next
+  // cursor (api.js) rather than trusting a single page always has
+  // everything; this is the actual fix for "reported 8 campaigns, the
+  // account has 9" — campaignCount below is only as correct as that call.
   const campaignsResult = await attempt(() => meta.listCampaigns(accessToken, primaryAdAccountId));
   if (campaignsResult.status !== "exists") {
-    return { status: "fetch_failed", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "fetch_failed", items: [] } };
+    return { status: "fetch_failed", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, ...EMPTY_METRICS, insightsCoverage: null, bestPerformingCampaigns: { status: "fetch_failed", items: [] } };
   }
   const campaigns = campaignsResult.value;
   const activeCampaigns = campaigns.filter((c) => c.status === "ACTIVE").length;
   const pausedCampaigns = campaigns.filter((c) => c.status === "PAUSED").length;
 
   if (!campaigns.length) {
-    return { status: "exists", campaignCount: 0, activeCampaigns: 0, pausedCampaigns: 0, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "exists", items: [] } };
+    return { status: "exists", campaignCount: 0, activeCampaigns: 0, pausedCampaigns: 0, ...EMPTY_METRICS, insightsCoverage: { campaignsWithInsights: 0, campaignsChecked: 0, totalCampaigns: 0, capped: false }, bestPerformingCampaigns: { status: "exists", items: [] } };
   }
 
+  // MAX_CAMPAIGNS_FOR_INSIGHTS (see its own comment above) bounds how many
+  // campaigns ever get a real getCampaignInsights call — capped is true
+  // the moment the real total exceeds that bound, regardless of how many
+  // of the checked campaigns actually had usable insights data back.
+  const checkedCampaigns = campaigns.slice(0, MAX_CAMPAIGNS_FOR_INSIGHTS);
+  const capped = campaigns.length > MAX_CAMPAIGNS_FOR_INSIGHTS;
   const withInsights = [];
-  for (const c of campaigns.slice(0, MAX_CAMPAIGNS_FOR_INSIGHTS)) {
+  for (const c of checkedCampaigns) {
     const insightsResult = await attempt(() => meta.getCampaignInsights(accessToken, c.id));
     if (insightsResult.status === "exists" && insightsResult.value) withInsights.push({ campaignId: c.id, name: c.name, ...insightsResult.value });
   }
+  const insightsCoverage = { campaignsWithInsights: withInsights.length, campaignsChecked: checkedCampaigns.length, totalCampaigns: campaigns.length, capped };
   if (!withInsights.length) {
-    return { status: "exists", campaignCount: campaigns.length, activeCampaigns, pausedCampaigns, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "unavailable", items: [] } };
+    return { status: "exists", campaignCount: campaigns.length, activeCampaigns, pausedCampaigns, ...EMPTY_METRICS, insightsCoverage, bestPerformingCampaigns: { status: "unavailable", items: [] } };
   }
 
   const sum = (field) => withInsights.reduce((acc, c) => acc + (Number(c[field]) || 0), 0);
-  const avg = (field) => {
-    const vals = withInsights.map((c) => Number(c[field])).filter((n) => !Number.isNaN(n));
-    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-  };
+  const totalSpend = sum("spend");
+  const totalClicks = sum("clicks");
+  const totalImpressions = sum("impressions");
+  const totalReach = sum("reach");
+  const totalPurchases = sum("purchases");
+  const totalRevenue = sum("revenue");
   const sorted = [...withInsights].sort((a, b) => (Number(b.roas) || 0) - (Number(a.roas) || 0));
 
   return {
@@ -374,14 +423,22 @@ async function gatherMetaHistory(userId, accessToken, primaryAdAccountId) {
     campaignCount: campaigns.length,
     activeCampaigns,
     pausedCampaigns,
-    recentSpend: withInsights.some((c) => c.spend !== undefined) ? sum("spend") : null,
-    purchases: withInsights.some((c) => c.purchases !== undefined) ? sum("purchases") : null,
-    cpa: avg("cpa"),
-    roas: avg("roas"),
-    ctr: avg("ctr"),
-    cpm: avg("cpm"),
-    cpc: avg("cpc"),
-    frequency: avg("frequency"),
+    recentSpend: withInsights.some((c) => c.spend !== undefined) ? totalSpend : null,
+    purchases: withInsights.some((c) => c.purchases !== undefined) ? totalPurchases : null,
+    // Blended from totals, never averaged per-campaign rates — see this
+    // function's own header comment for the live bug this replaces.
+    cpa: blendedRate(totalSpend, totalPurchases),
+    roas: blendedRate(totalRevenue, totalSpend),
+    ctr: blendedRate(totalClicks, totalImpressions, 100),
+    cpm: blendedRate(totalSpend, totalImpressions, 1000),
+    cpc: blendedRate(totalSpend, totalClicks),
+    frequency: blendedRate(totalImpressions, totalReach),
+    // Round 49 — the raw sums every rate above was computed from. A rate
+    // with no visible denominator is how the unweighted-mean bug went
+    // unnoticed this long; never hide these again behind the derived
+    // numbers alone.
+    totals: { spend: totalSpend, clicks: totalClicks, impressions: totalImpressions, reach: totalReach, purchases: totalPurchases, revenue: totalRevenue },
+    insightsCoverage,
     bestPerformingCampaigns: { status: "exists", items: sorted.slice(0, 3).map((c) => ({ campaignId: c.campaignId, name: c.name, roas: c.roas ?? null, purchases: c.purchases ?? null })) },
   };
 }
@@ -535,7 +592,7 @@ export async function gatherBusinessSnapshot(userId) {
       version: null,
       business,
       metaAssets: { adAccounts: emptyList, defaultAdAccount: emptyDefault, pages: emptyList, defaultPage: emptyDefault, pixels: emptyList, defaultPixel: emptyDefault, catalogs: emptyList, defaultCatalog: emptyDefault, instagram: { status: "not_connected", account: null }, defaultInstagramId: null },
-      metaHistory: { status: "not_connected", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, recentSpend: null, purchases: null, cpa: null, roas: null, ctr: null, cpm: null, cpc: null, frequency: null, bestPerformingCampaigns: { status: "not_connected", items: [] } },
+      metaHistory: { status: "not_connected", campaignCount: null, activeCampaigns: null, pausedCampaigns: null, ...EMPTY_METRICS, insightsCoverage: null, bestPerformingCampaigns: { status: "not_connected", items: [] } },
       recentContent: { facebookPosts: { status: "not_connected", items: [], reason: null }, instagramPosts: { status: "not_connected", items: [], reason: null } },
       metaConnected: false,
       metaConnectionError: err.message,

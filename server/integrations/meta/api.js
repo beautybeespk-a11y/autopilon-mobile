@@ -40,8 +40,14 @@ function redactToken(token) {
 }
 
 async function metaFetch(path, { accessToken, method = "GET", body }) {
-  const url = new URL(`${BASE}${path}`);
-  if (method === "GET") url.searchParams.set("access_token", accessToken);
+  // Round 49 — path may now be a complete absolute URL (Meta's own
+  // paging.next cursor, used by the pagination loop below) rather than
+  // always a relative path to prepend BASE to. Every existing caller
+  // passes a relative path (no scheme), so this is purely additive — zero
+  // behavior change for them. paging.next already carries its own
+  // access_token, so it's never overwritten below when already present.
+  const url = path.startsWith("http") ? new URL(path) : new URL(`${BASE}${path}`);
+  if (method === "GET" && !url.searchParams.has("access_token")) url.searchParams.set("access_token", accessToken);
   const headers = { "content-type": "application/json" };
   // Diagnostic (live bug: a page token proven working by hand in Graph API
   // Explorer still hit Meta's real "(#10) requires pages_read_engagement
@@ -110,9 +116,30 @@ export async function listAdAccounts(accessToken) {
   return data.data || [];
 }
 
+// Round 49 (live bug): an account with 9 real campaigns got only 8 back
+// here — this function had no explicit `limit` (trusting Meta's own
+// undocumented-here default page size) and never followed `paging.next`,
+// so a page boundary landing between campaign 8 and 9 silently dropped
+// the rest. Nothing in this whole file followed pagination for ANY list
+// endpoint before this fix — see the investigation notes on the other
+// list calls that share this same gap (reported separately, not fixed
+// here). MAX_PAGINATION_PAGES bounds the loop against a pathological/
+// looping cursor; a real account's campaign list is never anywhere near
+// this deep.
+const MAX_PAGINATION_PAGES = 20;
+async function metaFetchAllPages(path, accessToken) {
+  const all = [];
+  let next = path;
+  for (let page = 0; page < MAX_PAGINATION_PAGES && next; page++) {
+    const data = await metaFetch(next, { accessToken });
+    all.push(...(data.data || []));
+    next = data.paging?.next || null;
+  }
+  return all;
+}
+
 export async function listCampaigns(accessToken, adAccountId) {
-  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget`, { accessToken });
-  return data.data || [];
+  return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/campaigns?fields=id,name,status,objective,daily_budget,lifetime_budget&limit=100`, accessToken);
 }
 
 // isAdsetBudgetSharingEnabled: optional, new (round 31 live bug) — a
@@ -161,8 +188,14 @@ function extractActionValue(actionsArray) {
   return match ? Number(match.value) : null;
 }
 export async function getCampaignInsights(accessToken, campaignId, datePreset = "last_30d") {
+  // Round 49 — action_values added (real purchase revenue, extracted the
+  // same way purchases already is from actions) so a BLENDED roas can be
+  // computed from totals (Σrevenue / Σspend) elsewhere — purchase_roas is
+  // kept too (Meta's own per-campaign ratio, still useful standalone) but
+  // is no longer the only revenue signal available; see businessSnapshot.js's
+  // gatherMetaHistory for why a per-campaign ratio alone can't be blended.
   const data = await metaFetch(
-    `/${campaignId}/insights?fields=impressions,clicks,spend,ctr,cpc,cpm,reach,frequency,actions,cost_per_action_type,purchase_roas&date_preset=${datePreset}`,
+    `/${campaignId}/insights?fields=impressions,clicks,spend,ctr,cpc,cpm,reach,frequency,actions,action_values,cost_per_action_type,purchase_roas&date_preset=${datePreset}`,
     { accessToken }
   );
   const row = data.data?.[0];
@@ -170,6 +203,7 @@ export async function getCampaignInsights(accessToken, campaignId, datePreset = 
   return {
     ...row,
     purchases: extractActionValue(row.actions),
+    revenue: extractActionValue(row.action_values),
     cpa: extractActionValue(row.cost_per_action_type),
     roas: Array.isArray(row.purchase_roas) && row.purchase_roas[0] ? Number(row.purchase_roas[0].value) : null,
   };
