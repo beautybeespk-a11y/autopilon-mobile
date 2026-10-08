@@ -326,6 +326,27 @@ function capturedUnavailableReason(activeStrategy) {
 // confirmation (formatCreativeConfirmationQuestion, round 34's second
 // fix) — both formatters deliberately end with the same "...as the ad's
 // creative[.?]" phrase so one check covers either.
+//
+// KNOWN OPEN GAP (filed, not fixed, round 51 follow-up): this anchor only
+// enforces that SOME creative question reached the customer — it never
+// verifies the model relayed the REST of the backend-authored text
+// faithfully. Round 51's escape-hatch sentence (formatCreativeConfirmationQuestion's
+// "say 'show me the other options' to see all N real candidates...") is a
+// real, backend-computed fact (the real candidate count) sitting right
+// next to the enforced anchor phrase, and a live production reply dropped
+// the count entirely ("...let me know if you'd like to see other
+// options") while still passing this gate, because the gate never checked
+// for it. Same class of risk as round 41 (compound-answer resolution) —
+// a fact the backend computed correctly can still fail to reach the
+// customer purely through the model's own paraphrase, with nothing here
+// to catch it — and it will matter more as more backend-authored facts
+// (counts, ids, dates) flow through text this gate only spot-checks by a
+// single substring. Not addressed this round: fixing it means either
+// widening this gate to verify specific facts (which numbers/which
+// phrases, case by case) or a structurally different approach (e.g.
+// surfacing escape-hatch text as real structured data rather than prose
+// the model must transcribe) — a design decision bigger than this round's
+// fix, left for its own round rather than bolted on here.
 const MAX_CREATIVE_QUESTION_NUDGES = 1;
 const CREATIVE_QUESTION_ANCHOR_PATTERN = /as the ad's creative[.?]/i;
 function checkUnresolvedCreativeChoiceGate(activeStrategy) {
@@ -856,7 +877,21 @@ function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpert
   if (hasActivePlan && PLAN_REVIEW_INTENT_PATTERNS.test(userMessage)) {
     return 'This looks like a request to review or revise the ACTIVE campaign plan (e.g. "review my data," "why did you choose this audience/budget," "improve/reconsider the plan") — that must go through the real revision path, never a conversational answer from memory. If the user asked you to review WooCommerce products, Meta account history, or audience data, call meta_expert.research_business_context first to get CURRENT data — a Pixel or connection status can change between turns, never state it from what an earlier turn said. Then call meta_expert.create_campaign_plan with revisesPlanId set to the active plan\'s id, changing only what the current evidence actually supports, before presenting anything to the user.';
   }
-  if (CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) {
+  // Round 51 follow-up (live production report): this branch's whole
+  // point is "the model is about to pick/compare creative — force it to
+  // use real data instead of inventing." Its own instruction text tells
+  // the model to call revise_strategy with a content_selector — exactly
+  // the wrong move when the user's message (same CREATIVE_SELECTION_INTENT_
+  // PATTERNS phrasing can say "select ad creatives" while genuinely asking
+  // to see the candidate list, never to have one picked) is actually a
+  // messageRequestsCreativeOptionsList request. Collapsing the just-
+  // reopened ambiguous list back into a guessed single pick is now
+  // prevented at the source (resolveCreativeSelection, creativeResolution.js
+  // — the selector itself is ignored for a list-request message), but an
+  // instruction that tells the model to do the wrong thing in a known case
+  // will keep causing redundant/confusing tool calls even once its effect
+  // is harmless, so this branch is skipped entirely for that case.
+  if (CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage) && !messageRequestsCreativeOptionsList(userMessage)) {
     const snapshotTool = hasV2Tools ? "meta_expert_v2.get_business_snapshot" : "meta_expert.research_business_context";
     const revisionClause = hasV2Tools && hasActivePlan
       ? " Since an active strategy already exists for this conversation, then call meta_expert_v2.revise_strategy updating ONLY the creative fields (creative_strategy / content_selector) with what the real data supports — preserve the Page, ad account, Pixel, objective, audience, and budget exactly as they are; do not rebuild the campaign."
@@ -897,9 +932,19 @@ function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpert
 // rejection is a real, honest attempt; the single-call gate already
 // prevents that from becoming a retry loop).
 const MAX_CREATIVE_REVISION_NUDGES = 1;
+// Round 51 follow-up (same reasoning as checkStaleFactualAnswerGate's own
+// round-51 comment above): this gate's instruction text ("updating ONLY
+// the creative fields ... with what the business snapshot actually
+// supports") tells the model to supply content_selector — wrong when the
+// user's message is actually messageRequestsCreativeOptionsList, asking
+// to SEE the candidates rather than have one picked. The pick itself can
+// no longer collapse the reopened list (resolveCreativeSelection ignores
+// content_selector for that message), but the instruction to make one is
+// still wrong and still worth not giving.
 function checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy, hasV2Tools, revisedThisTurn }) {
   if (!hasV2Tools || !hasActiveV2Strategy || revisedThisTurn) return null;
   if (typeof userMessage !== "string" || !CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) return null;
+  if (messageRequestsCreativeOptionsList(userMessage)) return null;
   return 'An active strategy already exists for this conversation and this is a creative-selection/change request. You must call meta_expert_v2.revise_strategy — updating ONLY the creative fields (creative_strategy / content_selector) with what the business snapshot actually supports — before finalizing. Preserve the existing objective, audience, budget, Page, ad account, and Pixel exactly as they are; never rebuild the campaign from scratch. The required flow is: get_business_snapshot -> revise_strategy -> final.';
 }
 

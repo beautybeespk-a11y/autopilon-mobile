@@ -5763,6 +5763,187 @@ async function run() {
     assert.ok(!/show me the other options/i.test(formatCreativeConfirmationQuestion("EXISTING_PAGE_POST", candidate, 1)), "must NOT offer the escape hatch for a count of 1 either");
   });
 
+  // --- pendingCreative options list must survive the REST of the turn -----
+  // (round 51 follow-up) -----------------------------------------------
+  // Live production report: the pre-loop fired and correctly reopened the
+  // list (Auto-reopened trace step), but the model then called
+  // get_business_snapshot and revise_strategy TWICE more and re-collapsed
+  // it back to the SAME single post before composing its reply. Root
+  // cause: a later revise_strategy call this same turn reintroduced a
+  // guessed content_selector (nudged into doing so by checkStaleFactualAnswerGate/
+  // checkCreativeRevisionRequiredGate's own instruction text), which
+  // resolveCreativeSelection's matchCreativeCandidateId correctly refused
+  // to verify but still turned into a fresh single-candidate pendingCreative
+  // instead of staying the full list.
+  await check("[pendingCreative options survive the turn, round 51 follow-up] a SECOND, guessed content_selector call with the SAME list-request userMessage must NOT collapse the just-reopened list", async () => {
+    const userId = makeUser(`v2-pending-reopen-survives-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "use one of my facebook page posts as the ad",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+
+      const listRequestMessage = "can you list the facebook recent post to select ad creatives";
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going in");
+
+      // Step 1: the pre-loop's own reopen (content_selector: {}).
+      const reopened = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: { content_selector: {} }, userMessage: listRequestMessage,
+      });
+      assert.equal(reopened.resolved.pendingCreative, null, "sanity: reopen must clear the stale pick");
+      assert.equal(reopened.resolved.creativeCandidates?.length, 5, "sanity: reopen must restore the full list");
+
+      // Step 2: the EXACT production shape — a LATER revise_strategy call
+      // in the same turn (same raw userMessage), now with the model's own
+      // GUESSED content_selector, exactly what checkStaleFactualAnswerGate/
+      // checkCreativeRevisionRequiredGate's instruction text pushes the
+      // model toward. Must NOT collapse the list back down.
+      const afterGuess = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: reopened.strategyId,
+        requestedChanges: { content_selector: { position: 1 } }, userMessage: listRequestMessage,
+      });
+      assert.equal(afterGuess.ok, true, JSON.stringify(afterGuess.unresolved));
+      assert.equal(afterGuess.resolved.pendingCreative, null, "the list-request message must suppress ANY content_selector this turn — a later guess must never recreate pendingCreative");
+      assert.equal(afterGuess.resolved.creative, null, "a list-request message is never a pick, no matter what content_selector a later call in the same turn supplies");
+      assert.equal(afterGuess.resolved.creativeCandidates?.length, 5, "the full list must still be the one actually stored");
+      const listQuestion = afterGuess.strategy.unresolved_questions.find((q) => q.startsWith("Which "));
+      assert.ok(listQuestion, `the list question must still be open, not replaced by a single-pick confirmation: ${JSON.stringify(afterGuess.strategy.unresolved_questions)}`);
+      assert.ok(!afterGuess.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "no single-pick confirmation must reappear");
+
+      // A DIFFERENT, later userMessage (a genuine new turn) is unaffected
+      // — the guard is scoped to the message that asked for the list, not
+      // a permanent override for the rest of the conversation.
+      const laterPick = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: afterGuess.strategyId,
+        requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
+      });
+      assert.deepEqual(laterPick.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a genuinely verified pick on a LATER, different message must still resolve normally — the guard must not leak past its own turn");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[pendingCreative options survive the turn, round 51 follow-up] full production trace reproduced end-to-end: reopen -> get_business_snapshot -> TWO guessed revise_strategy calls -> the list still reaches storage intact", async () => {
+    const userId = makeUser(`v2-pending-full-trace-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going in — this reproduces the agent having already proposed the single YSL-equivalent post");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      // The EXACT trace from the production report: Selected: get_business_snapshot,
+      // Selected: revise_strategy, Selected: revise_strategy, Completed —
+      // each revise_strategy call carrying a guessed content_selector, the
+      // same way checkStaleFactualAnswerGate/checkCreativeRevisionRequiredGate's
+      // own instruction text pushes a real model toward.
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { content_selector: { position: 1 } } }),
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { content_selector: { position: 1 } } }),
+        finalText("Here are your real recent Facebook posts — which one should I use as the ad's creative?"),
+      ],
+    }));
+    try {
+      const userMessage = "can you list the facebook recent post to select ad creatives";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "the list must survive TWO further guessed revise_strategy calls in the same turn — never recollapse to a single pick");
+      assert.equal(active?.resolvedAssets.creative, null, "a list-request turn must never resolve to a pick, regardless of how many extra tool calls the model makes");
+      assert.equal(active?.resolvedAssets.creativeCandidates?.length, 5, "the full real candidate list must be what's actually in storage at the end of this turn");
+      assert.ok(active?.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the full candidate-list question must be the one left open");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "no single-post confirmation must have reappeared");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[nudge suppression, round 51 follow-up] a list-request message does NOT force the model into an extra get_business_snapshot/revise_strategy round trip — a single immediate final reply is accepted", async () => {
+    const userId = makeUser(`v2-pending-no-forced-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going in");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      // ONLY ONE scripted response. Before this round's fix,
+      // checkStaleFactualAnswerGate's creative-selection branch would have
+      // force-nudged this exact message (it matches CREATIVE_SELECTION_
+      // INTENT_PATTERNS) into a mandatory get_business_snapshot call before
+      // it could finalize — this mock would then need a second response it
+      // never gets, and the test would fail with "chat mock exhausted."
+      chatResponses: [finalText("Here are your real recent Facebook posts — which one should I use as the ad's creative?")],
+    }));
+    try {
+      const userMessage = "can you list the facebook recent post to select ad creatives";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply, "a single immediate final reply must be accepted with no forced extra tool-call round trip");
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "the pre-loop's reopen must still have happened before the model's turn");
+      assert.equal(active?.resolvedAssets.creativeCandidates?.length, 5, "the full list must be what's in storage");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- pendingCreative compound-message affirmation (round 41) ------------
   // Live production deadlock: three questions (creative, budget,
   // destination URL) were asked in one turn; the user answered all three

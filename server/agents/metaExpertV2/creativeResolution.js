@@ -557,7 +557,24 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
     };
   }
 
-  const selector = strategy.content_selector || {};
+  // Round 51 follow-up (live production report): the pre-loop reopens the
+  // real candidate list when the user asks to see it
+  // (messageRequestsCreativeOptionsList, orchestrator/index.js), but
+  // nothing stopped a LATER revise_strategy call in the SAME turn —
+  // typically the model's own, nudged by checkStaleFactualAnswerGate/
+  // checkCreativeRevisionRequiredGate into supplying content_selector —
+  // from guessing a pick and collapsing that same list straight back into
+  // a single-candidate pendingCreative. matchCreativeCandidateId's
+  // verification (below) correctly rejects the guess as unverified, but
+  // "unverified" still produced pendingCreative, not a return to the list
+  // — exactly the bug this round reported. Every call this turn shares
+  // the SAME raw userMessage (the user only sent one message; the model's
+  // extra tool calls are all processing it), so checking it once HERE
+  // closes the gap for every call this turn, not just the pre-loop's own:
+  // once the user's own words say they want the list, no content_selector
+  // — the pre-loop's {} or a later guessed one — is ever treated as a
+  // pick for the rest of this turn.
+  const selector = messageRequestsCreativeOptionsList(userMessage) ? {} : (strategy.content_selector || {});
   let chosen = null;
   let pickedViaSelector = false;
   if (typeof selector.confirmedId === "string" && selector.confirmedId) {
