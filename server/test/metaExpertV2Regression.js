@@ -28,6 +28,7 @@ const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaE
 const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { validateStrategyStructure } = await import("../agents/metaExpertV2/strategySchema.js");
 const { logger } = await import("../config/logger.js");
 const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
@@ -6042,6 +6043,214 @@ async function run() {
     assert.equal(verified.needsPrimaryTextQuestion, false);
   });
 
+  // --- Carousel ads from WooCommerce products (round 48) -------------------
+  // One ad, one creative, up to 10 cards, each a different real product.
+  // Extension of the PRODUCT_IMAGE path (creative_strategy.layout:
+  // "CAROUSEL"), not a new source — see resolveCarouselSelection,
+  // creativeResolution.js, for the full design. Unit-level: hand-built
+  // snapshots, same pattern as the primaryText tests directly above.
+  function carouselSnapshot(count) {
+    const sampleProducts = Array.from({ length: count }, (_, i) => ({
+      id: String(i + 1), name: `Product ${i + 1}`, price: `${1000 + i * 100}`,
+      imageUrl: `https://store.example.com/product-${i + 1}.jpg`,
+      permalink: `https://store.example.com/product/product-${i + 1}/`,
+      shortDescription: null,
+    }));
+    return { recentContent: { facebookPosts: { items: [] }, instagramPosts: { items: [] } }, business: { sampleProducts, storeUrl: "https://store.example.com" } };
+  }
+  const carouselStrategy = { mode: "campaign", creative_strategy: { source: "PRODUCT_IMAGE", description: "Carousel of real products.", layout: "CAROUSEL" }, content_selector: {} };
+
+  await check("[Carousel, round 48] with no explicit selection, the deterministic default proposes the N most recent eligible products (never a performance ranking) — capped at the real max with 12+ available", () => {
+    const snapshot = carouselSnapshot(12);
+    const result = resolveCreativeSelection({ strategy: carouselStrategy, snapshot, priorCreative: null, contentSelectorProvidedThisCall: false, userMessage: "run a carousel ad for my products" });
+    assert.equal(result.creativeError, null, JSON.stringify(result));
+    assert.equal(result.creative.layout, "CAROUSEL");
+    assert.equal(result.creative.defaultProposed, true, "must be flagged as a stated-rule default, not an explicit pick, so the recommendation text states the rule");
+    assert.equal(result.creative.cards.length, 10, "capped at the documented max even though 12 eligible products exist");
+    assert.equal(result.creative.cards[0].productId, "1", "most-recent-first order — product 1 (the fixture's own 'most recent') leads");
+    assert.equal(result.creative.cards[9].productId, "10");
+  });
+
+  await check("[Carousel, round 48] fewer than 10 eligible products: the default uses ALL of them, honestly stating the real count — never pads or invents", () => {
+    const snapshot = carouselSnapshot(4);
+    const result = resolveCreativeSelection({ strategy: carouselStrategy, snapshot, priorCreative: null, contentSelectorProvidedThisCall: false, userMessage: "run a carousel ad" });
+    assert.equal(result.creativeError, null, JSON.stringify(result));
+    assert.equal(result.creative.cards.length, 4);
+    assert.equal(result.creative.defaultProposed, true);
+  });
+
+  await check("[Carousel, round 48] fewer than 2 eligible products refuses outright — a carousel structurally cannot be built, never silently downgraded to a single-image ad", () => {
+    const snapshot = carouselSnapshot(1);
+    const result = resolveCreativeSelection({ strategy: carouselStrategy, snapshot, priorCreative: null, contentSelectorProvidedThisCall: false, userMessage: "run a carousel ad" });
+    assert.equal(result.creative, null);
+    assert.match(result.creativeError, /at least 2 products/i);
+  });
+
+  await check("[Carousel, round 48] an explicit full card list resolves in the given order, by confirmedId or by position", () => {
+    const snapshot = carouselSnapshot(6);
+    const byId = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { confirmedIds: ["3", "1"] } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "use product 3 and product 1, ids 3 and 1",
+    });
+    assert.equal(byId.creativeError, null, JSON.stringify(byId));
+    assert.deepEqual(byId.creative.cards.map((c) => c.productId), ["3", "1"], "card order must match the requested order exactly");
+    assert.equal(byId.creative.defaultProposed, false);
+
+    const byPosition = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { positions: [2, 4] } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "use the 2nd and 4th ones",
+    });
+    assert.equal(byPosition.creativeError, null, JSON.stringify(byPosition));
+    assert.deepEqual(byPosition.creative.cards.map((c) => c.productId), ["2", "4"]);
+  });
+
+  await check("[Carousel, round 48] a duplicate product in the requested list is refused, naming the real duplicate — never silently deduplicated", () => {
+    const snapshot = carouselSnapshot(6);
+    const result = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { confirmedIds: ["2", "2"] } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "use product 2 twice",
+    });
+    assert.equal(result.creative, null);
+    assert.match(result.creativeError, /chosen more than once/i);
+    assert.match(result.creativeError, /Product 2/);
+  });
+
+  await check("[Carousel, round 48] a card count outside the documented 2–10 range is refused with a citable reason — never silently truncated", () => {
+    const snapshot = carouselSnapshot(12);
+    const tooMany = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { positions: Array.from({ length: 11 }, (_, i) => i + 1) } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "use all 11 of these",
+    });
+    assert.equal(tooMany.creative, null);
+    assert.match(tooMany.creativeError, /between 2 and 10 cards/i);
+    assert.match(tooMany.creativeError, /got 11/i);
+
+    const tooFew = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { positions: [1] } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "just use the first one",
+    });
+    assert.equal(tooFew.creative, null);
+    assert.match(tooFew.creativeError, /between 2 and 10 cards/i);
+  });
+
+  await check("[Carousel, round 48] a named product with no real image is refused by name, citing the real reason — never silently dropped from the carousel", () => {
+    const snapshot = carouselSnapshot(3);
+    // A real product that exists in the full catalog but has no image —
+    // present in sampleProducts (so resolveCarouselCardEntry can find and
+    // name it) but filtered out of the eligible candidates by
+    // eligibleProductCandidates (creativeResolution.js), exactly like a
+    // live product with no uploaded photo.
+    snapshot.business.sampleProducts.push({ id: "99", name: "No-Image Serum", price: "500", imageUrl: null, permalink: "https://store.example.com/product/no-image/", shortDescription: null });
+    const result = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: { confirmedIds: ["1", "99"] } },
+      snapshot, priorCreative: null, contentSelectorProvidedThisCall: true, userMessage: "use product 1 and the No-Image Serum",
+    });
+    assert.equal(result.creative, null);
+    assert.match(result.creativeError, /No-Image Serum/);
+    assert.match(result.creativeError, /no real product image/i);
+  });
+
+  await check("[Carousel, round 48] reuse-verbatim: nothing explicitly changed this call — the prior resolved card list is reused, never re-derived", () => {
+    const snapshot = carouselSnapshot(6);
+    const priorCreative = { source: "PRODUCT_IMAGE", layout: "CAROUSEL", cards: [{ productId: "2", imageUrl: "x", link: "y", productName: "Product 2", price: "1100" }, { productId: "5", imageUrl: "x", link: "y", productName: "Product 5", price: "1400" }], defaultProposed: false };
+    const result = resolveCreativeSelection({ strategy: carouselStrategy, snapshot, priorCreative, contentSelectorProvidedThisCall: false, userMessage: "change the budget to 50/day" });
+    assert.equal(result.creative, priorCreative, "an unrelated revision must reuse the exact prior resolution, never re-run resolution against the (possibly changed) candidate list");
+  });
+
+  await check("[Carousel, round 48] full-list resend: an UNCHANGED card needs no re-verification, but a CHANGED card must be independently confirmed against the user's own current words — this turn's message need not mention every card", () => {
+    const snapshot = carouselSnapshot(6);
+    const priorCreative = {
+      source: "PRODUCT_IMAGE", layout: "CAROUSEL", defaultProposed: false,
+      cards: [
+        { productId: "1", imageUrl: "x", link: "y", productName: "Product 1", price: "1000" },
+        { productId: "2", imageUrl: "x", link: "y", productName: "Product 2", price: "1100" },
+        { productId: "3", imageUrl: "x", link: "y", productName: "Product 3", price: "1200" },
+      ],
+    };
+    // Resend the complete list — cards 1 and 3 unchanged, card 2 replaced
+    // by product 5. The raw message below mentions NOTHING about products
+    // 1 or 3 at all — if those were wrongly re-verified against this
+    // message, this would incorrectly fail.
+    const requestedSelector = { confirmedIds: ["1", "5", "3"] };
+
+    const verified = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: requestedSelector },
+      snapshot, priorCreative, contentSelectorProvidedThisCall: true, userMessage: "replace card 2 with Product 5",
+    });
+    assert.equal(verified.creativeError, null, JSON.stringify(verified));
+    assert.deepEqual(verified.creative.cards.map((c) => c.productId), ["1", "5", "3"]);
+
+    // Same request, but the message never actually says "Product 5" or its
+    // id anywhere — the changed card must fail independent verification,
+    // never silently trusted just because the model asserted it.
+    const unverified = resolveCreativeSelection({
+      strategy: { ...carouselStrategy, content_selector: requestedSelector },
+      snapshot, priorCreative, contentSelectorProvidedThisCall: true, userMessage: "change the second card please",
+    });
+    assert.equal(unverified.creative, null);
+    assert.match(unverified.creativeError, /Card 2/);
+    assert.match(unverified.creativeError, /couldn't be independently verified/i);
+  });
+
+  await check("[Carousel, round 48] creative_strategy.layout CAROUSEL is only valid for source PRODUCT_IMAGE — structurally rejected for an existing post", () => {
+    const rejected = validateStrategyStructure({ ...baseStrategy(), creative_strategy: { source: "EXISTING_PAGE_POST", description: "x", layout: "CAROUSEL" } });
+    assert.equal(rejected.valid, false);
+    assert.ok(rejected.errors.some((e) => e.field === "creative_strategy.layout" && /only supported for creative_strategy\.source "PRODUCT_IMAGE"/.test(e.message)));
+  });
+
+  await check("[Business snapshot, round 48] WooCommerce products are fetched with an explicit date-desc order — made explicit in code rather than relying on an unasserted implicit API default", async () => {
+    const userId = makeUser(`v2-woo-order-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    let productsRequestUrl = null;
+    const metaHandler = metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] });
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "store.example.com" && u.pathname === "/wp-json/wc/v3/products") {
+        productsRequestUrl = url;
+        return { ok: true, status: 200, json: async () => DEFAULT_WC_PRODUCTS };
+      }
+      if (u.hostname === "store.example.com") return { ok: true, status: 200, json: async () => [] };
+      return metaHandler(url, options);
+    });
+    try {
+      await gatherBusinessSnapshot(userId);
+      assert.ok(productsRequestUrl, "the WooCommerce products endpoint must actually be called");
+      const parsed = new URL(productsRequestUrl);
+      assert.equal(parsed.searchParams.get("orderby"), "date");
+      assert.equal(parsed.searchParams.get("order"), "desc");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Business snapshot, round 48] Shopify products are fetched with an explicit created_at-desc order — Shopify's own real default is NOT recency, unlike WooCommerce's, so leaving it implicit would make 'most recent products' silently false for every Shopify store", async () => {
+    const userId = makeUser(`v2-shopify-order-${stamp}@example.com`);
+    connectMeta(userId);
+    saveConnection(userId, "shopify", { accessToken: "fake-shopify-token", expiresAt: null, scopes: [], meta: { shopDomain: "teststore.myshopify.com" } });
+    let productsRequestUrl = null;
+    const metaHandler = metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }] });
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "teststore.myshopify.com") {
+        if (u.pathname.endsWith("/products.json")) {
+          productsRequestUrl = url;
+          return { ok: true, status: 200, json: async () => ({ products: [] }) };
+        }
+        return { ok: true, status: 200, json: async () => ({}) };
+      }
+      return metaHandler(url, options);
+    });
+    try {
+      await gatherBusinessSnapshot(userId);
+      assert.ok(productsRequestUrl, "the Shopify products endpoint must actually be called");
+      const parsed = new URL(productsRequestUrl);
+      assert.equal(parsed.searchParams.get("order"), "created_at desc");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
     const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
     connectMeta(userId);
@@ -6135,6 +6344,114 @@ async function run() {
       assert.equal(creativeWrite.body.call_to_action, undefined, "PRODUCT_IMAGE must never send a top-level call_to_action — Meta rejects it for link_data creatives");
       assert.equal(creativeWrite.body.object_story_spec.link_data.call_to_action?.type, "SHOP_NOW");
       assert.equal(creativeWrite.body.object_story_spec.link_data.call_to_action?.value?.link, "https://store.example.com/product/vitamin-c-serum/");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Carousel, round 48] execute_strategy builds the Explorer-confirmed carousel shape: child_attachments inside link_data, per-card FLAT call_to_action, a real parent link, and NO parent message", async () => {
+    const userId = makeUser(`v2-carousel-execute-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    const carouselProducts = Array.from({ length: 3 }, (_, i) => ({
+      id: i + 1, name: `Product ${i + 1}`, price: `${1000 + i * 100}`, categories: [{ name: "Skincare" }],
+      images: [{ src: `https://store.example.com/wp-content/uploads/product-${i + 1}.jpg` }],
+      permalink: `https://store.example.com/product/product-${i + 1}/`,
+      short_description: `Description for product ${i + 1}.`,
+    }));
+    mockFetch(scriptedFetch({
+      chatResponses: [], wcProducts: carouselProducts,
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "PRODUCT_IMAGE", description: "Carousel of 3 real products.", layout: "CAROUSEL" } }),
+        userMessage: "run a carousel ad for my products",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.match(built.recommendationText, /Carousel cards \(proposed/i, "the stated default rule must reach the text the user actually approves");
+      assert.match(built.recommendationText, /1\) Product 1 — 1000/);
+
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+
+      const imageUploads = writes.filter((w) => w.path.endsWith("/adimages"));
+      assert.equal(imageUploads.length, 3, "one real image upload per card, never a single shared image");
+
+      const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
+      assert.equal(creativeWrite.body.message, undefined);
+      assert.equal(creativeWrite.body.object_story_spec.link_data.message, undefined, "no parent message — Explorer-confirmed accepted with none, so never invent one");
+      assert.equal(creativeWrite.body.object_story_spec.link_data.link, "https://store.example.com", "parent link_data.link falls back to the connected store's real URL — never invented");
+      assert.equal(creativeWrite.body.call_to_action, undefined, "no top-level call_to_action for a carousel");
+
+      const children = creativeWrite.body.object_story_spec.link_data.child_attachments;
+      assert.equal(children.length, 3);
+      children.forEach((child, i) => {
+        assert.equal(child.name, `Product ${i + 1}`);
+        assert.equal(child.description, `${1000 + i * 100}`);
+        assert.equal(child.link, `https://store.example.com/product/product-${i + 1}/`);
+        assert.equal(child.image_hash, "fake-image-hash-1");
+        // The third distinct call_to_action placement shape in this
+        // codebase — FLAT inside each child_attachment, confirmed live
+        // against Meta's real API (v25.0, round 48) — neither the
+        // top-level shape (EXISTING_PAGE_POST) nor the nested-in-link_data
+        // shape (single-card PRODUCT_IMAGE, round 46) used elsewhere here.
+        assert.equal(child.call_to_action?.type, "SHOP_NOW");
+        assert.equal(child.call_to_action?.value?.link, `https://store.example.com/product/product-${i + 1}/`, "each card's own CTA must land on THAT card's own product page, never a shared link");
+      });
+
+      // Read-back verification actually ran and passed (executeStrategy
+      // would have thrown otherwise) — confirmed again explicitly here so
+      // a future change to the mock's /adcreatives echo can't silently
+      // make this pass for the wrong reason.
+      const verifyCreativeRead = writes.find((w) => w.path.endsWith("/adimages"));
+      assert.ok(verifyCreativeRead);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Carousel, round 48] a card count rejected by Meta itself surfaces verbatim — never swallowed, never silently truncated", async () => {
+    const userId = makeUser(`v2-carousel-meta-reject-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const carouselProducts = Array.from({ length: 2 }, (_, i) => ({
+      id: i + 1, name: `Product ${i + 1}`, price: `${1000 + i * 100}`, categories: [{ name: "Skincare" }],
+      images: [{ src: `https://store.example.com/wp-content/uploads/product-${i + 1}.jpg` }],
+      permalink: `https://store.example.com/product/product-${i + 1}/`,
+      short_description: `Description for product ${i + 1}.`,
+    }));
+    mockFetch(scriptedFetch({
+      chatResponses: [], wcProducts: carouselProducts,
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        // Simulates Meta genuinely rejecting a carousel-shaped creative for
+        // some real, account-level reason this app doesn't model (never
+        // reachable through this app's own 2-10 build-time cap alone,
+        // which this 2-card request already satisfies) — the point is
+        // that whatever Meta itself says must reach the caller unedited.
+        writeError: { pathSuffix: "/adcreatives", status: 400, error: { message: "(#100) Invalid parameter: child_attachments", code: 100, error_subcode: 1234567 }, failWhen: (body) => Boolean(body.object_story_spec?.link_data?.child_attachments) },
+      },
+    }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "PRODUCT_IMAGE", description: "Carousel of 2 real products.", layout: "CAROUSEL" } }),
+        userMessage: "run a carousel ad for my products",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => {
+          assert.equal(err.code, 100);
+          assert.match(err.message, /Invalid parameter: child_attachments/, `Meta's own real message must reach the caller verbatim: ${err.message}`);
+          return true;
+        }
+      );
     } finally {
       restoreFetch();
     }

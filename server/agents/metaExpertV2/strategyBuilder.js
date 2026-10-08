@@ -9,7 +9,7 @@
 // another LLM attempt.
 import { gatherBusinessSnapshot, getStoreCountryForFallback } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
-import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, toCreativeCandidateRefs } from "./creativeResolution.js";
+import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, formatCarouselCreativeLines, toCreativeCandidateRefs } from "./creativeResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
@@ -84,7 +84,16 @@ function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
     const priorSource = prior.strategy.creative_strategy?.source;
     const newActionType = merged.action_type;
     const newSource = merged.creative_strategy?.source;
-    if (priorActionType !== newActionType || priorSource !== newSource) {
+    // Round 48 — layout (SINGLE/CAROUSEL) changes content_selector's own
+    // MEANING just as much as source does: a single {position}/{confirmedId}
+    // pick and a carousel's {positions: [...]}/{confirmedIds: [...]} list
+    // are not interchangeable, so a selector carried forward across a
+    // layout change (same reasoning as the source check already here)
+    // would misapply just as badly as a stale position indexing into the
+    // wrong candidate list.
+    const priorLayout = prior.strategy.creative_strategy?.layout || "SINGLE";
+    const newLayout = merged.creative_strategy?.layout || "SINGLE";
+    if (priorActionType !== newActionType || priorSource !== newSource || priorLayout !== newLayout) {
       delete merged.content_selector;
     }
   }
@@ -199,7 +208,7 @@ function assetSummaryValue(name, id, emptyLabel) {
   return name || id || emptyLabel;
 }
 
-function formatRecommendation(strategy, names, resolved) {
+function formatRecommendation(strategy, names, resolved, creative) {
   if (strategy.mode === "explicit_action") {
     const actionLabel = {
       BOOST_FACEBOOK_POST: "boost your most recent Facebook post",
@@ -252,6 +261,13 @@ function formatRecommendation(strategy, names, resolved) {
     `Placements: ${placementsLabel}`,
     `Optimization: ${strategy.optimization_event.replace(/_/g, " ").toLowerCase()}`,
     `Creative: ${strategy.creative_strategy.description}`,
+    // Round 48 — deterministic, backend-rendered card list for a carousel
+    // (never the model's own free-text description alone) so the stated
+    // default rule and the real per-card name/price actually reach the
+    // text the user approves — same principle as formatGoalAlignmentNote/
+    // assetSummaryValue elsewhere in this function: a fact this important
+    // is never left to the model's prose to restate faithfully.
+    ...formatCarouselCreativeLines(creative),
     `Budget: ${budgetLine}`,
     // Round 40 — per-user defaults are used SILENTLY and never re-asked
     // about — this summary is the only place a stale/wrong default
@@ -920,7 +936,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // is the dedicated affirmation check inside resolveCreativeSelection —
   // never a re-guess).
   const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative };
-  const recommendationText = formatRecommendation(normalized, names, resolved);
+  const recommendationText = formatRecommendation(normalized, names, resolved, creativeResolution.creative);
   const stored = insertStrategy({
     userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
     resolved: resolvedForStorage, names, snapshotVersion: snapshot.version, snapshot, recommendationText, revisionOf,

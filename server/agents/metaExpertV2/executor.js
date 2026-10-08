@@ -19,6 +19,7 @@ import { getTool } from "../../tools/registry.js";
 import { buildTargeting } from "../../tools/meta/campaigns.js";
 import { publishEvent } from "../../automation/triggers.js";
 import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign } from "./policy.js";
+import { MIN_CAROUSEL_CARDS, MAX_CAROUSEL_CARDS } from "./creativeResolution.js";
 import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 import { logger } from "../../config/logger.js";
@@ -208,6 +209,57 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
     // object_story_spec.source_instagram_media_id) previously could never
     // have passed against a real account.
     creativeFields = { name: `${strategy.business_goal} — creative`, object_story_spec: { instagram_user_id: igAccountId, source_instagram_media_id: creative.contentId } };
+  } else if (creative.source === "PRODUCT_IMAGE" && creative.layout === "CAROUSEL") {
+    // Round 48 (carousel ads) — verified empirically against the live Meta
+    // API (v25.0): child_attachments nested inside object_story_spec.
+    // link_data (same wrapper the single-card link_data shape above
+    // already uses); call_to_action FLAT inside each child_attachment
+    // (its own third, distinct placement — neither the top-level shape
+    // EXISTING_PAGE_POST uses nor the nested-in-link_data shape the
+    // single-card PRODUCT_IMAGE case above uses); each child carries its
+    // own link/image_hash/name/description; the parent link_data.link is
+    // still required/accepted; NO parent message — sending one was never
+    // tested as accepted and the user's own confirmation explicitly says
+    // not to invent one here.
+    //
+    // Defense in depth — creativeResolution.js's own
+    // resolveCarouselSelection already enforces this bound at propose/
+    // build time; re-checked here too (same cited numbers, imported, never
+    // re-declared) so a strategy stored before this bound existed, or
+    // reached via any other path, can never silently send an out-of-range
+    // card count to Meta. A rejection Meta itself still returns for some
+    // OTHER count-related reason (e.g. an account-level restriction this
+    // app doesn't know about) surfaces verbatim below — never swallowed,
+    // never silently truncated.
+    if (creative.cards.length < MIN_CAROUSEL_CARDS || creative.cards.length > MAX_CAROUSEL_CARDS) {
+      throw new Error(`A carousel must have between ${MIN_CAROUSEL_CARDS} and ${MAX_CAROUSEL_CARDS} cards — this strategy has ${creative.cards.length}.`);
+    }
+    const childAttachments = [];
+    for (const card of creative.cards) {
+      const imgRes = await fetch(card.imageUrl);
+      if (!imgRes.ok) throw new Error(`Could not fetch the resolved product image for "${card.productName}" from ${card.imageUrl}`);
+      const base64 = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
+      const { hash } = await meta.uploadAdImage(accessToken, adAccountId, base64);
+      // Per-card call_to_action, built here (not in the shared CTA block
+      // below, which assumes ONE destination link) — each card's button
+      // must land on THAT product's own page, verified live: tapping card
+      // N lands on product N's page, never a shared/parent link.
+      childAttachments.push({
+        link: card.link, image_hash: hash, name: card.productName, description: card.price || "",
+        call_to_action: strategy.cta ? { type: strategy.cta, value: { link: card.link } } : undefined,
+      });
+    }
+    // Parent link_data.link — real data only, never invented: the
+    // explicitly confirmed/verified destination_url for this strategy,
+    // falling back to the connected store's own real homepage/shop URL
+    // (snapshot.business.storeUrl — the same real field destination_url's
+    // own suggestion already draws from), falling back to the first
+    // card's own link only if neither broader URL is known.
+    const parentLink = strategy.destination_url || stored.snapshot?.business?.storeUrl || creative.cards[0].link;
+    creativeFields = {
+      name: `${strategy.business_goal} — creative`,
+      object_story_spec: { page_id: pageId, link_data: { link: parentLink, child_attachments: childAttachments } },
+    };
   } else if (creative.source === "PRODUCT_IMAGE") {
     const imgRes = await fetch(creative.imageUrl);
     if (!imgRes.ok) throw new Error(`Could not fetch the resolved product image from ${creative.imageUrl}`);
@@ -263,8 +315,14 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   // real message/code/subcode, and nothing here or in executeCampaignMode's
   // caller catches-and-retries it; the campaign-cleanup catch below
   // rethrows the ORIGINAL error unchanged after best-effort cleanup.
+  // Round 48 — a carousel already set its own, PER-CARD call_to_action
+  // above (each card needs its OWN link in call_to_action.value, not one
+  // shared destination) — this block assumes a single destination for the
+  // whole creative, which is never true for a carousel, so it's skipped
+  // entirely for that case rather than overwriting/duplicating what the
+  // carousel branch already built correctly.
   const destinationLink = creative.link || strategy.destination_url || null;
-  if (strategy.cta) {
+  if (strategy.cta && creative.layout !== "CAROUSEL") {
     const callToAction = { type: strategy.cta, value: destinationLink ? { link: destinationLink } : undefined };
     if (creative.source === "PRODUCT_IMAGE") {
       creativeFields.object_story_spec.link_data.call_to_action = callToAction;
@@ -298,7 +356,27 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   if (creative.source === "EXISTING_INSTAGRAM_POST" && verifyCreative.object_story_spec?.source_instagram_media_id !== creative.contentId) {
     throw new Error(`Creative verification failed: readback source_instagram_media_id (${verifyCreative.object_story_spec?.source_instagram_media_id}) does not match the resolved post (${creative.contentId}).`);
   }
-  if (creative.source === "PRODUCT_IMAGE" && verifyCreative.object_story_spec?.link_data?.link !== creative.link) {
+  if (creative.source === "PRODUCT_IMAGE" && creative.layout === "CAROUSEL") {
+    // Round 48 — every card, not just the first/last, the same "confirm
+    // what was actually applied, never just trust the create response"
+    // principle as every other source here, extended to a per-card list.
+    const verifyChildren = verifyCreative.object_story_spec?.link_data?.child_attachments || [];
+    if (verifyChildren.length !== creative.cards.length) {
+      throw new Error(`Creative verification failed: readback carousel has ${verifyChildren.length} card(s), expected ${creative.cards.length}.`);
+    }
+    creative.cards.forEach((card, i) => {
+      const child = verifyChildren[i] || {};
+      if (child.link !== card.link) {
+        throw new Error(`Creative verification failed: card ${i + 1} readback link (${child.link}) does not match the resolved product link (${card.link}).`);
+      }
+      if (child.name !== card.productName) {
+        throw new Error(`Creative verification failed: card ${i + 1} readback name (${child.name}) does not match the resolved product name (${card.productName}).`);
+      }
+      if (strategy.cta && child.call_to_action?.type !== strategy.cta) {
+        throw new Error(`Creative verification failed: card ${i + 1} readback call_to_action (${child.call_to_action?.type || "none"}) does not match the requested CTA (${strategy.cta}).`);
+      }
+    });
+  } else if (creative.source === "PRODUCT_IMAGE" && verifyCreative.object_story_spec?.link_data?.link !== creative.link) {
     throw new Error(`Creative verification failed: readback link (${verifyCreative.object_story_spec?.link_data?.link}) does not match the resolved product link (${creative.link}).`);
   }
   // Round 46 — the read-back previously inspected nothing about
@@ -308,8 +386,9 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
   // even after a fix landed. Checked for every source now, not just
   // PRODUCT_IMAGE — EXISTING_INSTAGRAM_POST's top-level placement has
   // never been verified against live Meta either, and this is how that
-  // gets found out rather than assumed.
-  if (strategy.cta) {
+  // gets found out rather than assumed. Carousel's own CTA (per card) was
+  // already verified above — never duplicated/overwritten here.
+  if (strategy.cta && creative.layout !== "CAROUSEL") {
     const verifyCtaType = creative.source === "PRODUCT_IMAGE"
       ? verifyCreative.object_story_spec?.link_data?.call_to_action?.type
       : verifyCreative.call_to_action?.type;

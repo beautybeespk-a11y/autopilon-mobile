@@ -51,7 +51,12 @@
       "required": ["source", "description"],
       "properties": {
         "source": { "type": "string", "enum": ["EXISTING_PAGE_POST", "EXISTING_INSTAGRAM_POST", "PRODUCT_IMAGE", "GENERATED_IMAGE", "GENERATED_VIDEO", "USER_ATTACHED_MEDIA"] },
-        "description": { "type": "string" }
+        "description": { "type": "string" },
+        "layout": {
+          "type": "string",
+          "enum": ["SINGLE", "CAROUSEL"],
+          "description": "Round 48 — optional, defaults to SINGLE. CAROUSEL is only valid when source is PRODUCT_IMAGE: one ad, up to 10 cards, each a different real product (its own image, name, price, link, call-to-action) — never valid for an existing Facebook/Instagram post or a generated/attached asset."
+        }
       }
     },
     "budget_daily": { "type": ["number", "null"], "description": "In the ad account's currency's smallest unit. Null if a budget policy/user input is still needed — never invent a number." },

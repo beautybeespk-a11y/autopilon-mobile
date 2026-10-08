@@ -114,7 +114,16 @@ async function gatherCommerce(userId) {
       return { commerceConnected: true, commerceProvider: "woocommerce", commerceDataStatus: "fetch_failed", storeUrl: m.siteUrl || null, storeCountry: null, businessType: null, businessTypeInferredFrom: null, productCount: null, productCategories: [], sampleProducts: [], priceRange: null, topProducts: { status: "fetch_failed", items: [] }, shippingGeography: null };
     }
     const accessToken = requireValidToken(userId, "woocommerce");
-    const productsResult = await attempt(() => wc.listProducts(m.siteUrl, m.consumerKey, accessToken, { per_page: MAX_PRODUCTS }));
+    // Round 48 (carousel ads) — orderby/order set explicitly rather than
+    // relying on WooCommerce's own undocumented-here default (date desc,
+    // confirmed against WooCommerce's own REST API docs — products are
+    // already returned most-recent-first without this). Made explicit so
+    // "sampleProducts is the N most recent products" — the stated,
+    // deterministic rule a carousel's default 10-card proposal relies on
+    // (see creativeResolution.js's resolveCarouselSelection) — is true by
+    // construction in this code, not by an implicit API default this file
+    // never asserted.
+    const productsResult = await attempt(() => wc.listProducts(m.siteUrl, m.consumerKey, accessToken, { per_page: MAX_PRODUCTS, orderby: "date", order: "desc" }));
     const categoriesResult = await attempt(() => wc.listCategories(m.siteUrl, m.consumerKey, accessToken));
     if (productsResult.status !== "exists") {
       return { commerceConnected: true, commerceProvider: "woocommerce", commerceDataStatus: "fetch_failed", storeUrl: m.siteUrl, storeCountry: null, businessType: null, businessTypeInferredFrom: null, productCount: null, productCategories: [], sampleProducts: [], priceRange: null, topProducts: { status: "fetch_failed", items: [] }, shippingGeography: null };
@@ -159,7 +168,17 @@ async function gatherCommerce(userId) {
     return { commerceConnected: true, commerceProvider: "shopify", commerceDataStatus: "fetch_failed", storeUrl: null, storeCountry: null, businessType: null, businessTypeInferredFrom: null, productCount: null, productCategories: [], sampleProducts: [], priceRange: null, topProducts: { status: "fetch_failed", items: [] }, shippingGeography: null };
   }
   const token = requireValidToken(userId, "shopify");
-  const productsResult = await attempt(() => shopify.listProducts(m.shopDomain, token, { limit: MAX_PRODUCTS }));
+  // Round 48 (carousel ads) fix — Shopify's REST Admin API default product
+  // order is NOT recency (ascending by id/creation order, the opposite),
+  // unlike WooCommerce's own real default above. Left implicit, "the N
+  // most recent products" (the stated rule a carousel's default proposal
+  // relies on) would have been silently FALSE for every Shopify store —
+  // the exact goal-substitution failure mode in a new place, just found in
+  // the data-fetch layer instead of a prompt. created_at desc is Shopify's
+  // own real, documented sort parameter — never a client-side re-sort of
+  // already-fetched data, which the per_page=limit cutoff would make
+  // unreliable anyway.
+  const productsResult = await attempt(() => shopify.listProducts(m.shopDomain, token, { limit: MAX_PRODUCTS, order: "created_at desc" }));
   if (productsResult.status !== "exists") {
     return { commerceConnected: true, commerceProvider: "shopify", commerceDataStatus: "fetch_failed", storeUrl: m.shopDomain, storeCountry: null, businessType: null, businessTypeInferredFrom: null, productCount: null, productCategories: [], sampleProducts: [], priceRange: null, topProducts: { status: "fetch_failed", items: [] }, shippingGeography: null };
   }

@@ -52,6 +52,204 @@ function candidatesForSource(source, snapshot) {
   return [];
 }
 
+// Round 48 — carousel ads (one ad, up to MAX_CAROUSEL_CARDS cards, each a
+// different real product). Meta's own documented minimum for a standard
+// link_data carousel — unverified independently this round (the 2-card
+// shape itself WAS verified live against Meta's real API; this floor is
+// the long-standing documented minimum, not separately tested).
+export const MIN_CAROUSEL_CARDS = 2;
+// Meta's documented maximum for a standard link_data carousel — also not
+// independently verified this round (flagged explicitly rather than
+// assumed). Enforced here so an oversized request is refused with a
+// clear, citable reason BEFORE ever reaching Meta — never silently
+// truncated, which would drop a product the user explicitly asked for
+// with no mention of the drop. If this number is ever wrong, Meta's own
+// rejection at execution time (executor.js) surfaces verbatim — this cap
+// is a courtesy that fails loudly, not the only guard.
+export const MAX_CAROUSEL_CARDS = 10;
+
+// Independent, per-card verification (round 48) — same PURPOSE as
+// matchCreativeCandidateId's verification of a single pick (round 34:
+// never trust a model-asserted selection without checking it against the
+// user's own raw words), but deliberately NOT the same function: a
+// carousel's full-list-resend contract (see resolveCarouselSelection
+// below) means several cards can change in ONE message ("swap 3 and 7"),
+// and matchCreativeCandidateId's own "2+ matches anywhere in the
+// candidate list means stop, don't guess" rule — exactly right for a
+// SINGLE pick — would make an unrelated SECOND real product name anywhere
+// in the message block verification of a card that's otherwise completely
+// unambiguous on its own. This checks only "does THIS card's own id or
+// name appear in the message" — nothing about any other candidate. No
+// position/ordinal matching here — "2)" is already meaningless once a
+// card's CARD-LIST position, not the ORIGINAL candidate list position, is
+// what the user is really pointing at; id or literal product name are the
+// only unambiguous signals for an individual carousel card.
+function cardIsVerifiedInMessage(userMessage, candidate) {
+  if (typeof userMessage !== "string" || !candidate) return false;
+  if (/^\d+$/.test(candidate.id)) {
+    const digitRuns = userMessage.match(/\d+/g) || [];
+    if (digitRuns.includes(candidate.id)) return true;
+  } else if (userMessage.includes(candidate.id)) {
+    return true;
+  }
+  return userMessageContainsText(userMessage, candidate.name);
+}
+
+// Resolves ONE requested carousel card entry ({confirmedId} or
+// {position}) against the REAL, image-eligible candidates — same
+// never-guess discipline as the single-pick path's confirmedId/position
+// branches, just returning an {error}/{candidate} result instead of
+// throwing, so the caller can report exactly which card (by its position
+// in the REQUESTED list) failed. allProducts (the full, UN-filtered
+// sampleProducts list) is passed separately so a product that's real but
+// has no image gets its own specific, honest rejection — naming the
+// product and the real reason — rather than the generic "not a real
+// candidate" message a merely-invented id gets.
+function resolveCarouselCardEntry(entry, candidates, allProducts) {
+  if (typeof entry.confirmedId === "string" && entry.confirmedId) {
+    const found = candidates.find((c) => c.id === entry.confirmedId);
+    if (found) return { candidate: found };
+    const existsButNoImage = (allProducts || []).find((p) => p.id === entry.confirmedId && !p.imageUrl);
+    if (existsButNoImage) {
+      return { error: `"${existsButNoImage.name}" (id ${existsButNoImage.id}) has no real product image in the current snapshot, so it can't be used as a carousel card. Add a real image to that product first, or choose a different one.` };
+    }
+    return { error: `"${entry.confirmedId}" is not one of the real product candidates already shown this conversation.` };
+  }
+  if (Number.isInteger(entry.position) && entry.position > 0) {
+    const found = candidates[entry.position - 1];
+    if (!found) return { error: `There is no product candidate at position ${entry.position} — only ${candidates.length} real candidate(s) are available.` };
+    return { candidate: found };
+  }
+  return { error: "Each carousel card must be chosen by a real confirmedId or a real list position — never invented." };
+}
+
+// content_selector for a carousel carries the WHOLE card list every call
+// (see this module's header-adjacent comment on resolveCarouselSelection
+// below for why) — either positions (ordinal, into the current candidate
+// list) or confirmedIds (real product ids already shown), never mixed.
+// Returns null when neither is present at all — the caller's own signal
+// to auto-propose the deterministic default instead of treating this as a
+// (rejected) explicit empty list.
+function extractCarouselEntries(selector) {
+  if (Array.isArray(selector.confirmedIds)) return selector.confirmedIds.map((id) => ({ confirmedId: id }));
+  if (Array.isArray(selector.positions)) return selector.positions.map((p) => ({ position: p }));
+  return null;
+}
+
+// strategy/snapshot/priorCreative/contentSelectorProvidedThisCall/userMessage
+// — same meaning as resolveCreativeSelection's own params (this is called
+// FROM there, never directly). priorCreative here is specifically the
+// PRIOR strategy's resolvedAssets.creative — {source, layout, cards} on
+// carousel reuse, or null/single-shaped otherwise; only ever read as
+// carousel-shaped after confirming layout === "CAROUSEL" below, so a
+// single-card creative from BEFORE this strategy switched to carousel (or
+// vice versa) is never misread as a partial card list.
+//
+// Full-list-resend contract (explicit design decision, confirmed before
+// building this): every call that changes the carousel's cards resends
+// the COMPLETE ordered list — e.g. "replace 4 with the CeraVe cleanser"
+// means the model sends all 10 entries, 9 identical to what's already
+// stored and one different — rather than this function trying to merge a
+// sparse by-position edit onto the prior list itself. This is simpler and
+// strictly safer than inventing partial-merge machinery: every entry that
+// ACTUALLY differs from the prior stored list is independently verified
+// against the user's own raw words (cardIsVerifiedInMessage above) before
+// being trusted; every entry that's byte-identical to what's already
+// there is treated as a carried-forward, already-verified fact — exactly
+// mirroring the single-pick path's own reuse-verbatim vs re-verify split,
+// just applied per-card instead of to one whole value.
+export function resolveCarouselSelection({ strategy, snapshot, priorCreative, contentSelectorProvidedThisCall, userMessage }) {
+  const empty = { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
+
+  // Reuse verbatim — the prior strategy already resolved a carousel and
+  // nothing this call explicitly asked to change. Never re-derived (the
+  // same bug class fixed for Pixel and for the single-card creative path).
+  if (!contentSelectorProvidedThisCall && priorCreative?.source === "PRODUCT_IMAGE" && priorCreative?.layout === "CAROUSEL") {
+    return { ...empty, creative: priorCreative };
+  }
+
+  const candidates = eligibleProductCandidates(snapshot);
+  if (candidates.length < MIN_CAROUSEL_CARDS) {
+    return {
+      ...empty,
+      creativeError: `A carousel needs at least ${MIN_CAROUSEL_CARDS} products with a real image — only ${candidates.length} currently ${candidates.length === 1 ? "has" : "have"} one in the connected store. Add images to more products, or use creative_strategy.layout "SINGLE" for a one-product ad instead.`,
+    };
+  }
+
+  const selector = strategy.content_selector || {};
+  const entries = extractCarouselEntries(selector);
+
+  let chosenCandidates;
+  let defaultProposed = false;
+  if (!entries) {
+    // No explicit list at all — the deterministic, STATED-rule default:
+    // the N most recent image-eligible products. candidates is already
+    // most-recent-first (businessSnapshot.js fetches WooCommerce/Shopify
+    // products in that real order now — see its own round-48 comment) —
+    // never a ranking by sales/engagement, which this app has no real data
+    // to honestly support (the exact goal-substitution trap this project
+    // has hit before, in a new field). defaultProposed:true is carried
+    // through to the stored creative specifically so formatRecommendation
+    // (strategyBuilder.js) can state this rule in the text the user
+    // actually reads, not just imply it.
+    const count = Math.min(MAX_CAROUSEL_CARDS, candidates.length);
+    chosenCandidates = candidates.slice(0, count);
+    defaultProposed = true;
+  } else {
+    if (entries.length < MIN_CAROUSEL_CARDS || entries.length > MAX_CAROUSEL_CARDS) {
+      return { ...empty, creativeError: `A carousel must have between ${MIN_CAROUSEL_CARDS} and ${MAX_CAROUSEL_CARDS} cards — got ${entries.length}.` };
+    }
+    const allProducts = snapshot?.business?.sampleProducts || [];
+    const resolvedEntries = entries.map((e) => resolveCarouselCardEntry(e, candidates, allProducts));
+    const firstError = resolvedEntries.find((r) => r.error);
+    if (firstError) return { ...empty, creativeError: firstError.error };
+    chosenCandidates = resolvedEntries.map((r) => r.candidate);
+    const seenIds = new Set();
+    for (const c of chosenCandidates) {
+      if (seenIds.has(c.id)) {
+        return { ...empty, creativeError: `"${c.name}" (id ${c.id}) is chosen more than once — a carousel needs ${chosenCandidates.length} DISTINCT products.` };
+      }
+      seenIds.add(c.id);
+    }
+
+    // Independent per-card verification — see cardIsVerifiedInMessage's
+    // own header comment above for why this is scoped to CHANGED cards
+    // only, never the whole resent list.
+    const priorCards = (priorCreative?.source === "PRODUCT_IMAGE" && priorCreative?.layout === "CAROUSEL") ? priorCreative.cards : null;
+    for (let i = 0; i < chosenCandidates.length; i++) {
+      const candidate = chosenCandidates[i];
+      if (priorCards?.[i]?.productId === candidate.id) continue; // unchanged — already a trusted, prior fact
+      if (!cardIsVerifiedInMessage(userMessage, candidate)) {
+        return {
+          ...empty,
+          creativeError: `Card ${i + 1} ("${candidate.name}") couldn't be independently verified against your message — refer to it by the id shown or its exact product name, and resend the complete card list.`,
+        };
+      }
+    }
+  }
+
+  const cards = chosenCandidates.map((c) => ({ productId: c.id, imageUrl: c.imageUrl, link: c.permalink, productName: c.name, price: c.price || null }));
+  return { ...empty, creative: { source: "PRODUCT_IMAGE", layout: "CAROUSEL", cards, defaultProposed } };
+}
+
+// Deterministic, backend-authored lines for the recommendation text
+// (strategyBuilder.js's formatRecommendation) — same "never model prose"
+// principle as formatCreativeCandidatesQuestion below: real product
+// names/prices only, and the STATED rule spelled out verbatim whenever
+// the default (not an explicit pick) is what's being presented, so the
+// user is never asked to approve a ranking implied to be smarter than it
+// actually is.
+export function formatCarouselCreativeLines(creative) {
+  if (!creative || creative.layout !== "CAROUSEL") return [];
+  const lines = [
+    creative.defaultProposed
+      ? `Carousel cards (proposed — your ${creative.cards.length} most recently added products with a real image; no sales or engagement data exists yet to rank them, so recency is the rule used):`
+      : `Carousel cards (${creative.cards.length}):`,
+  ];
+  creative.cards.forEach((c, i) => lines.push(`  ${i + 1}) ${c.productName}${c.price ? ` — ${c.price}` : ""}`));
+  return lines;
+}
+
 // A real, non-negotiable literal check — same principle as policy.js's
 // userMessageContainsAmount for USER_PROVIDED budget: the model's own
 // transcription of what the user said is never trusted on its own for a
@@ -266,6 +464,16 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
 
   if (OUT_OF_SCOPE_SOURCES.has(source)) {
     return { ...empty, unsupportedSource: true };
+  }
+
+  // Round 48 — carousel is a PRODUCT_IMAGE-only ad FORMAT (creative_strategy.
+  // layout), not a different source; resolved by its own dedicated function
+  // since the shape (N cards, never one pick) is fundamentally different
+  // from every branch below. Isolated in its own function (never inlined
+  // here) specifically so none of the single-pick logic below — the thing
+  // every existing campaign depends on — has to change to support it.
+  if (source === "PRODUCT_IMAGE" && strategy.creative_strategy?.layout === "CAROUSEL") {
+    return resolveCarouselSelection({ strategy, snapshot, priorCreative, contentSelectorProvidedThisCall, userMessage });
   }
 
   // Reuse verbatim — the prior strategy already resolved a creative for

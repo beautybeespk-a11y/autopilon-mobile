@@ -413,6 +413,17 @@ export function validateStrategyStructure(strategy) {
       const validSources = INTERNAL_STRATEGY_SCHEMA.properties.creative_strategy.properties.source.enum;
       if (!validSources.includes(strategy.creative_strategy.source)) fail("creative_strategy.source", `creative_strategy.source must be one of: ${validSources.join(", ")}.`);
       if (!strategy.creative_strategy.description || typeof strategy.creative_strategy.description !== "string") fail("creative_strategy.description", "creative_strategy.description is required.");
+      // Round 48 (carousel ads) — layout is optional (defaults to SINGLE
+      // wherever it's read, never enforced here), but when present it must
+      // be a real value, and CAROUSEL only ever makes sense for a
+      // PRODUCT_IMAGE creative — an existing Facebook/Instagram post or a
+      // generated/attached asset is always exactly one piece of content.
+      const validLayouts = INTERNAL_STRATEGY_SCHEMA.properties.creative_strategy.properties.layout.enum;
+      if (strategy.creative_strategy.layout !== undefined && !validLayouts.includes(strategy.creative_strategy.layout)) {
+        fail("creative_strategy.layout", `creative_strategy.layout must be one of: ${validLayouts.join(", ")}.`);
+      } else if (strategy.creative_strategy.layout === "CAROUSEL" && strategy.creative_strategy.source !== "PRODUCT_IMAGE") {
+        fail("creative_strategy.layout", `creative_strategy.layout "CAROUSEL" is only supported for creative_strategy.source "PRODUCT_IMAGE" — got "${strategy.creative_strategy.source}".`);
+      }
     }
   }
 
