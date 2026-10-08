@@ -18,6 +18,7 @@ import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strat
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
 import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
+import { gatherBusinessSnapshot } from "../agents/metaExpertV2/businessSnapshot.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -112,6 +113,7 @@ const MAX_NARRATION_NUDGES = 1;
 // it.
 const EXECUTION_CLAIM_WITHOUT_CALL_PATTERN = /\b(executing the (strategy|campaign)|i'?ve (set|updated|increased|revised|applied)\b.{0,30}\bbudget|successfully executed|(campaign|strategy|ad ?set)\b.{0,30}\b(is now|has been|will be|was)\b.{0,25}\b(created|running|live|executing|executed|set ?up)\b|proceeding to (execute|create) the (campaign|strategy))\b/i;
 const MAX_EXECUTION_CLAIM_NUDGES = 1;
+const MAX_PERFORMANCE_DATA_CLAIM_NUDGES = 1;
 function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools, hasActiveV2Strategy, executeCalledThisTurn, reviseCalledThisTurn, executeGateBlockedThisTurn, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   if (executeCalledThisTurn || reviseCalledThisTurn) return null;
@@ -144,6 +146,130 @@ function checkExecutionClaimWithoutCallGate({ decision, userMessage, hasV2Tools,
     return 'The user just approved the active strategy in their current message, but meta_expert_v2.execute_strategy was never actually called this turn. Call it now with type "tool_call" — never tell the user the campaign is set up, created, executing, or running unless that tool call actually ran (it requires a separate confirmation step, so say that plainly if it comes back awaiting confirmation, never claim it already spent or executed).';
   }
   return 'Your reply claims the strategy is being executed, revised, updated, or set up, but neither meta_expert_v2.revise_strategy nor meta_expert_v2.execute_strategy was actually called this turn — nothing happened. If you now have what you need (e.g. a budget the user just gave you, or explicit approval), call the real tool now with type "tool_call" instead of describing it as done. Never describe an action as executing/created/updated/running/set up unless the matching tool call actually ran and succeeded this turn.';
+}
+
+// Round 54 fix (CRITICAL live production bug, worse than any prior one):
+// "how did last week compare to the week before" and, separately,
+// "which ad set is spending the most" were each answered with ZERO tool
+// calls (Agent Trace: Planning -> Completed) and fully INVENTED numbers —
+// claimed spend 5,000 against a real 587.41, claimed revenue 30,000
+// against a real ALL-TIME account total of 57,340 (arithmetically
+// impossible as a single week), and two fabricated CAMPAIGN names
+// standing in for a specific ad set (one of them paused, with no ad set
+// in the real active campaign at all). checkExecutionClaimWithoutCallGate
+// above exists for a claimed ACTION with no backing call; nothing existed
+// for a claimed DATA point. This is that gate, for data — the load-
+// bearing fix for this round. Checked with NO stepsRun restriction, same
+// reasoning as checkExecutionClaimWithoutCallGate: a tool call earlier
+// this turn for something unrelated doesn't excuse fabricating a number
+// now.
+//
+// Never a bare digit run alone (an id, a position, an unrelated count) —
+// only a number appearing directly next to a RECOGNIZED performance-
+// metric word counts as a claimed figure, in either order ("spend $500"
+// or "$500 in spend").
+const PERFORMANCE_METRIC_WORDS = "(?:spend|spent|roas|return on ad spend|cpa|cost per (?:acquisition|purchase|action|result|click)|ctr|click-through(?: rate)?|cpc|cpm|clicks?|impressions?|reach|purchases?|conversions?|revenue)";
+const PERFORMANCE_NUMBER_TOKEN = "\\$?\\d[\\d,]*(?:\\.\\d+)?%?";
+const METRIC_THEN_NUMBER_PATTERN = new RegExp(`\\b${PERFORMANCE_METRIC_WORDS}\\b[^.?!\\n]{0,25}?(${PERFORMANCE_NUMBER_TOKEN})`, "gi");
+const NUMBER_THEN_METRIC_PATTERN = new RegExp(`(${PERFORMANCE_NUMBER_TOKEN})[^.?!\\n]{0,25}?\\b${PERFORMANCE_METRIC_WORDS}\\b`, "gi");
+// A period-over-period CLAIM asserts a FRESH comparison was just
+// computed — always needs its own fresh call this turn, even if its
+// individual numbers happen to overlap with something said before (see
+// priorAssistantFigures' own restatement exemption below, which
+// deliberately excludes this case).
+const PERIOD_COMPARISON_CLAIM_PATTERN = /\b(compared to|vs\.?|versus)\b.{0,20}\b(last week|this week|the week before|previous (week|period)|prior (week|period))\b|\blast week\b.{0,30}\b(the week before|previous week|prior week)\b|\bweek[- ]over[- ]week\b/i;
+// get_business_snapshot is account/campaign granularity only — it cannot
+// honestly name which SPECIFIC ad set is doing what. A reply mentioning
+// "ad set(s)" with performance figures needs the granular tool
+// specifically (or the campaign-edit tools, which read live ad-set data
+// for their own drift check) — this is the second confirmed live bug:
+// a campaign presented as if it were an ad set.
+const AD_SET_MENTION_PATTERN = /\bad sets?\b/i;
+
+function normalizePerformanceFigure(raw) {
+  return raw.replace(/[$,]/g, "");
+}
+function extractPerformanceFigures(text) {
+  if (typeof text !== "string") return [];
+  const figures = new Set();
+  for (const m of text.matchAll(METRIC_THEN_NUMBER_PATTERN)) figures.add(normalizePerformanceFigure(m[1]));
+  for (const m of text.matchAll(NUMBER_THEN_METRIC_PATTERN)) figures.add(normalizePerformanceFigure(m[1]));
+  return [...figures];
+}
+
+const PERFORMANCE_BACKED_TOOLS = [
+  "meta_expert_v2.get_business_snapshot",
+  "meta_expert_v2.get_performance_breakdown",
+  "meta_expert_v2.build_strategy",
+  "meta_expert_v2.revise_strategy",
+  "meta_expert_v2.propose_campaign_edit",
+  "meta_expert_v2.apply_campaign_edit",
+  "meta_expert_v2.execute_strategy",
+];
+const AD_SET_GRANULAR_TOOLS = ["meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.apply_campaign_edit"];
+
+// priorAssistantFigures (built once per orchestrate() call from `history`
+// — see this gate's call site) is every performance figure the ASSISTANT
+// ITSELF already stated in an EARLIER turn of this SAME conversation. By
+// induction, any such figure could only have reached history by already
+// passing THIS gate once, backed by a real tool call at the time — so a
+// follow-up restating it ("so the ROAS was 9.1?") is a legitimate
+// reference to an already-verified fact, never a fresh fabrication, and
+// must not be blocked. A number the USER supplies that the assistant
+// never itself said is NOT in this set (it's built only from assistant
+// turns), so confirming an invented user guess still gets caught — only
+// a number genuinely traceable to this conversation's own prior real
+// tool-backed reply is exempted, nothing "from nowhere."
+function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, v2ToolCallCounts, priorAssistantFigures }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  const message = decision.message;
+  const claimedFigures = extractPerformanceFigures(message);
+  const claimsPeriodComparison = PERIOD_COMPARISON_CLAIM_PATTERN.test(message);
+  if (!claimedFigures.length && !claimsPeriodComparison) return null;
+
+  const isPureRestatement = claimedFigures.length > 0 && !claimsPeriodComparison
+    && claimedFigures.every((f) => priorAssistantFigures.includes(f));
+  if (isPureRestatement) return null;
+
+  const mentionsAdSets = AD_SET_MENTION_PATTERN.test(message);
+  const calledGranularTool = AD_SET_GRANULAR_TOOLS.some((t) => (v2ToolCallCounts.get(t) || 0) > 0);
+  if (mentionsAdSets && !calledGranularTool) {
+    return 'Your reply names or compares specific AD SETS with performance numbers, but meta_expert_v2.get_performance_breakdown — the only tool with real ad-set-level data — was never called this turn. meta_expert_v2.get_business_snapshot alone is account/campaign-level and can never honestly answer an ad-set-level question. Call meta_expert_v2.get_performance_breakdown with the real campaign id now and answer ONLY from what it actually returns — never a campaign\'s own name or data presented as if it were an ad set.';
+  }
+  const calledAnyBackingTool = PERFORMANCE_BACKED_TOOLS.some((t) => (v2ToolCallCounts.get(t) || 0) > 0);
+  if (!calledAnyBackingTool) {
+    return 'Your reply states specific performance figures or a period-over-period comparison, but no tool that could have returned real numbers was called this turn. Call meta_expert_v2.get_business_snapshot (account-level) or meta_expert_v2.get_performance_breakdown (one campaign, broken down by ad set/ad) now and answer ONLY from what it actually returns. Never state a specific number, percentage, or period comparison that wasn\'t just returned by a real tool call this turn — not from memory, not estimated, not invented.';
+  }
+  return null;
+}
+
+// Requirement (round 54): the hard-stop below must never be a dead end —
+// "never getting numbers is the one that cannot bend," but a user asking
+// a reasonable question still deserves either real data or an honest,
+// specific reason it isn't available right now, never just "ask again."
+// Attempts ONE real, always-safe fetch (get_business_snapshot — zero
+// parameters, the same call instruction #1 already tells the model to
+// make first) and composes the reply from WHATEVER IT ACTUALLY RETURNED —
+// never from the model's own rejected claim. Deliberately never includes
+// a number from bestPerformingCampaigns (real campaign NAMES/ids only) —
+// this function's whole job is to be the one place that is allowed to
+// fail toward "no numbers" with total confidence, so it holds itself to
+// an even stricter bar than the gate it backs up.
+async function composeHonestPerformanceFallback(userId) {
+  try {
+    const snapshot = await gatherBusinessSnapshot(userId);
+    if (!snapshot.metaConnected) {
+      return "I don't have a verified answer for that — your Meta Ads account isn't connected right now, so there's no real data to report. Connect it and ask again.";
+    }
+    const items = snapshot.metaHistory?.bestPerformingCampaigns?.items || [];
+    if (!items.length) {
+      return "I don't have a verified answer for that right now — I wasn't able to confirm real performance data for any campaign in this account just now. Ask me again in a moment, or name a specific campaign and I'll pull its real numbers directly.";
+    }
+    const names = items.map((c) => `"${c.name}" (id ${c.campaignId})`).join(", ");
+    return `I don't have a verified answer for that yet, so rather than guess, here's what I can actually confirm right now: your real campaigns with recent data are ${names}. Tell me which one you'd like a detailed breakdown for (ad sets, ads, or a week-over-week comparison) and I'll pull the real numbers for it.`;
+  } catch (err) {
+    return "I wasn't able to pull real performance numbers just now — please ask again in a moment and I'll fetch the actual figures rather than guess.";
+  }
 }
 
 // Round 47 (live production bug): "change the campaign budget to 750/day"
@@ -864,6 +990,27 @@ function matchedCreativeSelectionPatternLabel(userMessage) {
   return hit ? hit.label : null;
 }
 
+// Round 54 fix — proactive half of the fabricated-performance-data fix
+// (see checkPerformanceDataClaimWithoutCallGate, the load-bearing
+// backstop, for the live bug this answers). Routes a performance
+// question toward a real tool call BEFORE the model ever gets a chance
+// to answer from invented numbers, same loose/non-exhaustive regex
+// trade-off as every other trigger in this file — an occasional
+// unnecessary nudge is far cheaper than inventing a week's spend.
+const PERFORMANCE_QUESTION_INTENT_PATTERNS = new RegExp(
+  [
+    /\bhow (is|are|did|has)\b.{0,40}\b(campaign|ad set|ad|account)\b.{0,30}\b(doing|perform|performing|performed|done)\b/i,
+    /\bwhich\b.{0,30}\b(campaign|ad set|ad)\b.{0,30}\b(spending|spend|converting|performing|performs)\b/i,
+    /\b(spending|converting)\b.{0,20}\b(the )?(most|least|worst|best)\b/i,
+    /\bhow (did|has|does)\b.{0,40}\b(compare|compared|do|done)\b.{0,30}\b(last week|this week|the week before|previous (week|period)|prior (week|period))\b/i,
+    /\b(week[- ]over[- ]week|month[- ]over[- ]month)\b/i,
+    /\bwhat('s| is| was)\b.{0,25}\b(the )?(spend|roas|cpa|ctr|cpc|cpm|revenue|purchases|clicks|impressions|reach)\b/i,
+  ]
+    .map((r) => r.source)
+    .join("|"),
+  "i"
+);
+
 // Returns a nudge message when the model's "final" decision should be
 // blocked because it's answering a plan-review/revision request or an
 // integration-state question without ever calling a tool this turn — or
@@ -897,6 +1044,12 @@ function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpert
       ? " Since an active strategy already exists for this conversation, then call meta_expert_v2.revise_strategy updating ONLY the creative fields (creative_strategy / content_selector) with what the real data supports — preserve the Page, ad account, Pixel, objective, audience, and budget exactly as they are; do not rebuild the campaign."
       : "";
     return `This asks you to select or compare specific creative (a Reel, post, or product) for an ad. Never name a specific post, product, or date, and never describe something as "high engagement," "high performing," or "proven effectiveness," without real CURRENT data behind it. Call ${snapshotTool} first to get the actual recent content list before selecting or describing anything specific.${revisionClause} If no real engagement/performance data is available for a piece of content, say so plainly and choose based on clearly-labeled factors instead (e.g. "Based on content relevance and format...") — never claim something is your best- or highest-performing content without the numbers to back it up.`;
+  }
+  if (PERFORMANCE_QUESTION_INTENT_PATTERNS.test(userMessage)) {
+    const snapshotTool = hasV2Tools
+      ? "meta_expert_v2.get_business_snapshot (account-level) or meta_expert_v2.get_performance_breakdown (one campaign, broken down by ad set/ad)"
+      : "meta_expert.research_business_context";
+    return `This asks about REAL performance (spend, CPA, ROAS, CTR, clicks, impressions, reach, purchases, revenue, or a period-over-period comparison). Never state a specific number, percentage, or comparison from memory or estimation — call ${snapshotTool} now and answer ONLY from what it actually returns. If this names or implies a SPECIFIC ad set, you must call meta_expert_v2.get_performance_breakdown for the real campaign — the account-level snapshot alone cannot honestly say which ad set is doing what, and a campaign's own name/data must never be presented as if it were an ad set.`;
   }
   if (INTEGRATION_STATE_QUESTION_PATTERNS.test(userMessage)) {
     return "This asks about CURRENT connected integration state (a Pixel, Page, ad account, or store connection) — these can change between turns and must never be answered from what an earlier message said. Call the real lookup tool (meta_expert.research_business_context, meta.list_pages, meta.list_ad_accounts, etc. as appropriate) to get the CURRENT answer before replying.";
@@ -1291,6 +1444,20 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const v2ToolCallCounts = new Map();
   const v2ToolNudgeCounts = new Map();
   const v2ToolLastOutcome = new Map();
+  // Round 54 — built ONCE per orchestrate() call (history is fixed for
+  // the whole turn): every performance figure the ASSISTANT itself
+  // already stated in an EARLIER turn of this conversation. See
+  // checkPerformanceDataClaimWithoutCallGate's own header comment for why
+  // this is what makes a follow-up restatement ("so the ROAS was 9.1?")
+  // safe to allow without a fresh tool call this turn, while a genuinely
+  // new number still isn't.
+  const priorAssistantFigures = extractPerformanceFigures(
+    (Array.isArray(history) ? history : [])
+      .filter((m) => m?.role === "assistant" && typeof m.content === "string")
+      .map((m) => m.content)
+      .join("\n")
+  );
+  let performanceDataClaimNudges = 0;
 
   // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
   // plain chat three separate times ("Rs.500"), the strategy's own
@@ -1886,6 +2053,39 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           reply: "I wasn't able to actually apply that — could you say \"approve\" (or repeat whatever you'd like changed) one more time, and I'll update and execute the strategy for real this time?",
           trace, toolResults, usage: usageTotals,
         };
+      }
+      // Round 54 fix (CRITICAL live production bug) — see
+      // checkPerformanceDataClaimWithoutCallGate's own header comment.
+      // The load-bearing fix this round: a "final" reply stating
+      // performance figures or a period comparison with no backing tool
+      // call this turn must never reach the customer, full stop.
+      const performanceDataClaimGateMessage = checkPerformanceDataClaimWithoutCallGate({
+        decision, hasV2Tools, v2ToolCallCounts, priorAssistantFigures,
+      });
+      if (performanceDataClaimGateMessage && performanceDataClaimNudges < MAX_PERFORMANCE_DATA_CLAIM_NUDGES) {
+        performanceDataClaimNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: performanceDataClaimGateMessage },
+        ];
+        continue;
+      }
+      if (performanceDataClaimGateMessage) {
+        // Nudge already used and it STILL stated unbacked figures —
+        // never let this reach the customer, no matter what. Unlike the
+        // action-claim gate above, this doesn't just ask the user to
+        // repeat themselves: it makes ONE real, safe fetch itself
+        // (composeHonestPerformanceFallback) and replies with whatever
+        // that ACTUALLY returns — real campaign names to choose from, or
+        // a plain admission it couldn't confirm anything right now.
+        // Never a bare dead end, and never a number that wasn't just
+        // fetched for real.
+        trace[trace.length - 1].state = "done";
+        const honestReply = await composeHonestPerformanceFallback(userId);
+        trace.push(traceStep("completed", "Blocked a performance claim with no backing tool call this turn — replaced with a real fetch.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return { reply: honestReply, trace, toolResults, usage: usageTotals };
       }
       // Round 47 — see checkPostExecutionChangeWithoutEditCallGate above.
       // getMostRecentExecutedStrategyForConversation is only actually

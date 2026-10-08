@@ -7250,6 +7250,164 @@ async function run() {
     await assert.rejects(() => gatherPerformanceBreakdown("fake-token", {}), /campaignId is required/);
   });
 
+  // --- CRITICAL live production bug: fabricated performance data (round 54) ---
+  // Two real production failures, same deploy. 1) "how did last week
+  // compare to the week before" — Agent Trace: Planning -> Completed,
+  // ZERO tool calls — answered with fully invented numbers. 2) "which ad
+  // set is spending the most" — answered with two CAMPAIGN names and
+  // campaign-level numbers; the real ad set was never named, and one
+  // named campaign is paused with no ad set in the real active campaign.
+  // The rule that must hold: a reply containing performance figures must
+  // be backed by a real tool call this turn that actually returned them.
+  await check("[Performance data claim gate, round 54] the EXACT fabricated reply from production (spend 5,000, clicks 400, impressions 7,500, reach 4,200, purchases 5, revenue 30,000, 'Week Before' framing) is blocked — the user gets real campaign names, never those numbers", async () => {
+    const userId = makeUser(`v2-fabricated-perf-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // The real text shape from the production transcript — not a tidy
+    // example. All six numbers are invented; none backed by any call.
+    const fabricatedReply =
+      "Here's how last week compared to the Week Before:\n\n" +
+      "Spend: $5,000 (vs $4,000)\n" +
+      "Clicks: 400\n" +
+      "Impressions: 7,500\n" +
+      "Reach: 4,200\n" +
+      "Purchases: 5\n" +
+      "Revenue: $30,000";
+    mockFetch(scriptedFetch({
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        campaigns: [{ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES" }],
+        campaignInsights: { c1: { impressions: "833", clicks: "26", spend: "587.41", ctr: "3.1", cpc: "22.6", cpm: "705", reach: "645", frequency: "1.3", actions: [], action_values: [], cost_per_action_type: [], purchase_roas: [] } },
+      },
+      // The model never calls anything — ZERO tool calls, matching the
+      // real trace exactly — and repeats the same fabricated claim even
+      // after the nudge, so the hard-stop must fire.
+      chatResponses: [finalText(fabricatedReply), finalText(fabricatedReply)],
+    }));
+    try {
+      const userMessage = "how did last week compare to the week before";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      for (const invented of ["5,000", "5000", "400", "7,500", "7500", "4,200", "4200", "30,000", "30000"]) {
+        assert.ok(!result.reply.includes(invented), `the invented figure "${invented}" must never reach the customer: ${result.reply}`);
+      }
+      assert.ok(result.reply.includes("Real Campaign"), `the honest fallback must name a REAL campaign instead of inventing numbers: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance data claim gate, round 54] a reply naming ad sets, backed only by get_business_snapshot, is blocked — the real second production failure (campaign data/names presented as an ad set)", async () => {
+    const userId = makeUser(`v2-fabricated-adset-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const adSetClaim = "The ad set spending the most is \"Imaginary Set\" with $900 in spend.";
+    mockFetch(scriptedFetch({
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }],
+        campaigns: [{ id: "c1", name: "Pakistan Sales", status: "ACTIVE", objective: "OUTCOME_SALES" }],
+        campaignInsights: { c1: { impressions: "833", clicks: "26", spend: "587.41", actions: [], action_values: [] } },
+      },
+      // get_business_snapshot IS called (the account-level tool) — but
+      // that can never honestly name a specific ad set. The model then
+      // claims ad-set-level figures anyway, twice (surviving the nudge),
+      // with no meta_expert_v2.get_performance_breakdown call at all.
+      chatResponses: [toolCall("meta_expert_v2.get_business_snapshot", {}), finalText(adSetClaim), finalText(adSetClaim)],
+    }));
+    try {
+      const userMessage = "which ad set is spending the most";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(!result.reply.includes("Imaginary Set"), `the invented ad set name must never reach the customer: ${result.reply}`);
+      assert.ok(!result.reply.includes("900"), `the invented figure must never reach the customer: ${result.reply}`);
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.get_performance_breakdown");
+      assert.ok(!revise, "get_performance_breakdown was never actually called — the hard-stop's own real fetch (get_business_snapshot) is the only real data behind the fallback, never a fabricated ad-set answer");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance data claim gate, round 54] a follow-up restating a figure the assistant ALREADY said in an earlier turn is allowed with no fresh tool call — 'so the ROAS was 9.1?' is a legitimate reference, not a fresh fabrication", async () => {
+    const userId = makeUser(`v2-perf-followup-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      // Only ONE scripted response — if the gate wrongly blocked this,
+      // the nudge would consume it and the mock would need a second
+      // response it never gets ("chat mock exhausted").
+      chatResponses: [finalText("Yes, that's right — the ROAS was 9.1 for that period.")],
+    }));
+    try {
+      const userMessage = "so the ROAS was 9.1?";
+      // The REAL prior turn (role: assistant) already stated this exact
+      // figure — this is what makes the restatement legitimate, never a
+      // number invented out of nowhere.
+      const history = [
+        { role: "user", content: "how is my campaign doing" },
+        { role: "assistant", content: "Your campaign's ROAS was 9.1 over the last 7 days." },
+        { role: "user", content: userMessage },
+      ];
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("9.1"), `the legitimate restatement must be allowed through unblocked: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance data claim gate, round 54] a BRAND NEW figure the user merely guesses, with no prior assistant statement of it, is still blocked even though a DIFFERENT figure was said before", async () => {
+    const userId = makeUser(`v2-perf-followup-newnum-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const wrongConfirmation = "Yes, that's right — the ROAS was 50.";
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      chatResponses: [finalText(wrongConfirmation), finalText(wrongConfirmation)],
+    }));
+    try {
+      const userMessage = "so the ROAS was 50?"; // the user's own guess — never said by the assistant
+      const history = [
+        { role: "user", content: "how is my campaign doing" },
+        { role: "assistant", content: "Your campaign's ROAS was 9.1 over the last 7 days." },
+        { role: "user", content: userMessage },
+      ];
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history, agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(!result.reply.includes("50"), `confirming a NEW, never-before-stated figure must still be blocked, even with a real prior figure (9.1) elsewhere in history: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance data claim gate, round 54] does NOT false-positive when build_strategy is actually called this turn and the reply relays its own real budget/spend figures", async () => {
+    const userId = makeUser(`v2-perf-no-false-positive-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
+      // build_strategy IS called this turn — a real backing tool — so a
+      // final reply relaying its own output's budget figure (which
+      // "spend"/"budget" + a number would otherwise match) must sail
+      // through with no nudge and no hard-stop. Only ONE final response
+      // is scripted: if this were wrongly blocked, the nudge would
+      // consume it and the mock would need a second response it never
+      // gets ("chat mock exhausted").
+      chatResponses: [
+        toolCall("meta_expert_v2.build_strategy", baseStrategy({ budget_daily: 2000 })),
+        finalText("I recommend a daily budget spend of $2000 for website sales. Approve to proceed."),
+      ],
+    }));
+    try {
+      const userMessage = "I want more sales on my website";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("2000"), `a reply backed by a REAL build_strategy call this turn must never be blocked or stripped: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
     const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
     connectMeta(userId);
