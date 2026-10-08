@@ -111,21 +111,23 @@ function normalizeAdAccountId(id) {
   return id.startsWith("act_") ? id : `act_${id}`;
 }
 
-export async function listAdAccounts(accessToken) {
-  const data = await metaFetch("/me/adaccounts?fields=id,name,account_status,currency", { accessToken });
-  return data.data || [];
-}
-
 // Round 49 (live bug): an account with 9 real campaigns got only 8 back
-// here — this function had no explicit `limit` (trusting Meta's own
-// undocumented-here default page size) and never followed `paging.next`,
-// so a page boundary landing between campaign 8 and 9 silently dropped
-// the rest. Nothing in this whole file followed pagination for ANY list
-// endpoint before this fix — see the investigation notes on the other
-// list calls that share this same gap (reported separately, not fixed
-// here). MAX_PAGINATION_PAGES bounds the loop against a pathological/
-// looping cursor; a real account's campaign list is never anywhere near
-// this deep.
+// from listCampaigns — that function had no explicit `limit` (trusting
+// Meta's own undocumented-here default page size) and never followed
+// `paging.next`, so a page boundary landing between campaign 8 and 9
+// silently dropped the rest. Nothing in this whole file followed
+// pagination for ANY list endpoint before that fix.
+//
+// Round 50 — extended to every OTHER Meta list endpoint whose real count
+// has no natural small ceiling and whose caller genuinely needs the
+// COMPLETE list (ad accounts, Pages, Pixels, catalogs, ad sets, ads, and
+// the Business Portfolio lookups inside getPageAccessToken/listPages/
+// getInstagramAccountId) — never used for an endpoint whose caller only
+// ever wants a bounded, recent handful (listPagePosts/listInstagramPosts
+// use their own explicit, citable `limit` instead; see those functions'
+// own comments for why unbounded paging would be actively wrong there).
+// MAX_PAGINATION_PAGES bounds the loop against a pathological/looping
+// cursor; none of these real lists are ever anywhere near this deep.
 const MAX_PAGINATION_PAGES = 20;
 async function metaFetchAllPages(path, accessToken) {
   const all = [];
@@ -136,6 +138,10 @@ async function metaFetchAllPages(path, accessToken) {
     next = data.paging?.next || null;
   }
   return all;
+}
+
+export async function listAdAccounts(accessToken) {
+  return metaFetchAllPages("/me/adaccounts?fields=id,name,account_status,currency&limit=100", accessToken);
 }
 
 export async function listCampaigns(accessToken, adAccountId) {
@@ -225,19 +231,24 @@ export async function getCampaignInsights(accessToken, campaignId, datePreset = 
 // call fails for any other reason) this degrades to just the classic
 // /me/accounts result rather than throwing.
 export async function listPages(accessToken) {
-  const direct = await metaFetch("/me/accounts?fields=id,name,category", { accessToken });
-  if (direct.data?.length) return direct.data;
+  // Round 50 — every call below now follows pagination (metaFetchAllPages)
+  // instead of trusting a single page: a business with enough classic
+  // Pages, enough connected Business Portfolios, or a portfolio owning
+  // enough Pages could all previously lose real Pages silently past
+  // whatever Meta's undocumented default page size happened to be.
+  const direct = await metaFetchAllPages("/me/accounts?fields=id,name,category&limit=100", accessToken);
+  if (direct.length) return direct;
 
-  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
+  const businesses = await metaFetchAllPages("/me/businesses?fields=id,name&limit=100", accessToken).catch(() => []);
   const perBusiness = await Promise.all(
-    (businesses.data || []).map((b) =>
-      metaFetch(`/${b.id}/owned_pages?fields=id,name,category`, { accessToken }).catch(() => ({ data: [] }))
+    businesses.map((b) =>
+      metaFetchAllPages(`/${b.id}/owned_pages?fields=id,name,category&limit=100`, accessToken).catch(() => [])
     )
   );
   const seen = new Set();
   const pages = [];
   for (const result of perBusiness) {
-    for (const page of result.data || []) {
+    for (const page of result) {
       if (seen.has(page.id)) continue;
       seen.add(page.id);
       pages.push(page);
@@ -284,10 +295,15 @@ export async function getPageAccessToken(accessToken, pageId) {
     return direct.access_token;
   }
 
-  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
-  for (const business of businesses.data || []) {
-    const pages = await metaFetch(`/${business.id}/owned_pages?fields=id,access_token`, { accessToken }).catch(() => ({ data: [] }));
-    const match = (pages.data || []).find((p) => p.id === pageId);
+  // Round 50 — identical shape (and identical bug) as listPages' own
+  // Business Portfolio fallback above: a page landing past whatever
+  // Meta's undocumented default page size was, in either the business
+  // list or a given business's owned_pages list, was silently never
+  // checked — the exact class of bug round 49 fixed for listCampaigns.
+  const businesses = await metaFetchAllPages("/me/businesses?fields=id,name&limit=100", accessToken).catch(() => []);
+  for (const business of businesses) {
+    const pages = await metaFetchAllPages(`/${business.id}/owned_pages?fields=id,access_token&limit=100`, accessToken).catch(() => []);
+    const match = pages.find((p) => p.id === pageId);
     if (match?.access_token) {
       logger.info("meta_api.get_page_access_token", { pageId, resolution: "business_portfolio", businessId: business.id });
       return match.access_token;
@@ -296,7 +312,7 @@ export async function getPageAccessToken(accessToken, pageId) {
   // businessesChecked distinguishes "no Business Portfolio to even check"
   // (0) from "checked N, none had this page" (>0) — different real
   // causes for the same failure, both genuinely unrecoverable here.
-  const businessesChecked = (businesses.data || []).length;
+  const businessesChecked = businesses.length;
   logger.error("meta_api.get_page_access_token_failed", { pageId, businessesChecked });
   const err = new Error(`Could not obtain a Page access token for Page ${pageId} — it wasn't found via /{pageId}?fields=access_token or any connected Business Portfolio (${businessesChecked} checked).`);
   err.code = "META_PAGE_TOKEN_UNAVAILABLE";
@@ -366,7 +382,22 @@ export async function createAd(accessToken, adAccountId, fields) {
 // so real engagement counts for Facebook Page posts are simply never
 // present again until pages_read_user_content is granted; nothing
 // downstream needs a code change to handle that, it already does.
-export async function listPagePosts(accessToken, pageId) {
+// Round 50 — bounded on purpose, NOT pagination-following like the other
+// list endpoints fixed this round: every real caller (businessSnapshot.js's
+// gatherRecentContent, V1's research.js, tools/meta/campaigns.js) fetches
+// the result and immediately keeps only the first 5 — walking every page
+// of a Page's entire post history to throw away all but 5 would be
+// strictly worse than today's bug, not a fix for it. limit defaults to 25
+// — comfortably above the real 5-item need of every current caller (so
+// this is a no-op for them), while still bounded and cheap. Returns
+// {items, hasMore} rather than a bare array so a caller can tell a cap
+// was actually hit (hasMore: a paging.next cursor existed after this
+// capped fetch) instead of silently assuming "that's all of them" —
+// same principle as round 49's insightsCoverage, scaled to what this edge
+// can honestly report (Meta doesn't cheaply expose a total count for
+// posts/media the way campaigns' list does).
+const DEFAULT_RECENT_POSTS_LIMIT = 25;
+export async function listPagePosts(accessToken, pageId, limit = DEFAULT_RECENT_POSTS_LIMIT) {
   // getPageAccessToken now THROWS (META_PAGE_TOKEN_UNAVAILABLE) instead
   // of ever returning null — this call either gets a genuine Page token
   // or never reaches the fetch below at all. Previously this fell back
@@ -391,10 +422,10 @@ export async function listPagePosts(accessToken, pageId) {
   // "...Token..." — logger.js's redact() strips any field whose KEY
   // matches /token/i regardless of its value, which would have silently
   // hidden this exact diagnostic.
-  logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: "page" });
-  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}`, { accessToken: pageToken });
-  logger.info("meta_api.list_page_posts.response", { pageId, postCount: (data.data || []).length, raw: data });
-  return data.data || [];
+  logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: "page", limit });
+  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}&limit=${limit}`, { accessToken: pageToken });
+  logger.info("meta_api.list_page_posts.response", { pageId, postCount: (data.data || []).length, hasMore: Boolean(data.paging?.next), raw: data });
+  return { items: data.data || [], hasMore: Boolean(data.paging?.next) };
 }
 
 // A Page's Instagram Business Account isn't the Page itself — it's a
@@ -413,20 +444,35 @@ export async function getInstagramAccountId(accessToken, pageId) {
   const data = await metaFetch(`/${pageId}?fields=instagram_business_account`, { accessToken });
   if (data.instagram_business_account?.id) return data.instagram_business_account.id;
 
-  const businesses = await metaFetch("/me/businesses?fields=id,name", { accessToken }).catch(() => ({ data: [] }));
-  for (const business of businesses.data || []) {
-    const igAccounts = await metaFetch(`/${business.id}/instagram_accounts?fields=id,username`, { accessToken }).catch(() => ({ data: [] }));
-    if (igAccounts.data?.length) return igAccounts.data[0].id;
+  // Round 50 — both calls now follow pagination (same bug, same fix as
+  // listPages/getPageAccessToken's identical Business Portfolio lookups):
+  // a business past whatever Meta's undocumented default page size was,
+  // or an instagram_accounts list deep enough to span pages, could
+  // previously be silently missed. Still picks the FIRST match across the
+  // first business that has any — that pre-existing "could get an
+  // ambiguous match" tradeoff (see this function's own header comment)
+  // is unchanged; this fix only ensures the businesses/accounts actually
+  // considered are the complete real list, not a truncated one.
+  const businesses = await metaFetchAllPages("/me/businesses?fields=id,name&limit=100", accessToken).catch(() => []);
+  for (const business of businesses) {
+    const igAccounts = await metaFetchAllPages(`/${business.id}/instagram_accounts?fields=id,username&limit=100`, accessToken).catch(() => []);
+    if (igAccounts.length) return igAccounts[0].id;
   }
   return null;
 }
 
 // like_count/comments_count are real counts returned directly on the
 // media object — no extra per-post call needed. Same purpose as
-// listPagePosts' engagement fields above.
-export async function listInstagramPosts(accessToken, igAccountId) {
-  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count`, { accessToken });
-  return data.data || [];
+// listPagePosts' engagement fields above, and the SAME deliberate bound
+// (round 50) for the identical reason: every real caller keeps only the
+// first 5 of whatever this returns, so an explicit, cheap limit — never
+// pagination-following a creator's entire media history — is the correct
+// fix here, not "fetch everything." See listPagePosts' own comment for
+// the full reasoning; {items, hasMore} is the same shape for the same
+// "let the caller tell a cap applied" purpose.
+export async function listInstagramPosts(accessToken, igAccountId, limit = DEFAULT_RECENT_POSTS_LIMIT) {
+  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count&limit=${limit}`, { accessToken });
+  return { items: data.data || [], hasMore: Boolean(data.paging?.next) };
 }
 
 // Meta Pixels (conversion tracking) live under the ad account, not the
@@ -434,18 +480,20 @@ export async function listInstagramPosts(accessToken, igAccountId) {
 // to know whether Purchase-optimized campaigns are even possible before
 // recommending one. Most accounts that have never run conversion
 // campaigns simply have none — that's a normal, expected empty result,
-// not an error.
+// not an error. Round 50 — follows pagination like the other small-but-
+// unbounded account-scoped lists (catalogs, ad sets, ads); a real
+// account's Pixel count is always small, but "always small" is exactly
+// the assumption round 49's campaign-count bug proved unsafe to make
+// silently.
 export async function listPixels(accessToken, adAccountId) {
-  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/adspixels?fields=id,name`, { accessToken });
-  return data.data || [];
+  return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/adspixels?fields=id,name&limit=100`, accessToken);
 }
 
 // Product catalogs (for dynamic/catalog ads) — also ad-account-scoped.
 // Same "commonly empty, not an error" reasoning as listPixels: most
 // accounts without a product feed set up will simply have none.
 export async function listCatalogs(accessToken, adAccountId) {
-  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/product_catalogs?fields=id,name`, { accessToken });
-  return data.data || [];
+  return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/product_catalogs?fields=id,name&limit=100`, accessToken);
 }
 
 // --- Ad-level read/fetch helpers ------------------------------------------
@@ -509,14 +557,24 @@ export async function getAdCreative(accessToken, creativeId) {
 // Ad-account-scoped, same shape as the existing listCampaigns — ad sets
 // span campaigns within an account, so this lists all of them rather than
 // requiring a specific campaign id up front.
+//
+// Round 50 — no caller exists yet (checked the whole codebase; this is a
+// primitive ahead of the planned performance-analysis feature, not
+// currently wired to anything), but it follows pagination (metaFetchAllPages)
+// the same way listCampaigns does, deliberately — a performance diagnosis
+// needs the COMPLETE set of ad sets, not a recent/bounded sample the way
+// listPagePosts/listInstagramPosts correctly are. Whoever builds that
+// analyst inherits a complete-by-pagination list already — this isn't a
+// question to re-derive later.
 export async function listAdSets(accessToken, adAccountId) {
-  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy`, { accessToken });
-  return data.data || [];
+  return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/adsets?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy&limit=100`, accessToken);
 }
 
+// Same reasoning as listAdSets directly above — no caller yet, complete-
+// by-pagination on purpose for the same future performance-analysis use
+// case, never a bounded/recent sample.
 export async function listAds(accessToken, adAccountId) {
-  const data = await metaFetch(`/${normalizeAdAccountId(adAccountId)}/ads?fields=id,name,status,adset_id,campaign_id,creative`, { accessToken });
-  return data.data || [];
+  return metaFetchAllPages(`/${normalizeAdAccountId(adAccountId)}/ads?fields=id,name,status,adset_id,campaign_id,creative&limit=100`, accessToken);
 }
 
 // --- Carousel creative support --------------------------------------------

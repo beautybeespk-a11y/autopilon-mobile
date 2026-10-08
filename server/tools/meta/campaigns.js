@@ -231,12 +231,17 @@ registerTool({
   async execute(parameters, context) {
     const accessToken = token(context);
     const pageId = await resolvePageId({ accessToken, providedPageId: parameters.pageId, userId: context.userId });
-    const posts = await meta.listPagePosts(accessToken, pageId);
+    // Round 50 — meta.listPagePosts returns {items, hasMore} (a real,
+    // bounded fetch, never the Page's complete post history). hasMore is
+    // surfaced on the result so the model never implies these are the
+    // only recent posts when more genuinely exist.
+    const { items, hasMore } = await meta.listPagePosts(accessToken, pageId);
     return {
-      posts: posts.map((p) => ({
+      posts: items.map((p) => ({
         id: p.id, message: p.message || null, createdTime: p.created_time, permalink: p.permalink_url,
         mediaType: p.attachments?.data?.[0]?.media_type || null,
       })),
+      hasMore,
     };
   },
 });
@@ -260,10 +265,13 @@ registerTool({
     // even when an IG account IS linked. Degrade to an empty list with a
     // clear reason rather than surfacing Meta's raw permission error.
     try {
-      const posts = await meta.listInstagramPosts(accessToken, igAccountId);
+      // Round 50 — meta.listInstagramPosts returns {items, hasMore} (a
+      // real, bounded fetch, never the account's complete media history).
+      const { items, hasMore } = await meta.listInstagramPosts(accessToken, igAccountId);
       return {
         instagramConnected: true,
-        posts: posts.map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, mediaUrl: p.media_url, permalink: p.permalink, timestamp: p.timestamp })),
+        posts: items.map((p) => ({ id: p.id, caption: p.caption || null, mediaType: p.media_type, mediaUrl: p.media_url, permalink: p.permalink, timestamp: p.timestamp })),
+        hasMore,
       };
     } catch (err) {
       return { instagramConnected: true, posts: [], reason: `Instagram account is linked, but reading its posts isn't available yet (${err.message}). Facebook post boosting still works.` };

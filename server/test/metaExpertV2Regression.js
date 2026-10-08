@@ -6413,6 +6413,206 @@ async function run() {
     }
   });
 
+  // Round 50 — generic paginated-list mock, generalizing the exact
+  // campaignsPageSize mechanism round 49 proved out for listCampaigns:
+  // serves real pages (with a genuine paging.next cursor this same mock
+  // reads back on the next call, via an opaque __page_offset param — not
+  // a real Meta cursor format, since the point is only that the real code
+  // follows WHATEVER cursor Meta gives it) for any number of distinct
+  // endpoints in one test, keyed by path suffix.
+  function paginatedMock(responses) {
+    return async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      for (const r of responses) {
+        if (path.endsWith(r.pathSuffix)) {
+          const offset = Number(u.searchParams.get("__page_offset") || "0");
+          const pageItems = r.items.slice(offset, offset + r.pageSize);
+          const nextOffset = offset + r.pageSize;
+          const hasMore = nextOffset < r.items.length;
+          return jsonResponse({ data: pageItems, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${nextOffset}` } : undefined });
+        }
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    };
+  }
+
+  await check("[Meta API, round 50] listAdAccounts/listPixels/listCatalogs/listAdSets/listAds all follow paging.next — none silently drop items past the first page", async () => {
+    const adAccounts = Array.from({ length: 7 }, (_, i) => ({ id: `act_${i + 1}`, name: `Account ${i + 1}` }));
+    const pixels = Array.from({ length: 7 }, (_, i) => ({ id: `px${i + 1}`, name: `Pixel ${i + 1}` }));
+    const catalogs = Array.from({ length: 7 }, (_, i) => ({ id: `cat${i + 1}`, name: `Catalog ${i + 1}` }));
+    const adsets = Array.from({ length: 7 }, (_, i) => ({ id: `as${i + 1}`, name: `Ad Set ${i + 1}` }));
+    const ads = Array.from({ length: 7 }, (_, i) => ({ id: `ad${i + 1}`, name: `Ad ${i + 1}` }));
+    mockFetch(paginatedMock([
+      { pathSuffix: "/me/adaccounts", items: adAccounts, pageSize: 3 },
+      { pathSuffix: "/adspixels", items: pixels, pageSize: 3 },
+      { pathSuffix: "/product_catalogs", items: catalogs, pageSize: 3 },
+      { pathSuffix: "/adsets", items: adsets, pageSize: 3 },
+      { pathSuffix: "/ads", items: ads, pageSize: 3 },
+    ]));
+    try {
+      assert.equal((await meta.listAdAccounts("fake-token")).length, 7);
+      assert.equal((await meta.listPixels("fake-token", "act_1")).length, 7);
+      assert.equal((await meta.listCatalogs("fake-token", "act_1")).length, 7);
+      assert.equal((await meta.listAdSets("fake-token", "act_1")).length, 7, "listAdSets has no caller yet, but must be complete-by-pagination for the planned performance-analysis feature");
+      assert.equal((await meta.listAds("fake-token", "act_1")).length, 7, "listAds has no caller yet, but must be complete-by-pagination for the same reason");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta API, round 50] listPages follows paging.next on BOTH the direct /me/accounts path and the Business Portfolio fallback (/me/businesses + /<business>/owned_pages)", async () => {
+    const directPages = Array.from({ length: 5 }, (_, i) => ({ id: `p${i + 1}`, name: `Page ${i + 1}` }));
+    mockFetch(paginatedMock([{ pathSuffix: "/me/accounts", items: directPages, pageSize: 2 }]));
+    try {
+      const result = await meta.listPages("fake-token");
+      assert.equal(result.length, 5, "the direct /me/accounts path must follow pagination too");
+    } finally {
+      restoreFetch();
+    }
+
+    // Business Portfolio fallback — /me/accounts returns nothing (forcing
+    // the fallback), then BOTH /me/businesses (which business portfolios
+    // exist) and /<business>/owned_pages (which pages that portfolio owns)
+    // must each follow their own pagination.
+    const businesses = Array.from({ length: 4 }, (_, i) => ({ id: `biz${i + 1}`, name: `Business ${i + 1}` }));
+    const ownedPagesByBusiness = { biz1: Array.from({ length: 4 }, (_, i) => ({ id: `op${i + 1}`, name: `Owned Page ${i + 1}` })) };
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path.endsWith("/me/accounts")) return jsonResponse({ data: [] });
+      if (path.endsWith("/me/businesses")) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = businesses.slice(offset, offset + 2);
+        const hasMore = offset + 2 < businesses.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      const ownedMatch = path.match(/^\/(biz\d+)\/owned_pages$/);
+      if (ownedMatch) {
+        const items = ownedPagesByBusiness[ownedMatch[1]] || [];
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = items.slice(offset, offset + 2);
+        const hasMore = offset + 2 < items.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const result = await meta.listPages("fake-token");
+      assert.equal(result.length, 4, "must have followed pagination on BOTH /me/businesses (4 businesses across 2 pages) and biz1's own /owned_pages (4 pages across 2 pages)");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta API, round 50] getPageAccessToken's Business Portfolio fallback follows paging.next on both /me/businesses and /<business>/owned_pages — a page past the first batch must never be reported unreachable", async () => {
+    const businesses = Array.from({ length: 4 }, (_, i) => ({ id: `biz${i + 1}`, name: `Business ${i + 1}` }));
+    // The real page we want is the 4th owned_pages entry of biz1 — past a
+    // page size of 2, so only reachable if owned_pages pagination is
+    // actually followed.
+    const ownedPages = [
+      { id: "op1" }, { id: "op2" }, { id: "op3" }, { id: "target-page", access_token: "fake-page-token-target" },
+    ];
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === "/target-page" && u.searchParams.get("fields") === "access_token") return jsonResponse({});
+      if (path.endsWith("/me/businesses")) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = businesses.slice(offset, offset + 2);
+        const hasMore = offset + 2 < businesses.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      if (path === "/biz1/owned_pages") {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = ownedPages.slice(offset, offset + 2);
+        const hasMore = offset + 2 < ownedPages.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      if (/^\/biz\d+\/owned_pages$/.test(path)) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const token = await meta.getPageAccessToken("fake-token", "target-page");
+      assert.equal(token, "fake-page-token-target");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta API, round 50] getInstagramAccountId's Business Portfolio fallback follows paging.next on both /me/businesses and /<business>/instagram_accounts", async () => {
+    const businesses = Array.from({ length: 4 }, (_, i) => ({ id: `biz${i + 1}`, name: `Business ${i + 1}` }));
+    const igAccounts = [{ id: "ig1" }, { id: "ig2" }, { id: "ig3" }, { id: "ig-target" }];
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === "/page1" && u.searchParams.get("fields") === "instagram_business_account") return jsonResponse({});
+      if (path.endsWith("/me/businesses")) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = businesses.slice(offset, offset + 2);
+        const hasMore = offset + 2 < businesses.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      if (path === "/biz1/instagram_accounts") {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const page = igAccounts.slice(offset, offset + 2);
+        const hasMore = offset + 2 < igAccounts.length;
+        return jsonResponse({ data: page, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${offset + 2}` } : undefined });
+      }
+      if (/^\/biz\d+\/instagram_accounts$/.test(path)) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const igId = await meta.getInstagramAccountId("fake-token", "page1");
+      // The function deliberately takes the FIRST account of the first
+      // business that has any (same pre-existing ambiguity tradeoff its
+      // own header comment documents) — this proves pagination fetched
+      // the REAL first page's first id (ig1), not that it somehow found
+      // ig-target specifically; the point of this test is that biz1's
+      // real id set (all 4) was actually reachable, not truncated to 2.
+      assert.equal(igId, "ig1");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Meta API, round 50] listPagePosts/listInstagramPosts use an explicit, bounded limit (never full pagination) and report hasMore when more exists beyond it", async () => {
+    const posts = Array.from({ length: 30 }, (_, i) => ({ id: `post${i + 1}` }));
+    const media = Array.from({ length: 30 }, (_, i) => ({ id: `media${i + 1}` }));
+    let postsRequestUrl = null;
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === "/page1" && u.searchParams.get("fields") === "access_token") return jsonResponse({ access_token: "fake-page-token" });
+      if (path.endsWith("/posts")) {
+        postsRequestUrl = u.toString();
+        const limit = Number(u.searchParams.get("limit"));
+        return jsonResponse({ data: posts.slice(0, limit), paging: limit < posts.length ? { next: "https://graph.facebook.com/v25.0/page1/posts?after=x" } : undefined });
+      }
+      if (path.endsWith("/media")) {
+        const limit = Number(u.searchParams.get("limit"));
+        return jsonResponse({ data: media.slice(0, limit), paging: limit < media.length ? { next: "https://graph.facebook.com/v25.0/ig1/media?after=x" } : undefined });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const pagePostsResult = await meta.listPagePosts("fake-token", "page1");
+      assert.equal(pagePostsResult.items.length, 25, "default limit must be 25 — never fetch the Page's entire post history just to keep 5");
+      assert.equal(pagePostsResult.hasMore, true, "30 real posts exist behind a 25-item page — hasMore must say so");
+      assert.ok(postsRequestUrl.includes("limit=25"), `the real request must carry the explicit limit: ${postsRequestUrl}`);
+
+      const igPostsResult = await meta.listInstagramPosts("fake-token", "ig1");
+      assert.equal(igPostsResult.items.length, 25);
+      assert.equal(igPostsResult.hasMore, true);
+
+      const igPostsCustomLimit = await meta.listInstagramPosts("fake-token", "ig1", 30);
+      assert.equal(igPostsCustomLimit.items.length, 30);
+      assert.equal(igPostsCustomLimit.hasMore, false, "asking for exactly the real total leaves nothing more behind");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
     const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
     connectMeta(userId);

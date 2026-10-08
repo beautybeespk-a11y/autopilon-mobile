@@ -515,12 +515,24 @@ function normalizeContentItem(platform, raw, sampleProducts) {
 }
 
 async function gatherRecentContent(accessToken, pageId, instagram, sampleProducts) {
+  // Round 50 — meta.listPagePosts/listInstagramPosts now return
+  // {items, hasMore} instead of a bare array (an explicit, bounded limit,
+  // never full pagination — see those functions' own comments, api.js).
+  // hasMore is threaded through to the final shape below so a Page/IG
+  // account with more recent content than MAX_RECENT_CONTENT ever shows
+  // says so, rather than silently implying these are the only candidates.
   const facebook = pageId
-    ? await attempt(async () => (await meta.listPagePosts(accessToken, pageId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts)))
-    : { status: "not_connected", value: [], reason: null };
+    ? await attempt(async () => {
+        const { items, hasMore } = await meta.listPagePosts(accessToken, pageId);
+        return { items: items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts)), hasMore };
+      })
+    : { status: "not_connected", value: { items: [], hasMore: false }, reason: null };
   const instagramPosts = instagram?.accountId
-    ? await attempt(async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts)))
-    : { status: "not_connected", value: [], reason: null };
+    ? await attempt(async () => {
+        const { items, hasMore } = await meta.listInstagramPosts(accessToken, instagram.accountId);
+        return { items: items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts)), hasMore };
+      })
+    : { status: "not_connected", value: { items: [], hasMore: false }, reason: null };
   // Same friendly-reason wrapping as the meta.list_instagram_posts tool
   // (tools/meta/campaigns.js:268-270) — an IG account IS linked but the
   // read itself failed (missing OAuth scope on this deployment today), so
@@ -532,8 +544,8 @@ async function gatherRecentContent(accessToken, pageId, instagram, sampleProduct
     ? `Instagram account is linked, but reading its posts isn't available yet (${instagramPosts.reason}). Facebook post boosting still works.`
     : instagramPosts.reason || null;
   return {
-    facebookPosts: { status: facebook.status, items: facebook.value || [], reason: facebook.reason || null },
-    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value || [], reason: instagramReason },
+    facebookPosts: { status: facebook.status, items: facebook.value?.items || [], hasMore: facebook.value?.hasMore || false, reason: facebook.reason || null },
+    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value?.items || [], hasMore: instagramPosts.value?.hasMore || false, reason: instagramReason },
   };
 }
 

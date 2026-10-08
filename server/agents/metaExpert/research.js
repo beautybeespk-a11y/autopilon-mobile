@@ -173,13 +173,18 @@ export async function gatherBusinessContext(userId) {
 
   if (pages.length) {
     const primaryPageId = pages[0].id;
-    knownFacts.meta.recentPagePosts = (await tryFetch(unavailable, "Recent Facebook Page posts", async () => (await meta.listPagePosts(accessToken, primaryPageId)).slice(0, MAX_POSTS))) || [];
+    // Round 50 — meta.listPagePosts now returns {items, hasMore} instead
+    // of a bare array (api.js); only items is needed here, same as before.
+    knownFacts.meta.recentPagePosts = (await tryFetch(unavailable, "Recent Facebook Page posts", async () => (await meta.listPagePosts(accessToken, primaryPageId)).items.slice(0, MAX_POSTS))) || [];
   } else {
     knownFacts.meta.recentPagePosts = [];
   }
 
   if (instagram) {
-    knownFacts.meta.recentInstagramPosts = (await tryFetch(unavailable, "Recent Instagram posts", async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).slice(0, MAX_POSTS))) || [];
+    // Round 50 — meta.listInstagramPosts now returns {items, hasMore}
+    // instead of a bare array (api.js); only items is needed here, same
+    // as before.
+    knownFacts.meta.recentInstagramPosts = (await tryFetch(unavailable, "Recent Instagram posts", async () => (await meta.listInstagramPosts(accessToken, instagram.accountId)).items.slice(0, MAX_POSTS))) || [];
   } else {
     knownFacts.meta.recentInstagramPosts = [];
   }
