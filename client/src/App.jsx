@@ -8,6 +8,7 @@ import Signup from "./pages/Signup.jsx";
 import ForgotPassword from "./pages/ForgotPassword.jsx";
 import Privacy from "./pages/Privacy.jsx";
 import DataDeletion from "./pages/DataDeletion.jsx";
+import Terms from "./pages/Terms.jsx";
 
 import Dashboard from "./pages/Dashboard.jsx";
 import Chat from "./pages/Chat.jsx";
@@ -48,6 +49,7 @@ export default function App() {
       <Route path="/share/:token" element={<SharedFile />} />
       <Route path="/privacy" element={<Privacy />} />
       <Route path="/data-deletion" element={<DataDeletion />} />
+      <Route path="/terms" element={<Terms />} />
 
       <Route
         path="/app"

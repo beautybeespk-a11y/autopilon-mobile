@@ -166,6 +166,7 @@ export default function Landing() {
         </div>
         <Link to="/signup" className="hover:text-ink">Request Beta Access</Link> · Private beta
         <div className="mt-2">
+          <Link to="/terms" className="hover:text-ink">Terms of Service</Link> ·{" "}
           <Link to="/privacy" className="hover:text-ink">Privacy Policy</Link> ·{" "}
           <Link to="/data-deletion" className="hover:text-ink">Data Deletion</Link>
         </div>

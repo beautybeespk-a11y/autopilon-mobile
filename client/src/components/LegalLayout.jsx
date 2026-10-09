@@ -2,11 +2,11 @@ import { Link } from "react-router-dom";
 import { LogoMark } from "./Logo.jsx";
 
 // Shared chrome for public, no-login legal/compliance pages (Privacy.jsx,
-// DataDeletion.jsx) — same header mark and footer link pattern as
-// Landing.jsx's own public header/footer, deliberately WITHOUT the
+// DataDeletion.jsx, Terms.jsx) — same header mark and footer link pattern
+// as Landing.jsx's own public header/footer, deliberately WITHOUT the
 // marketing page's aurora/hero styling: these are reference documents a
 // Meta reviewer (or a user, or a lawyer) needs to read plainly, not sell
-// the product. Both pages that use this are registered at the top level
+// the product. All pages that use this are registered at the top level
 // in App.jsx (outside the /app ProtectedRoute), so they render with no
 // auth check — reachable directly by URL, logged in or not.
 export default function LegalLayout({ title, lastUpdated, children }) {
@@ -18,6 +18,7 @@ export default function LegalLayout({ title, lastUpdated, children }) {
           <span className="font-display text-[15px] font-semibold">Autopilon</span>
         </Link>
         <nav className="flex items-center gap-4 text-sm text-muted">
+          <Link to="/terms" className="hover:text-ink">Terms of Service</Link>
           <Link to="/privacy" className="hover:text-ink">Privacy Policy</Link>
           <Link to="/data-deletion" className="hover:text-ink">Data Deletion</Link>
         </nav>
@@ -31,6 +32,7 @@ export default function LegalLayout({ title, lastUpdated, children }) {
 
       <footer className="border-t border-line py-8 text-center text-sm text-muted">
         <Link to="/" className="hover:text-ink">Autopilon</Link> ·{" "}
+        <Link to="/terms" className="hover:text-ink">Terms of Service</Link> ·{" "}
         <Link to="/privacy" className="hover:text-ink">Privacy Policy</Link> ·{" "}
         <Link to="/data-deletion" className="hover:text-ink">Data Deletion</Link>
       </footer>
