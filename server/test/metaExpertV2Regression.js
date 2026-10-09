@@ -151,6 +151,18 @@ function metaRouter({
     if (path === "/me/adaccounts") return jsonResponse({ data: adAccounts });
     if (path === "/me/accounts") return jsonResponse({ data: pages });
     if (path === "/me/businesses") return jsonResponse({ data: [] });
+    // Round 54 follow-up (currency gate fix) — meta.getAdAccount's
+    // single-entity lookup (/act_N?fields=...,currency,...), now called
+    // by performanceBreakdown.js so the breakdown's own output can carry
+    // the account's real currency. Looks up the SAME adAccounts fixture
+    // already used for /me/adaccounts above; defaults to USD when the
+    // test didn't pass one (matching every pre-existing perf-breakdown
+    // test, none of which assert on currency).
+    const adAccountFieldsMatch = path.match(/^\/(act_\w+)$/);
+    if (adAccountFieldsMatch && u.searchParams.get("fields")?.includes("currency")) {
+      const acct = adAccounts.find((a) => a.id === adAccountFieldsMatch[1]);
+      return jsonResponse({ id: adAccountFieldsMatch[1], name: acct?.name || "Ad Account", account_status: 1, currency: acct?.currency || "USD" });
+    }
     const pageFieldsMatch = path.match(/^\/(\d+)$/);
     if (pageFieldsMatch && u.searchParams.get("fields") === "instagram_business_account") {
       const igId = igByPageId[pageFieldsMatch[1]];
@@ -7118,6 +7130,50 @@ async function run() {
     }
   });
 
+  await check("[Performance breakdown, round 54 follow-up #2] a real insights row with real spend but an EMPTY actions array is zero conversions, never 'data not available' — distinct from an entity with no row at all", async () => {
+    // Live bug (user-reported): the prior week had genuine spend (587.41)
+    // and a real insights row, but Meta's actions/action_values arrays
+    // were empty (no purchase action occurred) — the reply said purchases
+    // and revenue were "not available," which reads as a measurement gap
+    // rather than the true fact: zero conversions on real spend. Meta's
+    // own Insights API convention is that actions/action_values list only
+    // action types that actually occurred within a REAL row — an absent
+    // type there means zero, never "unknown." Reserve null/"unavailable"
+    // exclusively for the OTHER case: no row returned at all (asserted
+    // against separately below, in the SAME test, to prove this fix
+    // cannot blur that distinction).
+    const adSetRoster = [
+      { id: "as-real-zero", name: "Real Spend, Zero Conversions", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as-no-row", name: "No Row At All", status: "PAUSED", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        { adset_id: "as-real-zero", adset_name: "Real Spend, Zero Conversions", campaign_id: CAMPAIGN_ID, campaign_name: "Real Campaign", spend: "587.41", clicks: "60", impressions: "4000", reach: "3500", frequency: "1.1", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        // as-no-row is deliberately absent — matching Meta's own real
+        // behavior of returning no row at all for an entity with no
+        // activity, never a zeroed one.
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const realZero = result.adSets.find((a) => a.id === "as-real-zero");
+      assert.equal(realZero.noActivityInRange, false, "a real insights row means real activity, even with zero purchases");
+      assert.equal(realZero.totals.spend, 587.41);
+      assert.equal(realZero.totals.purchases, 0, "an empty actions array on a REAL row is zero purchases, never null/unavailable");
+      assert.equal(realZero.totals.revenue, 0, "an empty action_values array on a REAL row is zero revenue, never null/unavailable");
+      assert.equal(realZero.rates.roas, 0, "roas = revenue/spend = 0/587.41 is a real, honest zero — not an invented verdict");
+      assert.equal(realZero.rates.cpa, null, "cpa (spend/purchases) stays null — dividing by zero purchases is still undefined, not zero");
+
+      const noRow = result.adSets.find((a) => a.id === "as-no-row");
+      assert.equal(noRow.noActivityInRange, true, "an entity with NO row at all must stay noActivityInRange — genuinely no activity, unaffected by the zero-vs-unavailable fix above");
+      assert.equal(noRow.totals, null, "no row at all must never be given invented zero totals");
+      assert.equal(noRow.rates, null);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Performance breakdown, round 53] date range: defaults to last_7d, states the REAL resolved dates Meta returned, and a custom since/until uses time_range instead", async () => {
     const campaignInsights = { [CAMPAIGN_ID]: { spend: "100", clicks: "10", impressions: "1000", reach: "900", frequency: "1.1", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" } };
     let lastInsightsUrl = null;
@@ -7125,6 +7181,7 @@ async function run() {
       const u = new URL(url);
       const path = u.pathname.replace(/^\/v[\d.]+/, "");
       if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/insights")) {
         lastInsightsUrl = u.toString();
         const level = u.searchParams.get("level");
@@ -7147,6 +7204,7 @@ async function run() {
       const u = new URL(url);
       const path = u.pathname.replace(/^\/v[\d.]+/, "");
       if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/insights")) {
         lastInsightsUrl = u.toString();
         const level = u.searchParams.get("level");
@@ -7200,6 +7258,7 @@ async function run() {
       const u = new URL(url);
       const path = u.pathname.replace(/^\/v[\d.]+/, "");
       if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
       if (path.endsWith("/insights")) {
         const level = u.searchParams.get("level");
@@ -7234,6 +7293,7 @@ async function run() {
       const u = new URL(url);
       const path = u.pathname.replace(/^\/v[\d.]+/, "");
       if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
       if (path.endsWith("/insights")) return jsonResponse({ data: [] });
       return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
@@ -7537,6 +7597,7 @@ async function run() {
       if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
         return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
       }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/insights")) {
         const level = u.searchParams.get("level");
         if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
@@ -7600,6 +7661,7 @@ async function run() {
       if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
         return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
       }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
       if (path.endsWith("/insights")) {
         const level = u.searchParams.get("level");
         if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
@@ -7615,6 +7677,120 @@ async function run() {
       const userMessage = "how did last week compare to the week before";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       assert.ok(result.reply.includes("last week") && result.reply.includes("the week before"), `a genuinely 7-day comparison correctly called "last week"/"the week before" must never be rewritten: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54 follow-up #2] CRITICAL live bug: the currency-symbol gate (round 31) now fires on a get_performance_breakdown-only turn with NO active V2 strategy — nudged, then deterministically rewritten with the real account currency", async () => {
+    // Live bug (user-reported): every figure in a performance-breakdown
+    // reply rendered as "$" on a real PKR account. The pre-existing
+    // currency gate (messageHasWrongDollarSign, round 31) only ever
+    // resolved realCurrency from an ACTIVE V2 STRATEGY
+    // (resolvedAssets.adAccountCurrency) — structurally null for a pure
+    // performance QUESTION like this one, which never builds a strategy.
+    // The fix: get_performance_breakdown's own result now carries the
+    // real account currency (fetched via meta.getAdAccount, the same
+    // primitive build_strategy already used), and the gate reads it.
+    const userId = makeUser(`v2-breakdown-currency-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const dollarReply = "Here's how the campaign is doing:\n\nSpend: $4,608.14\nRevenue: $52,341\nCPA: $576.02";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1" }),
+      finalText(dollarReply),
+      finalText(dollarReply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      // The account is real PKR — never USD. No active V2 strategy
+      // exists in this conversation, so the gate's ONLY way to learn this
+      // is via the breakdown's own carried currency field.
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "PKR" });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "4608.14", clicks: "100", impressions: "10000", reach: "9000", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "52341" }], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how is the campaign doing this week";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(!/\$\s?\d/.test(result.reply), `a "$" sign must never reach the customer on a real PKR account: ${result.reply}`);
+      assert.ok(result.reply.includes("PKR 4,608.14"), `the real currency must be substituted in, numbers untouched: ${result.reply}`);
+      assert.ok(result.reply.includes("PKR 52,341"), `revenue must also be rewritten: ${result.reply}`);
+      assert.ok(result.reply.includes("PKR 576.02"), `CPA must also be rewritten: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54 follow-up #2] does NOT false-positive on a genuinely USD account — a get_performance_breakdown-only turn never rewrites a correct '$'", async () => {
+    const userId = makeUser(`v2-breakdown-currency-usd-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const dollarReply = "Here's how the campaign is doing:\n\nSpend: $1,000.00";
+    let chatIndex = 0;
+    // Only ONE final response — if the gate wrongly nudged, the mock
+    // would need a second response it never gets.
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1" }),
+      finalText(dollarReply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "9000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how is the campaign doing this week";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("$1,000.00"), `a genuinely USD account's "$" must never be rewritten: ${result.reply}`);
     } finally {
       restoreFetch();
     }

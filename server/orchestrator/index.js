@@ -2147,6 +2147,14 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // performance figures or a period comparison with no backing tool
       // call this turn must never reach the customer, full stop.
       const calledToolNames = new Set(toolResults.map((r) => r.toolName));
+      // Hoisted so both checkPeriodMislabelGate below AND the currency
+      // gate further down (messageHasWrongDollarSign) can read the SAME
+      // real result this turn — the currency gate's own real-currency
+      // resolution (round 54 follow-up) needs this too.
+      const latestBreakdownResult = toolResults
+        .filter((r) => r.toolName === "meta_expert_v2.get_performance_breakdown" && r.result)
+        .map((r) => r.result)
+        .pop() || null;
       const performanceDataClaimGateMessage = checkPerformanceDataClaimWithoutCallGate({
         decision, hasV2Tools, calledToolNames, priorAssistantFigures,
       });
@@ -2183,10 +2191,6 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // caught it) — only the period's NAME is wrong, so this rewrites
       // just that phrase rather than blocking the whole reply.
       {
-        const latestBreakdownResult = toolResults
-          .filter((r) => r.toolName === "meta_expert_v2.get_performance_breakdown" && r.result)
-          .map((r) => r.result)
-          .pop() || null;
         const periodMislabelMessage = checkPeriodMislabelGate({ decision, hasV2Tools, latestBreakdownResult });
         if (periodMislabelMessage && periodMislabelNudges < MAX_PERIOD_MISLABEL_NUDGES) {
           periodMislabelNudges += 1;
@@ -2369,8 +2373,19 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // Live bug (round 31): see messageHasWrongDollarSign/
       // DOLLAR_AMOUNT_TEST_PATTERN above — the model's own final reply
       // used "$" on a real PKR account.
+      //
+      // Round 54 follow-up (live production report): the SAME bug at a
+      // new output path this gate's original realCurrency resolution
+      // couldn't see — get_performance_breakdown has no active V2
+      // strategy behind it (a performance QUESTION, not a campaign being
+      // built), so activeStrategyForCurrency was always null for it and
+      // this gate never fired; every figure rendered with "$" on a real
+      // PKR account, misreading the numbers by roughly 280x. Extended to
+      // also read latestBreakdownResult.currency (hoisted above,
+      // computed from the SAME real meta.getAdAccount call the
+      // breakdown itself made) — never model-authored either way.
       const activeStrategyForCurrency = hasV2Tools ? getActiveStrategyForConversation(userId, conversationId) : null;
-      const realCurrency = activeStrategyForCurrency?.resolvedAssets?.adAccountCurrency || null;
+      const realCurrency = activeStrategyForCurrency?.resolvedAssets?.adAccountCurrency || latestBreakdownResult?.currency || null;
       if (messageHasWrongDollarSign(decision.message, realCurrency)) {
         if (currencyNudges < MAX_CURRENCY_NUDGES) {
           currencyNudges += 1;

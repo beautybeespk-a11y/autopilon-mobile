@@ -46,14 +46,12 @@ export const DEFAULT_DATE_PRESET = "last_7d";
 
 // Deliberately a LOCAL copy, not an import of businessSnapshot.js's own
 // blendedRate — this round is additive only and doesn't touch round 49's
-// code. Extended with a numerator-null guard round 49's version never
-// needed: its numerator is always a real SUMMED number (via Number(x)||0
-// across every campaign), never null, so that case was unreachable there.
-// THIS file's numerators are a single ad set/ad's own purchases/revenue,
-// which can genuinely be null — no purchase action recorded at all for
-// that entity in the range (confirmed live: Meta omits the action type
-// entirely rather than reporting a zero) — and null/denominator must
-// never silently read as a real zero rate.
+// code. Carries a numerator-null guard as defense-in-depth: totalsFromRow
+// below (round 54 follow-up) now always supplies a real number (0 or
+// higher) for every field, including purchases/revenue, for any row that
+// genuinely exists — so this guard is never actually exercised through
+// normal flow — but a rate must still never silently read as a real zero
+// if a numerator were ever genuinely absent, so it stays.
 function blendedRate(numerator, denominator, multiplier = 1) {
   if (numerator == null) return null;
   return denominator > 0 ? (numerator / denominator) * multiplier : null;
@@ -70,18 +68,35 @@ function ratesFromTotals(totals) {
   };
 }
 
-// spend/clicks/impressions/reach are always real numbers on a returned
-// row (Meta never omits these); purchases/revenue can genuinely be null
-// (extractActionValue, api.js) — kept as null here rather than coerced to
-// 0, so ratesFromTotals' numerator-null guard above actually gets to see it.
+// Round 54 follow-up (live production report): a prior week with real
+// spend (587.41) and no purchase action was reported to the customer as
+// purchases/revenue "not available" — literally true of the raw API
+// field (Meta's actions array simply omits a type with zero occurrences,
+// per extractActionValue's own comment, api.js), but misleading as a
+// customer-facing fact: "not available" reads as a measurement gap,
+// when this is actually a verified performance result — real spend,
+// zero conversions.
+//
+// This function is ONLY ever called for a row that EXISTS (a real
+// insights row Meta actually returned — spend/clicks/impressions/reach
+// are real numbers here by construction). The OTHER case — no row at
+// all, genuinely nothing measured — is handled one level up, entirely
+// separately (noActivityInRange:true, totals set to null for the WHOLE
+// entity, never routed through this function). So within a real row,
+// an absent purchase/revenue action type is unambiguous: Meta's own
+// convention is that a real row lists only action types that actually
+// occurred, never a fixed schema backfilled with zeros — so "absent" IS
+// "zero occurrences," not "unknown." purchases/revenue are therefore 0
+// here, a real fact, never null (null is reserved exclusively for the
+// genuinely-no-row case this function never sees).
 function totalsFromRow(row) {
   return {
     spend: Number(row.spend) || 0,
     clicks: Number(row.clicks) || 0,
     impressions: Number(row.impressions) || 0,
     reach: Number(row.reach) || 0,
-    purchases: row.purchases ?? null,
-    revenue: row.revenue ?? null,
+    purchases: row.purchases ?? 0,
+    revenue: row.revenue ?? 0,
   };
 }
 
@@ -160,12 +175,13 @@ function worstByCpa(entities, n = 3) {
 async function gatherForOneCampaign(accessToken, campaignId, dateParams, compareToPriorPeriod) {
   const campaign = await meta.getCampaign(accessToken, campaignId);
 
-  const [campaignRows, adSetRows, adRows, fullAdSetRoster, fullAdRoster] = await Promise.all([
+  const [campaignRows, adSetRows, adRows, fullAdSetRoster, fullAdRoster, adAccount] = await Promise.all([
     meta.getCampaignLevelInsights(accessToken, campaignId, dateParams),
     meta.getAdSetLevelInsights(accessToken, campaignId, dateParams),
     meta.getAdLevelInsights(accessToken, campaignId, dateParams),
     meta.listAdSets(accessToken, campaign.account_id),
     meta.listAds(accessToken, campaign.account_id),
+    meta.getAdAccount(accessToken, campaign.account_id),
   ]);
 
   const campaignRow = campaignRows[0] || null;
@@ -227,6 +243,13 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
 
   return {
     scope: "campaign",
+    // Round 54 follow-up (live production report): every figure in a
+    // reply rendered with a "$" on a real PKR account — a misread of
+    // roughly 280x. The account's REAL currency (never model-authored)
+    // travels with the data itself now, the same way dateRange.label
+    // carries the real resolved period — see orchestrator/index.js's
+    // currency gate, which now also reads this field.
+    currency: adAccount.currency || null,
     campaign: { id: campaign.id, name: campaign.name, status: campaign.status, objective: campaign.objective },
     dateRange: { requested: dateParams, resolvedSince: campaignSummary.dateStart, resolvedUntil: campaignSummary.dateStop, label: formatRangeLabel(campaignSummary.dateStart, campaignSummary.dateStop) },
     campaignSummary,
@@ -248,10 +271,11 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
 // campaign (campaignId/campaignName) — the exact fact missing from the
 // live bug this fixes (campaign data presented AS an ad set).
 async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
-  const [rows, fullAdSetRoster, campaigns] = await Promise.all([
+  const [rows, fullAdSetRoster, campaigns, adAccount] = await Promise.all([
     meta.getAccountAdSetLevelInsights(accessToken, adAccountId, dateParams),
     meta.listAdSets(accessToken, adAccountId),
     meta.listCampaigns(accessToken, adAccountId),
+    meta.getAdAccount(accessToken, adAccountId),
   ]);
   const campaignById = new Map(campaigns.map((c) => [c.id, c]));
 
@@ -282,6 +306,9 @@ async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
   return {
     scope: "account_wide",
     adAccountId,
+    // See gatherForOneCampaign's own comment — the real account currency
+    // travels with the data, never left to the model to guess/default.
+    currency: adAccount.currency || null,
     dateRange: { requested: dateParams, resolvedSince, resolvedUntil, label: formatRangeLabel(resolvedSince, resolvedUntil) },
     adSets: allAdSets,
     topAdSetsBySpend: topBySpend(adSetsWithActivity),
