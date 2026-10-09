@@ -220,7 +220,19 @@ const AD_SET_GRANULAR_TOOLS = ["meta_expert_v2.get_performance_breakdown", "meta
 // turns), so confirming an invented user guess still gets caught — only
 // a number genuinely traceable to this conversation's own prior real
 // tool-backed reply is exempted, nothing "from nowhere."
-function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, v2ToolCallCounts, priorAssistantFigures }) {
+// calledToolNames — a Set of every toolName dispatched THIS TURN,
+// built from `toolResults` (always populated on every dispatch, success
+// or failure — see this gate's call site). Round 54 follow-up fix:
+// this gate originally read v2ToolCallCounts, which ONLY ever increments
+// for V2_SINGLE_CALL_TOOLS/V2_RETRYABLE_BUILD_TOOLS (get_business_snapshot,
+// execute_strategy, build_strategy, revise_strategy) — get_performance_breakdown
+// was never in either set, so a genuinely successful call to it was
+// invisible to this gate, which would then wrongly block an honest,
+// backed reply. Caught by this round's own tests once get_performance_breakdown
+// started succeeding more often (round 53's campaignId requirement
+// previously meant most real calls to it failed anyway, which is why
+// this stayed latent through the first round-54 production reports).
+function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, calledToolNames, priorAssistantFigures }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   const message = decision.message;
   const claimedFigures = extractPerformanceFigures(message);
@@ -232,11 +244,11 @@ function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, v2Tool
   if (isPureRestatement) return null;
 
   const mentionsAdSets = AD_SET_MENTION_PATTERN.test(message);
-  const calledGranularTool = AD_SET_GRANULAR_TOOLS.some((t) => (v2ToolCallCounts.get(t) || 0) > 0);
+  const calledGranularTool = AD_SET_GRANULAR_TOOLS.some((t) => calledToolNames.has(t));
   if (mentionsAdSets && !calledGranularTool) {
     return 'Your reply names or compares specific AD SETS with performance numbers, but meta_expert_v2.get_performance_breakdown — the only tool with real ad-set-level data — was never called this turn. meta_expert_v2.get_business_snapshot alone is account/campaign-level and can never honestly answer an ad-set-level question. Call meta_expert_v2.get_performance_breakdown with the real campaign id now and answer ONLY from what it actually returns — never a campaign\'s own name or data presented as if it were an ad set.';
   }
-  const calledAnyBackingTool = PERFORMANCE_BACKED_TOOLS.some((t) => (v2ToolCallCounts.get(t) || 0) > 0);
+  const calledAnyBackingTool = PERFORMANCE_BACKED_TOOLS.some((t) => calledToolNames.has(t));
   if (!calledAnyBackingTool) {
     return 'Your reply states specific performance figures or a period-over-period comparison, but no tool that could have returned real numbers was called this turn. Call meta_expert_v2.get_business_snapshot (account-level) or meta_expert_v2.get_performance_breakdown (one campaign, broken down by ad set/ad) now and answer ONLY from what it actually returns. Never state a specific number, percentage, or period comparison that wasn\'t just returned by a real tool call this turn — not from memory, not estimated, not invented.';
   }
@@ -270,6 +282,80 @@ async function composeHonestPerformanceFallback(userId) {
   } catch (err) {
     return "I wasn't able to pull real performance numbers just now — please ask again in a moment and I'll fetch the actual figures rather than guess.";
   }
+}
+
+// Round 54 follow-up (live production bug): get_performance_breakdown
+// correctly returned real, internally-consistent numbers for a
+// last_30d-resolved comparison, but the reply itself called the two
+// 30-day windows "last week (September 9 to October 8)" and "previous
+// week (August 10 to September 8)." The numbers were real; the period
+// NAME was a false statement about what was actually measured. Enforced
+// deterministically — the real resolved span, not the model's own
+// wording, decides whether "week" language is even allowed.
+const CURRENT_WEEK_PHRASE_TEST = /\b(last week|this week)\b/i;
+const PRIOR_WEEK_PHRASE_TEST = /\b(the week before|previous week|prior week)\b/i;
+const WEEK_OVER_WEEK_TEST = /\bweek[- ]over[- ]week\b/i;
+const ANY_WEEK_LABEL_PATTERN = /\b(last week|this week|the week before|previous week|prior week|week[- ]over[- ]week)\b/i;
+const CURRENT_WEEK_PHRASE_GLOBAL = /\b(last week|this week)\b/gi;
+const PRIOR_WEEK_PHRASE_GLOBAL = /\b(the week before|previous week|prior week)\b/gi;
+const WEEK_OVER_WEEK_GLOBAL = /\bweek[- ]over[- ]week\b/gi;
+const MAX_PERIOD_MISLABEL_NUDGES = 1;
+
+function daySpanBetween(since, until) {
+  if (!since || !until) return null;
+  const start = new Date(`${since}T00:00:00Z`);
+  const end = new Date(`${until}T00:00:00Z`);
+  return Math.round((end.getTime() - start.getTime()) / 86400000) + 1;
+}
+
+// Reads the actual resolved span(s) straight off THIS turn's real
+// get_performance_breakdown result — never off the model's own claim.
+// `current` covers both shapes the tool returns: a comparison's own
+// currentRange, or (no comparison requested) the top-level dateRange.
+function resolveBreakdownSpans(result) {
+  const currentRange = result?.comparison?.currentRange
+    || (result?.dateRange?.resolvedSince && result?.dateRange?.resolvedUntil
+      ? { since: result.dateRange.resolvedSince, until: result.dateRange.resolvedUntil, label: result.dateRange.label }
+      : null);
+  const priorRange = result?.comparison?.priorRange || null;
+  return {
+    currentSpan: currentRange ? daySpanBetween(currentRange.since, currentRange.until) : null,
+    priorSpan: priorRange ? daySpanBetween(priorRange.since, priorRange.until) : null,
+    currentLabel: currentRange?.label || null,
+    priorLabel: priorRange?.label || null,
+  };
+}
+
+function checkPeriodMislabelGate({ decision, hasV2Tools, latestBreakdownResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string" || !latestBreakdownResult) return null;
+  const message = decision.message;
+  if (!ANY_WEEK_LABEL_PATTERN.test(message)) return null;
+  const { currentSpan, priorSpan, currentLabel, priorLabel } = resolveBreakdownSpans(latestBreakdownResult);
+  const currentWrong = CURRENT_WEEK_PHRASE_TEST.test(message) && currentSpan != null && currentSpan !== 7;
+  const priorWrong = PRIOR_WEEK_PHRASE_TEST.test(message) && priorSpan != null && priorSpan !== 7;
+  const wowWrong = WEEK_OVER_WEEK_TEST.test(message) && ((currentSpan != null && currentSpan !== 7) || (priorSpan != null && priorSpan !== 7));
+  if (!currentWrong && !priorWrong && !wowWrong) return null;
+  const parts = [];
+  if (currentSpan != null) parts.push(`the current period is actually ${currentSpan} days (${currentLabel})`);
+  if (priorSpan != null) parts.push(`the prior period is actually ${priorSpan} days (${priorLabel})`);
+  return `Your reply calls the period "a week," but ${parts.join(" and ")} — never say "last week"/"the week before"/"week over week" unless the real resolved span is exactly 7 days. Restate using the ACTUAL label from the tool result (dateRange.label, or comparison.currentRange.label/priorRange.label) or the real dates/day-count directly, worded naturally.`;
+}
+
+// Hard-stop path — the nudge was spent and the reply STILL mislabels the
+// period. Rather than block the whole reply (the NUMBERS are real and
+// already correct), deterministically rewrite just the mislabelled
+// phrase using the real label computed from the actual resolved dates —
+// same natural phrasing the tool itself would state ("the 30 days from 9
+// Sep to 8 Oct"), never a mechanical date dump.
+function rewritePeriodMislabel(message, latestBreakdownResult) {
+  const { currentSpan, priorSpan, currentLabel, priorLabel } = resolveBreakdownSpans(latestBreakdownResult);
+  let rewritten = message;
+  if (currentLabel && currentSpan !== 7) rewritten = rewritten.replace(CURRENT_WEEK_PHRASE_GLOBAL, currentLabel);
+  if (priorLabel && priorSpan !== 7) rewritten = rewritten.replace(PRIOR_WEEK_PHRASE_GLOBAL, priorLabel);
+  if ((currentSpan != null && currentSpan !== 7) || (priorSpan != null && priorSpan !== 7)) {
+    rewritten = rewritten.replace(WEEK_OVER_WEEK_GLOBAL, "period-over-period");
+  }
+  return rewritten;
 }
 
 // Round 47 (live production bug): "change the campaign budget to 750/day"
@@ -1458,6 +1544,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       .join("\n")
   );
   let performanceDataClaimNudges = 0;
+  let periodMislabelNudges = 0;
 
   // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
   // plain chat three separate times ("Rs.500"), the strategy's own
@@ -2059,8 +2146,9 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // The load-bearing fix this round: a "final" reply stating
       // performance figures or a period comparison with no backing tool
       // call this turn must never reach the customer, full stop.
+      const calledToolNames = new Set(toolResults.map((r) => r.toolName));
       const performanceDataClaimGateMessage = checkPerformanceDataClaimWithoutCallGate({
-        decision, hasV2Tools, v2ToolCallCounts, priorAssistantFigures,
+        decision, hasV2Tools, calledToolNames, priorAssistantFigures,
       });
       if (performanceDataClaimGateMessage && performanceDataClaimNudges < MAX_PERFORMANCE_DATA_CLAIM_NUDGES) {
         performanceDataClaimNudges += 1;
@@ -2086,6 +2174,37 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         trace.push(traceStep("completed", "Blocked a performance claim with no backing tool call this turn — replaced with a real fetch.", "done"));
         if (planId) setPlanStatus(planId, "failed");
         return { reply: honestReply, trace, toolResults, usage: usageTotals };
+      }
+      // Round 54 follow-up (live production bug) — see checkPeriodMislabelGate's
+      // own header comment. Same nudge-then-deterministic-rewrite shape as
+      // the "specific reason"/creative-question gates below: the NUMBERS
+      // in this reply are real and already correct (a backing tool call
+      // for data already happened, or the generic gate above would have
+      // caught it) — only the period's NAME is wrong, so this rewrites
+      // just that phrase rather than blocking the whole reply.
+      {
+        const latestBreakdownResult = toolResults
+          .filter((r) => r.toolName === "meta_expert_v2.get_performance_breakdown" && r.result)
+          .map((r) => r.result)
+          .pop() || null;
+        const periodMislabelMessage = checkPeriodMislabelGate({ decision, hasV2Tools, latestBreakdownResult });
+        if (periodMislabelMessage && periodMislabelNudges < MAX_PERIOD_MISLABEL_NUDGES) {
+          periodMislabelNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            { role: "user", content: periodMislabelMessage },
+          ];
+          continue;
+        }
+        if (periodMislabelMessage) {
+          // Nudge already used and it STILL calls the period "a week" —
+          // never let a false statement about what was measured reach
+          // the customer. Deterministically rewrite just the mislabelled
+          // phrase using the real label computed from the actual
+          // resolved dates — the numbers themselves are untouched.
+          decision.message = rewritePeriodMislabel(decision.message, latestBreakdownResult);
+        }
       }
       // Round 47 — see checkPostExecutionChangeWithoutEditCallGate above.
       // getMostRecentExecutedStrategyForConversation is only actually

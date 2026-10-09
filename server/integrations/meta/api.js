@@ -662,6 +662,24 @@ export async function getAdLevelInsights(accessToken, campaignId, dateParams) {
   return rows.map(extractInsightsRow);
 }
 
+// Round 54 follow-up — verified live (Graph API Explorer, v25.0, real ad
+// account act_237956315579168): /{adAccountId}/insights?level=adset
+// returns one row per ad set ACROSS ALL CAMPAIGNS in the account, each
+// carrying its own real campaign_id/campaign_name — confirmed genuinely
+// account-wide (the first row returned came from a DIFFERENT campaign
+// than the one active campaign checked by hand), not silently scoped to
+// one. Used when campaignId is omitted and 2+ campaigns are active at
+// once (performanceBreakdown.js) — never scoped to a single campaign,
+// which is the whole point of this function versus getAdSetLevelInsights
+// above.
+export async function getAccountAdSetLevelInsights(accessToken, adAccountId, dateParams) {
+  const rows = await metaFetchAllPages(
+    `/${normalizeAdAccountId(adAccountId)}/insights?level=adset&fields=adset_id,adset_name,campaign_id,campaign_name,${PERFORMANCE_BREAKDOWN_FIELDS}&limit=100&${buildDateRangeQuery(dateParams)}`,
+    accessToken
+  );
+  return rows.map(extractInsightsRow);
+}
+
 // --- Carousel creative support --------------------------------------------
 // The existing creative paths (meta.create_image_ad/meta.create_video_ad
 // in tools/meta/campaigns.js) build a single-image or single-video

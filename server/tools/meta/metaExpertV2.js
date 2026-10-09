@@ -285,33 +285,38 @@ registerOnRejectedHandler("meta_expert_v2.apply_campaign_edit", async (parameter
   if (strategyId) markStrategyRejected(strategyId);
 });
 
-// Phase 3A (round 53) — read-only. No diagnosis, no recommendations, no
-// actions: that's 3B/3C. This answers "how is campaign X doing," "which
-// ad set is spending the most / converting worst," and "how did last
-// week compare to the week before" with real per-ad-set/per-ad numbers.
+// Phase 3A (round 53, routing extended round 54) — read-only. No
+// diagnosis, no recommendations, no actions: that's 3B/3C. This answers
+// "how is campaign X doing," "which ad set is spending the most /
+// converting worst," and "how did last week compare to the week before"
+// with real per-ad-set/per-ad numbers.
 registerTool({
   name: "meta_expert_v2.get_performance_breakdown",
   description:
-    "Reads ONE SPECIFIC campaign's real performance broken down by ad set and ad, over a date range (default last 7 days — pass datePreset, e.g. last_30d/last_90d/this_month, or since+until as YYYY-MM-DD for a custom range). Returns REAL totals (spend, clicks, impressions, reach, purchases, revenue) for every ad set/ad, with blended rates (CPA, ROAS, CTR, CPM, CPC, frequency) computed from those totals — NEVER average per-entity rates yourself; a rate is never the average of rates when the denominators differ (a confirmed live bug once already, at the account level — do not reintroduce it at this one). " +
-    "An ad set/ad with noActivityInRange:true had NO recorded activity in this exact range — Meta returns no row at all for it, confirmed live; never report it as having spent zero, say it had no activity in the range instead. dateRange.resolvedSince/resolvedUntil are the REAL dates Meta actually used for this call — always state these to the user, never just the requested preset string. " +
-    "topAdSetsBySpend/worstAdSetsByCpa (and the ad-level equivalents) are plain sorts of real numbers, already computed — use them to answer 'which is spending the most / converting worst' directly, lead with 2-3 numbers per entity rather than listing every field for every ad set/ad, and never phrase any of this as a recommendation to act (no 'you should pause this' — a later capability, not this one). Pass compareToPriorPeriod:true for a 'this period vs the one before' comparison — campaign-level totals/rates and plain percent deltas only; comparison.unavailable:true means the current period itself had no activity to compare from.",
+    "Reads real Meta performance broken down by ad set (and, when scoped to one campaign, by ad too), over a date range (default last 7 days — pass datePreset, e.g. last_30d/last_90d/this_month, or since+until as YYYY-MM-DD for a custom range). campaignId is OPTIONAL: pass it to scope to one specific campaign; omit it and the backend resolves automatically — exactly one ACTIVE campaign is used automatically, 2+ active campaigns returns a real account-wide ad-set breakdown (scope:\"account_wide\" in the result) instead of asking which, 0 active campaigns is refused (name one, including a paused one). Never guess or invent a campaignId yourself — omit the field and let the backend resolve it. " +
+    "Returns REAL totals (spend, clicks, impressions, reach, purchases, revenue) for every ad set/ad, with blended rates (CPA, ROAS, CTR, CPM, CPC, frequency) computed from those totals — NEVER average per-entity rates yourself; a rate is never the average of rates when the denominators differ (a confirmed live bug once already, at the account level — do not reintroduce it at this one). " +
+    "Every ad set (and ad) carries its own real campaignId/campaignName — in an account-wide breakdown this is the ONLY way to know which campaign a given ad set belongs to; never present an ad set's numbers without naming its real campaign, and never substitute a campaign's own data as if it were an ad set's (a confirmed live bug). " +
+    "An ad set/ad with noActivityInRange:true had NO recorded activity in this exact range — Meta returns no row at all for it, confirmed live; never report it as having spent zero, say it had no activity in the range instead. " +
+    "dateRange.label (and comparison.currentRange.label/priorRange.label when compareToPriorPeriod is used) is the ONLY honest way to describe the period — it is computed from the REAL resolved dates (dateRange.resolvedSince/resolvedUntil), never the requested preset string. Relay this label, or the exact same dates/day-count, verbatim — NEVER say \"last week\"/\"the week before\"/\"week over week\" unless the label itself says the real span is 7 days (a confirmed live bug: a real 30-day window was described to the customer as \"last week\"). " +
+    "topAdSetsBySpend/worstAdSetsByCpa (and the ad-level equivalents, campaign-scoped only) are plain sorts of real numbers, already computed — use them to answer 'which is spending the most / converting worst' directly, lead with 2-3 numbers per entity rather than listing every field for every ad set/ad, and never phrase any of this as a recommendation to act (no 'you should pause this' — a later capability, not this one). Pass compareToPriorPeriod:true for a 'this period vs the one before' comparison — requires a resolved single campaign (an explicit campaignId, or exactly one active campaign); campaign-level totals/rates and plain percent deltas only; comparison.unavailable:true means the current period itself had no activity to compare from.",
   category: "meta_expert_v2",
   parameters: {
     type: "object",
     properties: {
-      campaignId: { type: "string", description: "Required — the specific campaign's real id (from get_business_snapshot's existingCampaigns, or one already named this conversation). An account-wide breakdown across multiple campaigns isn't supported yet." },
+      campaignId: { type: "string", description: "Optional — a specific campaign's real id (from get_business_snapshot's existingCampaigns, or one already named this conversation). Omit it to let the backend resolve the right scope automatically — never guess an id." },
       datePreset: { type: "string", description: "Meta date preset, e.g. last_7d (the default), last_30d, last_90d, this_month, last_month. Ignored if since/until are both given." },
       since: { type: "string", description: "YYYY-MM-DD — custom range start. Must be paired with until." },
       until: { type: "string", description: "YYYY-MM-DD — custom range end. Must be paired with since." },
-      compareToPriorPeriod: { type: "boolean", description: "When true, also returns campaign-level totals/rates for the immediately preceding period of equal length." },
+      compareToPriorPeriod: { type: "boolean", description: "When true, also returns campaign-level totals/rates for the immediately preceding period of equal length. Needs a resolved single campaign." },
     },
-    required: ["campaignId"],
+    required: [],
   },
   requiredPermissions: ["meta.read"],
   requiresConfirmation: false,
   async execute(parameters, context) {
     assertV2RuntimeEnabled(context.userId);
     return gatherPerformanceBreakdown(token(context), {
+      userId: context.userId,
       campaignId: parameters.campaignId,
       datePreset: parameters.datePreset,
       since: parameters.since,

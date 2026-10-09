@@ -22,7 +22,7 @@ const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
-const { gatherPerformanceBreakdown } = await import("../agents/metaExpertV2/performanceBreakdown.js");
+const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
@@ -7246,8 +7246,13 @@ async function run() {
     }
   });
 
-  await check("[Performance breakdown, round 53] campaignId is required — Phase 3A is scoped to one specific campaign, never an unverified account-wide breakdown", async () => {
-    await assert.rejects(() => gatherPerformanceBreakdown("fake-token", {}), /campaignId is required/);
+  await check("[Performance breakdown, round 53/54] no campaignId and no ACTIVE campaign at all — genuinely nothing to resolve automatically, refused rather than guessed", async () => {
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], campaigns: [{ id: "c1", name: "Paused Campaign", status: "PAUSED" }] }));
+    try {
+      await assert.rejects(() => gatherPerformanceBreakdown("fake-token", {}), /no ACTIVE campaign exists to resolve automatically/);
+    } finally {
+      restoreFetch();
+    }
   });
 
   // --- CRITICAL live production bug: fabricated performance data (round 54) ---
@@ -7403,6 +7408,213 @@ async function run() {
       const userMessage = "I want more sales on my website";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       assert.ok(result.reply.includes("2000"), `a reply backed by a REAL build_strategy call this turn must never be blocked or stripped: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 54 follow-up: date-range labelling + campaignId routing -----
+  // Two live production follow-ups on the round-53 tool. 1) A real
+  // last_30d-resolved comparison was presented to the customer as "last
+  // week"/"the week before" — real numbers, false period name. 2) "which
+  // ad set is spending the most" (no campaign named) called
+  // get_performance_breakdown and still fell back honest — campaignId
+  // was required and the question names no campaign.
+  await check("[Performance breakdown, round 54] formatRangeLabel: exactly 7 days reads as 'the past week'; any other span states the real day count — a 30-day window is never called a week", () => {
+    assert.equal(formatRangeLabel("2026-10-01", "2026-10-07"), "the past week (1 Oct to 7 Oct)");
+    // The EXACT real numbers from the production report: September 9 to
+    // October 8 is a genuine 30-day span, never "a week."
+    assert.equal(formatRangeLabel("2026-09-09", "2026-10-08"), "the 30 days from 9 Sep to 8 Oct");
+    assert.equal(formatRangeLabel("2026-08-10", "2026-09-08"), "the 30 days from 10 Aug to 8 Sep");
+    assert.equal(formatRangeLabel(null, "2026-10-07"), null, "no real resolved dates means no label to compute, never a guess");
+  });
+
+  await check("[Performance breakdown, round 54] campaignId omitted with EXACTLY ONE active campaign resolves it automatically — a user asking about 'the campaign' when one is active means that one", async () => {
+    // Round 53's campaignDetails lookup (metaRouter) matches a single-id
+    // GET path via an all-digits regex (meta.getCampaign's real id shape)
+    // — "111"/"222" here, not "c1"/"c2", for that reason.
+    const campaignInsights = { 111: { impressions: "833", clicks: "26", spend: "587.41", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" } };
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      campaigns: [{ id: "111", name: "The Active One", status: "ACTIVE" }, { id: "222", name: "Paused One", status: "PAUSED" }],
+      campaignInsights,
+      // meta.getCampaign's single-entity lookup, needed once a campaign
+      // is resolved automatically (same fixture shape round 53's own
+      // tests already use).
+      campaignDetails: { 111: { id: "111", name: "The Active One", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" } },
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", {});
+      assert.equal(result.scope, "campaign", "exactly one active campaign must resolve to the single-campaign shape, never account-wide");
+      assert.equal(result.campaign.id, "111");
+      assert.equal(result.campaign.name, "The Active One");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54] campaignId omitted with 2+ ACTIVE campaigns: a real ACCOUNT-WIDE ad-set breakdown, never asking which — every ad set attributed to its real campaign (the exact fact missing from the live bug)", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "AdSet in Campaign One", status: "ACTIVE", campaign_id: "c1" },
+      { id: "as2", name: "AdSet in Campaign Two", status: "ACTIVE", campaign_id: "c2" },
+    ];
+    // Verified live shape (Explorer, v25.0, real account
+    // act_237956315579168): /{adAccountId}/insights?level=adset returns
+    // rows from DIFFERENT campaigns in one call — reproduced here with
+    // as1/c1 and as2/c2 to prove the breakdown is genuinely account-wide,
+    // never scoped to a single campaign.
+    const adSetLevelInsights = {
+      act_1: [
+        { adset_id: "as1", adset_name: "AdSet in Campaign One", campaign_id: "c1", campaign_name: "Campaign One", spend: "900", clicks: "90", impressions: "9000", reach: "8000", frequency: "1.1", actions: [{ action_type: "purchase", value: "3" }], action_values: [{ action_type: "purchase", value: "600" }], date_start: "2026-10-01", date_stop: "2026-10-07" },
+        { adset_id: "as2", adset_name: "AdSet in Campaign Two", campaign_id: "c2", campaign_name: "Campaign Two", spend: "100", clicks: "10", impressions: "1000", reach: "900", frequency: "1.1", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" },
+      ],
+    };
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      campaigns: [{ id: "c1", name: "Campaign One", status: "ACTIVE" }, { id: "c2", name: "Campaign Two", status: "ACTIVE" }],
+      adSetRoster, adSetLevelInsights,
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", {});
+      assert.equal(result.scope, "account_wide");
+      assert.equal(result.adSets.length, 2);
+      const as1 = result.adSets.find((a) => a.id === "as1");
+      const as2 = result.adSets.find((a) => a.id === "as2");
+      assert.equal(as1.campaignId, "c1", "every ad set must name its real campaign");
+      assert.equal(as1.campaignName, "Campaign One");
+      assert.equal(as2.campaignId, "c2");
+      assert.equal(as2.campaignName, "Campaign Two");
+      assert.equal(result.topAdSetsBySpend[0].id, "as1", "the real top spender, sorted correctly");
+      assert.equal(result.topAdSetsBySpend[0].campaignName, "Campaign One", "the top-spend convenience view must ALSO carry campaign attribution — the exact live bug was a campaign presented with no ad-set/campaign identity at all");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54] compareToPriorPeriod with 2+ active campaigns and no campaignId is refused — a period comparison needs one resolved campaign, never silently skipped or guessed", async () => {
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      campaigns: [{ id: "c1", name: "Campaign One", status: "ACTIVE" }, { id: "c2", name: "Campaign Two", status: "ACTIVE" }],
+    }));
+    try {
+      await assert.rejects(() => gatherPerformanceBreakdown("fake-token", { compareToPriorPeriod: true }), /compareToPriorPeriod needs one specific campaign/);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54] CRITICAL live bug reproduced end-to-end: a real 30-day comparison mislabelled as 'last week'/'the week before' is nudged, then deterministically rewritten with the real day count and dates — the real numbers survive untouched", async () => {
+    const userId = makeUser(`v2-period-mislabel-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // The real text shape from the production transcript.
+    const mislabelledReply = "Here's how last week compared to the week before:\n\nSpend: $1000 (vs $500)";
+    let insightsCallCount = 0;
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1", since: "2026-09-09", until: "2026-10-08", compareToPriorPeriod: true }),
+      finalText(mislabelledReply),
+      finalText(mislabelledReply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        insightsCallCount += 1;
+        // First campaign-level call = the current period (the REAL
+        // production dates: Sep 9 - Oct 8, a genuine 30-day span); the
+        // second = the prior period gatherForOneCampaign computes from
+        // those real resolved dates (Aug 10 - Sep 8 — also matches the
+        // real production report exactly).
+        if (insightsCallCount === 1) {
+          return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "9000", actions: [], action_values: [], date_start: "2026-09-09", date_stop: "2026-10-08" }] });
+        }
+        return jsonResponse({ data: [{ spend: "500", clicks: "50", impressions: "5000", reach: "4500", actions: [], action_values: [], date_start: "2026-08-10", date_stop: "2026-09-08" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how did last week compare to the week before";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(!/\blast week\b/i.test(result.reply), `the mislabelled "last week" phrase must be rewritten: ${result.reply}`);
+      assert.ok(!/\bthe week before\b/i.test(result.reply), `the mislabelled "the week before" phrase must be rewritten: ${result.reply}`);
+      assert.ok(result.reply.includes("the 30 days from 9 Sep to 8 Oct"), `the real current period must read naturally, computed from the real dates: ${result.reply}`);
+      assert.ok(result.reply.includes("the 30 days from 10 Aug to 8 Sep"), `the real prior period must read naturally: ${result.reply}`);
+      assert.ok(result.reply.includes("1000") && result.reply.includes("500"), `the real numbers themselves must survive the rewrite untouched: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54] does NOT false-positive on a GENUINELY 7-day comparison correctly called 'last week'/'the week before'", async () => {
+    const userId = makeUser(`v2-period-no-false-positive-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const correctReply = "Here's how last week compared to the week before:\n\nSpend: $1000 (vs $500)";
+    let insightsCallCount = 0;
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1", compareToPriorPeriod: true }),
+      // Only ONE final response — if this were wrongly nudged, the mock
+      // would need a second response it never gets.
+      finalText(correctReply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        insightsCallCount += 1;
+        if (insightsCallCount === 1) {
+          return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "9000", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" }] });
+        }
+        return jsonResponse({ data: [{ spend: "500", clicks: "50", impressions: "5000", reach: "4500", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how did last week compare to the week before";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("last week") && result.reply.includes("the week before"), `a genuinely 7-day comparison correctly called "last week"/"the week before" must never be rewritten: ${result.reply}`);
     } finally {
       restoreFetch();
     }
