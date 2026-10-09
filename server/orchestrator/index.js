@@ -358,6 +358,55 @@ function rewritePeriodMislabel(message, latestBreakdownResult) {
   return rewritten;
 }
 
+// Round 54 follow-up #3 (live production bug): checkPeriodMislabelGate
+// above guards how a period is NAMED once get_performance_breakdown
+// actually returned a comparison — it has nothing to say when a
+// comparison was never attempted in the first place. Live bug: asked
+// "how did last week compare to the week before," the model called the
+// tool with a plain 30-day range and no compareToPriorPeriod at all —
+// the reply stated a single total, no "last week" wording to catch
+// (correctly not caught by the gate above), and the user had no way to
+// tell from the output that a different question had been answered.
+// Same failure class as checkPerformanceDataClaimWithoutCallGate: a
+// reply that silently answers something other than what was asked.
+//
+// COMPARISON_WORD_PATTERN alone ("compare"/"vs"/"versus") is too broad
+// for a Meta-ads conversation — "compare these two creative images" and
+// "which ad set is spending the most vs the others" are ordinary,
+// non-period questions that must never trip this. Only fires when a
+// comparison word appears near actual period/time vocabulary (week,
+// month, day, period, previous, prior, before, last, yesterday) — the
+// false-positive cost here is unusually high, since the fallback below
+// is a hard stop, not a deterministic rewrite: a wrongly-fired gate kills
+// a legitimate question outright rather than just rephrasing a label.
+const COMPARISON_WORD_PATTERN = /\b(compar(?:e|ed|ing|ison)|vs\.?|versus)\b/gi;
+const PERIOD_VOCAB_PATTERN = /\b(weeks?|months?|days?|period|previous|prior|before|last|yesterday)\b/i;
+const WEEK_OR_MONTH_OVER_OVER_PATTERN = /\bweek[- ]over[- ]week\b|\bmonth[- ]over[- ]month\b/i;
+const COMPARISON_PROXIMITY_CHARS = 40;
+function messageRequestsPeriodComparison(message) {
+  if (typeof message !== "string") return false;
+  if (WEEK_OR_MONTH_OVER_OVER_PATTERN.test(message)) return true;
+  for (const match of message.matchAll(COMPARISON_WORD_PATTERN)) {
+    const windowStart = Math.max(0, match.index - COMPARISON_PROXIMITY_CHARS);
+    const windowEnd = Math.min(message.length, match.index + match[0].length + COMPARISON_PROXIMITY_CHARS);
+    if (PERIOD_VOCAB_PATTERN.test(message.slice(windowStart, windowEnd))) return true;
+  }
+  return false;
+}
+const MAX_COMPARISON_MISSING_NUDGES = 1;
+// latestBreakdownResult?.comparison is the right test, not merely
+// whether get_performance_breakdown was called: an honest
+// { unavailable: true, reason: "..." } (genuinely nothing to compare
+// against) means a comparison WAS attempted, and must pass through
+// untouched — only the silent case, where no comparison was even
+// attempted, trips this.
+function checkComparisonRequestedButMissingGate({ decision, hasV2Tools, userMessage, latestBreakdownResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  if (!messageRequestsPeriodComparison(userMessage)) return null;
+  if (latestBreakdownResult?.comparison) return null;
+  return 'You asked a question that compares two periods, but your reply reports only a single-period total — no actual period-over-period comparison was performed this turn. Call meta_expert_v2.get_performance_breakdown with a specific campaignId AND compareToPriorPeriod: true now, and answer using the real current-vs-prior totals and deltas it returns — never a single total presented as if it answered a comparison question.';
+}
+
 // Round 47 (live production bug): "change the campaign budget to 750/day"
 // after a campaign was already created got a "final" reply presenting the
 // new number and asking for approval — with NO meta_expert_v2.
@@ -1545,6 +1594,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   );
   let performanceDataClaimNudges = 0;
   let periodMislabelNudges = 0;
+  let comparisonMissingNudges = 0;
 
   // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
   // plain chat three separate times ("Rs.500"), the strategy's own
@@ -2182,6 +2232,33 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         trace.push(traceStep("completed", "Blocked a performance claim with no backing tool call this turn — replaced with a real fetch.", "done"));
         if (planId) setPlanStatus(planId, "failed");
         return { reply: honestReply, trace, toolResults, usage: usageTotals };
+      }
+      // Round 54 follow-up #3 (live production bug) — see
+      // checkComparisonRequestedButMissingGate's own header comment. No
+      // deterministic rewrite is possible here (there's no real
+      // comparison data to rewrite INTO) — the nudge is spent, so this
+      // fails honest rather than let a single-period total silently
+      // stand in for the comparison that was actually asked for.
+      const comparisonMissingGateMessage = checkComparisonRequestedButMissingGate({
+        decision, hasV2Tools, userMessage, latestBreakdownResult,
+      });
+      if (comparisonMissingGateMessage && comparisonMissingNudges < MAX_COMPARISON_MISSING_NUDGES) {
+        comparisonMissingNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: comparisonMissingGateMessage },
+        ];
+        continue;
+      }
+      if (comparisonMissingGateMessage) {
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "A comparison was requested but never actually performed — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I wasn't able to put together an actual period-over-period comparison for that — could you repeat the request (naming the specific campaign, if you haven't) and I'll pull the real current-vs-prior numbers this time?",
+          trace, toolResults, usage: usageTotals,
+        };
       }
       // Round 54 follow-up (live production bug) — see checkPeriodMislabelGate's
       // own header comment. Same nudge-then-deterministic-rewrite shape as

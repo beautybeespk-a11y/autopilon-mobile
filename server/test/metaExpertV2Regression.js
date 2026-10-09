@@ -7796,6 +7796,201 @@ async function run() {
     }
   });
 
+  await check("[Performance breakdown, round 54 follow-up #3] CRITICAL live bug reproduced end-to-end: a comparison was asked for, the tool was called WITHOUT compareToPriorPeriod, the reply silently answers with a single total — nudged, then fails honest rather than let it through", async () => {
+    // The exact live bug: "how did last week compare to the week before"
+    // got a real tool call, but without compareToPriorPeriod — a single
+    // 7-day total, no comparison object at all. checkPeriodMislabelGate
+    // correctly stays silent (the reply never says "week"), which is
+    // exactly the gap this new gate closes.
+    const userId = makeUser(`v2-comparison-missing-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const singleTotalReply = "Here's how the campaign is doing: Spend: PKR 1,000, Revenue: PKR 2,000.";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1", since: "2026-09-24", until: "2026-09-30" }),
+      finalText(singleTotalReply),
+      finalText(singleTotalReply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "PKR" });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "9000", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "2000" }], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how did last week compare to the week before";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, "I wasn't able to put together an actual period-over-period comparison for that — could you repeat the request (naming the specific campaign, if you haven't) and I'll pull the real current-vs-prior numbers this time?", `a silently-answered comparison question must fail honest, never reach the customer as a single total: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54 follow-up #3] does NOT false-positive on 'compare these two creative images' — no period/time vocabulary near the comparison word", async () => {
+    const userId = makeUser(`v2-comparison-fp-creative-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const reply = "Here are the two creative images for your campaign — the first uses a lifestyle shot, the second a product close-up.";
+    let chatIndex = 0;
+    // Only ONE final response — if the gate wrongly nudged, the mock
+    // would need a second response it never gets.
+    const chatResponses = [finalText(reply)];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "compare these two creative images";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, reply, `an ordinary creative-comparison question (no period vocabulary) must never trip the comparison-missing gate: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54 follow-up #3] does NOT false-positive on 'which ad set is spending the most vs the others' — a cross-entity comparison, not a period one", async () => {
+    const userId = makeUser(`v2-comparison-fp-adset-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const reply = "Ad Set A is spending the most at PKR 900, compared to Ad Set B's PKR 100.";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1" }),
+      finalText(reply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "PKR" });
+      if (path.endsWith("/adsets")) {
+        return jsonResponse({ data: [{ id: "as1", name: "Ad Set A", status: "ACTIVE", campaign_id: "c1" }, { id: "as2", name: "Ad Set B", status: "ACTIVE", campaign_id: "c1" }] });
+      }
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset") {
+          return jsonResponse({ data: [
+            { adset_id: "as1", adset_name: "Ad Set A", campaign_id: "c1", campaign_name: "Real Campaign", spend: "900", clicks: "90", impressions: "9000", reach: "8000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+            { adset_id: "as2", adset_name: "Ad Set B", campaign_id: "c1", campaign_name: "Real Campaign", spend: "100", clicks: "10", impressions: "1000", reach: "900", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+          ] });
+        }
+        if (level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "10000", reach: "8900", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "which ad set is spending the most vs the others";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, reply, `a cross-entity ad-set comparison (no period vocabulary near "vs") must never trip the comparison-missing gate: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, round 54 follow-up #3] an HONEST 'comparison unavailable' result passes through untouched — a comparison was attempted, never silently invented", async () => {
+    const userId = makeUser(`v2-comparison-honest-unavailable-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const reply = "I don't have enough data to compare last week to the week before — there was no real activity in the most recent period.";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1", compareToPriorPeriod: true }),
+      finalText(reply),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/adsets") || path.endsWith("/ads")) {
+        return jsonResponse({ data: [] });
+      }
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "PKR" });
+      // No activity at all in the current range — gatherForOneCampaign's
+      // own pre-existing mechanism marks the comparison itself
+      // unavailable (comparison.unavailable: true), never fabricating a
+      // prior-period fetch against dates that don't exist. This IS a
+      // comparison that was attempted — must never trip the new gate.
+      if (path.endsWith("/insights")) return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how did last week compare to the week before";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, reply, `an honest "nothing to compare" result must pass through untouched, never overridden by the comparison-missing gate: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
     const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
     connectMeta(userId);
