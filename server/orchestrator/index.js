@@ -255,6 +255,45 @@ function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, called
   return null;
 }
 
+// Round 55 (Phase 3B — diagnosis). Sibling to
+// checkPerformanceDataClaimWithoutCallGate above, same discipline: a
+// JUDGEMENT (not just a raw figure) must be backed by a real tool result
+// this turn. performanceBreakdown.js now computes a deterministic
+// `diagnosis` array (creative fatigue, zero conversions, CTR decline,
+// budget concentration — see that file's own header comment for the full
+// design and the thresholds). This gate stops the model from reaching a
+// verdict in its own words — "this ad set looks fatigued" — when either
+// the tool was never called this turn, or it was called and returned no
+// diagnosis findings at all (meaning nothing actually crossed a
+// threshold). Deliberately checked at the coarse grain of "did
+// diagnosis come back non-empty," not by matching the claim's exact
+// wording against a specific finding — the same grain
+// checkPerformanceDataClaimWithoutCallGate already uses for raw figures
+// (it trusts "a backing tool was called," not a figure-by-figure replay).
+const DIAGNOSIS_CLAIM_PATTERN = /\b(fatigu(?:e|ed|ing)|losing|underperform\w*|declin\w*|worsening|struggling|saturat\w*|burnt?[- ]out|creative problem)\b/i;
+const MAX_DIAGNOSIS_CLAIM_NUDGES = 1;
+function checkDiagnosisClaimWithoutBackingGate({ decision, hasV2Tools, calledToolNames, latestBreakdownResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  if (!DIAGNOSIS_CLAIM_PATTERN.test(decision.message)) return null;
+  const hasBacking = calledToolNames.has("meta_expert_v2.get_performance_breakdown") && latestBreakdownResult?.diagnosis?.length > 0;
+  if (hasBacking) return null;
+  return 'Your reply makes a performance judgement (fatigue, underperformance, decline, saturation...), but meta_expert_v2.get_performance_breakdown either wasn\'t called this turn or returned no diagnosis findings at all — meaning nothing actually crossed a real threshold. Call it now and base any judgement ONLY on what diagnosis actually returns, with the real number and threshold it names — never a verdict from memory or intuition. If diagnosis genuinely returns nothing, say the data doesn\'t support a judgement right now rather than asserting one.';
+}
+
+// Round 55 (Phase 3B) — 3B is RECOMMENDATIONS ONLY: no tool exists this
+// round that pauses a campaign/ad set, changes a budget, or disables
+// anything (that's 3C). So a claim that one of those already happened is
+// never true, full stop — unlike the gates above, there is no "was the
+// right tool called" check to make, because no such tool exists to call.
+// Blocked unconditionally, no nudge: there's nothing to retry toward.
+const FALSE_ACTION_CLAIM_PATTERN = /\bi'?ve (paused|turned off|disabled|stopped|reduced the budget|cut the budget|lowered the budget)\b/i;
+const MAX_FALSE_ACTION_CLAIM_NUDGES = 1;
+function checkFalseActionClaimGate({ decision, hasV2Tools }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  if (!FALSE_ACTION_CLAIM_PATTERN.test(decision.message)) return null;
+  return "Your reply claims you already paused, disabled, or changed the budget of something. No tool exists yet that can do that — this round is recommendations only. Rewrite your reply as a recommendation (\"consider pausing...\", \"this ad set is a candidate for a lower budget...\") and never state that an action was taken.";
+}
+
 // Requirement (round 54): the hard-stop below must never be a dead end —
 // "never getting numbers is the one that cannot bend," but a user asking
 // a reasonable question still deserves either real data or an honest,
@@ -1595,6 +1634,8 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let performanceDataClaimNudges = 0;
   let periodMislabelNudges = 0;
   let comparisonMissingNudges = 0;
+  let diagnosisClaimNudges = 0;
+  let falseActionClaimNudges = 0;
 
   // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
   // plain chat three separate times ("Rs.500"), the strategy's own
@@ -2257,6 +2298,56 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         if (planId) setPlanStatus(planId, "failed");
         return {
           reply: "I wasn't able to put together an actual period-over-period comparison for that — could you repeat the request (naming the specific campaign, if you haven't) and I'll pull the real current-vs-prior numbers this time?",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
+      // Round 55 (Phase 3B) — see checkFalseActionClaimGate's own header
+      // comment. No tool exists this round that pauses/disables/changes a
+      // budget, so this claim can never be true, no matter what. One
+      // nudge to rephrase as a recommendation, then an honest hard-stop —
+      // same shape as every other gate here, even though the backing
+      // condition itself never varies.
+      const falseActionClaimMessage = checkFalseActionClaimGate({ decision, hasV2Tools });
+      if (falseActionClaimMessage && falseActionClaimNudges < MAX_FALSE_ACTION_CLAIM_NUDGES) {
+        falseActionClaimNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: falseActionClaimMessage },
+        ];
+        continue;
+      }
+      if (falseActionClaimMessage) {
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Claimed an action no tool could have taken this round — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I can recommend changes, but I can't actually pause, disable, or change a budget yet — that's not built in this round. Would you like me to lay out the recommendation instead, for you to apply yourself in Meta Ads Manager?",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
+      // Round 55 (Phase 3B) — see checkDiagnosisClaimWithoutBackingGate's
+      // own header comment. Same nudge-then-hard-stop shape as the
+      // performance-data-claim gate above, applied to a JUDGEMENT rather
+      // than a raw figure. No deterministic rewrite is possible (there's
+      // no real diagnosis to rewrite the claim INTO), so the hard-stop
+      // strips the judgement rather than inventing one.
+      const diagnosisClaimMessage = checkDiagnosisClaimWithoutBackingGate({ decision, hasV2Tools, calledToolNames, latestBreakdownResult });
+      if (diagnosisClaimMessage && diagnosisClaimNudges < MAX_DIAGNOSIS_CLAIM_NUDGES) {
+        diagnosisClaimNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: diagnosisClaimMessage },
+        ];
+        continue;
+      }
+      if (diagnosisClaimMessage) {
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "A performance judgement with no backing diagnosis — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I don't have a verified basis for a judgement like that right now — let me pull the real numbers first. Ask me again and I'll base any recommendation only on what the data actually shows.",
           trace, toolResults, usage: usageTotals,
         };
       }

@@ -172,6 +172,164 @@ function worstByCpa(entities, n = 3) {
     .map((e) => ({ id: e.id, name: e.name, cpa: e.rates.cpa, campaignId: e.campaignId ?? null, campaignName: e.campaignName ?? null }));
 }
 
+// --- Phase 3B (round 55): deterministic diagnosis ------------------------
+//
+// 3A (above) reads honestly. This teaches the agent to JUDGE what it
+// reads — RECOMMENDATIONS ONLY, never an action (pausing/budget changes
+// are 3C, not built here). Investigated and reported before coding;
+// exactly two sources of judgement are allowed, matching that report:
+//
+//   1. The account's OWN data — this period vs. prior periods, this
+//      entity vs. its siblings in the same account. Everything below
+//      reads only fields gatherForOneCampaign/gatherAccountWideAdSets
+//      already fetch (plus campaign.created_time, one additive field).
+//   2. Structural rules that need no external benchmark — mechanical
+//      facts about a ratio (frequency) or a sample size (clicks), never
+//      "good CPA for beauty in Pakistan is X."
+//
+// Investigated and explicitly rejected: Meta's public Marketing API (what
+// this file calls) has no industry-benchmark or auction-ranking endpoint
+// for a third-party app's own access token. No real source exists, so
+// none is used — the alternative (an invented number) is fabrication
+// wearing a different hat, the exact pattern this project has already
+// been burned by.
+//
+// Every finding below states the real number it rests on AND the
+// threshold that was crossed — a bare verdict is never acceptable here;
+// a user who disagrees with a threshold needs to be able to see it.
+const ZERO_CONVERSION_CLICKS_THRESHOLD = 50;
+// Clicks, not a spend amount — a currency figure means something
+// ~280x different depending on the account's currency (round 54
+// follow-up's PKR/$ bug proved this directly), so it can never be the
+// THRESHOLD, only something reported alongside one. Clicks are
+// currency-agnostic. 50 is a sample-size argument, not a performance
+// judgement: zero purchases across 50 real clicks is a pattern worth
+// naming, not two unlucky non-converters.
+const FATIGUE_FREQUENCY_THRESHOLD = 3.0;
+// A mechanical fact about the ratio itself (impressions/reach) — "the
+// average person in this audience has now seen this ad 3+ times" — not
+// a comparison to any outside benchmark.
+const CTR_DECLINE_PCT_THRESHOLD = -20;
+// Campaign-level only this round: the only granularity where a real
+// prior-period CTR exists today (comparison.deltas below). Ad-set/ad
+// level would need a new prior-period fetch at that granularity —
+// deferred as its own decision, not built here (see this round's
+// investigation report).
+const BUDGET_CONCENTRATION_SHARE_THRESHOLD = 0.5;
+const WORSE_CPA_MARGIN = 1.2; // the top spender's CPA must be >=20% worse
+// Both noise filters, not quality judgements: without them, a trivial
+// 2% spend-share or CPA gap between two ad sets would get surfaced as if
+// it meant something. They decide whether a difference is WORTH NAMING,
+// never whether a number is "good."
+const MIN_CAMPAIGN_AGE_DAYS_FOR_TREND = 14;
+
+function median(numbers) {
+  if (!numbers.length) return null;
+  const sorted = [...numbers].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function diagnoseZeroConversions(entity, scopeLabel) {
+  if (!entity.totals || entity.noActivityInRange) return null;
+  if (entity.totals.purchases !== 0) return null;
+  if (entity.totals.clicks < ZERO_CONVERSION_CLICKS_THRESHOLD) return null;
+  return {
+    type: "zero_conversions",
+    scope: scopeLabel,
+    entityId: entity.id,
+    entityName: entity.name,
+    message: `${entity.name}: ${entity.totals.clicks} clicks and 0 purchases (spend ${entity.totals.spend}) — zero conversions on ${entity.totals.clicks} clicks clears the ${ZERO_CONVERSION_CLICKS_THRESHOLD}-click sample-size threshold, so this is a real result, not a data gap.`,
+  };
+}
+
+// Reach qualifier is RELATIVE to this entity's own siblings in the same
+// account/campaign, never an absolute cutoff — an absolute "small reach"
+// number would be exactly as unjustified as an invented benchmark.
+// otherReaches excludes the entity itself. With no siblings to compare
+// against, frequency alone is still reported (it's a real fact about the
+// ratio regardless of audience size) — just without a relative-reach claim.
+function diagnoseFatigue(entity, scopeLabel, otherReaches) {
+  if (!entity.rates || entity.noActivityInRange) return null;
+  const freq = entity.rates.frequency;
+  if (freq == null || freq < FATIGUE_FREQUENCY_THRESHOLD) return null;
+  const reach = entity.totals.reach;
+  if (otherReaches && otherReaches.length > 0) {
+    const med = median(otherReaches);
+    if (reach > med) return null; // not small relative to its peers — no finding
+    return {
+      type: "creative_fatigue",
+      scope: scopeLabel,
+      entityId: entity.id,
+      entityName: entity.name,
+      message: `${entity.name}: frequency ${freq.toFixed(2)} exceeds the ${FATIGUE_FREQUENCY_THRESHOLD} fatigue threshold, on a reach of ${reach} — at or below the median reach (${med}) of its ${otherReaches.length} other ${scopeLabel}(s) with activity this period. The same people are seeing this repeatedly more than most of its peers; consider new creative.`,
+    };
+  }
+  return {
+    type: "creative_fatigue",
+    scope: scopeLabel,
+    entityId: entity.id,
+    entityName: entity.name,
+    message: `${entity.name}: frequency ${freq.toFixed(2)} exceeds the ${FATIGUE_FREQUENCY_THRESHOLD} fatigue threshold (reach ${reach}; no other ${scopeLabel} with activity this period to compare reach against). Consider new creative.`,
+  };
+}
+
+function diagnoseCtrDecline(comparison, campaign) {
+  if (!comparison || comparison.unavailable || !comparison.deltas) return null;
+  const ctrPct = comparison.deltas.ctrPct;
+  if (ctrPct == null || ctrPct > CTR_DECLINE_PCT_THRESHOLD) return null;
+  return {
+    type: "ctr_decline",
+    scope: "campaign",
+    entityId: campaign.id,
+    entityName: campaign.name,
+    message: `${campaign.name}: CTR fell ${ctrPct.toFixed(1)}% period over period, from ${comparison.prior.rates.ctr.toFixed(2)}% to ${comparison.current.rates.ctr.toFixed(2)}% — clears the ${CTR_DECLINE_PCT_THRESHOLD}% decline threshold. A falling click-through rate period over period usually signals the creative is wearing out.`,
+  };
+}
+
+// At most one finding per sibling group — the group's OWN numbers only,
+// no external anchor. share/margin are noise filters (see their own
+// comments above), never a claim about what a "good" CPA is.
+function diagnoseBudgetConcentration(entities, scopeLabel) {
+  const active = entities.filter((e) => !e.noActivityInRange && e.totals && e.totals.spend > 0);
+  if (active.length < 2) return null;
+  const totalSpend = active.reduce((sum, e) => sum + e.totals.spend, 0);
+  if (totalSpend <= 0) return null;
+  const top = [...active].sort((a, b) => b.totals.spend - a.totals.spend)[0];
+  const share = top.totals.spend / totalSpend;
+  if (share < BUDGET_CONCENTRATION_SHARE_THRESHOLD || top.rates.cpa == null) return null;
+  const others = active.filter((e) => e.id !== top.id && e.rates.cpa != null);
+  if (!others.length) return null;
+  const bestOther = others.reduce((best, e) => (e.rates.cpa < best.rates.cpa ? e : best));
+  if (bestOther.rates.cpa <= 0 || top.rates.cpa < bestOther.rates.cpa * WORSE_CPA_MARGIN) return null;
+  return {
+    type: "budget_concentration",
+    scope: scopeLabel,
+    entityId: top.id,
+    entityName: top.name,
+    message: `${top.name} consumes ${(share * 100).toFixed(0)}% of total ${scopeLabel} spend — clears the ${(BUDGET_CONCENTRATION_SHARE_THRESHOLD * 100).toFixed(0)}% concentration threshold — at a CPA of ${top.rates.cpa.toFixed(2)}, which is ${(top.rates.cpa / bestOther.rates.cpa).toFixed(1)}x ${bestOther.name}'s ${bestOther.rates.cpa.toFixed(2)} — clears the ${WORSE_CPA_MARGIN}x worse-CPA threshold. Most of the budget is going to the less efficient option.`,
+  };
+}
+
+// Only relevant when a trend was actually requested (compareToPriorPeriod)
+// — current-period-only findings (zero-conversion, fatigue, budget
+// concentration) don't need campaign age at all, so this never suppresses
+// those. "Three weeks of history on one campaign cannot support a
+// confident trend claim" — this is that rule, in code rather than left to
+// the model's judgement.
+function diagnoseInsufficientHistoryForTrend(campaign) {
+  if (!campaign.createdTime) return null;
+  const ageDays = Math.floor((Date.now() - new Date(campaign.createdTime).getTime()) / 86400000);
+  if (ageDays >= MIN_CAMPAIGN_AGE_DAYS_FOR_TREND) return null;
+  return {
+    type: "insufficient_data",
+    scope: "campaign",
+    entityId: campaign.id,
+    entityName: campaign.name,
+    message: `${campaign.name} is only ${ageDays} day(s) old — below the ${MIN_CAMPAIGN_AGE_DAYS_FOR_TREND}-day threshold for a confident trend judgement. The numbers above are real, but there isn't enough history yet to call a period-over-period trend.`,
+  };
+}
+
 async function gatherForOneCampaign(accessToken, campaignId, dateParams, compareToPriorPeriod) {
   const campaign = await meta.getCampaign(accessToken, campaignId);
 
@@ -234,12 +392,37 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
           purchasesPct: percentChange(campaignSummary.totals.purchases, priorTotals.purchases),
           cpaPct: percentChange(campaignSummary.rates.cpa, priorRates.cpa),
           roasPct: percentChange(campaignSummary.rates.roas, priorRates.roas),
+          // Round 55 (Phase 3B) — added so diagnoseCtrDecline below has a
+          // real delta to read; frequencyPct carried alongside for the
+          // same reason diagnosis text always ships its own numbers.
+          ctrPct: percentChange(campaignSummary.rates.ctr, priorRates.ctr),
+          frequencyPct: percentChange(campaignSummary.rates.frequency, priorRates.frequency),
         } : null,
       };
     } else {
       comparison = { unavailable: true, reason: "No activity in the current range, so there's no resolved date range to compare a prior period against." };
     }
   }
+
+  // Phase 3B diagnosis — see this file's own header comment above
+  // gatherForOneCampaign for the full design. Current-period rules
+  // (zero-conversion, fatigue, budget concentration) apply regardless of
+  // campaign age; only the TREND rule (CTR decline) is suppressed by
+  // insufficientHistory, since that's the only one a young campaign
+  // genuinely can't support.
+  const insufficientHistory = compareToPriorPeriod ? diagnoseInsufficientHistoryForTrend({ id: campaign.id, name: campaign.name, createdTime: campaign.created_time }) : null;
+  const diagnosis = [
+    insufficientHistory,
+    diagnoseZeroConversions(campaignSummary, "campaign"),
+    diagnoseFatigue(campaignSummary, "campaign", []),
+    insufficientHistory ? null : diagnoseCtrDecline(comparison, campaign),
+    ...adSetsWithActivity.map((a) => diagnoseZeroConversions(a, "ad set")),
+    ...adSetsWithActivity.map((a) => diagnoseFatigue(a, "ad set", adSetsWithActivity.filter((o) => o.id !== a.id).map((o) => o.totals.reach))),
+    diagnoseBudgetConcentration(adSetsWithActivity, "ad set"),
+    ...adsWithActivity.map((a) => diagnoseZeroConversions(a, "ad")),
+    ...adsWithActivity.map((a) => diagnoseFatigue(a, "ad", adsWithActivity.filter((o) => o.id !== a.id).map((o) => o.totals.reach))),
+    diagnoseBudgetConcentration(adsWithActivity, "ad"),
+  ].filter(Boolean);
 
   return {
     scope: "campaign",
@@ -260,6 +443,7 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
     topAdsBySpend: topBySpend(adsWithActivity),
     worstAdsByCpa: worstByCpa(adsWithActivity),
     comparison,
+    diagnosis,
   };
 }
 
@@ -303,6 +487,16 @@ async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
   const resolvedSince = rows[0]?.date_start || null;
   const resolvedUntil = rows[0]?.date_stop || null;
 
+  // Phase 3B diagnosis — no compareToPriorPeriod support at this scope
+  // (gatherPerformanceBreakdown already refuses that combination before
+  // this function is ever called), so no trend rule and no campaign-age
+  // guard applies here — only the current-period rules, same as above.
+  const diagnosis = [
+    ...adSetsWithActivity.map((a) => diagnoseZeroConversions(a, "ad set")),
+    ...adSetsWithActivity.map((a) => diagnoseFatigue(a, "ad set", adSetsWithActivity.filter((o) => o.id !== a.id).map((o) => o.totals.reach))),
+    diagnoseBudgetConcentration(adSetsWithActivity, "ad set"),
+  ].filter(Boolean);
+
   return {
     scope: "account_wide",
     adAccountId,
@@ -313,6 +507,7 @@ async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
     adSets: allAdSets,
     topAdSetsBySpend: topBySpend(adSetsWithActivity),
     worstAdSetsByCpa: worstByCpa(adSetsWithActivity),
+    diagnosis,
   };
 }
 

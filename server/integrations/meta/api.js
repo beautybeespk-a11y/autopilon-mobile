@@ -529,8 +529,14 @@ export async function getAdSet(accessToken, adSetId) {
 // cross-reference listAdSets/listAds (account-scoped, not campaign-
 // scoped) against this one campaign, without a second single-entity
 // lookup just to get the account id.
+//
+// Round 55 (Phase 3B) — created_time added (same reasoning: an extra
+// field no existing caller reads is harmless) so performanceBreakdown.js
+// can refuse a trend diagnosis on a campaign too young to support one,
+// instead of silently judging a 3-day-old campaign the same way it would
+// judge a 3-month-old one.
 export async function getCampaign(accessToken, campaignId) {
-  return metaFetch(`/${campaignId}?fields=id,name,status,objective,account_id`, { accessToken });
+  return metaFetch(`/${campaignId}?fields=id,name,status,objective,account_id,created_time`, { accessToken });
 }
 
 // Round 45 (edit-an-existing-campaign feature) — ad sets only ever had a

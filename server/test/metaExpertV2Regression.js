@@ -7991,6 +7991,356 @@ async function run() {
     }
   });
 
+  // --- Phase 3B: deterministic diagnosis (round 55) ------------------------
+  await check("[Diagnosis, round 55] zero conversions fires only once the 50-click sample-size threshold is cleared — not on a handful of clicks", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "Enough Clicks, No Sales", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Too Few Clicks To Judge", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        { adset_id: "as1", adset_name: "Enough Clicks, No Sales", campaign_id: CAMPAIGN_ID, spend: "300", clicks: "60", impressions: "3000", reach: "2800", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        { adset_id: "as2", adset_name: "Too Few Clicks To Judge", campaign_id: CAMPAIGN_ID, spend: "20", clicks: "10", impressions: "200", reach: "190", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const finding = result.diagnosis.find((d) => d.type === "zero_conversions" && d.entityId === "as1");
+      assert.ok(finding, `60 clicks with 0 purchases must clear the 50-click threshold and be flagged: ${JSON.stringify(result.diagnosis)}`);
+      assert.ok(finding.message.includes("60") && finding.message.includes("50-click"), `the finding must state the real click count AND the threshold: ${finding.message}`);
+      assert.ok(!result.diagnosis.some((d) => d.entityId === "as2"), `10 clicks never clears the 50-click sample-size threshold, regardless of purchases: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] creative fatigue uses a RELATIVE reach qualifier (median of siblings), never an arbitrary absolute reach number", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "Small Reach, High Frequency", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Big Reach A", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as3", name: "Big Reach B", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        // frequency = impressions/reach = 3500/1000 = 3.5 — clears 3.0, and
+        // reach 1000 is below the median of its two siblings (5000, 6000 -> 5500).
+        { adset_id: "as1", adset_name: "Small Reach, High Frequency", campaign_id: CAMPAIGN_ID, spend: "100", clicks: "20", impressions: "3500", reach: "1000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        { adset_id: "as2", adset_name: "Big Reach A", campaign_id: CAMPAIGN_ID, spend: "400", clicks: "80", impressions: "5500", reach: "5000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        { adset_id: "as3", adset_name: "Big Reach B", campaign_id: CAMPAIGN_ID, spend: "500", clicks: "100", impressions: "6600", reach: "6000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const finding = result.diagnosis.find((d) => d.type === "creative_fatigue" && d.entityId === "as1");
+      assert.ok(finding, `frequency 3.5 on a reach below its siblings' median must be flagged: ${JSON.stringify(result.diagnosis)}`);
+      assert.ok(finding.message.includes("3.50") && finding.message.includes("3 fatigue threshold") && finding.message.includes("5500"), `the finding must state the real frequency, the threshold, AND the real median it was compared against — never a bare verdict: ${finding.message}`);
+      assert.ok(!result.diagnosis.some((d) => d.type === "creative_fatigue" && (d.entityId === "as2" || d.entityId === "as3")), `neither big-reach ad set has frequency >= 3.0, so neither can be flagged: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] creative fatigue falls back to frequency alone (no relative-reach claim) when there is no sibling to compare reach against", async () => {
+    const adSetRoster = [{ id: "as1", name: "Only Ad Set", status: "ACTIVE", campaign_id: CAMPAIGN_ID }];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        { adset_id: "as1", adset_name: "Only Ad Set", campaign_id: CAMPAIGN_ID, spend: "200", clicks: "40", impressions: "9600", reach: "2400", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const finding = result.diagnosis.find((d) => d.type === "creative_fatigue" && d.entityId === "as1");
+      assert.ok(finding, `frequency 4.0 (9600/2400) with no sibling must still be flagged on frequency alone: ${JSON.stringify(result.diagnosis)}`);
+      assert.ok(finding.message.includes("4.00") && !finding.message.includes("median"), `with no sibling to compare against, the message must never claim a relative-reach comparison it didn't make: ${finding.message}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] budget concentration flags the top spender only when BOTH the share and the CPA-worse margin clear their noise-filter thresholds", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "Big Spender, Worse CPA", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Small Spender, Better CPA", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        // spend 800 of 1000 total = 80% share; cpa = 800/2 = 400
+        { adset_id: "as1", adset_name: "Big Spender, Worse CPA", campaign_id: CAMPAIGN_ID, spend: "800", clicks: "80", impressions: "8000", reach: "7500", actions: [{ action_type: "purchase", value: "2" }], action_values: [{ action_type: "purchase", value: "400" }], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        // spend 200 = 20% share; cpa = 200/10 = 20 -> 20x better than as1's 400
+        { adset_id: "as2", adset_name: "Small Spender, Better CPA", campaign_id: CAMPAIGN_ID, spend: "200", clicks: "40", impressions: "4000", reach: "3800", actions: [{ action_type: "purchase", value: "10" }], action_values: [{ action_type: "purchase", value: "1000" }], date_start: "2026-09-24", date_stop: "2026-09-30" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      const finding = result.diagnosis.find((d) => d.type === "budget_concentration");
+      assert.ok(finding, `80% share at a 20x-worse CPA must clear both noise-filter thresholds: ${JSON.stringify(result.diagnosis)}`);
+      assert.equal(finding.entityId, "as1");
+      assert.ok(finding.message.includes("80%") && finding.message.includes("50% concentration threshold") && finding.message.includes("20.0x") && finding.message.includes("1.2x worse-CPA threshold"), `the finding must state the real share, the real CPA multiple, AND both thresholds: ${finding.message}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] budget concentration does NOT false-positive on a trivial CPA gap — the margin is a noise filter, not a quality judgement", async () => {
+    const adSetRoster = [
+      { id: "as1", name: "Big Spender, Slightly Worse CPA", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+      { id: "as2", name: "Small Spender", status: "ACTIVE", campaign_id: CAMPAIGN_ID },
+    ];
+    const adSetLevelInsights = {
+      [CAMPAIGN_ID]: [
+        // cpa = 800/8 = 100
+        { adset_id: "as1", adset_name: "Big Spender, Slightly Worse CPA", campaign_id: CAMPAIGN_ID, spend: "800", clicks: "80", impressions: "8000", reach: "7500", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "1600" }], date_start: "2026-09-24", date_stop: "2026-09-30" },
+        // cpa = 200/2 = 100 -- same CPA, well under the 1.2x worse-CPA threshold
+        { adset_id: "as2", adset_name: "Small Spender", campaign_id: CAMPAIGN_ID, spend: "200", clicks: "20", impressions: "2000", reach: "1900", actions: [{ action_type: "purchase", value: "2" }], action_values: [{ action_type: "purchase", value: "400" }], date_start: "2026-09-24", date_stop: "2026-09-30" },
+      ],
+    };
+    mockFetch(metaRouter({ campaignDetails: perfCampaignDetails(), adSetRoster, adSetLevelInsights, adRoster: [], adLevelInsights: {} }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      assert.ok(!result.diagnosis.some((d) => d.type === "budget_concentration"), `an identical CPA must never be flagged as "worse," no matter the spend share: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] CTR decline fires at the campaign level from a REAL prior-period comparison, and is suppressed on a campaign too young to support a trend", async () => {
+    const oldEnoughCreatedTime = new Date(Date.now() - 365 * 86400000).toISOString();
+    const tooYoungCreatedTime = new Date(Date.now() - 2 * 86400000).toISOString();
+    let insightsCallCount = 0;
+    const buildMock = (createdTime) => async (url) => {
+      const u = new URL(url);
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ ...perfCampaignDetails()[CAMPAIGN_ID], created_time: createdTime });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
+      if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+        insightsCallCount += 1;
+        // Current period: CTR = 50/1000*100 = 5%. Prior: 100/1000*100 = 10%.
+        // Decline = (5-10)/10*100 = -50%, clears the -20% threshold.
+        if (insightsCallCount === 1) {
+          return jsonResponse({ data: [{ spend: "1000", clicks: "50", impressions: "1000", reach: "900", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "1000" }], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+        }
+        return jsonResponse({ data: [{ spend: "1000", clicks: "100", impressions: "1000", reach: "900", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "1000" }], date_start: "2026-09-17", date_stop: "2026-09-23" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    };
+    mockFetch(buildMock(oldEnoughCreatedTime));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, compareToPriorPeriod: true });
+      const finding = result.diagnosis.find((d) => d.type === "ctr_decline");
+      assert.ok(finding, `a -50% CTR change clears the -20% decline threshold on an old-enough campaign: ${JSON.stringify(result.diagnosis)}`);
+      assert.ok(finding.message.includes("50.0%") && finding.message.includes("-20% decline threshold"), `the finding must state the real decline AND the threshold: ${finding.message}`);
+      assert.ok(!result.diagnosis.some((d) => d.type === "insufficient_data"), `an old campaign must never be flagged as too young: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+
+    insightsCallCount = 0;
+    mockFetch(buildMock(tooYoungCreatedTime));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, compareToPriorPeriod: true });
+      assert.ok(result.diagnosis.some((d) => d.type === "insufficient_data"), `a 2-day-old campaign must be flagged as too young for a trend judgement: ${JSON.stringify(result.diagnosis)}`);
+      assert.ok(!result.diagnosis.some((d) => d.type === "ctr_decline"), `the SAME -50% CTR change must be suppressed on a campaign too young to support a trend claim, even though the raw numbers are identical: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] account-wide ad-set diagnosis (no campaignId, 2+ active campaigns) applies the same current-period rules", async () => {
+    const adSetRoster = [{ id: "as1", name: "Account-wide Zero Conversions", status: "ACTIVE", campaign_id: "c1" }];
+    const adSetLevelInsights = {
+      act_1: [{ adset_id: "as1", adset_name: "Account-wide Zero Conversions", campaign_id: "c1", campaign_name: "Campaign One", spend: "300", clicks: "60", impressions: "3000", reach: "2800", actions: [], action_values: [], date_start: "2026-10-01", date_stop: "2026-10-07" }],
+    };
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A" }],
+      campaigns: [{ id: "c1", name: "Campaign One", status: "ACTIVE" }, { id: "c2", name: "Campaign Two", status: "ACTIVE" }],
+      adSetRoster, adSetLevelInsights,
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", {});
+      assert.equal(result.scope, "account_wide");
+      const finding = result.diagnosis.find((d) => d.type === "zero_conversions" && d.entityId === "as1");
+      assert.ok(finding, `the account-wide path must run the same diagnosis rules as the single-campaign path: ${JSON.stringify(result.diagnosis)}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] checkDiagnosisClaimWithoutBackingGate: a judgement with NO backing diagnosis is nudged, then fails honest rather than reach the customer", async () => {
+    const userId = makeUser(`v2-diagnosis-unbacked-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const unbackedClaim = "This ad set shows clear creative fatigue and is losing money.";
+    let chatIndex = 0;
+    const chatResponses = [finalText(unbackedClaim), finalText(unbackedClaim)];
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how is my campaign doing";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, "I don't have a verified basis for a judgement like that right now — let me pull the real numbers first. Ask me again and I'll base any recommendation only on what the data actually shows.", `a judgement with no backing diagnosis must never reach the customer: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] checkDiagnosisClaimWithoutBackingGate does NOT false-positive when the judgement IS backed by a real, non-empty diagnosis", async () => {
+    const userId = makeUser(`v2-diagnosis-backed-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const backedClaim = "Ad Set A shows creative fatigue — frequency 4.00 exceeds the 3 fatigue threshold. Consider new creative.";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1" }),
+      finalText(backedClaim),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
+      if (path.endsWith("/adsets")) return jsonResponse({ data: [{ id: "asA", name: "Ad Set A", status: "ACTIVE", campaign_id: "c1" }] });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset") {
+          return jsonResponse({ data: [{ adset_id: "asA", adset_name: "Ad Set A", campaign_id: "c1", spend: "100", clicks: "20", impressions: "4000", reach: "1000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+        }
+        if (level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "100", clicks: "20", impressions: "4000", reach: "1000", actions: [], action_values: [], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how is my campaign doing";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, backedClaim, `a judgement backed by a real, non-empty diagnosis must pass through untouched: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] checkFalseActionClaimGate: 'I've paused' is blocked unconditionally — no tool exists this round that could make it true", async () => {
+    const userId = makeUser(`v2-false-action-claim-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const falseActionClaim = "I've paused the underperforming ad set for you.";
+    let chatIndex = 0;
+    const chatResponses = [finalText(falseActionClaim), finalText(falseActionClaim)];
+    mockFetch(async (url) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "pause whatever is underperforming";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, "I can recommend changes, but I can't actually pause, disable, or change a budget yet — that's not built in this round. Would you like me to lay out the recommendation instead, for you to apply yourself in Meta Ads Manager?", `a claimed action with no tool that could have performed it must never reach the customer: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Diagnosis, round 55] checkFalseActionClaimGate does NOT false-positive on an honest recommendation ('consider pausing') — advice is not an action claim", async () => {
+    // Calls get_performance_breakdown first (stepsRun > 0 by the time the
+    // model gives its advisory final reply) so the PRE-EXISTING, unrelated
+    // checkStaleFactualAnswerGate (round 13 — a performance QUESTION with
+    // no backing tool call yet) never has reason to intervene either —
+    // isolating this test to the ONE thing it's actually verifying.
+    const userId = makeUser(`v2-false-action-fp-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const recommendation = "You might consider pausing this ad set or lowering its budget.";
+    let chatIndex = 0;
+    const chatResponses = [
+      toolCall("meta_expert_v2.get_performance_breakdown", { campaignId: "c1" }),
+      finalText(recommendation),
+    ];
+    mockFetch(async (url, options = {}) => {
+      const u = new URL(url);
+      if (u.hostname === "api.anthropic.com") {
+        const text = chatResponses[chatIndex];
+        chatIndex += 1;
+        if (text === undefined) throw new Error(`Test error: chat mock exhausted after ${chatIndex - 1} scripted responses.`);
+        return jsonResponse({ content: [{ type: "text", text }], usage: { input_tokens: 5, output_tokens: 5 } });
+      }
+      const path = u.pathname.replace(/^\/v[\d.]+/, "");
+      const method = options.method || "GET";
+      if (method !== "GET") return jsonResponse({ id: "900000000000001" });
+      if (path === "/me/adaccounts") return jsonResponse({ data: [{ id: "act_1", name: "A" }] });
+      if (path === "/me/accounts") return jsonResponse({ data: [] });
+      if (path === "/me/businesses") return jsonResponse({ data: [] });
+      if (path.endsWith("/adspixels") || path.endsWith("/product_catalogs") || path.endsWith("/campaigns") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+      if (path === "/c1" && u.searchParams.get("fields")?.includes("account_id")) {
+        return jsonResponse({ id: "c1", name: "Real Campaign", status: "ACTIVE", objective: "OUTCOME_SALES", account_id: "act_1" });
+      }
+      if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
+      if (path.endsWith("/adsets")) return jsonResponse({ data: [{ id: "asA", name: "Ad Set A", status: "ACTIVE", campaign_id: "c1" }] });
+      if (path.endsWith("/insights")) {
+        const level = u.searchParams.get("level");
+        if (level === "adset") {
+          return jsonResponse({ data: [{ adset_id: "asA", adset_name: "Ad Set A", campaign_id: "c1", spend: "900", clicks: "90", impressions: "9000", reach: "8500", actions: [{ action_type: "purchase", value: "1" }], action_values: [{ action_type: "purchase", value: "50" }], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+        }
+        if (level === "ad") return jsonResponse({ data: [] });
+        return jsonResponse({ data: [{ spend: "900", clicks: "90", impressions: "9000", reach: "8500", actions: [{ action_type: "purchase", value: "1" }], action_values: [{ action_type: "purchase", value: "50" }], date_start: "2026-09-24", date_stop: "2026-09-30" }] });
+      }
+      return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+    });
+    try {
+      const userMessage = "how is my campaign doing";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.equal(result.reply, recommendation, `advisory language ("consider pausing") must never be confused with an action claim: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Creative attach] EXISTING_PAGE_POST execute_strategy creates the real ad creative + ad under the existing ad set, PAUSED — logged the same way campaign/adset creation already is, and read back to verify it matches the plan", async () => {
     const userId = makeUser(`v2-attach-boost-${stamp}@example.com`);
     connectMeta(userId);
