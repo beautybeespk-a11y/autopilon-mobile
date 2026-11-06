@@ -30,7 +30,7 @@ import { getConnection } from "../integrations/manager.js";
 
 // Same META_API_VERSION default as integrations/meta/api.js / oauth.js.
 const API_VERSION = process.env.META_API_VERSION || "v25.0";
-const REQUIRED_SCOPES = ["ads_read", "ads_management", "business_management", "pages_show_list", "pages_read_engagement"];
+const REQUIRED_SCOPES = ["ads_read", "ads_management", "business_management", "pages_show_list", "pages_read_engagement", "pages_manage_ads"];
 const DEFAULT_AD_ACCOUNT_ID = "237956315579168";
 
 function resolveUserId(idOrEmail) {
