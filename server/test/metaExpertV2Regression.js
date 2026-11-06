@@ -21,7 +21,7 @@ process.env.META_EXPERT_V2 = "true";
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
-const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage } = await import("../agents/metaExpertV2/businessSnapshot.js");
+const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage, searchCatalogueForProduct } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy, pixelSummaryValue } = await import("../agents/metaExpertV2/strategyBuilder.js");
@@ -30,12 +30,12 @@ const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaE
 const { messageIndicatesExecutionApproval, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative } = await import("../agents/metaExpertV2/creativeResolution.js");
-const { productNameMatchesText, findBestProductMatch } = await import("../agents/metaExpertV2/productMatching.js");
+const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } = await import("../agents/metaExpertV2/productMatching.js");
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
@@ -348,7 +348,7 @@ const DEFAULT_WC_PRODUCTS = [{
   short_description: "A brightening serum with 15% Vitamin C for daily use.",
 }];
 
-function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_PRODUCTS }) {
+function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_PRODUCTS, wcSearchProducts = null }) {
   let chatIndex = 0;
   const metaHandler = metaRouter(metaOpts);
   return async (url, options = {}) => {
@@ -361,7 +361,13 @@ function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_P
     }
     if (u.pathname.startsWith("/wp-json/wc/v3/")) {
       if (u.pathname.endsWith("/settings/general")) return jsonResponse([{ id: "woocommerce_default_country", value: "PK" }]);
-      if (u.pathname.endsWith("/products")) return jsonResponse(wcProducts);
+      if (u.pathname.endsWith("/products")) {
+        // PR #3 — the targeted catalogue search passes ?search=...; a test
+        // can give it a different answer from the plain 50-product list
+        // (a product outside the sample). Default: same list as before.
+        if (u.searchParams.get("search") && wcSearchProducts !== null) return jsonResponse(wcSearchProducts);
+        return jsonResponse(wcProducts);
+      }
       if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
       if (u.pathname.endsWith("/reports/top_sellers")) return jsonResponse([]);
       return jsonResponse([]);
@@ -7006,6 +7012,349 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- PR #3 (Nov 6 2026) — creative-revision gate deadlock ------------
+  // Live failure: after PR #1 and PR #2, Test 1 still failed with the
+  // canned reply "I wasn't able to sort out the creative choice…" — the
+  // hard-stop of checkCreativeRevisionRequiredGate, which fired on EVERY
+  // first-turn build and masked whether the search had worked at all.
+  // The decisive T2 test proved the search DOES work live (both Oct 2
+  // Maybelline posts found); the gate was the whole story.
+  await check("[PR #3 gate] the gate itself: first-turn build, resolved creative, and not-found-only question all skip it — a genuine second-turn change without a revise still fires it", async () => {
+    const base = { userMessage: "create a campaign from a Facebook post about Maybelline Serum Matte Lipstick", hasActiveV2Strategy: true, hasV2Tools: true, revisedThisTurn: false };
+    const resolvedStrategy = { strategy: { unresolved_questions: [] }, resolvedAssets: { creative: { contentId: "111_7", source: "EXISTING_PAGE_POST" } } };
+    const notFoundStrategy = { strategy: { unresolved_questions: ["I couldn't find a Facebook post about Maybelline Moisturizing Serum Lipstick Matte. I checked 6 recent posts and none of them is about it."] }, resolvedAssets: { creative: null } };
+    const ambiguousStrategy = { strategy: { unresolved_questions: ["Which of these posts should I use as the ad's creative?"] }, resolvedAssets: { creative: null } };
+    // (a) A build that succeeded THIS turn is a presentation, not a change.
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, builtThisTurn: true, activeStrategy: ambiguousStrategy }), null, "a first-turn build must never trip the gate, even with an open candidates question");
+    // (b) Resolved creative, plain presentation — not a change.
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, activeStrategy: resolvedStrategy }), null, "presenting an already-resolved creative must not trip the gate");
+    // ...but a genuine CHANGE request on a resolved creative still must.
+    assert.notEqual(checkCreativeRevisionRequiredGate({ ...base, userMessage: "please change the creative to a different post", activeStrategy: resolvedStrategy }), null, "a change request on a resolved creative must still require a revise");
+    // (b) A not-found question is the answer, not something to revise.
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, activeStrategy: notFoundStrategy }), null, "presenting a not-found question must not trip the gate");
+    // (c) The genuine case still fires: candidates open, no build/revise.
+    assert.notEqual(checkCreativeRevisionRequiredGate({ ...base, activeStrategy: ambiguousStrategy }), null, "an open candidates question with no build or revise this turn must still trip the gate");
+    // Pre-existing exemptions still hold.
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, userMessage: "show me the other options", activeStrategy: ambiguousStrategy }), null, "asking to see the options must not trip the gate");
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, hasActiveV2Strategy: false, activeStrategy: null }), null, "no active strategy means no gate");
+    assert.equal(checkCreativeRevisionRequiredGate({ ...base, revisedThisTurn: true, activeStrategy: ambiguousStrategy }), null, "a revise this turn satisfies the gate");
+  });
+
+  await check("[PR #3 gate] (a) first-turn build with a resolved creative is presentable as a final reply — NO revise_strategy call, NO hard-stop canned reply", async () => {
+    const userId = makeUser(`pr3-gate-first-turn-resolved-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    const posts = [
+      { id: "717559728109412_7", message: "Maybelline Serum Matte Lipstick – Comfortable Color, Zero Dryness 💄 Price 1250 Each", created_time: "2026-10-02T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    const userMessage = "create a website purchases campaign for Maybelline Serum Matte Lipstick, budget 550/day, link it to https://example.com";
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", baseStrategy({
+          business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+          destination_url: "https://example.com",
+          budget_daily: 550, budget_basis: "USER_PROVIDED",
+        })),
+        // The caption excerpt is quoted verbatim so the stored-
+        // recommendation fidelity gate has nothing to correct.
+        finalText("Here's your Maybelline campaign, paused and ready for your approval. The creative is the Oct 2 post: Maybelline Serum Matte Lipstick – Comfortable Color, Zero Dryness 💄 Price 1250 Each."),
+      ],
+      metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /Maybelline campaign, paused and ready/i, `the model's presentation must reach the user unchanged: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /wasn't able to sort out the creative choice/i, "the gate hard-stop must never fire on a first-turn build");
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length, 0, "no revise may be required to present a just-built strategy");
+      const stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(stored, "a strategy must have been stored");
+      assert.equal(stored.resolvedAssets.creative?.contentId, "717559728109412_7", "the resolved creative must be the real Maybelline post");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[PR #3 gate] (b) first-turn build with a not-found question presents that question — not the hard-stop canned reply", async () => {
+    const userId = makeUser(`pr3-gate-first-turn-notfound-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    const userMessage = "create a website purchases campaign for Maybelline Serum Matte Lipstick, budget 550/day, link it to https://example.com";
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", baseStrategy({
+          business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+          destination_url: "https://example.com",
+          budget_daily: 550, budget_basis: "USER_PROVIDED",
+        })),
+        finalText("I couldn't find a Facebook post about Maybelline Moisturizing Serum Lipstick Matte — I checked the 5 most recent posts and none of them is about it. Would you like to use a product image instead, or shall I look further back?"),
+      ],
+      metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /couldn't find a Facebook post about Maybelline/i, `the not-found question must reach the user: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /wasn't able to sort out the creative choice/i, "the gate hard-stop must never replace the not-found question");
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length, 0, "no revise may be required to present a not-found question");
+      const stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(stored, "a strategy must have been stored");
+      assert.equal(stored.resolvedAssets.creative, null, "no creative may resolve when nothing matches");
+      assert.equal(stored.strategy.unresolved_questions.length, 1, `exactly one question must be open: ${JSON.stringify(stored.strategy.unresolved_questions)}`);
+      assert.match(stored.strategy.unresolved_questions[0], /^I couldn't find a /, "the open question must be the not-found question");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[PR #3 gate] (b2) second turn, not-found question still open and no build this turn: presenting it again still skips the gate", async () => {
+    const userId = makeUser(`pr3-gate-notfound-turn2-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    const firstMessage = "create a website purchases campaign for Maybelline Serum Matte Lipstick, budget 550/day, link it to https://example.com";
+    const buildParams = baseStrategy({
+      business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+      creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+      destination_url: "https://example.com",
+      budget_daily: 550, budget_basis: "USER_PROVIDED",
+    });
+    // Turn 1 — build, no match, not-found question asked.
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", buildParams),
+        finalText("I couldn't find a Facebook post about Maybelline Moisturizing Serum Lipstick Matte."),
+      ],
+      metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct],
+    }));
+    let firstReply;
+    try {
+      const first = await orchestrate({ userId, agentId, conversationId, userMessage: firstMessage, history: [{ role: "user", content: firstMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      firstReply = first.reply;
+    } finally {
+      restoreFetch();
+    }
+    assert.match(firstReply, /couldn't find a Facebook post about Maybelline/i, "turn 1 must present the not-found question");
+    // Turn 2 — user re-sends the same request; the model presents the
+    // still-open not-found question WITHOUT building or revising. The
+    // gate must not fire: there is nothing to revise.
+    const secondMessage = "create a campaign from a Facebook post about Maybelline Serum Matte Lipstick";
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("I still couldn't find a Facebook post about Maybelline Moisturizing Serum Lipstick Matte — I checked the recent posts and none of them is about it."),
+      ],
+      metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct],
+    }));
+    try {
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage: secondMessage,
+        history: [{ role: "user", content: firstMessage }, { role: "assistant", content: firstReply }, { role: "user", content: secondMessage }],
+        agentSystemPrompt: "You are the Meta Ads Manager V2.",
+      });
+      assert.match(result.reply, /couldn't find a Facebook post about Maybelline/i, `the still-open not-found question must reach the user: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /wasn't able to sort out the creative choice/i, "the gate hard-stop must never replace a still-open not-found question");
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.build_strategy").length, 0, "no build ran this turn — the exemption is the not-found question, not builtThisTurn");
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length, 0, "no revise may be required to re-present a not-found question");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[PR #3 gate] (c) the gate STILL fires on a genuine second-turn creative change without a revise — the anti-fabrication protection is not lost", async () => {
+    const userId = makeUser(`pr3-gate-still-fires-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const posts = [
+      { id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-05T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/1" },
+      { id: "111_2", message: "Weekend sale, 20% off!", created_time: "2024-03-04T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2" },
+      { id: "111_3", message: "Behind the scenes at the studio", created_time: "2024-03-03T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/3" },
+      { id: "111_4", message: "Customer love — real reviews", created_time: "2024-03-02T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/4" },
+      { id: "111_5", message: "New arrivals this week", created_time: "2024-03-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/5" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    const firstMessage = "create a website purchases campaign from one of my recent Facebook posts, link it to https://example.com";
+    const buildParams = baseStrategy({
+      business_goal: "create a website purchases campaign from a recent Facebook post",
+      creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." },
+      destination_url: "https://example.com",
+    });
+    // Turn 1 — build with 5 genuinely ambiguous candidates; presenting
+    // the "which post?" question is a first-turn presentation, allowed.
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        toolCall("meta_expert_v2.build_strategy", buildParams),
+        finalText("I found 5 recent Facebook posts. Which one should I use as the ad's creative?"),
+      ],
+      metaOpts,
+    }));
+    let firstReply;
+    try {
+      const first = await orchestrate({ userId, agentId, conversationId, userMessage: firstMessage, history: [{ role: "user", content: firstMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      firstReply = first.reply;
+    } finally {
+      restoreFetch();
+    }
+    assert.match(firstReply, /which one should i use as the ad's creative/i, "turn 1 must present the candidates question");
+    assert.doesNotMatch(firstReply, /wasn't able to sort out the creative choice/i, "turn 1 must not hit the hard-stop");
+    // Turn 2 — the user asks to CHANGE the creative but names no pick,
+    // and the model finalises WITHOUT calling revise_strategy. The gate
+    // must fire (nudge once, then the canned hard-stop on the second
+    // final — hence two scripted finals).
+    const secondMessage = "please change the creative";
+    mockFetch(scriptedFetch({
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("Here's your updated campaign — I've switched the creative to a different post."),
+        finalText("OK — which post would you like me to use instead?"),
+      ],
+      metaOpts,
+    }));
+    try {
+      const result = await orchestrate({
+        userId, agentId, conversationId, userMessage: secondMessage,
+        history: [{ role: "user", content: firstMessage }, { role: "assistant", content: firstReply }, { role: "user", content: secondMessage }],
+        agentSystemPrompt: "You are the Meta Ads Manager V2.",
+      });
+      assert.match(result.reply, /wasn't able to sort out the creative choice/i, `the genuine-change case must still hit the gate hard-stop: ${result.reply}`);
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length, 0, "no revise ran — that is exactly why the gate fired");
+      assert.equal(result.toolResults.filter((r) => r.toolName === "meta_expert_v2.execute_strategy").length, 0, "nothing may execute from an unrevised creative change");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- PR #3 — hashtag de-compounding ------------------------------------
+  // Live finding (investigation 2): a real marketing caption scores 1/5
+  // tokens — "#serumlipstick" is ONE token under plain tokenisation, and
+  // "#maybellinepakistan" is not "maybelline" at all — so a caption that
+  // names the product ONLY in hashtags never matched, even though a human
+  // reads it instantly.
+  await check("[PR #3] hashtag compounds: a caption that names the product ONLY in hashtags still matches — and a random hashtag never invents one", async () => {
+    const real = "Maybelline Moisturizing Serum Lipstick Matte";
+    const catalogue = [
+      { id: 2, name: real, price: "1250" },
+      { id: 3, name: "Patrick Ta Double-Take Crème & Powder Blush Duo", price: "2500" },
+      { id: 4, name: "Huda Beauty Liquid Matte Mousse", price: "1700" },
+      { id: 1, name: "Vitamin C Serum", price: "1800" },
+    ];
+    // Realistic caption: marketing copy + hashtags, NO plain-text product name.
+    const hashtagCaption = "Comfortable color, zero dryness 💄 #maybellinepakistan #serumlipstick #maybelline #mattelipstick #maybellinelipstick";
+    assert.equal(productNameMatchesText(real, hashtagCaption), true, "the hashtag-only caption must match once compounds are split into real catalogue tokens");
+    assert.equal(findBestProductMatch(hashtagCaption, catalogue)?.name, real, "the hashtag-only caption must derive the real product");
+    // The real Oct 2 Facebook POST caption, verbatim (live T2 test, Nov 6 2026).
+    assert.equal(productNameMatchesText(real, "Maybelline Serum Matte Lipstick – Comfortable Color, Zero Dryness 💄 Price 1250 Each"), true, "the Oct 2 post caption must match");
+    // The real Oct 2 REEL caption, verbatim — it does NOT match, and must
+    // not: it carries only 3 of the 5 name tokens (no "matte", no
+    // "moisturizing", no hashtags to split), one short of the all-but-one
+    // bar. Lowering that bar would also admit a different Maybelline
+    // lipstick ("Maybelline SuperStay Matte Lipstick" is also 3/5) — the
+    // exact false positive PR #2 forbids. The reel is still found live
+    // when the agent lists the page's posts; the token rule is the
+    // anti-fabrication check, not the listing mechanism.
+    assert.equal(productNameMatchesText(real, "Maybelline serum lipstick gives bold, smooth color with a comfortable finish. Original, now available in Pakistan."), false, "the Oct 2 reel caption carries only 3 of 5 tokens — honestly a non-match under the all-but-one rule");
+    assert.equal(findBestProductMatch("Maybelline serum lipstick gives bold, smooth color with a comfortable finish. Original, now available in Pakistan.", catalogue), null, "the reel caption must derive no product rather than the closest one");
+    // Negatives: a hashtag that cannot split into real catalogue tokens
+    // stays one meaningless token and can never invent a match.
+    assert.equal(productNameMatchesText(real, "Shiny by noon? Not anymore 💗 #patrickta #blushduo #makeup"), false, "a Patrick Ta hashtag caption must never match Maybelline");
+    assert.equal(productNameMatchesText(real, "Weekend sale — everything must go! #weekendsale #newdrop"), false, "random hashtags must never invent a match");
+    assert.equal(findBestProductMatch("Shiny by noon? Not anymore 💗 #patrickta #blushduo #makeup", catalogue), null, "a Patrick Ta hashtag caption must derive no Maybelline product");
+    // The expansion itself, unit-level.
+    assert.equal(expandHashtagCompounds("#serumlipstick", new Set(["serum", "lipstick"])), "serum lipstick", "#serumlipstick must split into its catalogue-token parts");
+    assert.equal(expandHashtagCompounds("#maybellineserumlipstick", new Set(["maybelline", "serum", "lipstick"])), "maybelline serum lipstick", "a three-part compound must split into all three parts");
+    assert.equal(expandHashtagCompounds("#maybellinepakistan", new Set(["maybelline", "moisturizing", "serum", "lipstick", "matte"])), "#maybellinepakistan", "pakistan is not a catalogue token, so the compound must NOT split");
+    assert.equal(expandHashtagCompounds("#weekendsale", new Set(["maybelline", "serum", "lipstick"])), "#weekendsale", "a hashtag with no catalogue-token split must stay whole");
+  });
+
+  // --- PR #3 — targeted catalogue search (50-product sample cap) ---------
+  // Investigation 2 secondary finding: derive depends only on the 50
+  // most recent products, so a real product older than that can never
+  // be recognised — the deep post search never runs for it.
+  await check("[PR #3] product outside the first 50 sampled products: targeted catalogue search finds it, and the snapshot derives it", async () => {
+    const userId = makeUser(`pr3-targeted-search-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const maybellineProduct = {
+      id: 6015, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    // 50 filler products, most recent first — Maybelline is NOT among them.
+    const fillerProducts = Array.from({ length: 50 }, (_, i) => ({
+      id: 100 + i, name: `Filler Product ${i + 1}`, price: "999", categories: [{ name: "Makeup" }],
+      images: [], permalink: `https://beautybees.pk/product/filler-${i + 1}/`,
+      short_description: `Filler product ${i + 1}.`,
+    }));
+    const posts = [
+      { id: "717559728109412_7", message: "Maybelline Serum Matte Lipstick – Comfortable Color, Zero Dryness 💄 Price 1250 Each", created_time: "2026-10-02T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: fillerProducts, wcSearchProducts: [maybellineProduct] }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId, { userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick" });
+      const found = snapshot.business.sampleProducts.find((p) => p.name === "Maybelline Moisturizing Serum Lipstick Matte");
+      assert.ok(found, "the targeted search must append the real product to the snapshot's sampleProducts");
+      assert.equal(found.foundByTargetedSearch, true, "the appended product must be marked as found by the targeted search");
+      assert.equal(snapshot.recentContent.facebookPosts.productSearch.requestedProduct, "Maybelline Moisturizing Serum Lipstick Matte", "the snapshot must derive the real product");
+      assert.equal(snapshot.recentContent.facebookPosts.productSearch.matched, true, "the deep post search must then find the Oct 2 post");
+      const seventh = snapshot.recentContent.facebookPosts.items.find((i) => i.id === "717559728109412_7");
+      assert.ok(seventh, "the Oct 2 post must be present in the snapshot items");
+      assert.equal(seventh.linkedProduct?.name, "Maybelline Moisturizing Serum Lipstick Matte", "the Oct 2 post must link to the real product");
+    } finally {
+      restoreFetch();
+    }
+    // The guard: a message that cannot name a product never searches.
+    assert.deepEqual(await searchCatalogueForProduct(userId, "yes"), [], "a bare affirmation must never trigger a catalogue search");
+    assert.deepEqual(await searchCatalogueForProduct(userId, "3"), [], "a bare number must never trigger a catalogue search");
   });
 
   await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {

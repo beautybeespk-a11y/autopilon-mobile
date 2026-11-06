@@ -95,9 +95,16 @@ export function requiredTokenMatches(wantedTokens) {
   return Math.max(3, wantedTokens.length - 1);
 }
 
-export function scoreProductNameAgainstText(productName, text) {
+export function scoreProductNameAgainstText(productName, text, catalogueTokenSet = null) {
   const wanted = distinctiveTokens(productName);
-  const haystack = new Set(tokenizeProductText(text));
+  // PR #3 — hashtag compounds: a caption's "#serumlipstick" is one token
+  // under plain tokenisation, so it never matched "serum" or "lipstick".
+  // Expand it into its parts FIRST (parts must be tokens of a real
+  // catalogue product — see expandHashtagCompounds), then tokenise.
+  const tokenSet = catalogueTokenSet instanceof Set && catalogueTokenSet.size > 0
+    ? catalogueTokenSet
+    : new Set(wanted);
+  const haystack = new Set(tokenizeProductText(expandHashtagCompounds(text, tokenSet)));
   const matchedTokens = wanted.filter((t) => haystack.has(t));
   const required = requiredTokenMatches(wanted);
   return {
@@ -125,9 +132,13 @@ export function productNameMatchesText(productName, text) {
 // Used by the snapshot trace.
 export function scoreAllProductsAgainstText(text, sampleProducts) {
   if (typeof text !== "string" || !Array.isArray(sampleProducts)) return [];
+  // PR #3 — one shared catalogue token set for hashtag expansion, so a
+  // compound is only ever split into parts that are tokens of a REAL
+  // catalogue product, never invented from thin air.
+  const tokenSet = buildCatalogueTokenSet(sampleProducts);
   return sampleProducts
     .filter((p) => p && typeof p.name === "string" && p.name.trim())
-    .map((product) => ({ product, score: scoreProductNameAgainstText(product.name, text) }))
+    .map((product) => ({ product, score: scoreProductNameAgainstText(product.name, text, tokenSet) }))
     .sort((a, b) => {
       if (b.score.matchedCount !== a.score.matchedCount) return b.score.matchedCount - a.score.matchedCount;
       const ratioA = a.score.matchedCount / Math.max(1, a.score.wantedCount);
@@ -149,4 +160,69 @@ export function scoreProductsAgainstText(text, sampleProducts) {
 export function findBestProductMatch(text, sampleProducts) {
   const scored = scoreProductsAgainstText(text, sampleProducts);
   return scored.length ? scored[0].product : null;
+}
+
+// --- PR #3 (Nov 6 2026) — hashtag de-compounding ------------------------
+// Live finding (investigation 2): a real marketing caption scores 1/5
+// tokens — "#serumlipstick" is ONE token under plain tokenisation, and
+// "#maybellinepakistan" is not "maybelline" at all — so a caption that
+// names the product ONLY in hashtags never matched, even though a human
+// reads it instantly. Hashtags are how real store posts actually write
+// product names; the token rule must read them too.
+//
+// Safety rule, and the reason this cannot invent a match: a compound is
+// split ONLY when EVERY part is a token of a real catalogue product
+// (the union of all catalogue names' distinctive tokens). A random
+// hashtag ("#weekendsale", "#newdrop") has no such split and stays one
+// meaningless token. Splitting only ADDS real words the user actually
+// wrote (in hashtag form) to the haystack — the all-but-one / floor-3
+// match rule still decides, unchanged, per product.
+//
+// "serum"+"lipstick" are both catalogue tokens, so "#serumlipstick"
+// expands; "#maybellinepakistan" does NOT split — "pakistan" is not a
+// token of any product name, so the "maybelline" inside it stays hidden
+// rather than being guessed at. A caption carrying it still matches
+// through its other hashtags ("#maybelline", "#serumlipstick",
+// "#mattelipstick"), which do split. Each part must be >= 3 chars: a
+// 1- or 2-letter fragment ("c", "go") is too weak to be evidence of
+// anything.
+export function buildCatalogueTokenSet(sampleProducts) {
+  const set = new Set();
+  for (const product of Array.isArray(sampleProducts) ? sampleProducts : []) {
+    if (product && typeof product.name === "string") {
+      for (const token of distinctiveTokens(product.name)) set.add(token);
+    }
+  }
+  return set;
+}
+
+function splitHashtagCompound(compound, tokenSet) {
+  const lower = compound.toLowerCase();
+  // Two-part splits first (the common shape: brand+product, product+type).
+  for (let i = 3; i <= lower.length - 3; i++) {
+    const first = lower.slice(0, i);
+    const second = lower.slice(i);
+    if (tokenSet.has(first) && tokenSet.has(second)) return [first, second];
+  }
+  // Three-part splits (brand+product+type, e.g. maybelline+serum+lipstick).
+  for (let i = 3; i <= lower.length - 6; i++) {
+    for (let j = i + 3; j <= lower.length - 3; j++) {
+      const first = lower.slice(0, i);
+      const second = lower.slice(i, j);
+      const third = lower.slice(j);
+      if (tokenSet.has(first) && tokenSet.has(second) && tokenSet.has(third)) return [first, second, third];
+    }
+  }
+  return null;
+}
+
+export function expandHashtagCompounds(text, tokenSet) {
+  if (typeof text !== "string" || !text) return text;
+  if (!(tokenSet instanceof Set) || tokenSet.size === 0) return text;
+  return text.replace(/#([A-Za-z0-9]+)/g, (whole, compound) => {
+    // A split needs two parts of >= 3 chars each.
+    if (compound.length < 6) return whole;
+    const parts = splitHashtagCompound(compound, tokenSet);
+    return parts ? parts.join(" ") : whole;
+  });
 }
