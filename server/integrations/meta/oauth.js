@@ -44,7 +44,19 @@ export function metaOAuthStatus() {
 // through a Business Portfolio (owned_pages) when /me/accounts comes back
 // empty — confirmed live as the common case for a real business account,
 // not an edge case. See the fallback's own comment in integrations/meta/api.js.
-const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management"];
+//
+// pages_manage_ads: create an ad creative from an EXISTING Page post
+// (object_story_id) — the permission Meta requires for POST
+// /act_{ad-account}/adcreatives with an existing-post creative. ads_management
+// alone only gets campaigns and ad sets through: confirmed live Nov 6 2026,
+// the approved Test 1 paused campaign failed twice with Meta error
+// 200/1487194 ("Permission Error") at exactly that call, while the token
+// (valid, long-lived) held all five scopes above. pages_manage_ads is a
+// standard permission, available with Standard Access for app roles, so
+// requesting it does not trigger the whole-request rejection the
+// instagram_basic lesson warns about — but it only takes effect on a fresh
+// reconnect; tokens issued before this change need one more reconnect.
+const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

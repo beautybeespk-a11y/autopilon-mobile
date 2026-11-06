@@ -11672,6 +11672,41 @@ async function run() {
     }
   });
 
+  // --- pages_manage_ads scope (live 200/1487194 fix) -----------------------
+  // Live Nov 6 2026: the approved Test 1 paused campaign was created, then
+  // POST /act_.../adcreatives failed twice with Meta error 200/1487194
+  // (OAuthException, "Permission Error"). The token was valid and held all
+  // five scopes the app requested — the missing one was pages_manage_ads,
+  // which Meta requires to create an ad creative from an existing Page post
+  // (object_story_id). These checks pin the scope in both places that must
+  // agree: the OAuth request itself, and the read-only token diagnostic.
+  const EXPECTED_META_SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"];
+
+  await check("[V2 pages_manage_ads scope] the Meta OAuth authorization URL requests pages_manage_ads (and keeps every previously requested scope)", async () => {
+    process.env.META_REDIRECT_URI = process.env.META_REDIRECT_URI || "https://example.com/oauth/meta/callback";
+    const { buildAuthorizationUrl } = await import("../integrations/meta/oauth.js");
+    const url = new URL(buildAuthorizationUrl("test-state"));
+    const scopes = url.searchParams.get("scope").split(",");
+    for (const scope of EXPECTED_META_SCOPES) {
+      assert.ok(scopes.includes(scope), `OAuth scope list must include ${scope}; got: ${scopes.join(",")}`);
+    }
+    assert.equal(new Set(scopes).size, scopes.length, `OAuth scope list must not contain duplicates: ${scopes.join(",")}`);
+  });
+
+  await check("[V2 pages_manage_ads scope] the read-only token diagnostic's REQUIRED_SCOPES includes pages_manage_ads, so a future token missing it is flagged", async () => {
+    const fs = await import("node:fs");
+    const path = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "debugMetaToken.js");
+    const source = fs.readFileSync(scriptPath, "utf8");
+    const match = source.match(/const REQUIRED_SCOPES = \[([^\]]*)\]/);
+    assert.ok(match, "debugMetaToken.js must still declare REQUIRED_SCOPES as an array literal");
+    const required = match[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
+    for (const scope of EXPECTED_META_SCOPES) {
+      assert.ok(required.includes(scope), `debugMetaToken.js REQUIRED_SCOPES must include ${scope}; got: ${required.join(",")}`);
+    }
+  });
+
   const failed = results.filter((r) => !r.ok);
   console.log(`\n${results.length - failed.length}/${results.length} Meta Expert V2 checks passed.`);
   if (failed.length) {
