@@ -26,7 +26,20 @@ import * as wc from "../../integrations/woocommerce/api.js";
 import * as shopify from "../../integrations/shopify/api.js";
 import { trace } from "./diagnostics.js";
 
-const MAX_PRODUCTS = 12;
+// Stream A — was 12, which is the SAME bug class as the 5-post cap:
+// matchLinkedProduct() (below) and parseRequestedProduct()
+// (creativeResolution.js) can only ever recognise a product that is in
+// this list. A real store product older than the 12 most recent could
+// never be linked to its own post, so the anti-fabrication match could
+// never fire for it. Raised to 50: one WooCommerce/Shopify call either
+// way (per_page/limit only), and a <=50-product catalogue — the large
+// majority of this platform's small-business stores — is now fully
+// covered. Residual gap, documented not hidden: a store with >50
+// products can still have a product outside this list; for that case
+// the caption-substring match in postMatchesProduct() still works when
+// the name is known from the user's own words, and a targeted
+// store-search lookup is a follow-up, not smuggled in here.
+const MAX_PRODUCTS = 50;
 // Round 49 (live bug) — was 3, which is the SAME bug class as the
 // unweighted-mean rollup below wearing a different hat: a blended figure
 // computed from only 3 of a real account's campaigns is wrong in exactly
@@ -452,11 +465,35 @@ const CAPTION_EXCERPT_LENGTH = 140;
 // match rather than inferring one. Used so a creative-selection strategy
 // can honestly say "this post is about product X" only when that's
 // mechanically true, never invented.
-function matchLinkedProduct(captionText, sampleProducts) {
+// Stream A — exported (was module-private) so executor.js can recompute
+// the linked product from the LIVE caption at execution time (P-A6)
+// with the exact same literal rule, never a duplicated one.
+export function matchLinkedProduct(captionText, sampleProducts) {
   if (!captionText || !Array.isArray(sampleProducts) || !sampleProducts.length) return null;
   const lowerCaption = captionText.toLowerCase();
   const match = sampleProducts.find((p) => p.name && lowerCaption.includes(p.name.toLowerCase()));
   return match ? { name: match.name, price: match.price ?? null, category: match.category ?? null } : null;
+}
+
+// Stream A — derives WHICH product the user is talking about, from their
+// own raw words, against the store's REAL catalogue only. Returns the
+// product's real name, or null. Never guesses: if no real product name
+// literally appears in the message, there is no requested product and
+// every downstream check treats that as "no product constraint" rather
+// than inventing one. Longest-name-first so a specific product
+// ("Maybelline Serum Matte Lipstick") beats a generic shorter product
+// name ("Lipstick") when both are real catalogue entries.
+export function deriveRequestedProductFromMessage(userMessage, sampleProducts) {
+  if (typeof userMessage !== "string" || !Array.isArray(sampleProducts) || !sampleProducts.length) return null;
+  const normalizedMessage = userMessage.toLowerCase().replace(/\s+/g, " ").trim();
+  const names = sampleProducts
+    .map((p) => p.name)
+    .filter((n) => typeof n === "string" && n.trim())
+    .sort((a, b) => b.length - a.length);
+  for (const name of names) {
+    if (normalizedMessage.includes(name.toLowerCase().replace(/\s+/g, " ").trim())) return name;
+  }
+  return null;
 }
 
 // A Reel is really just an Instagram VIDEO whose permalink path says so —
@@ -493,6 +530,17 @@ function normalizeContentItem(platform, raw, sampleProducts) {
     platform,
     contentType: classifyContentType(platform, mediaType, permalink),
     captionExcerpt: captionText ? captionText.slice(0, CAPTION_EXCERPT_LENGTH) + (captionText.length > CAPTION_EXCERPT_LENGTH ? "…" : "") : null,
+    // Stream A — the FULL caption text, not just the 140-char excerpt.
+    // Backend matching (postMatchesProduct, creativeResolution.js) and
+    // execution-time re-validation (executor.js) must match against the
+    // whole caption: a product name past char 140 is still a real match,
+    // and a truncated excerpt can neither prove nor disprove it. The
+    // model is still SHOWN captionExcerpt (see the get_business_snapshot
+    // tool description); this field is backend evidence, and the
+    // recommendation text quotes captionExcerpt, never this raw field, so
+    // a very long caption does not bloat what the user reads. Null when
+    // the post genuinely has no caption/message — never "".
+    caption: captionText || null,
     publishedDate: raw.created_time || raw.timestamp || null,
     permalink,
     mediaType,
@@ -514,25 +562,125 @@ function normalizeContentItem(platform, raw, sampleProducts) {
   };
 }
 
-async function gatherRecentContent(accessToken, pageId, instagram, sampleProducts) {
-  // Round 50 — meta.listPagePosts/listInstagramPosts now return
-  // {items, hasMore} instead of a bare array (an explicit, bounded limit,
-  // never full pagination — see those functions' own comments, api.js).
-  // hasMore is threaded through to the final shape below so a Page/IG
-  // account with more recent content than MAX_RECENT_CONTENT ever shows
-  // says so, rather than silently implying these are the only candidates.
+// Stream A — pages a platform's posts BACK from the newest until a post
+// about `productName` is found, or the stated bound is hit. Shared by
+// gatherRecentContent (snapshot time) and strategyBuilder.js (build time,
+// when the product was named in business_goal/description or an earlier
+// turn rather than in the snapshot call's own message) — one helper, one
+// bound, never two implementations drifting apart. `matchFn` is
+// postMatchesProduct (creativeResolution.js) applied to NORMALIZED items
+// (so linkedProduct is computed on the full caption first); this helper
+// does NOT re-implement matching on raw Meta rows. Returns matched
+// normalized items (at most MAX_PRODUCT_SEARCH_MATCHES, newest first)
+// plus honest search metadata — postsScanned/pagesFetched are what the
+// not-found question quotes, never a vague "couldn't find it".
+export const MAX_PRODUCT_SEARCH_MATCHES = 3;
+export async function searchContentForProduct({ accessToken, pageId, instagramAccountId, platform, productName, sampleProducts }) {
+  const normalizedName = (productName || "").toLowerCase().replace(/\s+/g, " ").trim();
+  if (!normalizedName) return { matched: [], postsScanned: 0, pagesFetched: 0, reachedBound: false };
+  // Test-stage fix (creative-source grounding): a fetch failure here must
+  // NOT throw out of the caller — the strategyBuilder safety net calls
+  // this outside any attempt() wrapper, so a throw escaped runBuildOrRevise
+  // entirely and the revise crashed with the raw Meta error instead of
+  // reaching checkCreativeSourceAvailabilityPolicy, whose whole job is to
+  // reject exactly this "claims an existing post while the platform's
+  // content is unusable" shape with a proper unresolved issue. Return an
+  // empty result with fetchFailed:true; the section status (fetch_failed)
+  // stays the authoritative signal, and the policy layer owns the
+  // rejection. Callers only ever read matched/postsScanned/pagesFetched/
+  // reachedBound, so the extra field is additive.
+  let raw;
+  const isFacebook = platform === "facebook";
+  try {
+    raw = isFacebook
+      ? await meta.listPagePosts(accessToken, pageId, undefined, { maxPages: meta.MAX_PRODUCT_SEARCH_PAGES })
+      : await meta.listInstagramPosts(accessToken, instagramAccountId, undefined, { maxPages: meta.MAX_PRODUCT_SEARCH_PAGES });
+  } catch {
+    return { matched: [], postsScanned: 0, pagesFetched: 0, reachedBound: false, fetchFailed: true };
+  }
+  // Dynamic import: businessSnapshot.js must not import
+  // creativeResolution.js at module top level (creativeResolution.js
+  // imports nothing from here today, but keeping the direction one-way
+  // avoids ever creating a cycle if that changes). The function is
+  // tiny and pure; the import cost is one module load.
+  const { postMatchesProduct } = await import("./creativeResolution.js");
+  // NOTE: listPagePosts/listInstagramPosts already follow paging.next
+  // internally (api.js, P-A1) and return the FULL scanned set; this
+  // function only filters + normalizes. Do not re-page here.
+  const matched = [];
+  for (const rawPost of raw.items || []) {
+    const item = normalizeContentItem(platform, rawPost, sampleProducts);
+    if (postMatchesProduct(item, normalizedName) && !matched.some((m) => m.id === item.id)) {
+      matched.push({ ...item, foundByProductSearch: true });
+      if (matched.length >= MAX_PRODUCT_SEARCH_MATCHES) break;
+    }
+  }
+  return {
+    matched,
+    postsScanned: raw.totalScanned || 0,
+    pagesFetched: raw.pagesFetched || 0,
+    // reachedBound: true means "stopped because the bound was hit, not
+    // because the history ran out" — the not-found question must say
+    // which one, they are different facts.
+    reachedBound: (raw.pagesFetched || 0) >= meta.MAX_PRODUCT_SEARCH_PAGES && raw.hasMore === true,
+  };
+}
+
+async function gatherRecentContent(accessToken, pageId, instagram, sampleProducts, productSearchName = null) {
+  // Stream A — the product search runs ONLY when a real product was
+  // actually named (productSearchName non-null). Otherwise this behaves
+  // exactly as before: one page, first MAX_RECENT_CONTENT items.
+  // When a product WAS named: the 5 most recent are still shown first
+  // (recency is still useful context), and any product-matching post
+  // found deeper is APPENDED after them, marked foundByProductSearch —
+  // the shown list grows past 5 rather than the match being silently
+  // dropped. hasMore keeps its old meaning (more content exists beyond
+  // what this fetch returned). productSearch is honest metadata for the
+  // model, the policy layer, and the not-found question — never hidden.
   const facebook = pageId
     ? await attempt(async () => {
-        const { items, hasMore } = await meta.listPagePosts(accessToken, pageId);
-        return { items: items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts)), hasMore };
+        const first = await meta.listPagePosts(accessToken, pageId);
+        const items = first.items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("facebook", p, sampleProducts));
+        let productSearch = { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: first.items.length, pagesFetched: 1, reachedBound: false };
+        if (productSearchName) {
+          const { postMatchesProduct } = await import("./creativeResolution.js");
+          const alreadyShownMatch = items.some((i) => postMatchesProduct(i, productSearchName));
+          if (!alreadyShownMatch) {
+            const deep = await searchContentForProduct({ accessToken, pageId, platform: "facebook", productName: productSearchName, sampleProducts });
+            const seen = new Set(items.map((i) => i.id));
+            for (const m of deep.matched) {
+              if (!seen.has(m.id)) { items.push(m); seen.add(m.id); }
+            }
+            productSearch = { searched: true, requestedProduct: productSearchName, matched: deep.matched.length > 0, postsScanned: Math.max(first.items.length, deep.postsScanned), pagesFetched: deep.pagesFetched, reachedBound: deep.reachedBound };
+          } else {
+            productSearch = { searched: true, requestedProduct: productSearchName, matched: true, postsScanned: first.items.length, pagesFetched: 1, reachedBound: false };
+          }
+        }
+        return { items, hasMore: first.hasMore, productSearch };
       })
-    : { status: "not_connected", value: { items: [], hasMore: false }, reason: null };
+    : { status: "not_connected", value: { items: [], hasMore: false, productSearch: { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: 0, pagesFetched: 0, reachedBound: false } }, reason: null };
   const instagramPosts = instagram?.accountId
     ? await attempt(async () => {
-        const { items, hasMore } = await meta.listInstagramPosts(accessToken, instagram.accountId);
-        return { items: items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts)), hasMore };
+        const first = await meta.listInstagramPosts(accessToken, instagram.accountId);
+        const items = first.items.slice(0, MAX_RECENT_CONTENT).map((p) => normalizeContentItem("instagram", p, sampleProducts));
+        let productSearch = { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: first.items.length, pagesFetched: 1, reachedBound: false };
+        if (productSearchName) {
+          const { postMatchesProduct } = await import("./creativeResolution.js");
+          const alreadyShownMatch = items.some((i) => postMatchesProduct(i, productSearchName));
+          if (!alreadyShownMatch) {
+            const deep = await searchContentForProduct({ accessToken, instagramAccountId: instagram.accountId, platform: "instagram", productName: productSearchName, sampleProducts });
+            const seen = new Set(items.map((i) => i.id));
+            for (const m of deep.matched) {
+              if (!seen.has(m.id)) { items.push(m); seen.add(m.id); }
+            }
+            productSearch = { searched: true, requestedProduct: productSearchName, matched: deep.matched.length > 0, postsScanned: Math.max(first.items.length, deep.postsScanned), pagesFetched: deep.pagesFetched, reachedBound: deep.reachedBound };
+          } else {
+            productSearch = { searched: true, requestedProduct: productSearchName, matched: true, postsScanned: first.items.length, pagesFetched: 1, reachedBound: false };
+          }
+        }
+        return { items, hasMore: first.hasMore, productSearch };
       })
-    : { status: "not_connected", value: { items: [], hasMore: false }, reason: null };
+    : { status: "not_connected", value: { items: [], hasMore: false, productSearch: { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: 0, pagesFetched: 0, reachedBound: false } }, reason: null };
   // Same friendly-reason wrapping as the meta.list_instagram_posts tool
   // (tools/meta/campaigns.js:268-270) — an IG account IS linked but the
   // read itself failed (missing OAuth scope on this deployment today), so
@@ -544,8 +692,8 @@ async function gatherRecentContent(accessToken, pageId, instagram, sampleProduct
     ? `Instagram account is linked, but reading its posts isn't available yet (${instagramPosts.reason}). Facebook post boosting still works.`
     : instagramPosts.reason || null;
   return {
-    facebookPosts: { status: facebook.status, items: facebook.value?.items || [], hasMore: facebook.value?.hasMore || false, reason: facebook.reason || null },
-    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value?.items || [], hasMore: instagramPosts.value?.hasMore || false, reason: instagramReason },
+    facebookPosts: { status: facebook.status, items: facebook.value?.items || [], hasMore: facebook.value?.hasMore || false, reason: facebook.reason || null, productSearch: facebook.value?.productSearch || { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: 0, pagesFetched: 0, reachedBound: false } },
+    instagramPosts: { status: instagramPosts.status, items: instagramPosts.value?.items || [], hasMore: instagramPosts.value?.hasMore || false, reason: instagramReason, productSearch: instagramPosts.value?.productSearch || { searched: false, requestedProduct: productSearchName || null, matched: false, postsScanned: 0, pagesFetched: 0, reachedBound: false } },
   };
 }
 
@@ -588,7 +736,15 @@ function computeAudienceEvidenceHint(hasStoreData, hasCampaignHistory) {
 // The single entry point — Step 1's "one canonical trusted snapshot from
 // live connected data." Never partially cached, never backed by chat
 // memory (Step 13); every call re-fetches from real APIs.
-export async function gatherBusinessSnapshot(userId) {
+// Stream A — options.userMessage is the raw message that triggered this
+// snapshot call (the get_business_snapshot tool passes
+// context.userMessage; strategyBuilder passes its own userMessage). It
+// is used for ONE purpose only: deriving which real product the user is
+// talking about, so the recent-content fetch can search deeper than the
+// 5 newest for it. It is never stored, never used for any other
+// derivation, and omitting it (all pre-existing callers) simply means
+// "no product search" — never a failure.
+export async function gatherBusinessSnapshot(userId, { userMessage } = {}) {
   const business = await gatherCommerce(userId);
 
   let accessToken = null;
@@ -616,7 +772,13 @@ export async function gatherBusinessSnapshot(userId) {
 
   const metaAssets = await gatherMetaAssets(userId, accessToken, conn);
   const metaHistory = await gatherMetaHistory(userId, accessToken, metaAssets.defaultAdAccount.id);
-  const recentContent = await gatherRecentContent(accessToken, metaAssets.defaultPage.id, metaAssets.instagram.account, business.sampleProducts);
+  // Stream A — derive the requested product AFTER gatherCommerce (the
+  // real catalogue is needed to recognise it) and BEFORE fetching
+  // recent content (the fetch needs it to search deeper). A null here
+  // just means "no product named in this message" — gatherRecentContent
+  // then behaves exactly as before.
+  const requestedProduct = deriveRequestedProductFromMessage(userMessage, business.sampleProducts);
+  const recentContent = await gatherRecentContent(accessToken, metaAssets.defaultPage.id, metaAssets.instagram.account, business.sampleProducts, requestedProduct);
 
   const snapshot = {
     generatedAt: new Date().toISOString(),

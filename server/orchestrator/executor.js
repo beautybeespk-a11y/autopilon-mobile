@@ -4,6 +4,9 @@ import { getTool, validateParameters, toolRequiresConfirmation } from "../tools/
 import { toolAvailableToAgent } from "./permissions.js";
 import { createNotification } from "./notifications.js";
 import { getStoredPlan, getActivePlanForConversation } from "../agents/metaExpert/planner.js";
+import { getStoredStrategy, getActiveStrategyForConversation, recordStrategyApproval } from "../agents/metaExpertV2/strategyStore.js";
+import { fingerprintStrategy } from "../agents/metaExpertV2/policy.js";
+import { isV2RuntimeEnabled } from "../agents/metaExpertV2/runtimeGate.js";
 
 const now = () => new Date().toISOString();
 
@@ -32,6 +35,25 @@ export function getExecution(id) {
 }
 
 export function createConfirmationRequest({ executionId, userId, toolName, reason, automationRunId }) {
+  // Stream B: one live confirmation per (user, tool, conversation) intent.
+  // Before inserting a new card, expire any still-pending card for the same
+  // tool in the same conversation (looked up through tool_executions, since
+  // confirmation_requests has no conversationId of its own). Without this,
+  // every re-call of execute_strategy stacked another pending card — the
+  // exact pile-up the typed-"approve" loop produced — and an old card could
+  // later be clicked to approve a strategy that has since been superseded.
+  // Automation-run approvals (automationRunId set) are excluded: they are
+  // not chat-conversation intents and must never be expired by a chat call.
+  if (!automationRunId) {
+    const execution = db.prepare("SELECT conversationId FROM tool_executions WHERE id = ?").get(executionId);
+    if (execution?.conversationId) {
+      db.prepare(
+        `UPDATE confirmation_requests SET status = 'expired', resolvedAt = ?
+         WHERE userId = ? AND toolName = ? AND status = 'pending' AND automationRunId IS NULL
+           AND executionId IN (SELECT id FROM tool_executions WHERE conversationId = ?)`
+      ).run(now(), userId, toolName, execution.conversationId);
+    }
+  }
   const id = cryptoRandom();
   const createdAt = now();
   const expiresAt = new Date(Date.now() + 1000 * 60 * 15).toISOString(); // 15 min
@@ -122,6 +144,21 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
   if (execution.status !== "awaiting_confirmation") {
     throw new Error(`Execution is not awaiting confirmation (status: ${execution.status})`);
   }
+  // Stream B (test stage): the card-click path (routes/confirmations.js
+  // resolve()) marks the confirmation row approved/rejected BEFORE calling
+  // this function, but the typed-approve/decline path (orchestrator's
+  // interception) calls this function directly — without the row update, a
+  // typed approval left the row 'pending' forever: the created campaign
+  // kept showing as awaiting approval in GET /pending, and a later click
+  // on the stale card would 500 here (execution no longer awaiting
+  // confirmation). Mark it here, the single place both paths flow
+  // through; the route's own UPDATE is idempotent with this one (same
+  // status, same row), so marking twice is harmless. Marked before the
+  // dispatch below on purpose: the user DID approve (or decline) — if
+  // execution then fails for another reason (e.g. a Meta error), the
+  // approval itself still happened, exactly as the route already does.
+  db.prepare("UPDATE confirmation_requests SET status = ?, resolvedAt = ? WHERE executionId = ? AND status = 'pending'")
+    .run(approved ? "approved" : "rejected", now(), executionId);
   if (!approved) {
     setExecutionStatus(executionId, "failed", { error: "Rejected by user", completedAt: now() });
     const onRejected = onRejectedHandlers[execution.toolName];
@@ -143,6 +180,43 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
     setExecutionStatus(executionId, "completed", { result: { approved: true }, completedAt: now() });
     return { executionId, status: "completed", result: { approved: true } };
   }
+  // Stream B: the card click (or typed-approve resume, Patch 5a) IS the
+  // approval event — record it, bound to the strategy's CURRENT fingerprint,
+  // BEFORE re-dispatching. executeStrategy() re-runs with userMessage ===
+  // undefined on this path (executeNow passes no userMessage), so without
+  // this persisted approval its own check (Patch 1) would reject every
+  // card click with META_V2_APPROVAL_REQUIRED. This is the single place
+  // card/typed approval is persisted — routes/confirmations.js must NOT
+  // duplicate it (it calls this function; see its resolve()).
+  // Test-stage fix (kill switch, round 2): the runtime gate must be
+  // checked BEFORE the approval is recorded, not just inside
+  // executeStrategy() afterwards — recording first silently marks the
+  // strategy "approved" even though execution is blocked while V2 is
+  // disabled, so the row no longer reflects that nothing was approved
+  // while the feature was off. When disabled, skip recording entirely
+  // (the strategy stays "proposed"); executeNow below still fails at
+  // executeStrategy's own gate with META_EXPERT_V2_DISABLED.
+  if (approved && execution.toolName === "meta_expert_v2.execute_strategy" && isV2RuntimeEnabled(execution.userId)) {
+    try {
+      const target = parameters.strategyId
+        ? getStoredStrategy(execution.userId, parameters.strategyId)
+        : getActiveStrategyForConversation(execution.userId, execution.conversationId);
+      if (target && ["proposed", "approved"].includes(target.status)) {
+        recordStrategyApproval(target.id, fingerprintStrategy(target.strategy), "confirmation-card");
+      }
+      // If there is no executable target (already executed / superseded),
+      // record nothing: executeStrategy()'s own loadExecutable() will fail
+      // honestly below, and the orchestrator's already-executed
+      // short-circuit handles the normal double-approve case before this
+      // function is ever reached.
+    } catch (recordErr) {
+      // Recording approval must never mask the real outcome: if the import
+      // or lookup fails, executeStrategy() will still run and fail with
+      // META_V2_APPROVAL_REQUIRED, which is diagnosable — rather than
+      // pretending the click worked. Log loudly.
+      console.error("[resumeAfterConfirmation] failed to record V2 approval:", recordErr.message);
+    }
+  }
   return executeNow({ executionId, tool, parameters, userId: execution.userId, agentId: execution.agentId, conversationId: execution.conversationId });
 }
 
@@ -161,6 +235,26 @@ function confirmationReason(toolName, parameters, context = {}) {
     const { plan } = stored.planData;
     const budget = plan.daily_budget != null ? `${plan.daily_budget}/day` : "no budget set yet";
     return `This creates a real Meta Campaign + Ad Set (PAUSED) for: "${plan.goal}" — Objective: ${plan.objective}, Budget: ${budget}. Nothing spends until you separately resume it in Meta.`;
+  }
+  if (toolName === "meta_expert_v2.execute_strategy") {
+    // Stream B: same reasoning as the V1 execute_campaign_plan branch
+    // above — a generic "requires your approval" card tells the user
+    // nothing about WHAT they are approving, which is how a stale card
+    // gets clicked for the wrong strategy. (Option 1: static import at the
+    // top of this file — strategyStore imports only db/middleware/
+    // diagnostics/policy, so there is no cycle.)
+    try {
+      const stored = parameters.strategyId
+        ? getStoredStrategy(context.userId, parameters.strategyId)
+        : getActiveStrategyForConversation(context.userId, context.conversationId);
+      if (!stored) return "This creates a real (paused) Meta Campaign and Ad Set — but no valid strategy was found to execute. Approving this will fail.";
+      const s = stored.strategy;
+      const budget = s.budget_daily != null ? `${s.budget_daily}/day` : "no budget set yet";
+      const page = stored.resolvedAssets?.pageName || stored.resolvedAssets?.pageId || "unknown Page";
+      return `This creates a real Meta Campaign + Ad Set (PAUSED) for: "${s.business_goal || "your campaign"}" — Objective: ${s.recommended_objective}, Budget: ${budget}, Page: ${page}. Nothing spends until you separately resume it in Meta.`;
+    } catch {
+      return "This creates a real (paused) Meta Campaign and Ad Set. Approving this will create it — nothing spends until you separately resume it in Meta.";
+    }
   }
   if (toolName === "create_memory") {
     return `This permanently stores in your long-term memory: "${parameters.content}"`;

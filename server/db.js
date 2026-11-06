@@ -2069,12 +2069,45 @@ CREATE TABLE IF NOT EXISTS meta_v2_strategies (
   createdAt           TEXT NOT NULL,
   updatedAt           TEXT NOT NULL,
   approvedAt          TEXT,
+  approvalFingerprint TEXT,
+  approvedVia         TEXT,
   executedAt          TEXT,
   FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_meta_v2_user ON meta_v2_strategies(userId);
 CREATE INDEX IF NOT EXISTS idx_meta_v2_conversation ON meta_v2_strategies(conversationId);
 `);
+
+// Stream C — audit trail for rejected build/revise attempts (one row per
+// rejected call; a failed attempt is never stored in meta_v2_strategies, so
+// it can never supersede or be mistaken for the live strategy — see
+// insertFailedAttempt, strategyStore.js). Additive CREATE TABLE IF NOT
+// EXISTS, same pattern as meta_v2_strategies above; safe on existing DBs.
+db.exec(`
+CREATE TABLE IF NOT EXISTS meta_v2_strategy_attempts (
+  id                  TEXT PRIMARY KEY,
+  userId              TEXT NOT NULL,
+  conversationId      TEXT,
+  revisionOf          TEXT,
+  attemptedAt         TEXT NOT NULL,
+  requestedChangesJson TEXT,
+  discardedFieldsJson TEXT,
+  errorsJson          TEXT NOT NULL,
+  userMessage         TEXT,
+  FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_meta_v2_attempts_conversation ON meta_v2_strategy_attempts(conversationId);
+`);
+
+// Stream B — bind an approval to the exact strategy content approved.
+// approvedAt already exists; approvalFingerprint is the fingerprintStrategy()
+// of the strategy row at approval time (NULL = never approved / approval
+// invalidated by a revise). approvedVia records how approval was given:
+// 'chat-strong' | 'confirmation-card' | 'typed-approve-resume' — audit only,
+// never a substitute for the fingerprint match.
+const metaV2Cols = db.prepare("PRAGMA table_info(meta_v2_strategies)").all().map((c) => c.name);
+if (!metaV2Cols.includes("approvalFingerprint")) db.exec("ALTER TABLE meta_v2_strategies ADD COLUMN approvalFingerprint TEXT");
+if (!metaV2Cols.includes("approvedVia")) db.exec("ALTER TABLE meta_v2_strategies ADD COLUMN approvedVia TEXT");
 
 db.prepare("INSERT OR IGNORE INTO skills (id, name, description, category, status) VALUES (?, ?, ?, ?, 'available')")
   .run("meta_expert_v2", "Meta Ads Expert V2", "Rebuilt Meta Ads AI Media Buyer — trusted business snapshot, deterministic strategy validation, and approval-gated execution. Behind the META_EXPERT_V2 feature flag; not yet enabled by default.", "marketing");

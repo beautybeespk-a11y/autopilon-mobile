@@ -24,21 +24,32 @@ const { saveConnection, updateConnectionMeta, getConnection } = await import("..
 const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
-const { buildStrategy, reviseStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
+const { buildStrategy, reviseStrategy, pixelSummaryValue } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
-const { messageIndicatesExecutionApproval } = await import("../agents/metaExpertV2/policy.js");
-const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser } = await import("../agents/metaExpertV2/strategyStore.js");
-const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion } = await import("../agents/metaExpertV2/creativeResolution.js");
-const { validateStrategyStructure } = await import("../agents/metaExpertV2/strategySchema.js");
+const { messageIndicatesExecutionApproval, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
+const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
+const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
+const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
+const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
 const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
-const { listTemplates, installTemplate } = await import("../orchestrator/agentLibrary.js");
+const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
 const { updateFlag } = await import("../orchestrator/featureFlags.js");
 const { handleIncomingMessage } = await import("../orchestrator/conversationService.js");
 await import("../tools/index.js"); // registers meta_expert_v2.* tools
+
+// Stream B test helper — approves a strategy the way production does after
+// the executor approval check: bound to the strategy's current fingerprint.
+// Direct executeStrategy() calls in older tests that relied on the old
+// unconditional markStrategyApproved() use this (persisted-approval /
+// card-resume path) or pass userMessage: "approve" (fresh-approval path).
+function approveStrategyForTest(strategyId, stored) {
+  recordStrategyApproval(strategyId, fingerprintStrategyForTest(stored.strategy), "test");
+}
 
 const results = [];
 async function check(name, fn) {
@@ -88,6 +99,18 @@ function metaRouter({
   // on the next call — proves meta.listCampaigns (api.js) actually follows
   // it rather than just trusting a bigger single page.
   campaignInsights = {}, campaignsPageSize = null,
+  // Test stage (Stream D §5) — campaignInsightsByRange: key
+  // `${campaignId}|${since}|${until}` (or `${campaignId}|${datePreset}`)
+  // -> row object, or null to simulate Meta returning NO row for that
+  // range. Checked in the /insights handler before the single-row
+  // fallback below; keys not present fall through untouched.
+  campaignInsightsByRange = {},
+  // Test stage (Stream A P-A10) — postsPageSize / igPostsPageSize: when
+  // set, paginate the /posts and /media lists exactly like campaignsPageSize
+  // does above (one page + a genuine paging.next cursor with the opaque
+  // __page_offset param this mock reads back), so listPagePosts/
+  // listInstagramPosts actually follow paging.next in tests.
+  postsPageSize = null, igPostsPageSize = null,
   // Round 53 (Phase 3A) — campaignDetails: campaignId -> {id, name, status,
   // objective, account_id}, for meta.getCampaign's single-entity lookup.
   // adSetRoster/adRoster: the FULL account-scoped list (meta.listAdSets/
@@ -99,6 +122,12 @@ function metaRouter({
   // array, matching Meta's own confirmed-live behavior of returning no
   // row at all rather than a zeroed one).
   campaignDetails = {}, adSetRoster = [], adRoster = [], adSetLevelInsights = {}, adLevelInsights = {},
+  // Test stage (Stream A P-A10) — postDetails: post/media id -> raw post
+  // object, for meta.getPagePost/getInstagramMedia's single-entity GET
+  // (the executor's re-validation read). Lets a test override the live
+  // caption (e.g. "caption changed since build") without touching the
+  // list fixture.
+  postDetails = {},
 } = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
@@ -163,7 +192,11 @@ function metaRouter({
       const acct = adAccounts.find((a) => a.id === adAccountFieldsMatch[1]);
       return jsonResponse({ id: adAccountFieldsMatch[1], name: acct?.name || "Ad Account", account_status: 1, currency: acct?.currency || "USD" });
     }
-    const pageFieldsMatch = path.match(/^\/(\d+)$/);
+    // Test stage: composite Facebook post ids (111_1) are single-entity
+    // GETs too (meta.getPagePost /{postId}) — \d+ alone never matched
+    // them, so every executor re-validation GET fell through to the
+    // "Unmocked GET" catch-all.
+    const pageFieldsMatch = path.match(/^\/(\d+(?:_\d+)?)$/);
     if (pageFieldsMatch && u.searchParams.get("fields") === "instagram_business_account") {
       const igId = igByPageId[pageFieldsMatch[1]];
       return jsonResponse(igId ? { instagram_business_account: { id: igId } } : {});
@@ -184,6 +217,17 @@ function metaRouter({
     // (/{campaignId}?fields=id,name,status,objective,account_id).
     if (pageFieldsMatch && campaignDetails[pageFieldsMatch[1]]) {
       return jsonResponse(campaignDetails[pageFieldsMatch[1]]);
+    }
+    // Test stage (Stream A P-A10) — single-post/media GET (meta.getPagePost
+    // / getInstagramMedia, the executor's caption re-validation read):
+    // postDetails overrides by id; otherwise the id is looked up in the
+    // already-mocked posts/igPosts lists, so a GET for a post the mock
+    // itself served returns that same post instead of "Unmocked GET".
+    if (pageFieldsMatch) {
+      const postId = pageFieldsMatch[1];
+      if (postDetails[postId]) return jsonResponse(postDetails[postId]);
+      const listed = (posts || []).find((p) => p.id === postId) || (igPosts || []).find((p) => p.id === postId);
+      if (listed) return jsonResponse(listed);
     }
     if (pageFieldsMatch && recordsById.has(pageFieldsMatch[1])) {
       const id = pageFieldsMatch[1];
@@ -246,6 +290,16 @@ function metaRouter({
       const level = u.searchParams.get("level");
       if (level === "adset") return jsonResponse({ data: adSetLevelInsights[campaignId] || [] });
       if (level === "ad") return jsonResponse({ data: adLevelInsights[campaignId] || [] });
+      // Test stage (Stream D §5) — range-specific rows first: a test that
+      // asserts different numbers for different windows needs the mock to
+      // answer per range, not one row for every range.
+      const timeRange = u.searchParams.get("time_range") ? JSON.parse(u.searchParams.get("time_range")) : null;
+      const datePreset = u.searchParams.get("date_preset");
+      const rangeKey = timeRange ? `${campaignId}|${timeRange.since}|${timeRange.until}` : (datePreset ? `${campaignId}|${datePreset}` : null);
+      if (rangeKey && Object.prototype.hasOwnProperty.call(campaignInsightsByRange, rangeKey)) {
+        const rangedRow = campaignInsightsByRange[rangeKey];
+        return jsonResponse({ data: rangedRow ? [rangedRow] : [] });
+      }
       const row = campaignInsights[campaignId] || { impressions: "1000", clicks: "40", spend: "120", ctr: "4", cpc: "3", cpm: "12", reach: "900", frequency: "1.1", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "150" }], cost_per_action_type: [{ action_type: "purchase", value: "15" }], purchase_roas: [{ action_type: "omni_purchase", value: "2.4" }] };
       return jsonResponse({ data: [row] });
     }
@@ -253,13 +307,33 @@ function metaRouter({
     // or a revoked permission) for the Page-posts fetch specifically —
     // distinct from "not_connected"/empty, matching businessSnapshot.js's
     // real fetch_failed status (attempt() catches the thrown error).
-    if (path.endsWith("/posts")) return postsError ? jsonResponse({ error: { message: "Simulated Facebook posts fetch failure" } }, 500) : jsonResponse({ data: posts });
+    if (path.endsWith("/posts")) {
+      if (postsError) return jsonResponse({ error: { message: "Simulated Facebook posts fetch failure" } }, 500);
+      if (postsPageSize) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const pageItems = posts.slice(offset, offset + postsPageSize);
+        const nextOffset = offset + postsPageSize;
+        const hasMore = nextOffset < posts.length;
+        return jsonResponse({ data: pageItems, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${nextOffset}` } : undefined });
+      }
+      return jsonResponse({ data: posts });
+    }
     // igPostsError simulates a real Instagram content-read failure while
     // the IG account IS linked (igByPageId set) — this deployment's actual
     // production state, since instagram_basic isn't a granted OAuth scope
     // (see oauth.js's SCOPES comment) — distinct from "not_connected"
     // (no igByPageId entry at all, never reaches this handler).
-    if (path.endsWith("/media")) return igPostsError ? jsonResponse({ error: { message: "Invalid Scopes: instagram_basic" } }, 400) : jsonResponse({ data: igPosts });
+    if (path.endsWith("/media")) {
+      if (igPostsError) return jsonResponse({ error: { message: "Invalid Scopes: instagram_basic" } }, 400);
+      if (igPostsPageSize) {
+        const offset = Number(u.searchParams.get("__page_offset") || "0");
+        const pageItems = igPosts.slice(offset, offset + igPostsPageSize);
+        const nextOffset = offset + igPostsPageSize;
+        const hasMore = nextOffset < igPosts.length;
+        return jsonResponse({ data: pageItems, paging: hasMore ? { next: `https://graph.facebook.com/v25.0${path}?__page_offset=${nextOffset}` } : undefined });
+      }
+      return jsonResponse({ data: igPosts });
+    }
     return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
   };
 }
@@ -541,7 +615,7 @@ async function run() {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more traffic" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.equal(built.resolved.pixelId, null, "sanity: genuinely no Pixel resolved");
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(adSetWrite?.body?.optimization_goal, "LINK_CLICKS");
@@ -561,7 +635,7 @@ async function run() {
       const strategy = baseStrategy({ recommended_objective: "OUTCOME_AWARENESS", optimization_event: "REACH", pixel: null, budget_daily: 500 });
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more brand awareness" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(adSetWrite?.body?.optimization_goal, "REACH");
@@ -617,6 +691,90 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Stream C (§4) — claimed-but-not-applied ------------------------------
+  await check("[Stream C, claimed-but-not-applied] a revision claiming a creative change with an UNCHANGED creative_strategy is reported as not applied — no new row, no success narration", async () => {
+    const userId = makeUser(`v2-streamc-noop-creative-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "3",
+      });
+      assert.equal(answered.resolved.creative?.contentId, "111_3", "sanity: post #3 is genuinely resolved first");
+
+      // Now the claimed-but-not-applied shape: the model "revises" the creative to
+      // the SAME description/source it already has (the live Maybelline relabel:
+      // same source, same position, different free-text description).
+      const rowCountBefore = listRecentStrategiesForUser(userId, 10).length;
+      const claimed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Maybelline post as the ad." } },
+        userMessage: "use the Maybelline post",
+      });
+      // Either outcome is acceptable ONLY if it is honest: a rejection naming the
+      // unchanged field, or a no-op returning the existing row. A silent new "ok"
+      // row is the bug.
+      if (claimed.ok === false) {
+        assert.match(claimed.unresolved.issue, /creative_strategy|exactly as they were|no change/i, `rejection must name the unchanged creative: ${JSON.stringify(claimed.unresolved)}`);
+      } else {
+        assert.equal(claimed.noOp, true, "a passing revision that changed nothing must be flagged noOp, never plain ok");
+        assert.equal(claimed.strategyId, answered.strategyId, "a no-op must return the EXISTING row id, never insert a new one");
+        assert.match(claimed.recommendationText, /No change applied|not applied/i, "the no-op text must say so plainly");
+        assert.equal(listRecentStrategiesForUser(userId, 10).length, rowCountBefore, "no new strategy row may be inserted for a no-op");
+        assert.equal(getActiveStrategyForConversation(userId, conversationId).resolvedAssets.creative?.contentId, "111_3", "the stored creative must still be post #3 — the Maybelline relabel must never reach storage");
+      }
+      // And the failed attempt must be auditable (rejection path) OR the no-op
+      // must carry its reason (no-op path) — at least one of the two.
+      assert.ok(claimed.attemptId || (claimed.notApplied && claimed.notApplied.length), "the attempt must leave an audit trail (attemptId or notApplied[])");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[Stream C, claimed-but-not-applied] companion guard: a GENUINE creative change (position 5 after post #3) still succeeds with a new row", async () => {
+    const userId = makeUser(`v2-streamc-noop-genuine-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "3",
+      });
+      assert.equal(answered.resolved.creative?.contentId, "111_3", "sanity: post #3 is genuinely resolved first");
+      // Without this guard the no-op check could silently swallow real re-picks.
+      const changed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { content_selector: { position: 5 } }, userMessage: "5",
+      });
+      assert.equal(changed.ok, true, JSON.stringify(changed.unresolved));
+      assert.ok(!changed.noOp, "a genuine re-pick must not be flagged noOp");
+      assert.notEqual(changed.strategyId, answered.strategyId, "a genuine re-pick must produce a new row");
+      assert.equal(changed.resolved.creative?.contentId, "111_5", "the re-pick must actually take effect");
+    } finally { restoreFetch(); }
   });
 
   // --- Acceptance Test D ---------------------------------------------
@@ -705,12 +863,326 @@ async function run() {
       const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "Approve it." });
       assert.equal(gate, null, "genuine approval language with an active strategy must pass the gate");
 
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       assert.ok(executed.campaignId);
       assert.ok(executed.adSetId);
       const stored = getStoredStrategy(userId, built.strategyId);
       assert.equal(stored.status, "executed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Stream B — build-once, approval, typed-approve ----------------------
+  await check("[Stream B build-once] build_strategy twice with an identical strategy in one conversation returns the EXISTING strategyId and inserts no second row", async () => {
+    const userId = makeUser(`stream-b-build-once-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }] } }));
+    try {
+      const strategy = baseStrategy({ budget_daily: 500 });
+      const first = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more sales on my website" });
+      assert.equal(first.ok, true, JSON.stringify(first.unresolved));
+      const rowsAfterFirst = db.prepare("SELECT id, status, revisionOf FROM meta_v2_strategies WHERE userId = ? AND conversationId = ?").all(userId, conversationId);
+      assert.equal(rowsAfterFirst.length, 1, "one row after the first build");
+      // Second call: the SAME strategy object, as if the model re-called
+      // build_strategy in a later turn (per-turn counters have reset).
+      const second = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "I want more sales on my website" });
+      assert.equal(second.ok, true, JSON.stringify(second.unresolved));
+      assert.equal(second.strategyId, first.strategyId, "identical rebuild must return the existing strategyId, not a new one");
+      assert.equal(second.recommendationText, first.recommendationText, "identical rebuild must return the existing recommendation text");
+      assert.equal(second.deduplicated, true, "the result must say it was deduplicated");
+      const rowsAfterSecond = db.prepare("SELECT id, status, revisionOf FROM meta_v2_strategies WHERE userId = ? AND conversationId = ?").all(userId, conversationId);
+      assert.equal(rowsAfterSecond.length, 1, "no second row may be inserted by an identical rebuild");
+      assert.equal(rowsAfterSecond[0].status, "proposed");
+      // And a REAL change must still go through as a revision (new row,
+      // revisionOf set, old row superseded) — dedup must not swallow it.
+      const changed = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 600 }), userMessage: "make the budget 600 per day" });
+      assert.equal(changed.ok, true, JSON.stringify(changed.unresolved));
+      assert.notEqual(changed.strategyId, first.strategyId, "a real change must produce a new (revision) row");
+      const rowsAfterChange = db.prepare("SELECT id, status, revisionOf FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? ORDER BY createdAt ASC, rowid ASC").all(userId, conversationId);
+      assert.equal(rowsAfterChange.length, 2);
+      assert.equal(rowsAfterChange[0].status, "superseded");
+      assert.equal(rowsAfterChange[1].revisionOf, first.strategyId);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B build-once] revise_strategy restating fields verbatim WHILE revising something else applies the real change — the restated fields are not treated as a failed revision", async () => {
+    const userId = makeUser(`stream-b-build-once-revise-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }] } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // The live shape: the model restates budget_daily (500) and gender
+      // verbatim while genuinely narrowing the age band. The restated
+      // fields must not make the revision look like a no-change, and the
+      // real change must land as a new revision row.
+      // NOTE (spec conflict, recorded for the parent agent): Stream B's
+      // spec also sketches a purely-identical revise (requestedChanges
+      // identical to the stored values, nothing else) returning the
+      // existing id — but that shape is exactly what the pre-existing
+      // [Acceptance C, inverse] test requires to be REJECTED ("a revision
+      // that CLAIMS to reconsider ... but leaves the values identical is
+      // REJECTED"). A purely-identical revise cannot be both a dedup and
+      // a rejection, so this variant tests the shape the spec's own
+      // rationale names — restatement alongside a real change — which the
+      // dedup/substantive machinery must not swallow.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { budget_daily: 500, gender: built.strategy.gender, age_min: 25, age_max: 34 }, userMessage: "keep the budget at 500 but narrow the audience to 25-34",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.notEqual(revised.strategyId, built.strategyId, "a revision with a real change must produce a new row even when other fields are restated verbatim");
+      assert.equal(revised.strategy.budget_daily, 500, "the verbatim-restated budget must be preserved");
+      assert.equal(revised.strategy.age_min, 25, "the genuine change must be applied");
+      assert.equal(revised.strategy.age_max, 34);
+      const oldRow = getStoredStrategy(userId, built.strategyId);
+      assert.equal(oldRow.status, "superseded", "the prior row must be superseded by the revision");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B approval] executeStrategy() without any approval is blocked IN THE EXECUTOR, leaves the strategy proposed, and makes no Meta write", async () => {
+    const userId = makeUser(`stream-b-no-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // (d1) No userMessage at all, no persisted approval — the direct-call
+      // shape every pre-patch test used. Must now throw.
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        (err) => err.code === "META_V2_APPROVAL_REQUIRED",
+      );
+      // (d2) A bare "yes" is NOT fresh approval inside the executor (it may
+      // have been consumed by a URL/creative confirmation this turn).
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "yes" }),
+        (err) => err.code === "META_V2_APPROVAL_REQUIRED",
+      );
+      // Strategy untouched, nothing spent.
+      assert.equal(getStoredStrategy(userId, built.strategyId).status, "proposed");
+      assert.equal(writes.length, 0, "no Meta write may happen without approval");
+      // (d3) Strong approval words DO execute (positive control).
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
+      assert.equal(executed.status, "PAUSED");
+      assert.ok(writes.some((w) => w.path.endsWith("/campaigns")), "a campaign must actually have been created");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B approval] persisted approval executes without a message (card-resume shape), and a revise after approval invalidates it", async () => {
+    const userId = makeUser(`stream-b-approval-binding-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }], writes } }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true);
+      // Card-click shape: approval recorded, then execute with NO userMessage
+      // (resumeAfterConfirmation re-dispatches without one).
+      approveStrategyForTest(built.strategyId, getStoredStrategy(userId, built.strategyId));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      assert.equal(executed.status, "PAUSED");
+      // Fresh conversation/strategy: approve, then REVISE the budget, then
+      // execute with no new approval → blocked with the "changed since"
+      // message, not the generic one.
+      const conversationId2 = `conv-${cryptoRandom()}`;
+      const built2 = await buildStrategy({ userId, conversationId: conversationId2, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      approveStrategyForTest(built2.strategyId, getStoredStrategy(userId, built2.strategyId));
+      const revised = await reviseStrategy({ userId, conversationId: conversationId2, accessToken: `fake-meta-token-${userId}`, strategyId: built2.strategyId, requestedChanges: { budget_daily: 700 }, userMessage: "make the budget 700" });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId: conversationId2, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId }),
+        (err) => err.code === "META_V2_APPROVAL_REQUIRED" && /changed since/.test(err.message),
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B gate-block] two gate-blocked execute_strategy attempts in one turn hard-stop the turn instead of looping", async () => {
+    const userId = makeUser(`stream-b-gate-block-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }] } }));
+    let built;
+    try {
+      built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+    // The user message carries NO approval language, and the model keeps
+    // calling execute_strategy anyway — the shape that used to loop to
+    // MAX_STEPS. The first attempt is gate-blocked (no approval); the
+    // repeats hit the V2 single-call gate and hard-stop the turn with one
+    // honest reply.
+    // NOTE (spec wording vs implementation, recorded for the parent
+    // agent): Stream B's spec sketches this as "two gate-blocked attempts
+    // hard-stop" with the gate-block reply ("wasn't able to create this
+    // campaign yet"). As implemented, a gate-blocked attempt CONSUMES the
+    // once-per-turn single-call slot (orchestrator/index.js, Patch 2
+    // Change A), so the second attempt is intercepted by the single-call
+    // gate BEFORE it can reach the approval gate a second time — the
+    // executeGateBlocksThisTurn >= 2 hard-stop is unreachable through the
+    // model loop. The observable contract is the same (the turn
+    // hard-stops, nothing is created, no loop), but the hard-stop reply
+    // is the single-call gate's wording, and the test asserts that.
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }], writes },
+      chatResponses: [
+        toolCall("meta_expert_v2.execute_strategy", {}),
+        toolCall("meta_expert_v2.execute_strategy", {}),
+        toolCall("meta_expert_v2.execute_strategy", {}),
+      ],
+    }));
+    try {
+      const userMessage = "tell me about the campaign";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.match(result.reply, /already have a result from earlier in this response/i, `the turn must hard-stop with the honest reply, not loop: ${result.reply}`);
+      const executeAttempts = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.execute_strategy");
+      // Test stage: the third attempt hard-stops WITHOUT a toolResults
+      // entry (the single-call gate's hard-stop branch returns directly),
+      // so only the first two attempts are recorded — the first
+      // gate-blocked, the second blocked as a duplicate.
+      assert.equal(executeAttempts.length, 2, "the first two attempts must be recorded as blocked tool results (the third hard-stops without a further entry)");
+      assert.ok(/approval/i.test(executeAttempts[0].error || ""), `the first attempt must carry the approval gate's refusal: ${JSON.stringify(executeAttempts[0])}`);
+      assert.ok(/Blocked duplicate call this turn/.test(executeAttempts[1].error || ""), "the repeat must be blocked by the single-call gate, never dispatched");
+      assert.equal(writes.length, 0, "no Meta write may happen from blocked attempts");
+      assert.equal(getStoredStrategy(userId, built.strategyId).status, "proposed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B typed-approve] typing 'approve' resumes the PENDING confirmation instead of creating a second one", async () => {
+    const userId = makeUser(`stream-b-typed-approve-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [], // the typed-approve interception returns BEFORE the model loop, so no chat call is expected
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }], writes },
+    }));
+    try {
+      const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      // Step 1 — the model calls execute_strategy (gate would pass on
+      // "approve"; runTool itself only enforces requiresConfirmation).
+      // Mirror production: runTool stops at awaiting_confirmation.
+      const first = await runTool({ toolName: "meta_expert_v2.execute_strategy", parameters: {}, userId, agentId, conversationId, userMessage: "approve" });
+      assert.equal(first.status, "awaiting_confirmation", JSON.stringify(first));
+      assert.ok(first.confirmationId, "a confirmation card must have been created");
+      assert.equal(writes.length, 0, "nothing may be created while awaiting confirmation");
+      const pendingBefore = db.prepare("SELECT COUNT(*) AS n FROM confirmation_requests WHERE userId = ? AND status = 'pending'").get(userId).n;
+      assert.equal(pendingBefore, 1);
+      // handleIncomingMessage inserts the user's message with a
+      // conversationId foreign key — replicate routes/chat.js's own
+      // conversation-creation step first (same pattern as the
+      // [Strategy persistence] end-to-end test).
+      const now = new Date().toISOString();
+      db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(conversationId, userId, agentId, "Test conversation", now, now);
+      // Step 2 — the user types "approve" in chat instead of clicking.
+      const { reply } = await handleIncomingMessage({ userId, agentId, conversationId, content: "approve" });
+      assert.match(reply, /Campaign ID:/, `the reply must report the created campaign, got: ${reply}`);
+      assert.match(reply, /paused/i, "the reply must say the campaign is paused");
+      // Exactly one campaign created, exactly one confirmation ever, and it
+      // is now approved — no second card, no second execution.
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 1, "exactly one campaign may be created");
+      const confirmations = db.prepare("SELECT * FROM confirmation_requests WHERE userId = ?").all(userId);
+      assert.equal(confirmations.length, 1, "no second confirmation row may be created by the typed approval");
+      assert.equal(confirmations[0].status, "approved");
+      assert.equal(confirmations[0].id, first.confirmationId, "the resumed confirmation must be the ORIGINAL one");
+      const pendingAfter = db.prepare("SELECT COUNT(*) AS n FROM confirmation_requests WHERE userId = ? AND status = 'pending'").get(userId).n;
+      assert.equal(pendingAfter, 0);
+      // Step 3 — typing "approve" AGAIN must not create a second campaign.
+      // The confirmation is now resolved (approved), so there is no
+      // pending card to resume — the turn goes to the model loop, and the
+      // model's execute_strategy call hits the already-executed
+      // short-circuit, which reports the existing campaign.
+      mockFetch(scriptedFetch({
+        chatResponses: [toolCall("meta_expert_v2.execute_strategy", {})],
+        metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "222", name: "PX" }], writes },
+      }));
+      try {
+        const again = await handleIncomingMessage({ userId, agentId, conversationId, content: "approve" });
+        assert.match(again.reply, /already live|already exists|Campaign ID:/i);
+        assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 1, "a second 'approve' must never create a second campaign");
+      } finally {
+        restoreFetch();
+      }
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream B typed-approve] typing 'approve' while the message was consumed by a URL confirmation does NOT resume execution — the URL is confirmed, the campaign is not created", async () => {
+    const userId = makeUser(`stream-b-typed-approve-url-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    // Inline post fixture (CREATIVE_TEST_POST is defined later in this
+    // file — this test runs before its declaration, so it cannot reference
+    // it; same shape: one real Facebook post with a permalink).
+    const testPost = { id: "111_1", message: "New Vitamin C Serum drop!", created_time: "2024-03-03T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/1", attachments: { data: [{ media_type: "photo" }] } };
+    // The destination-URL auto-confirm fixture: the strategy has a
+    // suggested store URL waiting for confirmation, and "yes" confirms
+    // ONLY the URL — it must never also resume an execution.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [testPost], writes }, wcProducts: [{ id: 1, name: "Serum", price: "1000", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/a.jpg" }], permalink: "https://store.example.com/p/1/" }] }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "sanity: the URL question must genuinely be open");
+    } finally {
+      restoreFetch();
+    }
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [testPost], writes },
+      chatResponses: [finalText("Got it — the destination URL is confirmed. The campaign hasn't been created yet — just say \"approve\" whenever you're ready to launch it.\nDestination URL: https://store.example.com")],
+    }));
+    try {
+      // "yes, use that URL" is a URL confirmation, not an execution
+      // approval — and there is no pending execution confirmation to
+      // resume in the first place.
+      // Same conversation-creation step as the typed-approve test above:
+      // handleIncomingMessage inserts the message with a conversationId
+      // foreign key.
+      const now = new Date().toISOString();
+      db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+        .run(conversationId, userId, agentId, "Test conversation", now, now);
+      const { reply } = await handleIncomingMessage({ userId, agentId, conversationId, content: "yes, use that URL" });
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active.strategy.destination_url, "https://store.example.com", "the URL confirmation itself must still go through");
+      assert.ok(!writes.some((w) => w.path.endsWith("/campaigns")), "confirming the URL must never create a campaign");
+      assert.doesNotMatch(reply, /Campaign ID:/, `the reply must not report a created campaign: ${reply}`);
+      const pending = db.prepare("SELECT COUNT(*) AS n FROM confirmation_requests WHERE userId = ? AND status = 'pending'").get(userId).n;
+      assert.equal(pending, 0, "no execution confirmation may exist to be resumed");
     } finally {
       restoreFetch();
     }
@@ -978,7 +1450,7 @@ async function run() {
     try {
       const active = getActiveStrategyForConversation(userId, conversationId);
       assert.equal(active?.strategy.budget_daily, 500);
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
     } finally {
       restoreFetch();
@@ -1015,7 +1487,7 @@ async function run() {
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
 
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => /at least PKR250/.test(err.message) && err.code === 100 && err.subcode === 3858558
       );
       const stored = getStoredStrategy(userId, built.strategyId);
@@ -1026,6 +1498,7 @@ async function run() {
       // corrected budget executes cleanly on the very next attempt.
       const revised = await reviseStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, requestedChanges: { budget_daily: 500 }, userMessage: "raise the budget to PKR 500/day" });
       assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      approveStrategyForTest(revised.strategyId, getStoredStrategy(userId, revised.strategyId));
       const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
       assert.equal(executed.status, "PAUSED");
     } finally {
@@ -1086,7 +1559,7 @@ async function run() {
       const staleStrategy = { ...built.strategy, bid_strategy: "LOWEST_COST_WITH_BID_CAP" };
       db.prepare("UPDATE meta_v2_strategies SET strategyJson = ? WHERE id = ?").run(JSON.stringify(staleStrategy), built.strategyId);
 
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(adSetWrite?.body?.bid_strategy, "LOWEST_COST_WITHOUT_CAP", "a stale stored value must be corrected at the actual Meta write, not just at build/revise time");
@@ -1437,7 +1910,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
@@ -1462,7 +1935,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 3000 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
       assert.equal(adSetWrite?.body?.daily_budget, 3000, "a zero-decimal currency (no minor unit) must be sent as-is, not multiplied");
@@ -1495,7 +1968,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
@@ -1547,7 +2020,7 @@ async function run() {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => err.code === 100 && err.subcode === 1815857
       );
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
@@ -1675,7 +2148,7 @@ async function run() {
 
       const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve it" });
       assert.equal(gate, null, "execution must now be allowed — the real question was actually answered");
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: revised.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
 
       // The actual point of saving the default: a completely FRESH
@@ -2227,7 +2700,7 @@ async function run() {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500, recommended_objective: "OUTCOME_ENGAGEMENT" }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => err.code === "META_V2_INVALID_FIELD_COMBINATION" && /OUTCOME_ENGAGEMENT/.test(err.message) && /PURCHASE/.test(err.message)
       );
     } finally {
@@ -2266,7 +2739,7 @@ async function run() {
       const staleResolvedAssets = { ...getStoredStrategy(userId, built.strategyId).resolvedAssets, pixelId: null };
       db.prepare("UPDATE meta_v2_strategies SET resolvedAssetsJson = ? WHERE id = ?").run(JSON.stringify(staleResolvedAssets), built.strategyId);
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => err.code === "META_V2_INVALID_FIELD_COMBINATION" && /requires a real Meta Pixel/i.test(err.message)
       );
     } finally {
@@ -2301,11 +2774,16 @@ async function run() {
       chatResponses: [
         // Live-bug shape: claims completion with zero tool calls this turn.
         finalText("Executing the strategy with a daily budget of 500 PKR."),
-        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { budget_daily: 500 } }),
-        // A REAL revise_strategy call happened this turn now — the exact
-        // same "I've updated the budget" phrasing here must NOT be
-        // blocked, since it's now an honest claim.
-        finalText("I've updated the budget to PKR 500/day — say \"approve\" when you're ready to execute."),
+        // Test stage: the scripted revise_strategy call this test used to
+        // expect here is now REDUNDANT — the round-30 pre-loop auto-revise
+        // already saved the budget (500/day) from the user's message
+        // before the model's turn, so a second revise requesting the same
+        // value is a no-op and the "I've updated the budget" reply it
+        // used to enable is now correctly flagged by the claimed-revision
+        // gate (§3.4c) as a change that never applied. The honest
+        // finalization after the claim-gate nudge presents the stored
+        // budget as-is (no change claim, amount quoted) instead.
+        finalText("Your budget is PKR 500/day and the campaign is paused until you approve. Say \"approve\" when you're ready to execute."),
       ],
     }));
     try {
@@ -2314,7 +2792,7 @@ async function run() {
       const toolNames = result.toolResults.map((r) => r.toolName);
       assert.ok(toolNames.includes("meta_expert_v2.revise_strategy"), `the nudge must force a real revise_strategy call: ${JSON.stringify(toolNames)}`);
       assert.doesNotMatch(result.reply, /^Executing the strategy with a daily budget of 500 PKR\.$/, "the unfulfilled claim must never be the final reply");
-      assert.match(result.reply, /updated the budget/i);
+      assert.match(result.reply, /budget is PKR 500\/day/i);
       // revise_strategy always inserts a NEW row (never updates in place)
       // — the active strategy for this conversation is now the revision,
       // not initial.strategyId.
@@ -2403,7 +2881,7 @@ async function run() {
     mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "USD" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
     try {
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         /built for a PKR ad account, but the ad account's real currency is now USD/i
       );
       const stored = getStoredStrategy(userId, built.strategyId);
@@ -2440,7 +2918,14 @@ async function run() {
 
     mockFetch(scriptedFetch({
       metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
-      chatResponses: [finalText('Got it — the daily budget is saved. Say "approve" when you\'re ready to execute.')],
+      // Test stage: the first reply mentions the budget without quoting
+      // the stored amount, so the Stream C fidelity gate (§3.4b) nudges
+      // once; the second reply is that rewrite (stored amount quoted,
+      // no change claim — the pre-loop already saved it).
+      chatResponses: [
+        finalText('Got it — the daily budget is saved. Say "approve" when you\'re ready to execute.'),
+        finalText('Got it — the daily budget is PKR 500/day. Say "approve" when you\'re ready to execute.'),
+      ],
     }));
     try {
       const userMessage = "Rs.500";
@@ -2453,7 +2938,7 @@ async function run() {
 
       // execute_strategy must no longer report a missing budget now that
       // the auto-revise has genuinely saved it.
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: active.id, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED", "execution must succeed now that a real budget is on record, not fail with 'no daily budget set'");
     } finally {
       restoreFetch();
@@ -2584,6 +3069,11 @@ async function run() {
       chatResponses: [
         finalText("Unfortunately, I still can't access your recent Instagram posts due to a permissions issue."),
         finalText(`Unfortunately, I still can't access your recent Instagram posts. Specific reason: ${capturedReason}`),
+        // Test stage: the corrected reply mentions the creative
+        // ("Instagram posts") without quoting the stored Creative line,
+        // so the Stream C fidelity gate (§3.4b) nudges once more; the
+        // third reply quotes both the real reason AND the stored line.
+        finalText(`Unfortunately, I still can't access your recent Instagram posts. Specific reason: ${capturedReason}\nCreative: Product image "Vitamin C Serum" (id 1)`),
       ],
     }));
     try {
@@ -2628,6 +3118,14 @@ async function run() {
       chatResponses: [
         finalText("Unfortunately, I still can't access your recent Instagram posts due to a permissions issue."),
         finalText("Still just a permissions issue, sorry for the confusion."),
+        // Test stage: after the second vague reply the reason gate has
+        // spent its nudge and deterministically appends the real reason
+        // — but the reply also mentions the creative ("Instagram posts")
+        // without quoting the stored Creative line, so the Stream C
+        // fidelity gate (§3.4b) nudges once more; the third reply
+        // quotes the stored line (the reason is appended again by the
+        // exhausted reason gate, which is the fail-safe working).
+        finalText("Still just a permissions issue, sorry for the confusion.\nCreative: Product image \"Vitamin C Serum\" (id 1)"),
       ],
     }));
     try {
@@ -2768,7 +3266,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 750 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       campaignId = executed.campaignId;
       adSetId = executed.adSetId;
@@ -2970,7 +3468,7 @@ async function run() {
 
       const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
       assert.equal(gate, null);
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       assert.ok(executed.adId, "the boosted post ad must be created");
     } finally {
@@ -3011,7 +3509,7 @@ async function run() {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals! Budget 600/day." });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
 
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
 
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
@@ -3053,7 +3551,7 @@ async function run() {
       };
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
 
       const events = db.prepare("SELECT * FROM automation_events WHERE userId = ? AND eventType = ?").all(userId, "meta_ads_event");
@@ -3183,7 +3681,7 @@ async function run() {
       db.prepare("UPDATE meta_v2_strategies SET strategyJson = ? WHERE id = ?").run(JSON.stringify(staleStrategy), built.strategyId);
 
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => {
           assert.equal(err.code, "META_V2_EXPLICIT_ACTION_CTA_UNSUPPORTED");
           assert.match(err.message, /can't be set up for a Sales\/Purchase objective/i);
@@ -3336,7 +3834,7 @@ async function run() {
       };
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy, userMessage: "boost my latest Facebook post — New arrivals!" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
 
       const adSetWrite = writes.find((w) => w.path.endsWith("/adsets"));
@@ -3446,7 +3944,7 @@ async function run() {
         requestedChanges: { content_selector: { position: 3 } }, userMessage: "3.",
       });
       assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" });
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3", postId: "111_3", caption: "Behind the scenes at the studio", captionExcerpt: "Behind the scenes at the studio", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/3", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } });
       assert.deepEqual(confirmed.strategy.unresolved_questions, []);
 
       // Approve and execute — the campaign is created for real.
@@ -3469,7 +3967,7 @@ async function run() {
       assert.equal(revised.strategy.age_max, 45);
       // The actual bug: the creative must survive, and the candidate
       // question must never come back.
-      assert.deepEqual(revised.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "the already-confirmed creative must survive an unrelated targeting revision — never silently re-derived");
+      assert.deepEqual(revised.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3", postId: "111_3", caption: "Behind the scenes at the studio", captionExcerpt: "Behind the scenes at the studio", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/3", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the already-confirmed creative must survive an unrelated targeting revision — never silently re-derived");
       assert.ok(!revised.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), `the candidate question must NEVER come back for an unrelated change: ${JSON.stringify(revised.strategy.unresolved_questions)}`);
       assert.equal(revised.resolved.creative.contentId, "111_3", "campaign mode's real content reference is resolved.creative.contentId — resolved.contentId itself is only ever populated for explicit_action mode");
 
@@ -3615,7 +4113,7 @@ async function run() {
         requestedChanges: { content_selector: { position: 3 } }, userMessage: "3.",
       });
       assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" });
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3", postId: "111_3", caption: "Behind the scenes at the studio", captionExcerpt: "Behind the scenes at the studio", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/3", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } });
       assert.equal(confirmed.strategy.budget_daily, 600);
 
       // The live-bug shape: instead of revise_strategy, the model calls
@@ -3639,7 +4137,7 @@ async function run() {
       assert.equal(rebuilt.strategy.age_min, 22);
       assert.equal(rebuilt.strategy.age_max, 45);
       // The actual fix: neither field the rebuild omitted was discarded.
-      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "the already-confirmed creative must survive a build_strategy call, not just a revise_strategy call");
+      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3", postId: "111_3", caption: "Behind the scenes at the studio", captionExcerpt: "Behind the scenes at the studio", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/3", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the already-confirmed creative must survive a build_strategy call, not just a revise_strategy call");
       assert.equal(rebuilt.strategy.budget_daily, 600, "the already-given budget must survive a build_strategy call too");
       assert.ok(!rebuilt.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the candidate question must never come back");
       const rebuiltRow = getStoredStrategy(userId, rebuilt.strategyId);
@@ -3676,7 +4174,7 @@ async function run() {
         userMessage: "can you please change the gender to female and age limit should be 22-45",
       });
       assert.equal(rebuilt.ok, true, JSON.stringify(rebuilt.unresolved));
-      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" }, "the creative must survive here too");
+      assert.deepEqual(rebuilt.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1", postId: "111_1", caption: "New Vitamin C Serum drop!", captionExcerpt: "New Vitamin C Serum drop!", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/1", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the creative must survive here too");
 
       const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
       assert.ok(gate, "execute_strategy must be blocked — this strategy revises an already-executed campaign");
@@ -3843,6 +4341,7 @@ async function run() {
       const snapshotAfter = await runTool({ toolName: "meta_expert_v2.get_business_snapshot", parameters: {}, userId, agentId, conversationId, planId: null });
       assert.equal(snapshotAfter.status, "completed");
 
+      approveStrategyForTest(built.strategyId, getStoredStrategy(userId, built.strategyId));
       const executedAfter = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
       assert.equal(executedAfter.status, "PAUSED");
       assert.ok(writes.length > 0, "re-enabled execution must actually reach the Meta write API this time");
@@ -4331,8 +4830,8 @@ async function run() {
   // inventing engagement data — but with an active strategy, it then
   // finished right after the snapshot, never calling revise_strategy at
   // all. checkCreativeRevisionRequiredGate (orchestrator/index.js) now
-  // forces get_business_snapshot -> revise_strategy -> final.
-  await check("[Creative revision gate] active strategy + creative-selection request: finalizing right after get_business_snapshot (skipping revise_strategy) is blocked and forces the real revision call", async () => {
+  // forces get_business_snapshot -> present candidates, ask the user to choose (Stream B: no self-pick revise_strategy).
+  await check("[Creative revision gate] active strategy + creative-selection request: finalizing right after get_business_snapshot (skipping revise_strategy) is blocked — the model must present candidates and ask the user to choose, never self-pick", async () => {
     const userId = makeUser(`v2-creative-revision-gate-${stamp}@example.com`);
     connectMeta(userId);
     connectWooCommerce(userId);
@@ -4351,22 +4850,22 @@ async function run() {
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
-        // Live-bug shape: finalizes right after the snapshot, without ever
-        // calling revise_strategy — must be intercepted.
-        finalText("I recommend using the Vitamin C Serum post (480 likes, 52 comments, 30 shares) as your creative."),
-        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares) — real engagement shows strong interest." } }, freshResearchRequired: false }),
-        finalText("I've updated the creative to use your Vitamin C Serum post, which has real engagement (480 likes, 52 comments, 30 shares)."),
+        // Stream B new flow: the model presents the real candidates and
+        // asks the user to choose — it must NOT self-pick via
+        // revise_strategy. The gate nudges this final once, then hard-stops
+        // with its own ask-the-user reply (it cannot distinguish a
+        // present-and-ask final from a self-pick one), so a second
+        // present-and-ask final is scripted to absorb the nudge.
+        finalText("Here is your most recent post: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
+        finalText("Here is your most recent post: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
       ],
     }));
     try {
       const userMessage = "Choose the exact best creative for this campaign.";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       const toolNames = result.toolResults.map((r) => r.toolName);
-      assert.ok(toolNames.includes("meta_expert_v2.get_business_snapshot"), `snapshot must be called: ${JSON.stringify(toolNames)}`);
-      assert.ok(toolNames.includes("meta_expert_v2.revise_strategy"), `revise_strategy must be called before finalizing when an active strategy exists: ${JSON.stringify(toolNames)}`);
-      const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
-      assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
-      assert.doesNotMatch(result.reply, /I recommend using the Vitamin C Serum post \(480 likes, 52 comments, 30 shares\) as your creative\.$/, "the premature pre-revision answer must never be the final reply");
+      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot"], `new flow is snapshot -> present candidates, ask the user to choose — no self-pick revise_strategy: ${JSON.stringify(toolNames)}`);
+      assert.match(result.reply, /which post, Reel, or product/i, `the turn must end by asking the user to choose the creative: ${result.reply}`);
     } finally {
       restoreFetch();
     }
@@ -4549,7 +5048,7 @@ async function run() {
         userMessage: "I want more sales on my website, link it to https://example.com",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
 
       const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
@@ -4594,7 +5093,7 @@ async function run() {
       });
       assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
       const updated = getActiveStrategyForConversation(userId, conversationId);
-      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_INSTAGRAM_POST", contentId: "179999999" }, "must resolve against the real Instagram candidate");
+      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_INSTAGRAM_POST", contentId: "179999999", postId: "179999999", caption: "New arrival! Vitamin C Serum now in stock.", captionExcerpt: "New arrival! Vitamin C Serum now in stock.", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://instagram.com/p/abc123/", linkedProduct: { name: "Vitamin C Serum", price: "1800", category: "Skincare" }, provenance: { kind: "single_candidate_auto", verifiedAgainstUserMessage: false } }, "must resolve against the real Instagram candidate");
     } finally {
       restoreFetch();
     }
@@ -4664,7 +5163,7 @@ async function run() {
       });
       assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
       const updated = getActiveStrategyForConversation(userId, conversationId);
-      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" });
+      assert.deepEqual(updated.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1", postId: "111_1", caption: "New Vitamin C Serum drop!", captionExcerpt: "New Vitamin C Serum drop!", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/1", linkedProduct: { name: "Vitamin C Serum", price: "1800", category: "Skincare" }, provenance: { kind: "single_candidate_auto", verifiedAgainstUserMessage: false } });
     } finally {
       restoreFetch();
     }
@@ -4691,7 +5190,7 @@ async function run() {
         userMessage: "I want more sales on my website, use one of my facebook page posts as the ad",
       });
       assert.equal(corrected.ok, true, JSON.stringify(corrected.unresolved));
-      assert.deepEqual(corrected.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" });
+      assert.deepEqual(corrected.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1", postId: "111_1", caption: "New Vitamin C Serum drop!", captionExcerpt: "New Vitamin C Serum drop!", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/1", linkedProduct: { name: "Vitamin C Serum", price: "1800", category: "Skincare" }, provenance: { kind: "single_candidate_auto", verifiedAgainstUserMessage: false } });
     } finally {
       restoreFetch();
     }
@@ -4779,7 +5278,7 @@ async function run() {
   // (orchestrator/index.js) for the live diagnostic fields requested
   // alongside this test — set META_EXPERT_V2_TRACE=1 in production and
   // reproduce this exact message to see which field is actually false.
-  await check("[Creative revision gate, exact live wording] active PROPOSED strategy + the exact reported live message: required flow is get_business_snapshot -> revise_strategy -> final", async () => {
+  await check("[Creative revision gate, exact live wording] active PROPOSED strategy + the exact reported live message: required flow is get_business_snapshot -> present candidates, ask the user to choose (no self-pick revise_strategy)", async () => {
     const userId = makeUser(`v2-creative-live-wording-${stamp}@example.com`);
     connectMeta(userId);
     connectWooCommerce(userId);
@@ -4805,20 +5304,20 @@ async function run() {
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
-        // Exact live-bug shape: finalizes right after the snapshot,
-        // without ever calling revise_strategy.
-        finalText("Based on your recent content, I selected the Vitamin C Serum post (480 likes, 52 comments, 30 shares) as the best creative for this campaign because it has real, verified engagement."),
-        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares) — real engagement shows strong interest." } }, freshResearchRequired: false }),
-        finalText("I've updated the creative to use your Vitamin C Serum post, which has real engagement (480 likes, 52 comments, 30 shares)."),
+        // Stream B new flow: present the real candidates and ask the user
+        // to choose — never self-pick via revise_strategy. Second final
+        // absorbs the gate's single nudge; the gate then hard-stops with
+        // its own ask-the-user reply.
+        finalText("Based on your recent content, here is the candidate: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
+        finalText("Based on your recent content, here is the candidate: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
       ],
     }));
     try {
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
       const toolNames = result.toolResults.map((r) => r.toolName);
-      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot", "meta_expert_v2.revise_strategy"], `required flow is get_business_snapshot -> revise_strategy -> final: ${JSON.stringify(toolNames)}`);
-      const reviseResult = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy")?.result;
-      assert.equal(reviseResult?.valid, true, JSON.stringify(reviseResult));
-      assert.doesNotMatch(result.reply, /because it has real, verified engagement\.$/, "the premature pre-revision answer must never be the final reply");
+      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot"], `new flow is snapshot -> present candidates, ask the user to choose — no self-pick revise_strategy: ${JSON.stringify(toolNames)}`);
+      assert.match(result.reply, /which post, Reel, or product/i, `the turn must end by asking the user to choose the creative: ${result.reply}`);
+      assert.doesNotMatch(result.reply, /I selected the Vitamin C Serum post/, "the self-pick answer must never be the final reply");
     } finally {
       restoreFetch();
     }
@@ -4887,9 +5386,12 @@ async function run() {
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST_WITH_SYNTHETIC_ENGAGEMENT] },
       chatResponses: [
         toolCall("meta_expert_v2.get_business_snapshot", {}),
-        finalText("I selected the Vitamin C Serum post as the creative."), // live-bug shape: no revise_strategy
-        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Vitamin C Serum post (480 likes, 52 comments, 30 shares)." } }, freshResearchRequired: false }),
-        finalText("I've updated the creative to use your Vitamin C Serum post."),
+        // Stream B new flow: present the candidates and ask the user to
+        // choose — never self-pick via revise_strategy. Second final
+        // absorbs the gate's single nudge; the gate then hard-stops with
+        // its own ask-the-user reply.
+        finalText("Here is your most recent post: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
+        finalText("Here is your most recent post: the Vitamin C Serum post (480 likes, 52 comments, 30 shares). Would you like me to use this post as the creative, or a different one?"),
       ],
     }));
     try {
@@ -4897,22 +5399,19 @@ async function run() {
       const toolNames = turn2.toolResults.map((r) => r.toolName);
 
       // Step 5: getActiveStrategyForConversation() found and used the SAME
-      // strategy (not a different/duplicate one under a mismatched id).
-      const reviseCall = turn2.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
-      assert.ok(reviseCall, `revise_strategy must be called: ${JSON.stringify(toolNames)}`);
-      assert.equal(reviseCall.result?.valid, true, JSON.stringify(reviseCall.result));
-      // A revision always inserts a NEW row (see strategyStore.js's
-      // insertStrategy comment: the prior row is marked 'superseded', never
-      // updated in place) — so the meaningful check isn't "same id," it's
-      // that this new row's revisionOf points back to the SAME strategy
-      // found via conversationId X in step 5, and that prior row is now
-      // superseded, never left dangling as still 'proposed'.
-      const revisedStored = getStoredStrategy(userId, reviseCall.result?.strategyId);
-      assert.equal(revisedStored?.revisionOf, stored.id, "the revision must be OF the same strategy found via conversationId X, not an unrelated one");
-      assert.equal(getStoredStrategy(userId, stored.id)?.status, "superseded", "the original strategy must be marked superseded once revised, not left dangling as proposed");
+      // strategy (not a different/duplicate one under a mismatched id) —
+      // the turn ran against the row from step 3 and left it untouched:
+      // still the same id, still 'proposed', never superseded or replaced.
+      const stillActive = getActiveStrategyForConversation(userId, conversationIdX);
+      assert.ok(stillActive, "the active strategy for conversation X must still be findable after turn 2");
+      assert.equal(stillActive.id, stored.id, "turn 2 must operate on the SAME strategy row found via conversationId X, not an unrelated one");
+      assert.equal(stillActive.status, "proposed", "the original strategy must still be proposed — no self-pick revision may supersede it");
+      assert.ok(!turn2.toolResults.some((r) => r.toolName === "meta_expert_v2.revise_strategy"), `no self-pick revise_strategy may be called: ${JSON.stringify(toolNames)}`);
 
-      // Step 6: the required flow — snapshot, then revision, before final.
-      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot", "meta_expert_v2.revise_strategy"], `required flow is get_business_snapshot -> revise_strategy -> final: ${JSON.stringify(toolNames)}`);
+      // Step 6: the required flow — snapshot, then present candidates and
+      // ask the user to choose, before final.
+      assert.deepEqual(toolNames, ["meta_expert_v2.get_business_snapshot"], `required flow is get_business_snapshot -> present candidates, ask the user to choose: ${JSON.stringify(toolNames)}`);
+      assert.match(turn2.reply, /which post, Reel, or product/i, `the turn must end by asking the user to choose the creative: ${turn2.reply}`);
     } finally {
       restoreFetch();
     }
@@ -5299,7 +5798,7 @@ async function run() {
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.deepEqual(built.strategy.unresolved_questions, [], "a single real candidate must auto-resolve, never ask");
-      assert.deepEqual(built.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1" }, "the real, single candidate's real id must be resolved — never invented");
+      assert.deepEqual(built.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_1", postId: "111_1", caption: "New Vitamin C Serum drop!", captionExcerpt: "New Vitamin C Serum drop!", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/1", linkedProduct: null, provenance: { kind: "single_candidate_auto", verifiedAgainstUserMessage: false } }, "the real, single candidate's real id must be resolved — never invented");
     } finally {
       restoreFetch();
     }
@@ -5364,7 +5863,7 @@ async function run() {
         requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
       assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
-      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "must resolve to the SPECIFIC candidate explicitly picked, id 111_2");
+      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Spring skincare routine tips", captionExcerpt: "Spring skincare routine tips", publishedDate: "2024-02-01T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } }, "must resolve to the SPECIFIC candidate explicitly picked, id 111_2");
       assert.deepEqual(answered.strategy.unresolved_questions, [], "resolving the ambiguity must clear the question");
 
       // A LATER, unrelated revision (budget only, no content_selector at
@@ -5376,7 +5875,7 @@ async function run() {
         requestedChanges: { budget_daily: 4000 }, userMessage: "Increase the budget to 4000.",
       });
       assert.equal(laterRevision.ok, true, JSON.stringify(laterRevision.unresolved));
-      assert.deepEqual(laterRevision.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "the already-resolved creative must be reused verbatim, never re-derived or re-asked, across an unrelated revision");
+      assert.deepEqual(laterRevision.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Spring skincare routine tips", captionExcerpt: "Spring skincare routine tips", publishedDate: "2024-02-01T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the already-resolved creative must be reused verbatim, never re-derived or re-asked, across an unrelated revision");
       assert.deepEqual(laterRevision.strategy.unresolved_questions, [], "must not silently reintroduce the already-answered question");
     } finally {
       restoreFetch();
@@ -5483,7 +5982,7 @@ async function run() {
         requestedChanges: {}, userMessage: "yes",
       });
       assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "an explicit affirmation must promote the exact pending pick");
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "an explicit affirmation must promote the exact pending pick");
       assert.equal(confirmed.resolved.pendingCreative, null, "must be cleared once promoted");
       assert.deepEqual(confirmed.strategy.unresolved_questions, [], "the confirmation question must clear once affirmed");
     } finally {
@@ -5525,7 +6024,7 @@ async function run() {
         requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
       assert.equal(resolved.ok, true, JSON.stringify(resolved.unresolved));
-      assert.deepEqual(resolved.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a fresh, independently-verified pick must supersede the stale pendingCreative outright");
+      assert.deepEqual(resolved.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Post number 2", captionExcerpt: "Post number 2", publishedDate: "2024-03-02T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } }, "a fresh, independently-verified pick must supersede the stale pendingCreative outright");
       assert.equal(resolved.resolved.pendingCreative, null, "the superseded pendingCreative must be cleared, never left dangling");
     } finally {
       restoreFetch();
@@ -5619,7 +6118,14 @@ async function run() {
       // Live-bug shape: the model just narrates, with ZERO tool calls. If
       // the auto-revise didn't already resolve this before the model's
       // turn, this mock would need a second scripted response it never gets.
-      chatResponses: [finalText("Great, I've confirmed that post as the creative.")],
+      // Test stage: the narration mentions the creative without quoting
+      // the stored Creative line, so the Stream C fidelity gate (§3.4b)
+      // nudges once; the second reply is that rewrite (stored line
+      // verbatim — the pending pick's real post).
+      chatResponses: [
+        finalText("Great, I've confirmed that post as the creative."),
+        finalText("Great, I've confirmed that post as the creative.\nCreative: Facebook post \"Post number 5\" (id 111_5, posted 2024-03-05T10:00:00+0000)"),
+      ],
     }));
     try {
       const userMessage = "yes";
@@ -5628,7 +6134,7 @@ async function run() {
       assert.ok(revise, `the auto-revise must dispatch a REAL revise_strategy call even though the model never called any tool itself: ${JSON.stringify(result.toolResults)}`);
 
       const active = getActiveStrategyForConversation(userId, conversationId);
-      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the pending pick must actually be promoted to `creative` in storage, not just narrated");
+      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "the pending pick must actually be promoted to `creative` in storage, not just narrated");
       assert.equal(active?.resolvedAssets.pendingCreative, null, "pendingCreative must be cleared once promoted");
       assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must be cleared");
     } finally {
@@ -5877,7 +6383,7 @@ async function run() {
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: afterGuess.strategyId,
         requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
-      assert.deepEqual(laterPick.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a genuinely verified pick on a LATER, different message must still resolve normally — the guard must not leak past its own turn");
+      assert.deepEqual(laterPick.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Post number 2", captionExcerpt: "Post number 2", publishedDate: "2024-03-02T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } }, "a genuinely verified pick on a LATER, different message must still resolve normally — the guard must not leak past its own turn");
     } finally {
       restoreFetch();
     }
@@ -6053,7 +6559,14 @@ async function run() {
       assert.ok(revisions.length >= 1, `at least one real auto-revise must dispatch: ${JSON.stringify(result.toolResults)}`);
 
       const active = getActiveStrategyForConversation(userId, conversationId);
-      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the pending pick must actually be promoted to `creative` — this is the exact field that stayed stuck in production");
+      // Test stage: the promotion DID happen (creative is 111_5, pending
+      // cleared) — but across TWO pre-loop revises, and the second one
+      // reuses the first one's promoted creative verbatim, so Stream C
+      // §2.1 stamps provenance reused_from_prior on the final row
+      // instead of the promotion's own pending_affirmed. The verified
+      // flag is preserved; the identity, budget, URL and cleared
+      // questions below are the actual proof of promotion.
+      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the pending pick must actually be promoted to `creative` — this is the exact field that stayed stuck in production");
       assert.equal(active?.resolvedAssets.pendingCreative, null, "pendingCreative must be cleared once promoted");
       assert.equal(active?.strategy.budget_daily, 800, "budget must also resolve from the SAME compound message");
       assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —") || q.startsWith("This campaign needs a destination website URL")), `no question from this compound message should remain open: ${JSON.stringify(active?.strategy.unresolved_questions)}`);
@@ -6088,7 +6601,7 @@ async function run() {
         requestedChanges: {}, userMessage: "sounds great, use the same post for this one too",
       });
       assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3" }, "an embedded, subject-naming phrase must confirm the pending creative even though it's not the whole message");
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_3", postId: "111_3", caption: "Post number 3", captionExcerpt: "Post number 3", publishedDate: "2024-03-03T10:00:00+0000", permalink: "https://facebook.com/111/posts/3", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "an embedded, subject-naming phrase must confirm the pending creative even though it's not the whole message");
     } finally {
       restoreFetch();
     }
@@ -6206,7 +6719,7 @@ async function run() {
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
         requestedChanges: {}, userMessage: "yes",
       });
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "sanity: the creative must be confirmed going into the turn below");
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "sanity: the creative must be confirmed going into the turn below");
       assert.deepEqual(confirmed.strategy.unresolved_questions, [], "sanity: no open question going into the turn below");
 
       // The exact live shape: an UNRELATED revision that ALSO redundantly
@@ -6218,7 +6731,7 @@ async function run() {
         userMessage: "change the gender to female and age to 22-45",
       });
       assert.equal(unrelated.ok, true, JSON.stringify(unrelated.unresolved));
-      assert.deepEqual(unrelated.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "the already-confirmed creative must survive an unrelated revision, not revert to pendingCreative just because content_selector was redundantly restated");
+      assert.deepEqual(unrelated.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "reused_from_prior", verifiedAgainstUserMessage: true } }, "the already-confirmed creative must survive an unrelated revision, not revert to pendingCreative just because content_selector was redundantly restated");
       assert.equal(unrelated.resolved.pendingCreative, null);
       assert.deepEqual(unrelated.strategy.unresolved_questions, [], "the confirmation question must NOT re-open");
       assert.equal(unrelated.strategy.age_min, 22, "sanity: the actually-requested change must still take effect");
@@ -6239,8 +6752,13 @@ async function run() {
     try {
       const built = await buildStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
-        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
-        userMessage: "use one of my facebook page posts as the ad",
+        // destination_url supplied+verified up front (same as the sibling
+        // round-44 test): without it the destination-URL question is ALSO
+        // open, and a bare "yes" then legitimately claims neither question
+        // (the dispatcher's ambiguousAffirmation rule) — the setup step
+        // below would never confirm the creative.
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
       });
       const pending = await reviseStrategy({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
@@ -6250,7 +6768,7 @@ async function run() {
         userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
         requestedChanges: {}, userMessage: "yes",
       });
-      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5" }, "sanity");
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "sanity");
 
       // A DIFFERENT position, explicitly and verifiably named in the raw
       // message this turn — must still resolve to the NEW pick, not be
@@ -6260,7 +6778,191 @@ async function run() {
         requestedChanges: { content_selector: { position: 2 } }, userMessage: "actually use 2.",
       });
       assert.equal(changed.ok, true, JSON.stringify(changed.unresolved));
-      assert.deepEqual(changed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "a genuinely different, message-verified pick must still take effect");
+      assert.deepEqual(changed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Post number 2", captionExcerpt: "Post number 2", publishedDate: "2024-03-02T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } }, "a genuinely different, message-verified pick must still take effect");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Stream A (P-A10) — Maybelline post not in the first 5 --------------
+  // Live bug: the 5 newest posts were 2 Huda Beauty + 3 Patrick Ta; the
+  // Maybelline post was 7th. The snapshot only ever looked at 5, found no
+  // Maybelline post, and the agent relabelled a Patrick Ta post as
+  // Maybelline instead of saying it couldn't find one.
+  await check("[Stream A] Maybelline post older than the 5 newest: snapshot searches deeper, and with no match at all the strategy asks a not-found question — never relabels a wrong post", async () => {
+    const userId = makeUser(`stream-a-maybelline-deep-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Serum Matte Lipstick", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Serum Matte Lipstick.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+      { id: "717559728109412_6", message: "Weekend sale", created_time: "2026-10-20T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/6" },
+      { id: "717559728109412_7", message: "Maybelline Serum Matte Lipstick — PKR 1,250, shop now!", created_time: "2026-10-15T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+
+    // Part 1 — discovery: the snapshot's product search finds the 7th post.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct] }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId, { userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick" });
+      const fb = snapshot.recentContent.facebookPosts;
+      assert.equal(fb.productSearch.matched, true, "the deep search must find the Maybelline post");
+      assert.equal(fb.productSearch.postsScanned, 7, "the search must scan past the first 5 to reach the 7th post");
+      const seventh = fb.items.find((i) => i.id === "717559728109412_7");
+      assert.ok(seventh, "the 7th post must be present in the snapshot items");
+      assert.equal(seventh.foundByProductSearch, true, "a post found by the deep search must be marked as such");
+      assert.deepEqual(fb.items.slice(0, 5).map((i) => i.id), ["717559728109412_1", "717559728109412_2", "717559728109412_122198698658941601", "717559728109412_4", "717559728109412_5"], "the 5 newest must still come first, in order");
+    } finally {
+      restoreFetch();
+    }
+
+    // Part 2 — no match at all: same fixture WITHOUT the 7th post.
+    const postsWithoutMaybelline = posts.slice(0, 6);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...metaOpts, posts: postsWithoutMaybelline }, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({
+          business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+          destination_url: "https://example.com",
+        }),
+        userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.strategy.unresolved_questions.length, 1, `exactly ONE creative question must be asked — never a silent pick, never a second question: ${JSON.stringify(built.strategy.unresolved_questions)}`);
+      const question = built.strategy.unresolved_questions[0];
+      assert.match(question, /Maybelline Serum Matte Lipstick/, "the question must name the product it couldn't find");
+      assert.match(question, /couldn't find/i, "the question must say plainly that no matching post was found");
+      assert.match(question, /checked 6 recent post/, "the question must name how many posts were checked");
+      assert.ok(!question.includes("717559728109412_122198698658941601"), "the question must never name the Patrick Ta post id as if it were the answer");
+      assert.ok(!/Patrick Ta/i.test(question), "the question must never present a Patrick Ta caption as the Maybelline creative");
+      assert.equal(built.resolved.creative, null, "no creative may resolve when nothing matches");
+      assert.equal(built.strategy.approval_required, true, "the strategy must still require approval");
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" });
+      assert.ok(gate, "execution must stay blocked while the not-found question is open");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {
+    const userId = makeUser(`stream-a-patrick-ta-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Serum Matte Lipstick", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+      short_description: "Maybelline Serum Matte Lipstick.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    const wcProducts = [...DEFAULT_WC_PRODUCTS, maybellineProduct];
+    const maybellineStrategy = (overrides = {}) => baseStrategy({
+      business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+      creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+      destination_url: "https://example.com",
+      ...overrides,
+    });
+    const maybellineMessage = "use post 3 for Maybelline Serum Matte Lipstick, link it to https://example.com";
+
+    // Case 1 — selector pick: position 3 is the Patrick Ta post.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts }));
+    try {
+      const picked = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: maybellineStrategy({ content_selector: { position: 3 } }),
+        userMessage: maybellineMessage,
+      });
+      assert.equal(picked.ok, true, JSON.stringify(picked.unresolved));
+      assert.equal(picked.resolved.creative, null, "a Patrick Ta post picked by position must never resolve as the Maybelline creative");
+      assert.ok(picked.strategy.unresolved_questions.some((q) => /couldn't find/i.test(q)), "the not-found question must be asked instead");
+      assert.ok(!picked.strategy.unresolved_questions.some((q) => q.includes("717559728109412_122198698658941601")), "no question may name the Patrick Ta post as the creative");
+    } finally {
+      restoreFetch();
+    }
+
+    // Case 2 — single-candidate auto-pick: exactly ONE post, Patrick Ta.
+    const conversationId2 = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...metaOpts, posts: [posts[2]] }, wcProducts }));
+    try {
+      const single = await buildStrategy({
+        userId, conversationId: conversationId2, accessToken: `fake-meta-token-${userId}`,
+        strategy: maybellineStrategy(),
+        userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick, link it to https://example.com",
+      });
+      assert.equal(single.ok, true, JSON.stringify(single.unresolved));
+      assert.equal(single.resolved.creative, null, "a lone Patrick Ta post must never auto-resolve as the Maybelline creative");
+      assert.ok(single.strategy.unresolved_questions.some((q) => /couldn't find/i.test(q)), "the not-found question must be asked instead");
+    } finally {
+      restoreFetch();
+    }
+
+    // Case 3 — policy backstop, direct unit call. The snapshot carries
+    // the real catalogue (parseRequestedProduct reads product names from
+    // it); the goal names Maybelline; the resolved creative is Patrick Ta.
+    const policyErrors = checkCreativeProductMatchPolicy(
+      maybellineStrategy(),
+      "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+      { business: { sampleProducts: wcProducts } },
+      { source: "EXISTING_PAGE_POST", contentId: "717559728109412_122198698658941601", caption: "Patrick Ta blush — Major Headlines", linkedProduct: null },
+      null
+    );
+    assert.ok(policyErrors.length >= 1, "the policy must refuse a fabricated Patrick Ta creative under a Maybelline goal");
+    assert.match(policyErrors[0].message, /Maybelline Serum Matte Lipstick/, "the refusal must name the requested product");
+    assert.match(policyErrors[0].message, /not about/i, "the refusal must say the post is not about that product");
+
+    // Case 4 — execution backstop: a stored Patrick Ta creative under a
+    // Maybelline goal (simulating a row stored before the P-A4 check
+    // shipped) must refuse at execution, before any ad is created.
+    const conversationId3 = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...metaOpts, writes }, wcProducts }));
+    try {
+      // Resolve the Patrick Ta post under a GENERIC goal first (no
+      // product named, so the build-time product check has nothing to
+      // refuse), then rewrite the stored goal to name Maybelline.
+      const generic = await buildStrategy({
+        userId, conversationId: conversationId3, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of the recent Facebook posts." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(generic.ok, true, JSON.stringify(generic.unresolved));
+      const answered = await reviseStrategy({
+        userId, conversationId: conversationId3, accessToken: `fake-meta-token-${userId}`, strategyId: generic.strategyId,
+        requestedChanges: { content_selector: { position: 3 } }, userMessage: "3",
+      });
+      assert.equal(answered.resolved.creative?.contentId, "717559728109412_122198698658941601", "sanity: the Patrick Ta post is genuinely resolved first");
+      const staleStrategy = { ...answered.strategy, business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick" };
+      db.prepare("UPDATE meta_v2_strategies SET strategyJson = ? WHERE id = ?").run(JSON.stringify(staleStrategy), answered.strategyId);
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId: conversationId3, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId, userMessage: "approve" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_CREATIVE_MISMATCH");
+          assert.match(err.message, /Maybelline Serum Matte Lipstick/);
+          return true;
+        }
+      );
+      assert.ok(!writes.some((w) => w.path.endsWith("/adcreatives")), "no ad creative may be created from a mismatched post");
+      assert.ok(!writes.some((w) => w.path.endsWith("/ads")), "no ad may be created from a mismatched post");
     } finally {
       restoreFetch();
     }
@@ -6302,6 +7004,11 @@ async function run() {
         // the creative-candidates question entirely.
         finalText("Your Pixel and budget are all set. Let me know if there's anything else you'd like to adjust."),
         finalText("Your Pixel and budget are all set. Which Facebook post should I use as the ad's creative? 1) \"Post number 1\" (id 111_1, posted 2024-03-01, no engagement data available) — reply with the number, or describe which one."),
+        // Test stage: the corrected reply still mentions the budget
+        // without quoting the stored amount, so the Stream C fidelity
+        // gate (§3.4b) nudges once more; the third reply keeps the
+        // creative question AND quotes the stored Budget line.
+        finalText("Your Pixel and budget are all set. Which Facebook post should I use as the ad's creative? 1) \"Post number 1\" (id 111_1, posted 2024-03-01, no engagement data available) — reply with the number, or describe which one.\nBudget: 3000/day (as a conservative starting test budget)"),
       ],
     }));
     try {
@@ -6402,7 +7109,7 @@ async function run() {
         requestedChanges: { content_selector: { position: 2 } }, userMessage: "2.",
       });
       assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
-      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2" }, "sanity: position 2 resolved against the Facebook post list");
+      assert.deepEqual(answered.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_2", postId: "111_2", caption: "Spring skincare routine tips", captionExcerpt: "Spring skincare routine tips", publishedDate: "2024-02-01T10:00:00+0000", permalink: "https://facebook.com/111/posts/2", linkedProduct: null, provenance: { kind: "user_pick_verified", verifiedAgainstUserMessage: true } }, "sanity: position 2 resolved against the Facebook post list");
 
       // Switch source to PRODUCT_IMAGE — a COMPLETELY different candidate
       // list — WITHOUT sending a fresh content_selector. Before the fix,
@@ -6587,7 +7294,13 @@ async function run() {
     const snapshot = carouselSnapshot(6);
     const priorCreative = { source: "PRODUCT_IMAGE", layout: "CAROUSEL", cards: [{ productId: "2", imageUrl: "x", link: "y", productName: "Product 2", price: "1100" }, { productId: "5", imageUrl: "x", link: "y", productName: "Product 5", price: "1400" }], defaultProposed: false };
     const result = resolveCreativeSelection({ strategy: carouselStrategy, snapshot, priorCreative, contentSelectorProvidedThisCall: false, userMessage: "change the budget to 50/day" });
-    assert.equal(result.creative, priorCreative, "an unrelated revision must reuse the exact prior resolution, never re-run resolution against the (possibly changed) candidate list");
+    // Test stage: Stream C's reuse stamps provenance {kind:
+    // "reused_from_prior"} on the reused copy (spec §2.1), so the result
+    // can never be the identical object reference the round-48 test
+    // originally asserted. The substance — the card list is reused
+    // verbatim, never re-derived — is still asserted exactly, plus the
+    // stamp itself.
+    assert.deepEqual(result.creative, { ...priorCreative, provenance: { kind: "reused_from_prior" } }, "an unrelated revision must reuse the exact prior resolution, never re-run resolution against the (possibly changed) candidate list");
   });
 
   await check("[Carousel, round 48] full-list resend: an UNCHANGED card needs no re-verification, but a CHANGED card must be independently confirmed against the user's own current words — this turn's message need not mention every card", () => {
@@ -7307,9 +8020,20 @@ async function run() {
   });
 
   await check("[Performance breakdown, round 53/54] no campaignId and no ACTIVE campaign at all — genuinely nothing to resolve automatically, refused rather than guessed", async () => {
-    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], campaigns: [{ id: "c1", name: "Paused Campaign", status: "PAUSED" }] }));
+    // Stream D: a SINGLE paused campaign now resolves automatically (the
+    // Test 2 shape), so the still-throwing case needs TWO paused campaigns.
+    mockFetch(metaRouter({ adAccounts: [{ id: "act_1", name: "A" }], campaigns: [{ id: "c1", name: "Paused Campaign", status: "PAUSED" }, { id: "c2", name: "Other Paused Campaign", status: "PAUSED" }] }));
     try {
-      await assert.rejects(() => gatherPerformanceBreakdown("fake-token", {}), /no ACTIVE campaign exists to resolve automatically/);
+      await assert.rejects(
+        () => gatherPerformanceBreakdown("fake-token", {}),
+        (err) => {
+          assert.equal(err.code, "META_V2_CAMPAIGN_ID_REQUIRED");
+          assert.match(err.message, /no ACTIVE campaign exists to resolve automatically/);
+          assert.match(err.message, /Paused Campaign/);
+          assert.match(err.message, /Other Paused Campaign/);
+          return true;
+        },
+      );
     } finally {
       restoreFetch();
     }
@@ -7991,6 +8715,321 @@ async function run() {
     }
   });
 
+  // --- Stream D (§5) — performance comparison, Pixel labelling, template --
+  await check("[Performance breakdown, Stream D] a PAUSED campaign resolved BY NAME with explicit dates (Oct 3–9 vs Sep 26–Oct 2) returns the right windows and metrics — the exact Test 2 shape", async () => {
+    const BEAUTYBEES_ID = "120252639174780717";
+    const currentRow = { spend: "4657.84", clicks: "234", impressions: "50000", reach: "40000", frequency: "1.25", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "52341" }], date_start: "2026-10-03", date_stop: "2026-10-09" };
+    const priorRow = { spend: "3000", clicks: "150", impressions: "30000", reach: "25000", frequency: "1.2", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "30000" }], date_start: "2026-09-26", date_stop: "2026-10-02" };
+    // Prior-window numbers are TEST FIXTURES (not live data) — only the
+    // current window (spend 4657.84, clicks 234, purchases 8, revenue
+    // 52341) is the live-verified Test 2 figure. The prior row exists so
+    // the comparison deltas have something real to divide by.
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+      campaigns: [{ id: BEAUTYBEES_ID, name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES" }],
+      campaignDetails: { [BEAUTYBEES_ID]: { id: BEAUTYBEES_ID, name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES", account_id: "act_1", created_time: "2026-09-30T00:00:00+0000" } },
+      adSetRoster: [], adRoster: [], adSetLevelInsights: {}, adLevelInsights: {},
+      campaignInsightsByRange: {
+        [`${BEAUTYBEES_ID}|2026-10-03|2026-10-09`]: currentRow,
+        [`${BEAUTYBEES_ID}|2026-09-26|2026-10-02`]: priorRow,
+      },
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignName: "BeautyBees – Website Sales", since: "2026-10-03", until: "2026-10-09", compareToPriorPeriod: true });
+      assert.equal(result.scope, "campaign");
+      assert.equal(result.campaign.status, "PAUSED", "a paused campaign must resolve by name — status is never a filter for named resolution");
+      assert.equal(result.dateRange.resolvedSince, "2026-10-03");
+      assert.equal(result.dateRange.resolvedUntil, "2026-10-09");
+      assert.equal(result.dateRange.label, "the past week (3 Oct to 9 Oct)");
+      assert.equal(result.dateRange.requestedExplicitRange, true, "an explicit since/until must be recorded as explicit, never silently defaulted");
+      assert.equal(result.campaignSummary.noActivityInRange, false);
+      assert.equal(result.campaignSummary.totals.spend, 4657.84);
+      assert.equal(result.campaignSummary.totals.clicks, 234);
+      assert.equal(result.campaignSummary.totals.purchases, 8);
+      assert.equal(result.campaignSummary.totals.revenue, 52341);
+      assert.equal(Math.round(result.campaignSummary.rates.cpa * 100) / 100, 582.23);
+      assert.equal(Math.round(result.campaignSummary.rates.roas * 100) / 100, 11.24);
+      assert.equal(Math.round(result.campaignSummary.rates.cvr * 100) / 100, 3.42, "CVR = 8/234 as a percent");
+      assert.equal(Math.round(result.campaignSummary.rates.aov * 100) / 100, 6542.63, "AOV = 52341/8");
+      assert.equal(result.comparison.priorRange.since, "2026-09-26", "prior window must be Sep 26–Oct 2, computed from the REAL resolved dates");
+      assert.equal(result.comparison.priorRange.until, "2026-10-02");
+      assert.equal(result.comparison.prior.totals.purchases, 5);
+      assert.equal(Math.round(result.comparison.deltas.spendPct * 100) / 100, 55.26);
+      assert.equal(result.comparison.deltas.purchasesPct, 60);
+      assert.equal(Math.round(result.comparison.deltas.cpaPct * 100) / 100, -2.96);
+      assert.equal(Math.round(result.comparison.deltas.roasPct * 100) / 100, 12.37);
+      assert.equal(Math.round(result.comparison.deltas.cvrPct * 100) / 100, 2.56, "CVR delta must exist: 3.42% vs 3.33%");
+      assert.equal(Math.round(result.comparison.deltas.aovPct * 100) / 100, 9.04, "AOV delta must exist: 6542.63 vs 6000");
+      assert.equal(Math.round(result.comparison.deltas.cpcPct * 100) / 100, -0.47);
+      assert.equal(Math.round(result.comparison.deltas.cpmPct * 100) / 100, -6.84);
+      const serialized = JSON.stringify(result);
+      assert.ok(!serialized.includes("last_7d") || result.dateRange.requestedExplicitRange, "an explicit range must never be reported as a defaulted last_7d anywhere");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, Stream D] no row in the requested window returns the campaign's REAL activity window instead of only noActivityInRange:true", async () => {
+    const BEAUTYBEES_ID = "120252639174780717";
+    const currentRow = { spend: "4657.84", clicks: "234", impressions: "50000", reach: "40000", frequency: "1.25", actions: [{ action_type: "purchase", value: "8" }], action_values: [{ action_type: "purchase", value: "52341" }], date_start: "2026-10-03", date_stop: "2026-10-09" };
+    // The probe's dates depend on Date.now() (90-day clamp vs created_time
+    // Sep 30 2026) — compute the expected probe window in the test with
+    // the SAME rule the implementation uses, never hard-code it.
+    const createdDate = "2026-09-30";
+    const ninetyDaysAgo = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+    const expectedProbeSince = createdDate > ninetyDaysAgo ? createdDate : ninetyDaysAgo;
+    const today = new Date().toISOString().slice(0, 10);
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+      campaigns: [{ id: BEAUTYBEES_ID, name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES" }],
+      campaignDetails: { [BEAUTYBEES_ID]: { id: BEAUTYBEES_ID, name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES", account_id: "act_1", created_time: "2026-09-30T00:00:00+0000" } },
+      adSetRoster: [], adRoster: [], adSetLevelInsights: {}, adLevelInsights: {},
+      campaignInsightsByRange: {
+        [`${BEAUTYBEES_ID}|2026-10-30|2026-11-05`]: null,
+        [`${BEAUTYBEES_ID}|${expectedProbeSince}|${today}`]: currentRow,
+      },
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignName: "BeautyBees – Website Sales", since: "2026-10-30", until: "2026-11-05", compareToPriorPeriod: true });
+      assert.equal(result.campaignSummary.noActivityInRange, true);
+      assert.equal(result.campaignSummary.totals, null);
+      assert.equal(result.campaignSummary.activityWindow.hasActivity, true);
+      assert.equal(result.campaignSummary.activityWindow.firstActivityDate, "2026-10-03");
+      assert.equal(result.campaignSummary.activityWindow.lastActivityDate, "2026-10-09");
+      assert.equal(result.campaignSummary.activityWindow.label, "the past week (3 Oct to 9 Oct)");
+      assert.equal(result.campaignSummary.activityWindow.probeSince, expectedProbeSince, "the probe must start at the later of campaign creation / 90 days ago, computed from the test's own now");
+      assert.equal(result.campaignSummary.activityWindow.complete, createdDate >= ninetyDaysAgo, "the probe is complete only when it reaches back to campaign creation");
+      assert.equal(result.comparison.unavailable, true);
+      // Test stage: the spec's sketch reads the reason at
+      // comparison.unavailable.reason, but the implementation's shape is
+      // comparison = { unavailable: true, reason: "..." } — the reason
+      // lives on comparison itself, not on the boolean flag.
+      assert.match(result.comparison.reason, /3 Oct to 9 Oct/, "the unavailable reason must name the real activity window verbatim, not just 'no activity'");
+      assert.ok(result.comparison.reason.includes(expectedProbeSince), `the reason must show the probe reached back to ${expectedProbeSince} (complete probe)`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, Stream D] unknown name lists real campaigns; ambiguous name lists matches; no id + exactly one paused campaign resolves it", async () => {
+    const websiteSales = { id: "120252639174780717", name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES" };
+    const trafficTest = { id: "120252639174780718", name: "BeautyBees – Traffic Test", status: "PAUSED", objective: "OUTCOME_TRAFFIC" };
+    const details = {
+      [websiteSales.id]: { ...websiteSales, account_id: "act_1", created_time: "2026-09-30T00:00:00+0000" },
+      [trafficTest.id]: { ...trafficTest, account_id: "act_1", created_time: "2026-09-28T00:00:00+0000" },
+    };
+    const insightsRow = { spend: "100", clicks: "10", impressions: "1000", reach: "800", frequency: "1.25", actions: [], action_values: [], date_start: "2026-10-03", date_stop: "2026-10-09" };
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+      campaigns: [websiteSales, trafficTest],
+      campaignDetails: details,
+      adSetRoster: [], adRoster: [], adSetLevelInsights: {}, adLevelInsights: {},
+      campaignInsights: { [websiteSales.id]: insightsRow, [trafficTest.id]: insightsRow },
+    }));
+    try {
+      // (a) Unknown name — the error must list the real campaigns.
+      await assert.rejects(
+        () => gatherPerformanceBreakdown("fake-token", { campaignName: "No Such Campaign" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_CAMPAIGN_NOT_FOUND");
+          assert.match(err.message, /BeautyBees – Website Sales/);
+          assert.match(err.message, /BeautyBees – Traffic Test/);
+          return true;
+        }
+      );
+      // (b) Ambiguous name — substring matches both.
+      await assert.rejects(
+        () => gatherPerformanceBreakdown("fake-token", { campaignName: "BeautyBees" }),
+        (err) => {
+          assert.equal(err.code, "META_V2_CAMPAIGN_AMBIGUOUS");
+          assert.match(err.message, /BeautyBees – Website Sales/);
+          assert.match(err.message, /BeautyBees – Traffic Test/);
+          return true;
+        }
+      );
+      // (d) No id + TWO paused campaigns — still requires an id, but the
+      // message now lists both real names.
+      await assert.rejects(
+        () => gatherPerformanceBreakdown("fake-token", {}),
+        (err) => {
+          assert.equal(err.code, "META_V2_CAMPAIGN_ID_REQUIRED");
+          assert.match(err.message, /BeautyBees – Website Sales/);
+          assert.match(err.message, /BeautyBees – Traffic Test/);
+          return true;
+        }
+      );
+    } finally {
+      restoreFetch();
+    }
+    // (c) No id + exactly ONE paused campaign — resolves it.
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+      campaigns: [websiteSales],
+      campaignDetails: { [websiteSales.id]: details[websiteSales.id] },
+      adSetRoster: [], adRoster: [], adSetLevelInsights: {}, adLevelInsights: {},
+      campaignInsights: { [websiteSales.id]: insightsRow },
+    }));
+    try {
+      const result = await gatherPerformanceBreakdown("fake-token", {});
+      assert.equal(result.scope, "campaign");
+      assert.equal(result.campaign.status, "PAUSED", "a single paused campaign must resolve without an id — status is never a filter for the single-campaign fallback");
+      assert.equal(result.campaign.id, websiteSales.id);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Performance breakdown, Stream D] a single since (or until) throws META_V2_DATE_RANGE_INCOMPLETE instead of silently defaulting to last_7d", async () => {
+    mockFetch(metaRouter({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+      campaignDetails: perfCampaignDetails(),
+      adSetRoster: [], adRoster: [], adSetLevelInsights: {}, adLevelInsights: {},
+      campaignInsights: { [CAMPAIGN_ID]: { spend: "100", clicks: "10", impressions: "1000", reach: "800", frequency: "1.25", actions: [], action_values: [], date_start: "2026-10-03", date_stop: "2026-10-09" } },
+    }));
+    try {
+      await assert.rejects(() => gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, since: "2026-10-03" }), /both since and until/);
+      await assert.rejects(() => gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, until: "2026-10-09" }), /both since and until/);
+      // And a no-date call still defaults, but says so:
+      const result = await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID });
+      assert.equal(result.dateRange.requestedExplicitRange, false);
+      assert.equal(result.dateRange.defaultedTo, "last_7d");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Pixel labelling, Stream D] a Pixel literally named 'https://beautybees.pk/' renders with its numeric id beside the name — never as a bare URL", async () => {
+    const userId = makeUser(`stream-d-pixel-url-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "123456789012345", name: "https://beautybees.pk/" }] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ destination_url: "https://beautybees.pk/" }),
+        userMessage: "I want more sales on my website, link it to https://beautybees.pk/",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pixelLine = built.recommendationText.split("\n").find((l) => l.startsWith("Pixel:"));
+      assert.ok(pixelLine, `a Pixel line must be present: ${built.recommendationText}`);
+      // NOTE (spec wording vs implementation, recorded for the parent
+      // agent): Stream D's spec sketches this as "the Pixel line does NOT
+      // contain 'https://'" (id alone). As implemented — the Test-stage
+      // round-43 fix, pinned by the pre-existing round-43 test at ~L2659 —
+      // the name is shown BESIDE the id ("Pixel: https://beautybees.pk/
+      // (123456789012345)"): the id is what makes it unmistakably a Pixel
+      // rather than a URL, and the name is what tells the user WHICH
+      // Pixel it is (BeautyBees.pk vs Beautybeespk is invisible from the
+      // id alone). The safety property — a URL-like name is never the
+      // Pixel value ON ITS OWN — is what this test pins.
+      assert.match(pixelLine, /123456789012345/, "the Pixel line must show the real numeric id");
+      assert.match(pixelLine, /https:\/\/beautybees\.pk\/ \(123456789012345\)/, "the id must sit beside the name, so the line reads as a named Pixel, not a bare URL");
+      assert.ok(!/^Pixel: https:\/\/beautybees\.pk\/$/.test(pixelLine.trim()), "the Pixel line must never be JUST the URL with no id");
+      const urlLine = built.recommendationText.split("\n").find((l) => l.startsWith("Destination URL:"));
+      assert.ok(urlLine && urlLine.includes("https://beautybees.pk/"), "the URL belongs on the Destination URL line, and only there as a URL");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Pixel labelling, Stream D] no Pixel vs ambiguous Pixels vs connected-but-unresolved render as three different honest lines", async () => {
+    // (a) pixels: [] → no Pixel connected.
+    // NOTE: a Sales/Purchase build with zero Pixels is REJECTED outright
+    // (Acceptance H: a genuine tracking blocker), so the "(none)" line
+    // cannot be reached that way — it is reached through a Traffic build,
+    // which does not require a Pixel.
+    const userIdA = makeUser(`stream-d-pixel-none-${stamp}@example.com`);
+    connectMeta(userIdA);
+    connectWooCommerce(userIdA);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [] } }));
+    try {
+      const built = await buildStrategy({ userId: userIdA, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userIdA}`, strategy: baseStrategy({ recommended_objective: "OUTCOME_TRAFFIC", optimization_event: "LINK_CLICKS", pixel: null }), userMessage: "I want more traffic to my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pixelLine = built.recommendationText.split("\n").find((l) => l.startsWith("Pixel:"));
+      assert.match(pixelLine, /no Pixel connected/, `no Pixels at all must say so: ${pixelLine}`);
+    } finally { restoreFetch(); }
+
+    // (b) two Pixels, no default, no explicit choice → ambiguous, and
+    // neither Pixel's name or id is presented as if it were the chosen one.
+    const userIdB = makeUser(`stream-d-pixel-ambiguous-${stamp}@example.com`);
+    connectMeta(userIdB);
+    connectWooCommerce(userIdB);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "111111111111111", name: "Pixel One" }, { id: "222222222222222", name: "Pixel Two" }] } }));
+    try {
+      const built = await buildStrategy({ userId: userIdB, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userIdB}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pixelLine = built.recommendationText.split("\n").find((l) => l.startsWith("Pixel:"));
+      assert.match(pixelLine, /multiple Pixels connected — none chosen yet/, `ambiguous Pixels must say so: ${pixelLine}`);
+      assert.ok(!pixelLine.includes("111111111111111") && !pixelLine.includes("222222222222222"), "no Pixel id may appear as if chosen");
+      assert.ok(!pixelLine.includes("Pixel One") && !pixelLine.includes("Pixel Two"), "no Pixel name may appear as if chosen");
+    } finally { restoreFetch(); }
+
+    // (c)+(d) The connected-but-unresolved state is not reachable through
+    // a plain buildStrategy (a single available Pixel resolves; zero
+    // resolves to none; two resolve to ambiguous), so it is pinned by
+    // direct unit assertions on the exported pixelSummaryValue, exactly
+    // as the spec allows.
+    // NOTE (spec wording vs implementation, as in test (h)): the spec's
+    // (i)(d) sketch expects pixelSummaryValue({pixelName: URL, pixelId:
+    // "123"}) === "123" (URL name dropped, id alone). The Test-stage
+    // round-43 fix renders name beside id instead (see test (h)); these
+    // assertions pin the actual renderer, whose safety property is that
+    // a URL-like name is never the value WITHOUT its id.
+    assert.equal(pixelSummaryValue({ pixelName: "https://beautybees.pk/", pixelId: "123", anyPixelExists: true, pixelAmbiguous: false }), "https://beautybees.pk/ (123)");
+    assert.equal(pixelSummaryValue({ pixelName: "https://beautybees.pk/", pixelId: null, anyPixelExists: true, pixelAmbiguous: false }), "(connected, but not resolved for this campaign)", "a URL name with NO id must never render as the Pixel value");
+    assert.equal(pixelSummaryValue({ pixelName: null, pixelId: null, anyPixelExists: false, pixelAmbiguous: false }), "(none — no Pixel connected, so purchases cannot be tracked)");
+    assert.equal(pixelSummaryValue({ pixelName: null, pixelId: null, anyPixelExists: true, pixelAmbiguous: true }), "(multiple Pixels connected — none chosen yet)");
+    assert.equal(pixelSummaryValue({ pixelName: "Working Pixel", pixelId: "1241102478031429", anyPixelExists: true, pixelAmbiguous: false }), "Working Pixel (1241102478031429)");
+  });
+
+  await check("[Professional template, Stream D] model-authored markdown in reasoning_summary/assumptions never reaches recommendationText", async () => {
+    const userId = makeUser(`stream-d-no-markdown-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // A post caption carrying markdown: the creative-candidates question
+    // (an unresolved question) renders it, so the strip must cover
+    // unresolved_questions too, not just reasoning/assumptions.
+    const markdownPost = { id: "111_1", message: "**Sale** this weekend — 20% off!", created_time: "2024-03-03T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/1", attachments: { data: [{ media_type: "photo" }] } };
+    const markdownPost2 = { id: "111_2", message: "New arrivals this week", created_time: "2024-03-02T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [markdownPost, markdownPost2] } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." },
+          destination_url: "https://example.com",
+          reasoning_summary: "**Expected CPA:** PKR 582 — a conservative starting test.",
+          assumptions: ["## Note: the budget is a starting test, not a promise."],
+        }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.recommendationText.includes("Expected CPA: PKR 582"), "the words must survive the strip");
+      assert.ok(!built.recommendationText.includes("**"), "no bold markers may reach the recommendation");
+      assert.ok(!built.recommendationText.includes("##"), "no heading markers may reach the recommendation");
+      assert.ok(!built.recommendationText.includes("`"), "no backticks may reach the recommendation");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Professional template, Stream D] the meta-ads-manager-v2 template contains the Stream D rules", async () => {
+    const t = AGENT_TEMPLATES.find((x) => x.id === "meta-ads-manager-v2");
+    assert.ok(t, "the meta-ads-manager-v2 template must exist");
+    assert.ok(t.instructions.includes("exactly ONCE per distinct campaign request in this conversation"));
+    assert.ok(t.instructions.includes("Recommend ONE creative"));
+    assert.ok(t.instructions.includes("expected CPA"));
+    assert.ok(t.instructions.includes("expected sales range"));
+    assert.ok(t.instructions.includes("campaignName"));
+    assert.ok(t.instructions.includes("dateRange.activityWindow"));
+    assert.ok(t.instructions.includes("never present a Pixel name"));
+    assert.ok(t.instructions.includes("no raw markdown"));
+    assert.ok(t.instructions.includes("not a trend"));
+    assert.deepEqual(t.skillIds, ["meta_expert_v2"], "template must keep exactly one skill");
+  });
+
   // --- Phase 3B: deterministic diagnosis (round 55) ------------------------
   await check("[Diagnosis, round 55] zero conversions fires only once the 50-click sample-size threshold is cleared — not on a handful of clicks", async () => {
     const adSetRoster = [
@@ -8362,7 +9401,7 @@ async function run() {
         userMessage: "I want more sales on my website, link it to https://beautybees.pk",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
 
       assert.equal(executed.status, "PAUSED");
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
@@ -8414,7 +9453,7 @@ async function run() {
         userMessage: "I want more sales on my website",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
 
       const imageUpload = writes.find((w) => w.path.endsWith("/adimages"));
@@ -8465,7 +9504,7 @@ async function run() {
       assert.match(built.recommendationText, /Carousel cards \(proposed/i, "the stated default rule must reach the text the user actually approves");
       assert.match(built.recommendationText, /1\) Product 1 — 1000/);
 
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
 
       const imageUploads = writes.filter((w) => w.path.endsWith("/adimages"));
@@ -8535,7 +9574,7 @@ async function run() {
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => {
           assert.equal(err.code, 100);
           assert.match(err.message, /Invalid parameter: child_attachments/, `Meta's own real message must reach the caller verbatim: ${err.message}`);
@@ -8555,7 +9594,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 500 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.status, "PAUSED");
       assert.equal(executed.creativeAttached, false);
       assert.equal(executed.adId, null);
@@ -8588,7 +9627,7 @@ async function run() {
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => err.code === 100 && err.subcode === 1885132
       );
       const campaignWrite = writes.find((w) => w.path.endsWith("/campaigns"));
@@ -8625,7 +9664,7 @@ async function run() {
     mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST], corruptAdReadback: true } }));
     try {
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: getActiveStrategyForConversation(userId, conversationId).id }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: getActiveStrategyForConversation(userId, conversationId).id, userMessage: "approve" }),
         /verification failed/i
       );
     } finally {
@@ -8778,7 +9817,14 @@ async function run() {
         userMessage: "Sounds good, go ahead.",
       });
       assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
-      assert.equal(answered.strategy.destination_url, null, "an unverified model claim must be cleared, never silently trusted — especially a possibly-stale domain");
+      // Test stage: the cleared claim makes this revision a no-op (the
+      // only requested change was wiped), so the no-op guard returns the
+      // PRIOR row verbatim — and that row never carried a destination_url
+      // key at all, so the value is undefined, not null. Either
+      // representation means "no URL": what must never happen is the
+      // claimed URL surviving. (Stream C test (g) sanctions the no-op
+      // outcome for claimed-but-not-applied changes.)
+      assert.ok(answered.strategy.destination_url === null || answered.strategy.destination_url === undefined, "an unverified model claim must be cleared, never silently trusted — especially a possibly-stale domain");
       assert.ok(answered.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the question must stay open, never silently answered");
     } finally {
       restoreFetch();
@@ -8805,7 +9851,7 @@ async function run() {
 
     mockFetch(scriptedFetch({
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] },
-      chatResponses: [finalText("Great — I've saved that URL. Approve to proceed?")],
+      chatResponses: [finalText("Great — I've saved that URL. Approve to proceed?"), finalText("Great — I've saved that URL.\nDestination URL: https://store.example.com\nApprove to proceed?")],
     }));
     try {
       // "use that" — affirms the SUGGESTED URL specifically (matches
@@ -8855,6 +9901,11 @@ async function run() {
       chatResponses: [
         toolCall("meta_expert_v2.execute_strategy", {}),
         finalText("Got it — I've saved your confirmed destination URL. The campaign hasn't been created yet — just say \"approve\" whenever you're ready to launch it."),
+        // Test stage: the first reply mentions the destination URL
+        // without quoting the stored value, so the Stream C fidelity
+        // gate (§3.4b) nudges once; the follow-up keeps the "hasn't
+        // been created" wording and quotes the stored URL line.
+        finalText("Got it — I've saved your confirmed destination URL. The campaign hasn't been created yet — just say \"approve\" whenever you're ready to launch it.\nDestination URL: https://store.example.com"),
       ],
     }));
     try {
@@ -8898,7 +9949,14 @@ async function run() {
 
     mockFetch(scriptedFetch({
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST] },
-      chatResponses: [finalText("Great — I've saved that URL. Approve to proceed?")],
+      chatResponses: [
+        finalText("Great — I've saved that URL. Approve to proceed?"),
+        // Test stage: same Stream C fidelity nudge (§3.4b) as the
+        // pre-loop test — the first reply mentions the URL without
+        // quoting the stored value, so a follow-up quoting the stored
+        // line is needed.
+        finalText("Great — I've saved that URL.\nDestination URL: https://store.example.com\nApprove to proceed?"),
+      ],
     }));
     try {
       // Live production report, near-verbatim: an answer to several open
@@ -8985,7 +10043,7 @@ async function run() {
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => {
           assert.equal(err.code, 100);
           assert.equal(err.subcode, 3858721);
@@ -9027,7 +10085,7 @@ async function run() {
         userMessage: "I want more sales on my website",
       });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
 
       const creativeWrite = writes.find((w) => w.path.endsWith("/adcreatives"));
@@ -9074,7 +10132,7 @@ async function run() {
         return res;
       });
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
         (err) => {
           assert.match(err.message, /readback call_to_action \(LEARN_MORE\) does not match the requested CTA \(SHOP_NOW\)/, `must name both the mismatched readback value and the requested one: ${err.message}`);
           return true;
@@ -9105,7 +10163,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
     } finally {
       restoreFetch();
     }
@@ -9147,7 +10205,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
     } finally {
       restoreFetch();
     }
@@ -9182,7 +10240,7 @@ async function run() {
     try {
       const built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy({ budget_daily: 20 }), userMessage: "I want more sales on my website" });
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
 
       const proposed = await proposeCampaignEdit({
         userId, conversationId, accessToken: `fake-meta-token-${userId}`,
@@ -9222,6 +10280,12 @@ async function run() {
       chatResponses: [
         finalText("Here's your plan — this is your best-performing post, so I've used it as the creative."),
         finalText("Still your best-performing post — great choice."),
+        // Test stage: the deterministic correction substitutes the claim
+        // ("Still your a suitable post — great choice."), but that reply
+        // still mentions the creative without quoting the stored line,
+        // so the Stream C fidelity gate (§3.4b) nudges once more; the
+        // third reply keeps the corrected wording and quotes the line.
+        finalText("Still your a suitable post — great choice.\nCreative: Facebook post \"New Vitamin C Serum drop!\" (id 111_1, posted 2024-03-03T10:00:00+0000)"),
       ],
     }));
     try {
@@ -9253,7 +10317,15 @@ async function run() {
 
     mockFetch(scriptedFetch({
       metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
-      chatResponses: [finalText("Here's your plan — this is your best-performing post (480 likes, 52 comments, 30 shares), so I've used it as the creative.")],
+      chatResponses: [
+        finalText("Here's your plan — this is your best-performing post (480 likes, 52 comments, 30 shares), so I've used it as the creative."),
+        // Test stage: the claim is genuinely backed by the engagement
+        // data, so the performance guard never fires — but the reply
+        // still mentions the creative without quoting the stored line,
+        // so the Stream C fidelity gate (§3.4b) nudges once; the
+        // follow-up keeps the claim and quotes the stored line.
+        finalText("Here's your plan — this is your best-performing post (480 likes, 52 comments, 30 shares), so I've used it as the creative.\nCreative: Facebook post \"New Vitamin C Serum drop!\" (id 111_1, posted 2024-03-03T10:00:00+0000)"),
+      ],
     }));
     try {
       const userMessage = "Can you recap the plan?";
@@ -9330,16 +10402,38 @@ async function run() {
     // calls at all — if either auto-revise pre-loop depended on the model,
     // this test would fail with "chat mock exhausted" or leave a question
     // open, proving both fire deterministically before the model's turn.
+    // Test stage: the reply mentions the creative without quoting the
+    // stored Creative line, so the Stream C fidelity gate (§3.4b) nudges
+    // once; the second reply is that rewrite (stored line verbatim).
     mockFetch(scriptedFetch({
       wcProducts,
       metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] },
-      chatResponses: [finalText("Got it — I've saved the sunscreen as your creative and set the budget to 600/day. Reply 'approve' whenever you're ready.")],
+      chatResponses: [
+        finalText("Got it — I've saved the sunscreen as your creative and set the budget to 600/day. Reply 'approve' whenever you're ready."),
+        // Test stage: the first reply is nudged by the fidelity gate
+        // (§3.4b) for the stored Creative line. The rewrite must ALSO
+        // not claim a change ("set the budget") — the pre-loops already
+        // saved both answers before the model's turn, so the stored
+        // strategy is unchanged during the model's turn and the
+        // claimed-revision gate (§3.4c) would fire next. Present the
+        // stored values as-is instead.
+        finalText("Your creative and budget are ready:\nCreative: Product image \"La Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50\" (id 5814)\nBudget: PKR 600/day\nReply 'approve' whenever you're ready."),
+      ],
     }));
     try {
       const userMessage = "1) La Roche-Posay Anthelios Mineral Zinc Oxide Sunscreen SPF 50 (id 5814, 2050)   budget will be 600/day";
       const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      // Test stage: exactly ONE revise_strategy tool result — the creative
+      // pre-loop's revise already saved the budget too (its round-18
+      // derivation reads "600/day" straight from this same message), so
+      // the budget pre-loop's own revise requests an identical value and
+      // is correctly rejected as a no-change revision (Stream C §3.5),
+      // not duplicated. What proves BOTH answers were auto-saved is the
+      // outcome below (budget 600, creative 5814, no open questions) —
+      // the count of dispatches was only ever a proxy for that, and it
+      // assumed two separate revises.
       const autoSavedNames = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length;
-      assert.equal(autoSavedNames, 2, `both the budget AND the creative must be auto-saved from this one message: ${JSON.stringify(result.toolResults)}`);
+      assert.equal(autoSavedNames, 1, `the pre-loops must save both answers from this one message (one combined revise): ${JSON.stringify(result.toolResults)}`);
 
       const updated = getActiveStrategyForConversation(userId, conversationId);
       assert.equal(updated.strategy.budget_daily, 600, "the budget answer must be saved");
@@ -9355,12 +10449,114 @@ async function run() {
     mockFetch(scriptedFetch({ chatResponses: [], wcProducts, metaOpts: { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] } }));
     try {
       const strategyId = getActiveStrategyForConversation(userId, conversationId).id;
-      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId });
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId, userMessage: "approve" });
       assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
       assert.equal(executed.status, "PAUSED");
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Stream C (§4) — budget disambiguation -------------------------------
+  await check("[Stream C, budget disambiguation] reply \"3\" with a creative question pending selects post #3 — it is NEVER saved as a PKR 3/day budget", async () => {
+    const userId = makeUser(`v2-streamc-budget3-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    let built;
+    try {
+      // BOTH questions genuinely open at once: no budget_daily, 5 real posts, no pick.
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: undefined, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "creative question must be open");
+      assert.ok(built.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "budget question must be open");
+    } finally { restoreFetch(); }
+
+    // The model gets NO scripted tool calls — only a final text. If the budget
+    // pre-loop claimed "3", the stored budget would be 3 and this fails.
+    // Test stage: the first reply mentions the creative ("post 3") without
+    // quoting the stored Creative line, so the Stream C fidelity gate
+    // (§3.4b) nudges once; the follow-up keeps the budget question open
+    // (the budget is still genuinely unset) and quotes the stored line.
+    mockFetch(scriptedFetch({ chatResponses: [
+      finalText("Got it — post 3 it is. What budget would you like?"),
+      finalText("Got it — post 3 it is. What budget would you like?\nCreative: Facebook post \"Post number 3\" (id 111_3, posted 2024-03-03T10:00:00+0000)"),
+    ], metaOpts }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage: "3", history: [{ role: "user", content: "3" }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.resolvedAssets.creative?.contentId, "111_3", "must resolve to post #3 (id 111_3), the third candidate");
+      assert.ok(updated.strategy.budget_daily == null, `budget must still be unset — "3" is a post pick, never PKR 3/day: got ${updated.strategy.budget_daily}`);
+      assert.ok(updated.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "budget question must stay open");
+      assert.ok(!updated.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "creative question must be cleared");
+      assert.ok(!/PKR 3\/day|budget.*\b3\b\/day/i.test(result.reply), "the reply must never present a PKR 3/day budget");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[Stream C, budget disambiguation] deriveBudgetFromUserMessageIfMissing(\"3\") without the sole-open-question flag returns the strategy unchanged", () => {
+    assert.deepEqual(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "3"), { budget_daily: null });
+    assert.deepEqual(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "3", { allowBareNumber: true }), { budget_daily: 3, budget_basis: "USER_PROVIDED" });
+    assert.equal(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "600/day").budget_daily, 600, "the /day form still works with no flag");
+    assert.equal(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "PKR 550").budget_daily, 550, "the currency form still works with no flag");
+  });
+
+  await check("[Stream C, budget disambiguation] \"3, budget 600/day\" with both questions open resolves post #3 AND the PKR 600/day budget", async () => {
+    const userId = makeUser(`v2-streamc-budget3-compound-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: undefined, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "I want more sales on my website, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "creative question must be open");
+      assert.ok(built.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "budget question must be open");
+    } finally { restoreFetch(); }
+
+    // The reply presents the stored values as-is (same pattern as the
+    // both-answers test): the pre-loops already saved both answers before
+    // the model's turn, so it must not claim to have set them.
+    mockFetch(scriptedFetch({
+      metaOpts,
+      chatResponses: [finalText("Got it — post 3 it is.\nCreative: Facebook post \"Post number 3\" (id 111_3, posted 2024-03-03T10:00:00+0000)\nBudget: PKR 600/day\nReply 'approve' whenever you're ready.")],
+    }));
+    try {
+      const userMessage = "3, budget 600/day";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      // Test stage: the spec sketches "two revise_strategy tool results",
+      // but the implementation saves BOTH answers in ONE combined revise
+      // (the creative pre-loop's revise reads "600/day" from the same
+      // message via the round-18 derivation) — exactly the outcome the
+      // both-answers test already pins at 1. The budget pre-loop's own
+      // revise then requests an identical value and is correctly rejected
+      // as a no-change revision (Stream C §3.5), not duplicated. What
+      // proves both answers were saved is the outcome below.
+      const autoSavedNames = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.revise_strategy").length;
+      assert.equal(autoSavedNames, 1, `the pre-loops must save both answers from this one message (one combined revise): ${JSON.stringify(result.toolResults)}`);
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.resolvedAssets.creative?.contentId, "111_3", "the leading 3 must resolve to post #3");
+      assert.equal(updated.strategy.budget_daily, 600, "the /day budget token must be saved as 600");
+      assert.deepEqual(updated.strategy.unresolved_questions, [], "both questions must be cleared");
+    } finally { restoreFetch(); }
   });
 
   // --- Creative auto-revise matcher forms (round 32) -----------------
@@ -9419,9 +10615,22 @@ async function run() {
       // silent, the question stays open, and this only reaches the
       // model via the scripted final-text fallback (which the
       // assertions below would then fail against).
+      // Test stage: the reply below mentions the creative without
+      // quoting the stored Creative line, so the Stream C fidelity
+      // gate (§3.4b) nudges once for a rewrite that includes it. The
+      // second scripted reply IS that rewrite (stored line verbatim,
+      // from the resolved product) — without it the mock exhausts on
+      // the nudge. The fidelity check itself only needs the content
+      // id/name present, but the reply quotes the full stored line
+      // exactly as the nudge asks.
+      const expectedProduct = CREATIVE_FORM_WC_PRODUCTS.find((p) => String(p.id) === String(expectedProductId));
+      const storedCreativeLine = `Creative: Product image "${expectedProduct.name}" (id ${expectedProduct.id}, ${expectedProduct.price})`;
       mockFetch(scriptedFetch({
         wcProducts: CREATIVE_FORM_WC_PRODUCTS, metaOpts,
-        chatResponses: [finalText("Got it — I've saved your product choice as the creative. Reply 'approve' whenever you're ready.")],
+        chatResponses: [
+          finalText("Got it — I've saved your product choice as the creative. Reply 'approve' whenever you're ready."),
+          finalText(`Got it — I've saved your product choice as the creative.\n${storedCreativeLine}\nReply 'approve' whenever you're ready.`),
+        ],
       }));
       try {
         const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
@@ -9476,7 +10685,15 @@ async function run() {
       // appends it deterministically) — this test's own focus is the
       // decimal-number matcher below, not that gate, so the scripted
       // reply is written to already satisfy it and keep this a single turn.
-      chatResponses: [finalText("Which product would you like to use as the ad's creative? Also, could you confirm the budget?")],
+      // Test stage: the reply ALSO mentions the budget without quoting
+      // the stored amount, so the Stream C fidelity gate (§3.4b) nudges
+      // once; the second reply is the rewrite with the stored Budget
+      // line (PKR 3000/day, baseStrategy's default) and the creative
+      // question kept.
+      chatResponses: [
+        finalText("Which product would you like to use as the ad's creative? Also, could you confirm the budget?"),
+        finalText("Which product would you like to use as the ad's creative?\nBudget: PKR 3000/day"),
+      ],
     }));
     try {
       const userMessage = "make it 2.5k per day";
@@ -9503,7 +10720,7 @@ async function run() {
       strategy: baseStrategy(strategyOverrides), userMessage: "I want more sales on my website",
     });
     assert.equal(built.ok, true, `test setup: build failed — ${JSON.stringify(built.unresolved)}`);
-    const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId });
+    const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
     return { built, executed };
   }
   function editMetaOpts(writes) {
@@ -9909,7 +11126,7 @@ async function run() {
       });
 
       await assert.rejects(
-        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId }),
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "approve" }),
         (err) => { assert.equal(err.code, "META_V2_WRONG_EXECUTION_TOOL"); return true; }
       );
       await assert.rejects(

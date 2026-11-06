@@ -3,7 +3,7 @@ import { cryptoRandom } from "../middleware.js";
 import { chatComplete } from "../ai/provider.js";
 import { listToolsForSkills, getTool } from "../tools/registry.js";
 import { getAgentSkillIds } from "./permissions.js";
-import { runTool } from "./executor.js";
+import { runTool, resumeAfterConfirmation } from "./executor.js";
 import { enforceQuota } from "./billing.js";
 import { enforceSpendLimit } from "./costControls.js";
 import { recordAiTextUsage } from "./costEngine.js";
@@ -11,12 +11,12 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign } from "../agents/metaExpertV2/policy.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy, getStoredStrategy } from "../agents/metaExpertV2/strategyStore.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign, fingerprintStrategy as fingerprintStrategyV2 } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
-import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList } from "../agents/metaExpertV2/creativeResolution.js";
+import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList, messageIsBareCreativeAffirmation } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
 import { gatherBusinessSnapshot } from "../agents/metaExpertV2/businessSnapshot.js";
 
@@ -306,9 +306,9 @@ function checkFalseActionClaimGate({ decision, hasV2Tools }) {
 // this function's whole job is to be the one place that is allowed to
 // fail toward "no numbers" with total confidence, so it holds itself to
 // an even stricter bar than the gate it backs up.
-async function composeHonestPerformanceFallback(userId) {
+async function composeHonestPerformanceFallback(userId, userMessage) {
   try {
-    const snapshot = await gatherBusinessSnapshot(userId);
+    const snapshot = await gatherBusinessSnapshot(userId, { userMessage });
     if (!snapshot.metaConnected) {
       return "I don't have a verified answer for that — your Meta Ads account isn't connected right now, so there's no real data to report. Connect it and ask again.";
     }
@@ -890,6 +890,23 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   return null;
 }
 
+// Stream B — typed-approve lookup: the pending confirmation for THIS
+// conversation, if any. confirmation_requests has no conversationId column
+// (server/db.js:151) — the join goes through tool_executions, which does
+// (executionId -> conversationId, parameters JSON holding strategyId).
+// Only meta_expert_v2.execute_strategy confirmations are ever resumed
+// from chat; apply_campaign_edit keeps its own card-only path.
+function findPendingV2ExecuteConfirmation({ userId, conversationId }) {
+  return db.prepare(
+    `SELECT c.*, e.conversationId AS execConversationId, e.parameters AS execParameters, e.toolName AS execToolName
+     FROM confirmation_requests c
+     JOIN tool_executions e ON e.id = c.executionId
+     WHERE c.userId = ? AND c.status = 'pending' AND c.toolName = 'meta_expert_v2.execute_strategy'
+       AND e.conversationId = ? AND c.expiresAt > ?
+     ORDER BY c.createdAt DESC, c.rowid DESC LIMIT 1`
+  ).get(userId, conversationId, new Date().toISOString());
+}
+
 // Round 45 (edit-an-existing-campaign feature) — the SAME explicit-
 // approval-this-turn discipline as checkV2ExecutionApprovalGate above,
 // checked BEFORE meta_expert_v2.apply_campaign_edit is ever dispatched —
@@ -962,6 +979,13 @@ const V2_SINGLE_CALL_TOOLS = new Set([
 // it, and revise_strategy inserts a NEW stored row per successful call —
 // unbounded successful re-calls would create duplicate stored strategies
 // for one turn).
+// Stream B: "exactly once" is enforced PERSISTENTLY, not just per-turn —
+// runBuildOrRevise() (strategyBuilder.js) returns the existing strategyId
+// when a build/revise produces a fingerprint-identical strategy to the
+// active row, instead of inserting a new row. This per-turn cap (3) only
+// ever bounds valid:false retries; a successful build in ANY turn is the
+// last build for that request unless the user actually changes something,
+// in which case the change goes through revise_strategy.
 const V2_RETRYABLE_BUILD_TOOLS = new Set(["meta_expert_v2.build_strategy", "meta_expert_v2.revise_strategy"]);
 const MAX_V2_BUILD_ATTEMPTS = 3; // 1 initial + 2 retries
 const MAX_V2_TOOL_NUDGES = 1;
@@ -1214,8 +1238,17 @@ function checkStaleFactualAnswerGate({ userMessage, hasActivePlan, hasMetaExpert
   // is harmless, so this branch is skipped entirely for that case.
   if (CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage) && !messageRequestsCreativeOptionsList(userMessage)) {
     const snapshotTool = hasV2Tools ? "meta_expert_v2.get_business_snapshot" : "meta_expert.research_business_context";
+    // Stream B: NEVER instruct the model to pick a creative itself via
+    // revise_strategy. The old revisionClause told it to call revise_strategy
+    // "updating ONLY the creative fields … with what the real data supports"
+    // — i.e. to self-pick a candidate and store it as the strategy's
+    // creative. That is the live fabrication path (a relabelled post stored
+    // as the chosen creative). The snapshot call stays mandatory (real data
+    // before any naming), but the NEXT step is to present the real candidate
+    // list to the user and ask THEM to choose. Only a later turn, carrying
+    // the user's own pick, may call revise_strategy with a content_selector.
     const revisionClause = hasV2Tools && hasActivePlan
-      ? " Since an active strategy already exists for this conversation, then call meta_expert_v2.revise_strategy updating ONLY the creative fields (creative_strategy / content_selector) with what the real data supports — preserve the Page, ad account, Pixel, objective, audience, and budget exactly as they are; do not rebuild the campaign."
+      ? " Since an active strategy already exists for this conversation, present the real candidate list from the snapshot to the user and ask them to choose — do NOT pick one yourself and do NOT call meta_expert_v2.revise_strategy with a content_selector you chose. Only call revise_strategy with a creative pick once the user has picked one in their own words."
       : "";
     return `This asks you to select or compare specific creative (a Reel, post, or product) for an ad. Never name a specific post, product, or date, and never describe something as "high engagement," "high performing," or "proven effectiveness," without real CURRENT data behind it. Call ${snapshotTool} first to get the actual recent content list before selecting or describing anything specific.${revisionClause} If no real engagement/performance data is available for a piece of content, say so plainly and choose based on clearly-labeled factors instead (e.g. "Based on content relevance and format...") — never claim something is your best- or highest-performing content without the numbers to back it up.`;
   }
@@ -1272,7 +1305,18 @@ function checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy, h
   if (!hasV2Tools || !hasActiveV2Strategy || revisedThisTurn) return null;
   if (typeof userMessage !== "string" || !CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) return null;
   if (messageRequestsCreativeOptionsList(userMessage)) return null;
-  return 'An active strategy already exists for this conversation and this is a creative-selection/change request. You must call meta_expert_v2.revise_strategy — updating ONLY the creative fields (creative_strategy / content_selector) with what the business snapshot actually supports — before finalizing. Preserve the existing objective, audience, budget, Page, ad account, and Pixel exactly as they are; never rebuild the campaign from scratch. The required flow is: get_business_snapshot -> revise_strategy -> final.';
+  // Stream B: the old text ordered the model to call revise_strategy with
+  // creative fields "with what the business snapshot actually supports" —
+  // a direct instruction to self-pick. The gate's real job is narrower:
+  // stop the model finalizing a creative-selection answer without real
+  // data AND without the user's pick. It now requires the snapshot (already
+  // enforced by checkStaleFactualAnswerGate) and then requires the model to
+  // PRESENT the candidates and ask — never to store a pick itself. The
+  // required flow is: get_business_snapshot -> present candidates, ask the
+  // user to choose -> (next turn, with their pick) revise_strategy -> final.
+  // `revisedThisTurn` still suppresses the gate: a revise carrying the
+  // USER's own pick satisfies it, same as before.
+  return 'An active strategy already exists for this conversation and this is a creative-selection/change request. You must first have real snapshot data (call meta_expert_v2.get_business_snapshot if you have not this turn), then present the real candidate list to the user and ask them to choose which creative to use. Do NOT pick one yourself and do NOT call meta_expert_v2.revise_strategy with a content_selector you chose — only call revise_strategy with a creative pick once the user has picked one in their own words. Preserve the existing objective, audience, budget, Page, ad account, and Pixel exactly as they are; never rebuild the campaign from scratch.';
 }
 
 // Issue 5 (live testing round 5): "I want more sales to my website" put
@@ -1479,6 +1523,196 @@ function salvageMalformedToolCall(raw, decision) {
   return [{ toolName, parameters }];
 }
 
+// Stream C — one deterministic dispatcher for "which open question is this reply for?"
+// Reads ONLY the stored active strategy's open questions (resolvedAssets.pendingQuestions,
+// resolvedAssets.creativeCandidates, resolvedAssets.pendingCreative, strategy.unresolved_questions)
+// and the raw userMessage. Returns per-field claims; a single bare-number token may be
+// claimed by AT MOST ONE field, and a pending creative question ALWAYS wins it over budget.
+// Compound replies claim per-field: "3, budget 600/day" claims creative=3 AND budget=600.
+// A bare number with NO creative question pending and NO other open question except budget
+// may still be a budget (the round-18 "500" case) — that is the ONLY bare-number budget path.
+// A bare affirmation ("yes") with BOTH a pending-creative question and a destination-URL
+// question open claims NEITHER (ambiguousAffirmation) — the pre-loops must not fire on it,
+// and the model must be nudged to disambiguate. Typed execution approval ("approve",
+// "proceed", ...) claims nothing here — it is an execution approval, not a creative
+// answer, and the dispatcher leaves approval messages alone.
+export function resolvePendingQuestionAnswer({ activeStrategy, userMessage }) {
+  const claims = { creativeId: null, budgetDaily: null, budgetClaimedBy: null, bareNumberClaimedBy: null, pixelId: null, destinationUrl: null, ambiguousAffirmation: false };
+  if (!activeStrategy || typeof userMessage !== "string") return claims;
+
+  const resolvedAssets = activeStrategy.resolvedAssets || {};
+  const questions = activeStrategy.strategy?.unresolved_questions || [];
+  const hasCreativeCandidates = Array.isArray(resolvedAssets.creativeCandidates) && resolvedAssets.creativeCandidates.length > 0 && resolvedAssets.creative == null;
+  const hasPendingCreative = Boolean(resolvedAssets.pendingCreative);
+  const creativeQuestionPending = hasCreativeCandidates || hasPendingCreative;
+  const budgetQuestionOpen = activeStrategy.strategy?.budget_daily == null
+    || questions.includes("What daily budget would you like for this?");
+  const pendingEntries = Array.isArray(resolvedAssets.pendingQuestions) ? resolvedAssets.pendingQuestions : [];
+  const openQuestionKinds = new Set(
+    pendingEntries.map((e) => e.kind)
+      .concat(questions.map((q) => {
+        if (q.startsWith("Which ") && q.includes("should I use as the ad's creative?")) return "creative_candidates";
+        if (q.startsWith("To confirm — you'd like to use")) return "pending_creative";
+        if (q === "What daily budget would you like for this?") return "budget";
+        if (q.startsWith("This campaign needs a destination website URL")) return "destination_url";
+        if (q.startsWith('What ad text would you like for the "')) return "primary_text";
+        if (q.includes("Meta Pixels connected")) return "pixel";
+        return "other";
+      }))
+  );
+
+  // A bare affirmation with two open affirmation-questions (pending creative +
+  // destination URL) claims neither — recorded here so both pre-loops skip it.
+  const urlQuestionOpen = questions.some((q) => q.startsWith("This campaign needs a destination website URL"));
+  const pendingCreativeQuestionOpen = hasPendingCreative
+    && questions.some((q) => q.startsWith("To confirm — you'd like to use"));
+  if (pendingCreativeQuestionOpen && urlQuestionOpen && messageIsBareCreativeAffirmation(userMessage)) {
+    claims.ambiguousAffirmation = true;
+  }
+
+  // 1. Creative FIRST. A bare number / "N)"/"N." / id / label is a post selection
+  //    whenever a creative question is pending — never a budget, even if the
+  //    budget question is also open. matchCreativeCandidateId itself is also
+  //    gated (§2.2) so it returns null when no creative question is pending.
+  if (creativeQuestionPending) {
+    const candidates = resolvedAssets.creativeCandidates
+      || (resolvedAssets.pendingCreative ? [{ id: resolvedAssets.pendingCreative.candidate.id, label: resolvedAssets.pendingCreative.candidate.captionExcerpt || resolvedAssets.pendingCreative.candidate.name || null }] : []);
+    const shownEntry = pendingEntries.find((e) => e.kind === "creative_candidates" || e.kind === "pending_creative");
+    // Same scoping rule as resolveCreativeSelection: a pending_creative
+    // entry names only the single candidate being confirmed; a fresh pick
+    // ("2.") refers to the full candidate list, never just that one id.
+    const matched = matchCreativeCandidateId(userMessage, candidates, {
+      questionPending: true,
+      candidateIdsShown: shownEntry?.kind === "pending_creative"
+        ? (Array.isArray(candidates) ? candidates.map((c) => c.id) : null)
+        : (shownEntry?.candidateIds || (Array.isArray(candidates) ? candidates.map((c) => c.id) : null)),
+    });
+    if (matched) {
+      claims.creativeId = matched;
+      claims.bareNumberClaimedBy = "creative";
+    }
+  }
+
+  // 2. Budget SECOND, and only from a signal that names money. A bare number is
+  //    a budget ONLY if (a) no creative question is pending (enforced above:
+  //    bareNumberClaimedBy would already be "creative"), AND (b) either the
+  //    message carries a currency prefix / "/day" suffix, OR budget is the SOLE
+  //    open question kind. "3" with a creative question pending never reaches here.
+  if (budgetQuestionOpen && claims.bareNumberClaimedBy !== "creative") {
+    const extracted = deriveBudgetFromUserMessageIfMissing(
+      { budget_daily: null },
+      userMessage,
+      { allowBareNumber: openQuestionKinds.size === 1 && openQuestionKinds.has("budget") }
+    );
+    if (typeof extracted.budget_daily === "number") {
+      claims.budgetDaily = extracted.budget_daily;
+      claims.budgetClaimedBy = "user_message";
+      if (/^\s*\d+\s*\.?\s*$/.test(userMessage)) claims.bareNumberClaimedBy = "budget";
+    }
+  }
+
+  // 3. Pixel (digit-run id) and destination URL (explicit URL / reuse phrase) keep
+  //    their existing matchers, but only run on signals that cannot be a bare
+  //    creative position: a Pixel id is a long digit run (>= 10 digits) that is
+  //    ALSO in resolvedAssets.pixelCandidates; a bare "3" never matches here.
+  //    (Those pre-loops keep their existing matchers — see the note on
+  //    claims.pixelId / claims.destinationUrl below: the dispatcher does not
+  //    claim them, because their signals are unambiguous by construction, so
+  //    the pre-loops read the raw message exactly as before. claims.pixelId
+  //    and claims.destinationUrl stay null and are reserved for a future
+  //    stream that gives those fields the same pendingQuestion record.)
+  return claims;
+}
+
+// Stream C — whether a bare affirmation ("yes") may promote the pending creative
+// on THIS turn's stored state: the pending-creative confirmation question must
+// be open, and the message must not be a bare affirmation that could equally be
+// answering a destination-URL question (resolvePendingQuestionAnswer's
+// ambiguousAffirmation). An embedded, subject-naming phrase ("use that post")
+// still promotes — messageAffirmsPendingCreative itself handles that branch.
+function pendingCreativeAffirmationAllowed(activeStrategy, pendingAnswer, userMessage) {
+  if (!activeStrategy?.resolvedAssets?.pendingCreative) return false;
+  const questions = activeStrategy.strategy?.unresolved_questions || [];
+  if (!questions.some((q) => q.startsWith("To confirm — you'd like to use"))) return false;
+  if (pendingAnswer?.ambiguousAffirmation && messageIsBareCreativeAffirmation(userMessage)) return false;
+  return true;
+}
+
+const MAX_SELF_ANSWERED_CREATIVE_NUDGES = 1;
+const MAX_FIDELITY_NUDGES = 1;
+const MAX_CLAIMED_REVISION_NUDGES = 1;
+
+// Stream C: the model asked the user a creative question (stored pendingQuestion,
+// askedStrategyId = a PREVIOUS row) and then, in this same turn, called
+// build_strategy/revise_strategy with a content_selector — but the user's raw
+// message contains no answer to that question (resolvePendingQuestionAnswer()
+// claimed nothing for creative, and no pre-loop fired). The resulting
+// pendingCreative/creative is the MODEL's pick, not the user's. Block the final
+// reply from presenting it as chosen: nudge once ("present the open question,
+// do not state a pick"), then deterministically append the stored question.
+// openCreativeQuestion is the question text captured at the START of the turn
+// (before any pre-loop/model call could resolve it away); creativeResolvedThisTurn
+// is true when the active strategy's creative appeared or changed during the turn.
+function checkSelfAnsweredCreativeGate({ pendingAnswer, reviseCalledThisTurn, creativeResolvedThisTurn, openCreativeQuestion, hasPendingCreativeNow, pendingCreativeJustAutoConfirmedThisTurn, pendingCreativeAffirmedByUserThisTurn }) {
+  if (pendingCreativeJustAutoConfirmedThisTurn) return null;
+  // Test-stage fix (round 41 compound): a pending creative can be promoted
+  // by ANOTHER pre-loop's revise — the budget revise's own
+  // resolveCreativeSelection promotes it when the same compound message
+  // affirms it — so the dedicated pendingCreative pre-loop never runs and
+  // its flag above is never set. The creative still resolved from the
+  // USER's own affirmation, not from the model self-answering, so the gate
+  // must not fire. Scoped to creativeResolvedThisTurn: if the promotion
+  // did NOT happen (still pending), the gate still fires as before.
+  if (creativeResolvedThisTurn && pendingCreativeAffirmedByUserThisTurn) return null;
+  if (pendingAnswer?.creativeId) return null; // user DID answer — not self-answered
+  if (!reviseCalledThisTurn) return null;
+  if (!openCreativeQuestion) return null;
+  if (!hasPendingCreativeNow && !creativeResolvedThisTurn) return null;
+  return openCreativeQuestion;
+}
+
+// Stream C: the model's final reply must contain the stored row's three load-bearing
+// facts — the Budget value, the Creative value, and the Destination URL — by VALUE,
+// not by paraphrase. A reply that narrates a different budget/creative/URL than the
+// stored row is a claimed-but-not-applied report, even if a revise_strategy call ran
+// this turn. Narrowed to VALUES (not verbatim whole lines — a legitimate paraphrase
+// like "PKR 600 per day" for a stored "PKR 600/day" would otherwise trip the gate
+// on every turn): each field is only checked when the reply mentions that field's
+// topic at all, and passes when the stored value (or, for the creative, its caption
+// excerpt) appears in the reply. Returns the stored lines that are missing, or null.
+// Nudge once, then deterministically append the stored lines.
+function checkStoredRecommendationFidelityGate(activeStrategy, decisionMessage) {
+  if (!activeStrategy || typeof decisionMessage !== "string") return null;
+  const text = activeStrategy.recommendationText || "";
+  const storedLines = ["Budget:", "Creative:", "Destination URL:"].map((prefix) =>
+    text.split("\n").find((line) => line.startsWith(prefix)) || null);
+  const strategy = activeStrategy.strategy || {};
+  const resolved = activeStrategy.resolvedAssets || {};
+  const missing = [];
+  // Budget: value is the amount (with currency when known). Only checked when
+  // the reply mentions budgets at all and a budget is actually set.
+  if (storedLines[0] && typeof strategy.budget_daily === "number" && /budget/i.test(decisionMessage)) {
+    const amount = resolved.adAccountCurrency ? `${resolved.adAccountCurrency} ${strategy.budget_daily}` : `${strategy.budget_daily}`;
+    if (!decisionMessage.includes(amount) && !decisionMessage.includes(`${strategy.budget_daily}`)) missing.push(storedLines[0]);
+  }
+  // Creative: value is the resolved content id, or its caption excerpt.
+  // Only checked when the reply mentions the creative at all and one is resolved.
+  if (storedLines[1] && resolved.creative && /creative|post|image|reel|video/i.test(decisionMessage)) {
+    const contentId = resolved.creative.contentId || resolved.creative.productId || null;
+    const caption = resolved.creative.captionExcerpt || null;
+    const hasValue = (contentId && decisionMessage.includes(contentId))
+      || (caption && decisionMessage.includes(caption))
+      || (resolved.creative.productName && decisionMessage.includes(resolved.creative.productName));
+    if (!hasValue) missing.push(storedLines[1]);
+  }
+  // Destination URL: value is the URL itself. Only checked when the reply
+  // mentions links/URLs at all and one is set.
+  if (storedLines[2] && strategy.destination_url && /url|link|website|destination/i.test(decisionMessage)) {
+    if (!decisionMessage.includes(strategy.destination_url)) missing.push(storedLines[2]);
+  }
+  return missing.length ? missing : null;
+}
+
 /**
  * Runs one turn of the orchestrator: decide (plan/tool_call/final), execute
  * any tool calls through the executor, and produce a final natural-language
@@ -1565,6 +1799,13 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let performanceClaimNudges = 0;
   let unavailableReasonNudges = 0;
   let creativeQuestionNudges = 0;
+  // Stream C — one nudge each for the self-answered-creative gate, the
+  // stored-recommendation fidelity gate, and the claimed-revision-without-
+  // change gate (final branch, below). Same nudge-then-append shape as the
+  // other final-reply guards in this function.
+  let selfAnsweredCreativeNudges = 0;
+  let fidelityNudges = 0;
+  let claimedRevisionNudges = 0;
   // Set true the moment checkV2ExecutionApprovalGate blocks a real
   // execute_strategy attempt this turn (see round-29 fix in
   // checkExecutionClaimWithoutCallGate above) — distinguishes "the model
@@ -1618,6 +1859,11 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   const v2ToolCallCounts = new Map();
   const v2ToolNudgeCounts = new Map();
   const v2ToolLastOutcome = new Map();
+  // Stream B — counts gate-blocked execute_strategy attempts THIS TURN (see
+  // Change B). Reset every orchestrate() call like every other per-turn
+  // counter in this function.
+  let executeGateBlocksThisTurn = 0;
+  const MAX_V2_EXECUTE_GATE_BLOCKS = 2; // 1st block: directive feedback; 2nd: hard-stop the turn
   // Round 54 — built ONCE per orchestrate() call (history is fixed for
   // the whole turn): every performance figure the ASSISTANT itself
   // already stated in an EARLIER turn of this conversation. See
@@ -1636,6 +1882,84 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let comparisonMissingNudges = 0;
   let diagnosisClaimNudges = 0;
   let falseActionClaimNudges = 0;
+
+  // Stream C (§1.1): ONE dispatcher for the whole turn, computed once from
+  // the stored active strategy BEFORE any pre-loop runs. Every pre-loop below
+  // fires only on its own claim from pendingAnswer — never by re-matching the
+  // raw message independently. A typed execution approval ("approve") claims
+  // nothing here, so the typed-approve interception below is unaffected.
+  // Creative runs BEFORE budget (§1.4) so a compound reply ("3, budget
+  // 600/day") saves the creative first; the budget pre-loop then fires on
+  // pendingAnswer alone (it does not re-check budget_daily, since the
+  // creative revise's own round-18 derivation may already have saved it —
+  // in that case its revise requests an identical value and is rejected
+  // as a no-change revision (Stream C §3.5), so only one tool result
+  // appears — which is correct: the outcome, both answers saved, is
+  // what matters, not a second redundant dispatch).
+  const activeStrategyAtTurnStart = hasV2Tools && conversationId ? getActiveStrategyForConversation(userId, conversationId) : null;
+  const pendingAnswer = resolvePendingQuestionAnswer({ activeStrategy: activeStrategyAtTurnStart, userMessage });
+  // Stream C (§2.5): the creative state at the START of the turn, captured
+  // before any pre-loop can resolve it — the self-answered gate in the final
+  // branch compares against this.
+  const creativeContentIdBeforeTurn = activeStrategyAtTurnStart?.resolvedAssets?.creative?.contentId
+    || activeStrategyAtTurnStart?.resolvedAssets?.creative?.productId || null;
+  const openCreativeQuestionAtTurnStart = (activeStrategyAtTurnStart?.strategy?.unresolved_questions || [])
+    .find((q) => (q.startsWith("Which ") && q.includes("should I use as the ad's creative?")) || q.startsWith("To confirm — you'd like to use")) || null;
+
+  // Live bug (creative attach follow-up — same class as the Pixel fix and
+  // the budget fix): a genuinely ambiguous
+  // creative (2+ real candidates, resolvedAssets.creative null,
+  // resolvedAssets.creativeCandidates populated — see creativeResolution.js/
+  // strategyBuilder.js) was left depending on the model calling
+  // revise_strategy for a plain-chat answer — exactly the mechanism that
+  // failed repeatedly for Pixel. Same fix, same shape: BEFORE the model
+  // gets a turn, match the user's CURRENT message against the REAL
+  // candidate ids/list-position already shown, and call revise_strategy
+  // directly if there's exactly one unambiguous match.
+  // Stream C (§1.1): fires ONLY on the dispatcher's creative claim — the id
+  // is passed in, never re-matched from the raw message a second time.
+  if (hasV2Tools && conversationId && pendingAnswer.creativeId != null) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const creativeCandidates = activeStrategy?.resolvedAssets?.creativeCandidates;
+    if (activeStrategy && activeStrategy.resolvedAssets?.creative == null && Array.isArray(creativeCandidates) && creativeCandidates.length) {
+      const matchedCreativeId = pendingAnswer.creativeId;
+      if (matchedCreativeId) {
+        try {
+          const accessToken = requireValidToken(userId, "meta_ads");
+          const revised = await reviseStrategyV2({
+            userId, conversationId, accessToken, strategyId: activeStrategy.id,
+            requestedChanges: { content_selector: { confirmedId: matchedCreativeId } },
+            userMessage,
+            claimedBy: pendingAnswer.bareNumberClaimedBy,
+          });
+          if (revised.ok) {
+            otherFieldAutoRevisedThisTurn = true;
+            trace.push(traceStep("tool", "Auto-saved the creative you just chose (meta_expert_v2.revise_strategy)", "done"));
+            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+            // Same append-in-place pattern as the budget/Pixel auto-revise
+            // blocks above — including when ONE of those already fired for
+            // THIS SAME message (a single reply answering two open
+            // questions at once, e.g. "1) <product> ... budget 600/day"):
+            // conversationForModel/lastIdx are re-read fresh here, after
+            // whichever earlier block already appended its own note, so
+            // both notes stack rather than one overwriting the other.
+            const lastIdx = conversationForModel.length - 1;
+            const last = conversationForModel[lastIdx];
+            if (last?.role === "user" && typeof last.content === "string") {
+              conversationForModel = [
+                ...conversationForModel.slice(0, lastIdx),
+                { ...last, content: `${last.content}\n\n[System note: this message's chosen creative (id ${matchedCreativeId}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+              ];
+            }
+          } else {
+            v2Trace("auto-revise creative failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+          }
+        } catch (err) {
+          v2Trace("auto-revise creative failed (error)", { conversationId, error: err.message });
+        }
+      }
+    }
+  }
 
   // CONFIRMED LIVE BUG (round 30): a user supplied a daily budget in
   // plain chat three separate times ("Rs.500"), the strategy's own
@@ -1660,10 +1984,13 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   // (not connected, a genuine validation rejection, etc.) is logged and
   // never breaks the turn — the model still gets exactly the same gates
   // it would have without this, no worse than before.
-  if (hasV2Tools && conversationId) {
+  // Stream C (§1.1): fires ONLY on the dispatcher's budget claim — never by
+  // re-matching the raw message. A bare "3" answering a creative question is
+  // claimed for creative and never reaches here.
+  if (hasV2Tools && conversationId && pendingAnswer.budgetDaily != null) {
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
-    if (activeStrategy && activeStrategy.strategy.budget_daily == null) {
-      const extracted = deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, userMessage);
+    if (activeStrategy) {
+      const extracted = { budget_daily: pendingAnswer.budgetDaily, budget_basis: "USER_PROVIDED" };
       if (typeof extracted.budget_daily === "number") {
         try {
           const accessToken = requireValidToken(userId, "meta_ads");
@@ -1671,6 +1998,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
             userId, conversationId, accessToken, strategyId: activeStrategy.id,
             requestedChanges: { budget_daily: extracted.budget_daily, budget_basis: extracted.budget_basis },
             userMessage,
+            claimedBy: pendingAnswer.bareNumberClaimedBy,
           });
           if (revised.ok) {
             otherFieldAutoRevisedThisTurn = true;
@@ -1793,58 +2121,6 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     }
   }
 
-  // Live bug (creative attach follow-up — same class as the Pixel fix
-  // directly above, and the budget fix above that): a genuinely ambiguous
-  // creative (2+ real candidates, resolvedAssets.creative null,
-  // resolvedAssets.creativeCandidates populated — see creativeResolution.js/
-  // strategyBuilder.js) was left depending on the model calling
-  // revise_strategy for a plain-chat answer — exactly the mechanism that
-  // failed repeatedly for Pixel. Same fix, same shape: BEFORE the model
-  // gets a turn, match the user's CURRENT message against the REAL
-  // candidate ids/list-position already shown, and call revise_strategy
-  // directly if there's exactly one unambiguous match.
-  if (hasV2Tools && conversationId) {
-    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
-    const creativeCandidates = activeStrategy?.resolvedAssets?.creativeCandidates;
-    if (activeStrategy && activeStrategy.resolvedAssets?.creative == null && Array.isArray(creativeCandidates) && creativeCandidates.length) {
-      const matchedCreativeId = matchCreativeCandidateId(userMessage, creativeCandidates);
-      if (matchedCreativeId) {
-        try {
-          const accessToken = requireValidToken(userId, "meta_ads");
-          const revised = await reviseStrategyV2({
-            userId, conversationId, accessToken, strategyId: activeStrategy.id,
-            requestedChanges: { content_selector: { confirmedId: matchedCreativeId } },
-            userMessage,
-          });
-          if (revised.ok) {
-            otherFieldAutoRevisedThisTurn = true;
-            trace.push(traceStep("tool", "Auto-saved the creative you just chose (meta_expert_v2.revise_strategy)", "done"));
-            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
-            // Same append-in-place pattern as the budget/Pixel auto-revise
-            // blocks above — including when ONE of those already fired for
-            // THIS SAME message (a single reply answering two open
-            // questions at once, e.g. "1) <product> ... budget 600/day"):
-            // conversationForModel/lastIdx are re-read fresh here, after
-            // whichever earlier block already appended its own note, so
-            // both notes stack rather than one overwriting the other.
-            const lastIdx = conversationForModel.length - 1;
-            const last = conversationForModel[lastIdx];
-            if (last?.role === "user" && typeof last.content === "string") {
-              conversationForModel = [
-                ...conversationForModel.slice(0, lastIdx),
-                { ...last, content: `${last.content}\n\n[System note: this message's chosen creative (id ${matchedCreativeId}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
-              ];
-            }
-          } else {
-            v2Trace("auto-revise creative failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
-          }
-        } catch (err) {
-          v2Trace("auto-revise creative failed (error)", { conversationId, error: err.message });
-        }
-      }
-    }
-  }
-
   // Round 38 fix (production deadlock, same shape as round 36's
   // destination_url deadlock): a live report showed the user replying
   // "yes" three separate times to a pendingCreative confirmation question
@@ -1879,7 +2155,12 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   if (hasV2Tools && conversationId) {
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
     const pendingCreative = activeStrategy?.resolvedAssets?.pendingCreative;
-    if (activeStrategy && pendingCreative && messageAffirmsPendingCreative(userMessage)) {
+    // Stream C (§2.3): a bare "yes" promotes the pending pick ONLY when the
+    // pending-creative confirmation question is genuinely open (and the same
+    // "yes" is not equally an answer to a destination-URL question — the
+    // dispatcher's ambiguousAffirmation rule). An embedded, subject-naming
+    // phrase ("use that post") still promotes anywhere in the message.
+    if (activeStrategy && pendingCreative && messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: pendingCreativeAffirmationAllowed(activeStrategy, pendingAnswer, userMessage) })) {
       try {
         const accessToken = requireValidToken(userId, "meta_ads");
         const revised = await reviseStrategyV2({
@@ -1953,7 +2234,10 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   if (hasV2Tools && conversationId) {
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
     const pendingCreative = activeStrategy?.resolvedAssets?.pendingCreative;
-    if (activeStrategy && pendingCreative && !messageAffirmsPendingCreative(userMessage) && messageRequestsCreativeOptionsList(userMessage)) {
+    // Stream C (§2.3): the affirmation guard uses the same flag as the
+    // pendingCreative pre-loop above, so a bare "yes" that genuinely affirms
+    // the pending pick never also reopens the list.
+    if (activeStrategy && pendingCreative && !messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: pendingCreativeAffirmationAllowed(activeStrategy, pendingAnswer, userMessage) }) && messageRequestsCreativeOptionsList(userMessage)) {
       try {
         const accessToken = requireValidToken(userId, "meta_ads");
         const revised = await reviseStrategyV2({
@@ -2008,7 +2292,12 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     const openQuestion = activeStrategy?.strategy?.unresolved_questions?.find((q) => q.startsWith("This campaign needs a destination website URL"));
     const suggestedUrl = activeStrategy?.snapshot?.business?.storeUrl;
     const typedUrl = extractUrlFromMessage(userMessage);
-    const candidateUrl = typedUrl || (suggestedUrl && messageAffirmsSuggestedUrl(userMessage) ? suggestedUrl : null);
+    // Stream C (§2.3): a bare "yes" with a pending-creative question ALSO open
+    // claims neither — only a typed URL (unambiguous) may close the URL
+    // question on such a turn. (ambiguousAffirmation is only ever true for a
+    // bare affirmation, so an embedded, subject-naming phrase like "use the
+    // same url" still claims the URL.)
+    const candidateUrl = typedUrl || (suggestedUrl && !pendingAnswer.ambiguousAffirmation && messageAffirmsSuggestedUrl(userMessage) ? suggestedUrl : null);
     if (activeStrategy && openQuestion && candidateUrl) {
       try {
         const accessToken = requireValidToken(userId, "meta_ads");
@@ -2090,9 +2379,15 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
     const needsPrimaryTextOnly = Array.isArray(questions) && questions.length === 1
       && questions[0].startsWith('What ad text would you like for the "');
     const trimmedMessage = typeof userMessage === "string" ? userMessage.trim() : "";
+    // Stream C (§1.1): a bare number the dispatcher already claimed for
+    // another question is never ad copy. The affirmation exclusion uses the
+    // bare-word shape directly (messageAffirmsPendingCreative now needs its
+    // pendingCreativeQuestion flag, which cannot be true here — the
+    // primaryText question is the ONLY open one).
     if (
       activeStrategy && needsPrimaryTextOnly && !otherFieldAutoRevisedThisTurn && trimmedMessage
-      && !messageIndicatesExecutionApprovalV2(userMessage) && !messageAffirmsPendingCreative(userMessage)
+      && !messageIndicatesExecutionApprovalV2(userMessage) && !messageIsBareCreativeAffirmation(userMessage)
+      && pendingAnswer.bareNumberClaimedBy == null
     ) {
       try {
         const accessToken = requireValidToken(userId, "meta_ads");
@@ -2121,6 +2416,111 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       }
     }
   }
+
+  // Stream B (P0, typed "approve"): if the user typed approval in chat while
+  // a confirmation card for meta_expert_v2.execute_strategy is still pending
+  // for THIS conversation, resume THAT execution directly — never let the
+  // model re-call execute_strategy and mint a second confirmation row while
+  // the first stays pending until expiry (the live loop: "approve" ->
+  // new card -> "approve" -> new card …). Runs AFTER the deterministic
+  // auto-revise pre-loops above, so destinationUrlJustAutoConfirmedThisTurn /
+  // pendingCreativeJustAutoConfirmedThisTurn are already known: if this same
+  // message was just consumed confirming a URL or a pending creative, it is
+  // NOT execution approval and this block is skipped entirely — the normal
+  // flow re-presents the updated recommendation and waits for a separate
+  // approval (same rule as checkV2ExecutionApprovalGate). A typed DECLINE
+  // ("no", "don't", "cancel", "reject") resolves the pending confirmation
+  // as rejected instead, so a stale card can never be approved later by
+  // accident. If the confirmation's strategy is no longer the active one
+  // (superseded by a revise, or already executed), the confirmation is
+  // expired here and the turn falls through to the normal flow, which
+  // re-presents the current recommendation — resuming a stale card would
+  // execute (or fail on) a strategy the user is no longer looking at.
+  if (hasV2Tools && conversationId && !destinationUrlJustAutoConfirmedThisTurn && !pendingCreativeJustAutoConfirmedThisTurn) {
+    const pendingConfirmation = findPendingV2ExecuteConfirmation({ userId, conversationId });
+    if (pendingConfirmation && typeof userMessage === "string") {
+      const typedApproval = messageIndicatesExecutionApprovalV2(userMessage);
+      const typedDecline = /^\s*(no|nope|don't|do not|cancel|reject|stop|not yet)\b/i.test(userMessage);
+      if (typedApproval || typedDecline) {
+        // Staleness: the card was created for a specific strategy. Resolve
+        // it from the execution's parameters (strategyId, when the model
+        // passed one) or fall back to "the active strategy at card time"
+        // approximated by createdAt: if a NEWER strategy row exists for
+        // this conversation than the card, the card is stale.
+        let confirmationStrategy = null;
+        try {
+          const params = JSON.parse(pendingConfirmation.execParameters || "{}");
+          if (params.strategyId) confirmationStrategy = getStoredStrategy(userId, params.strategyId);
+        } catch { /* malformed parameters — treat as unresolvable, stale */ }
+        const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+        const newerStrategyExists = activeStrategy && new Date(activeStrategy.createdAt) > new Date(pendingConfirmation.createdAt);
+        const strategyIsStale =
+          (confirmationStrategy && !["proposed", "approved"].includes(confirmationStrategy.status)) ||
+          (!confirmationStrategy && newerStrategyExists);
+        if (strategyIsStale) {
+          db.prepare("UPDATE confirmation_requests SET status = 'expired', resolvedAt = ? WHERE id = ?")
+            .run(new Date().toISOString(), pendingConfirmation.id);
+          trace.push(traceStep("completed", "Pending approval was for a strategy that has since changed — expired, re-presenting the current recommendation.", "done"));
+          // Fall through to the normal model loop below: it will present
+          // the current recommendation and wait for a fresh approval.
+        } else {
+          let outcome;
+          try {
+            outcome = await resumeAfterConfirmation({ executionId: pendingConfirmation.executionId, approved: typedApproval });
+          } catch (resumeErr) {
+            // Card expired between lookup and resume, or the execution was
+            // already resolved: fall through to the normal model loop
+            // below, which re-presents the current recommendation and
+            // waits for a fresh approval — never a 500-style reply.
+            trace.push(traceStep("completed", `Pending approval could not be resumed (${resumeErr.message}) — re-presenting the current recommendation.`, "done"));
+            outcome = null;
+          }
+          if (outcome) {
+            trace.push(traceStep("completed", typedApproval ? "Typed approval resumed the pending execution." : "Typed decline rejected the pending execution.", "done"));
+            if (planId) setPlanStatus(planId, typedApproval && outcome.status === "completed" ? "completed" : "failed");
+            if (!typedApproval) {
+              return {
+                reply: "Understood — I won't create that campaign. The recommendation is still saved if you change your mind; just say so and I'll set it up again for your approval.",
+                trace, toolResults, usage: usageTotals,
+              };
+            }
+            if (outcome.status === "completed" && outcome.result) {
+              const r = outcome.result;
+              return {
+                reply: `Done — your campaign is created and paused (Campaign ID: ${r.campaignId}, Ad Set ID: ${r.adSetId}). Nothing will spend until you resume it in Meta Ads Manager.${r.adId ? "" : " No ad was attached yet — see the note I gave with the recommendation."}`,
+                trace,
+                toolResults: [...toolResults, { toolName: "meta_expert_v2.execute_strategy", result: outcome.result }],
+                usage: usageTotals,
+              };
+            }
+            // Resume failed (e.g. the strategy was revised mid-flight, or
+            // Meta rejected it). Never claim success; surface the real error
+            // and fall back to asking — the model loop below would only
+            // re-derive the same failure.
+            return {
+              reply: `I tried to create the campaign from your approval, but it didn't go through — ${outcome.error || "unknown error"}. Nothing was created. Tell me how you'd like to proceed and I'll sort it out.`,
+              trace, toolResults, usage: usageTotals,
+            };
+          }
+        }
+      }
+    }
+  }
+
+  // Stream C (§3.4c): the strategy fingerprint as the turn starts — BEFORE
+  // the deterministic pre-loops above. A pre-loop save IS a change this
+  // turn: the gate's job is to catch a reply claiming a revision when
+  // NOTHING changed all turn (a phantom change the user would believe).
+  // Capturing the fingerprint after the pre-loops made the gate fire —
+  // hard-stopping with "I wasn't able to actually apply that" — whenever
+  // a pre-loop had already applied the very change the model was
+  // truthfully reporting (full live loop: user says "500/day", the
+  // budget pre-loop saves it, the model says "I've set the budget" and
+  // the gate falsely claims it wasn't applied). The final branch
+  // compares the post-turn fingerprint against this turn-start one.
+  const strategyFingerprintBeforeTurn = activeStrategyAtTurnStart?.strategy
+    ? fingerprintStrategyV2(activeStrategyAtTurnStart.strategy)
+    : null;
 
   while (stepsRun < MAX_STEPS) {
     const provider = modelChoice?.aiProvider || process.env.AI_PROVIDER || "anthropic";
@@ -2269,7 +2669,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // Never a bare dead end, and never a number that wasn't just
         // fetched for real.
         trace[trace.length - 1].state = "done";
-        const honestReply = await composeHonestPerformanceFallback(userId);
+        const honestReply = await composeHonestPerformanceFallback(userId, userMessage);
         trace.push(traceStep("completed", "Blocked a performance claim with no backing tool call this turn — replaced with a real fetch.", "done"));
         if (planId) setPlanStatus(planId, "failed");
         return { reply: honestReply, trace, toolResults, usage: usageTotals };
@@ -2493,7 +2893,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace.push(traceStep("completed", "Creative update could not be finalized through the required revision step.", "done"));
           if (planId) setPlanStatus(planId, "failed");
           return {
-            reply: "I wasn't able to complete that creative update through the proper revision process — could you try again, or tell me more about what you'd like changed?",
+            reply: "I wasn't able to sort out the creative choice — could you tell me which post, Reel, or product you'd like to use as the ad's creative? I'll set it up from there.",
             trace,
             toolResults,
             usage: usageTotals,
@@ -2655,6 +3055,101 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         decision.message = `${decision.message}\n\n${unresolvedCreativeQuestion}`;
       }
 
+      // Stream C (§2.5): the model asked the creative question and then
+      // answered it itself this turn — present the stored question, never
+      // the model's pick. Same nudge-then-deterministic-append shape as the
+      // creative gate above.
+      const reviseCalledThisTurn = (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0
+        || (v2ToolCallCounts.get("meta_expert_v2.build_strategy") || 0) > 0
+        || toolResults.some((r) => r.toolName === "meta_expert_v2.revise_strategy" || r.toolName === "meta_expert_v2.build_strategy");
+      const freshCreative = activeStrategyForCurrency?.resolvedAssets?.creative;
+      const freshCreativeId = freshCreative?.contentId || freshCreative?.productId || null;
+      const creativeResolvedThisTurn = freshCreativeId != null && freshCreativeId !== creativeContentIdBeforeTurn;
+      const hasPendingCreativeNow = Boolean(activeStrategyForCurrency?.resolvedAssets?.pendingCreative);
+      // Test-stage fix (round 41 compound): whether THIS turn's raw message
+      // affirmed the pending creative that was open at turn start — the
+      // same allowed-check the pendingCreative pre-loop itself uses. A
+      // promotion that happened inside another pre-loop's revise (e.g. the
+      // budget revise) is still a user confirmation, not a model
+      // self-answer, so the gate below must exempt it too.
+      const pendingCreativeAffirmedByUserThisTurn = Boolean(
+        activeStrategyAtTurnStart?.resolvedAssets?.pendingCreative
+        && messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: pendingCreativeAffirmationAllowed(activeStrategyAtTurnStart, pendingAnswer, userMessage) })
+      );
+      const selfAnsweredQuestion = hasV2Tools ? checkSelfAnsweredCreativeGate({
+        pendingAnswer, reviseCalledThisTurn, creativeResolvedThisTurn,
+        openCreativeQuestion: openCreativeQuestionAtTurnStart, hasPendingCreativeNow,
+        pendingCreativeJustAutoConfirmedThisTurn, pendingCreativeAffirmedByUserThisTurn,
+      }) : null;
+      if (selfAnsweredQuestion && typeof decision.message === "string" && !CREATIVE_QUESTION_ANCHOR_PATTERN.test(decision.message)) {
+        if (selfAnsweredCreativeNudges < MAX_SELF_ANSWERED_CREATIVE_NUDGES) {
+          selfAnsweredCreativeNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `Your reply presents a creative pick the user never chose — the creative question is still open. Present the open question to the user and do NOT state a pick: "${selfAnsweredQuestion}"`,
+            },
+          ];
+          continue;
+        }
+        decision.message = `${decision.message}\n\n${selfAnsweredQuestion}`;
+      }
+
+      // Stream C (§3.4b): the reply must carry the stored row's Budget /
+      // Creative / Destination URL values (see
+      // checkStoredRecommendationFidelityGate). Same nudge-then-append shape
+      // as the creative gate above.
+      const fidelityMissing = hasV2Tools ? checkStoredRecommendationFidelityGate(activeStrategyForCurrency, decision.message) : null;
+      if (fidelityMissing?.length && typeof decision.message === "string") {
+        if (fidelityNudges < MAX_FIDELITY_NUDGES) {
+          fidelityNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `Your reply mentions the budget, creative, or destination URL but does not include the stored values. Rewrite your reply to include these exact stored lines verbatim:\n${fidelityMissing.join("\n")}`,
+            },
+          ];
+          continue;
+        }
+        decision.message = `${decision.message}\n\n${fidelityMissing.join("\n")}`;
+      }
+
+      // Stream C (§3.4c): a revise was called this turn but the strategy
+      // fingerprint is unchanged — the revision changed nothing, so a reply
+      // claiming it did is a claimed-but-not-applied report. Nudge once,
+      // then the honest fallback (same wording as the
+      // checkExecutionClaimWithoutCallGate fallback above).
+      const REVISION_CLAIM_PATTERN = /\b(set|updated|increased|revised|applied)\b.{0,30}\b(budget|creative|audience)/i;
+      const postTurnFingerprint = activeStrategyForCurrency?.strategy ? fingerprintStrategyV2(activeStrategyForCurrency.strategy) : null;
+      const claimedRevisionWithoutChange = hasV2Tools && reviseCalledThisTurn
+        && strategyFingerprintBeforeTurn != null && postTurnFingerprint === strategyFingerprintBeforeTurn
+        && typeof decision.message === "string" && REVISION_CLAIM_PATTERN.test(decision.message);
+      if (claimedRevisionWithoutChange) {
+        if (claimedRevisionNudges < MAX_CLAIMED_REVISION_NUDGES) {
+          claimedRevisionNudges += 1;
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            {
+              role: "user",
+              content: `Your reply claims a budget, creative, or audience change, but the stored strategy is unchanged from the start of this turn — the revision did not actually apply. Call meta_expert_v2.revise_strategy with a genuinely different value, or present the stored recommendation as-is without claiming a change.`,
+            },
+          ];
+          continue;
+        }
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Claimed a revision that changed nothing — overridden.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: "I wasn't able to actually apply that — could you say \"approve\" (or repeat whatever you'd like changed) one more time, and I'll update and execute the strategy for real this time?",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
+
       trace[trace.length - 1].state = "done";
       trace.push(traceStep("completed", null, "done"));
       if (planId) setPlanStatus(planId, "completed");
@@ -2801,14 +3296,28 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         }
         // Meta Ads Expert V2's own approval gate — see
         // checkV2ExecutionApprovalGate above. This runs IN ADDITION to the
-        // V2 single-call gate above — a gate-blocked attempt here (no
-        // active strategy yet, or no approval language) doesn't consume
-        // the once-per-turn dispatch budget, only a genuine execution
-        // attempt that reaches runTool() below does.
+        // V2 single-call gate above.
+        // Stream B: a gate-blocked execute_strategy attempt now CONSUMES the
+        // once-per-turn single-call slot (v2ToolCallCounts), exactly like a
+        // real dispatch. Before this, the counting block below only ran when
+        // outcome was unset, so a blocked attempt was free — the model could
+        // re-attempt execute_strategy until MAX_STEPS. Counting it here means
+        // the second attempt this turn is intercepted by the V2 single-call
+        // gate above (one nudge, quoting the first block reason), and the
+        // third hard-stops the turn. The counter is per-turn (reset every
+        // orchestrate() call), so a legitimate retry in a LATER turn — e.g.
+        // the user supplies the missing budget, then approves again — is
+        // unaffected. executeGateBlocksThisTurn (Change B) is the separate,
+        // tighter bound: a gate block for a reason the model cannot fix by
+        // re-calling in the same turn (no approval language in THIS message)
+        // hard-stops after the second block rather than spending the nudge.
         const gateError = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn });
         if (gateError) {
           outcome = { status: "failed", error: gateError };
           executeGateBlockedThisTurn = true;
+          executeGateBlocksThisTurn += 1;
+          v2ToolCallCounts.set("meta_expert_v2.execute_strategy", (v2ToolCallCounts.get("meta_expert_v2.execute_strategy") || 0) + 1);
+          v2ToolLastOutcome.set("meta_expert_v2.execute_strategy", outcome);
         }
       } else if (call.toolName === "meta_expert_v2.apply_campaign_edit") {
         // Round 45 — same shape as the execute_strategy gate immediately
@@ -2917,12 +3426,32 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // "approve" again — which cannot fix a missing budget, since nothing
         // about the strategy changes between identical approvals.
         if (call.toolName === "meta_expert_v2.execute_strategy" && executeGateBlockedThisTurn) {
+          // Stream B: the FIRST gate-block in a turn gets the directive
+          // feedback below (the model may still fix a fixable cause — e.g.
+          // revise in a missing budget — or ask the user for the one missing
+          // fact). The SECOND gate-block in the SAME turn hard-stops: nothing
+          // the model can do in this turn changes the user's own message, so
+          // a further attempt can only re-hit the same gate. The user gets
+          // one honest reply, not a loop toward MAX_STEPS. A later turn
+          // (new user message) resets executeGateBlocksThisTurn, so a
+          // genuine retry after the user answers is unaffected.
+          if (executeGateBlocksThisTurn >= MAX_V2_EXECUTE_GATE_BLOCKS) {
+            trace[trace.length - 1].state = "done";
+            trace.push(traceStep("completed", "Execution blocked twice this turn — stopping.", "done"));
+            if (planId) setPlanStatus(planId, "failed");
+            return {
+              reply: "I wasn't able to create this campaign yet — the approval for this exact recommendation isn't complete. If I asked you for something (like a daily budget), send that and I'll set it up; then approve the updated recommendation and I'll create it (paused) for you.",
+              trace,
+              toolResults,
+              usage: usageTotals,
+            };
+          }
           conversationForModel = [
             ...conversationForModel,
             { role: "assistant", content: JSON.stringify(decision) },
             {
               role: "user",
-              content: `"${call.toolName}" was blocked: ${outcome.error}\nRespond now with type "final". If the reason names a specific missing fact only the user can supply (like a daily budget amount), ask for exactly that, in plain language — never ask the user to just repeat their approval, since that alone cannot fix this. If instead you already have what's needed, call meta_expert_v2.revise_strategy to fix it, then wait for approval before calling execute_strategy again. Never claim the strategy was executed, created, or is running — it was not.`,
+              content: `"${call.toolName}" was blocked: ${outcome.error}\nRespond now with type "final". If the reason names a specific missing fact only the user can supply (like a daily budget amount), ask for exactly that, in plain language — never ask the user to just say "approve" again, since that alone cannot fix this. If instead you already have what's needed, call meta_expert_v2.revise_strategy to fix it, then wait for approval before calling execute_strategy again. Never claim the strategy was executed, created, or is running — it was not.`,
             },
           ];
           continue;

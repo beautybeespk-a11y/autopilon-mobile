@@ -65,6 +65,16 @@ function ratesFromTotals(totals) {
     cpm: blendedRate(totals.spend, totals.impressions, 1000),
     cpc: blendedRate(totals.spend, totals.clicks),
     frequency: blendedRate(totals.impressions, totals.reach),
+    // Stream D — CVR is a percent (same convention as CTR: *100), AOV is
+    // in account-currency units (same convention as CPC: no multiplier).
+    // Both reuse blendedRate, so the null/zero rules are identical to
+    // every other rate: null numerator -> null; zero denominator -> null;
+    // a real 0 numerator over a real denominator -> honest 0 (e.g. CVR 0%
+    // on 234 clicks with 0 purchases is a real result, never "unknown").
+    // AOV is null (not 0) when purchases are 0 — dividing by zero
+    // purchases is undefined, exactly like CPA today.
+    cvr: blendedRate(totals.purchases, totals.clicks, 100),
+    aov: blendedRate(totals.revenue, totals.purchases),
   };
 }
 
@@ -106,8 +116,16 @@ function entityFromRow(row, idField, nameField) {
 }
 
 function resolveDateParams({ datePreset, since, until } = {}) {
-  if (since && until) return { since, until };
-  return { datePreset: datePreset || DEFAULT_DATE_PRESET };
+  // Stream D — a half-given custom range used to be silently dropped in
+  // favour of last_7d. That is now a loud error: the caller meant a
+  // specific range and got a different one.
+  if ((since && !until) || (!since && until)) {
+    const err = new Error(`A custom date range needs both since and until (YYYY-MM-DD) — got only ${since ? `since=${since}` : `until=${until}`}.`);
+    err.code = "META_V2_DATE_RANGE_INCOMPLETE";
+    throw err;
+  }
+  if (since && until) return { since, until, requestedExplicitRange: true };
+  return { datePreset: datePreset || DEFAULT_DATE_PRESET, requestedExplicitRange: false, defaultedTo: datePreset || DEFAULT_DATE_PRESET };
 }
 
 // Pure date arithmetic on REAL resolved dates (Meta's own date_start/
@@ -330,6 +348,38 @@ function diagnoseInsufficientHistoryForTrend(campaign) {
   };
 }
 
+// Stream D — Test 2's dead end: "no recorded activity in the last week"
+// with no next step, when the campaign's real activity was three weeks
+// earlier. Meta returns no row at all for a no-activity window (api.js),
+// so the ONLY way to answer "when DID it run" is a second, wide probe.
+// Runs ONLY when the requested window had no row (one extra insights
+// call, campaign level only — never per ad set/ad), and reports exactly
+// what the probe covered so "first activity in the last 90 days" is
+// never presented as "first activity ever".
+async function getCampaignActivityWindow(accessToken, campaignId, createdTime) {
+  const today = new Date().toISOString().slice(0, 10);
+  const ninetyDaysAgo = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const createdDate = createdTime ? new Date(createdTime).toISOString().slice(0, 10) : null;
+  // Probe from the later of (campaign creation, 90 days ago): bounded cost,
+  // and `complete` says honestly whether the probe reaches back to creation.
+  const probeSince = createdDate && createdDate > ninetyDaysAgo ? createdDate : ninetyDaysAgo;
+  const probeUntil = today;
+  const rows = await meta.getCampaignLevelInsights(accessToken, campaignId, { since: probeSince, until: probeUntil });
+  const row = rows[0] || null;
+  if (!row) {
+    return { hasActivity: false, firstActivityDate: null, lastActivityDate: null, probeSince, probeUntil, complete: Boolean(createdDate && createdDate >= ninetyDaysAgo), label: null };
+  }
+  return {
+    hasActivity: true,
+    firstActivityDate: row.date_start || null,
+    lastActivityDate: row.date_stop || null,
+    probeSince,
+    probeUntil,
+    complete: Boolean(createdDate && createdDate >= ninetyDaysAgo),
+    label: formatRangeLabel(row.date_start, row.date_stop),
+  };
+}
+
 async function gatherForOneCampaign(accessToken, campaignId, dateParams, compareToPriorPeriod) {
   const campaign = await meta.getCampaign(accessToken, campaignId);
 
@@ -346,6 +396,24 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
   const campaignSummary = campaignRow
     ? { ...entityFromRow(campaignRow, "campaign_id", "campaign_name"), id: campaign.id, name: campaign.name, noActivityInRange: false }
     : { id: campaign.id, name: campaign.name, totals: null, rates: null, dateStart: null, dateStop: null, noActivityInRange: true };
+
+  // Stream D — when the requested window has no row, recover the real
+  // activity window instead of leaving resolvedSince/Until/label null
+  // with no next step. `campaign.created_time` comes from getCampaign()
+  // (api.js) — no extra call to learn it.
+  if (campaignSummary.noActivityInRange) {
+    campaignSummary.activityWindow = await getCampaignActivityWindow(accessToken, campaignId, campaign.created_time);
+  } else {
+    campaignSummary.activityWindow = {
+      hasActivity: true,
+      firstActivityDate: campaignSummary.dateStart,
+      lastActivityDate: campaignSummary.dateStop,
+      probeSince: campaignSummary.dateStart,
+      probeUntil: campaignSummary.dateStop,
+      complete: true,
+      label: formatRangeLabel(campaignSummary.dateStart, campaignSummary.dateStop),
+    };
+  }
 
   // The real, complete roster (round 50's listAdSets/listAds) filtered to
   // THIS campaign — cross-referenced against which ones actually had an
@@ -387,6 +455,7 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
         current: { totals: campaignSummary.totals, rates: campaignSummary.rates },
         prior: priorTotals ? { totals: priorTotals, rates: priorRates } : null,
         priorHadNoActivity: !priorTotals,
+        priorUnavailableReason: priorTotals ? null : "The immediately preceding window had no recorded activity, so there is no prior-period total to compare against — the current period's numbers stand on their own.",
         deltas: priorTotals ? {
           spendPct: percentChange(campaignSummary.totals.spend, priorTotals.spend),
           purchasesPct: percentChange(campaignSummary.totals.purchases, priorTotals.purchases),
@@ -397,10 +466,25 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
           // same reason diagnosis text always ships its own numbers.
           ctrPct: percentChange(campaignSummary.rates.ctr, priorRates.ctr),
           frequencyPct: percentChange(campaignSummary.rates.frequency, priorRates.frequency),
+          // Stream D — CPC/CPM/CVR/AOV deltas, same plain percentChange
+          // (null on a zero base — "AOV rose from 0 purchases" has no
+          // honest percentage; the reply must say "from 0 purchases to 8",
+          // never invent one).
+          cpcPct: percentChange(campaignSummary.rates.cpc, priorRates.cpc),
+          cpmPct: percentChange(campaignSummary.rates.cpm, priorRates.cpm),
+          cvrPct: percentChange(campaignSummary.rates.cvr, priorRates.cvr),
+          aovPct: percentChange(campaignSummary.rates.aov, priorRates.aov),
         } : null,
       };
     } else {
-      comparison = { unavailable: true, reason: "No activity in the current range, so there's no resolved date range to compare a prior period against." };
+      const window = campaignSummary.activityWindow;
+      const windowLabel = window && (window.label || (window.firstActivityDate && window.lastActivityDate ? `${window.firstActivityDate} to ${window.lastActivityDate}` : "on dates Meta did not return"));
+      comparison = {
+        unavailable: true,
+        reason: window && window.hasActivity
+          ? `No activity in the current range, so there's no resolved date range to compare a prior period against. This campaign's most recent recorded activity was ${windowLabel} (probed ${window.probeSince} to ${window.probeUntil}${window.complete ? "" : " — the probe only reaches back 90 days, so earlier activity is not ruled out"}). Ask for that window by its dates to compare it.`
+          : `No activity in the current range, so there's no resolved date range to compare a prior period against. No recorded activity was found in the probe window ${window ? `${window.probeSince} to ${window.probeUntil}` : ""} either.`,
+      };
     }
   }
 
@@ -434,7 +518,7 @@ async function gatherForOneCampaign(accessToken, campaignId, dateParams, compare
     // currency gate, which now also reads this field.
     currency: adAccount.currency || null,
     campaign: { id: campaign.id, name: campaign.name, status: campaign.status, objective: campaign.objective },
-    dateRange: { requested: dateParams, resolvedSince: campaignSummary.dateStart, resolvedUntil: campaignSummary.dateStop, label: formatRangeLabel(campaignSummary.dateStart, campaignSummary.dateStop) },
+    dateRange: { requested: dateParams, requestedExplicitRange: Boolean(dateParams.requestedExplicitRange), defaultedTo: dateParams.defaultedTo || null, resolvedSince: campaignSummary.dateStart, resolvedUntil: campaignSummary.dateStop, label: formatRangeLabel(campaignSummary.dateStart, campaignSummary.dateStop), activityWindow: campaignSummary.activityWindow || null },
     campaignSummary,
     adSets: [...adSetsWithActivity, ...adSetsWithNoActivity],
     ads: [...adsWithActivity, ...adsWithNoActivity],
@@ -503,7 +587,7 @@ async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
     // See gatherForOneCampaign's own comment — the real account currency
     // travels with the data, never left to the model to guess/default.
     currency: adAccount.currency || null,
-    dateRange: { requested: dateParams, resolvedSince, resolvedUntil, label: formatRangeLabel(resolvedSince, resolvedUntil) },
+    dateRange: { requested: dateParams, requestedExplicitRange: Boolean(dateParams.requestedExplicitRange), defaultedTo: dateParams.defaultedTo || null, resolvedSince, resolvedUntil, label: formatRangeLabel(resolvedSince, resolvedUntil), activityWindow: null },
     adSets: allAdSets,
     topAdSetsBySpend: topBySpend(adSetsWithActivity),
     worstAdSetsByCpa: worstByCpa(adSetsWithActivity),
@@ -511,9 +595,58 @@ async function gatherAccountWideAdSets(accessToken, adAccountId, dateParams) {
   };
 }
 
-export async function gatherPerformanceBreakdown(accessToken, { userId, campaignId, datePreset, since, until, compareToPriorPeriod } = {}) {
+// Stream D — a campaign the user NAMES must resolve regardless of status.
+// The model only ever knows the name ("BeautyBees – Website Sales") from
+// the conversation/snapshot; before this, the only scope key was a numeric
+// campaignId the model had no way to know, so a paused named campaign was
+// unreachable and the no-id path (ACTIVE-only, below) threw instead.
+// Matching is deterministic, never fuzzy: exact-after-normalisation wins,
+// then a UNIQUE substring match; 0 or 2+ matches are errors that list the
+// real names, never a silent first-match pick. Status is deliberately NOT
+// a filter here — a paused campaign has real history worth reporting.
+function normalizeCampaignName(name) {
+  return String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function resolveCampaignByName(accessToken, { userId, campaignName }) {
+  const adAccountId = await resolveAdAccountId({ userId, accessToken, providedAdAccountId: undefined });
+  const campaigns = await meta.listCampaigns(accessToken, adAccountId);
+  const wanted = normalizeCampaignName(campaignName);
+  const exact = campaigns.filter((c) => normalizeCampaignName(c.name) === wanted);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) {
+    const err = new Error(`Multiple campaigns are named "${campaignName}" (${exact.map((c) => `${c.name} [${c.id}, ${c.status}]`).join("; ")}). Name one by its exact name, or pass its campaignId.`);
+    err.code = "META_V2_CAMPAIGN_AMBIGUOUS";
+    err.candidates = exact.map((c) => ({ id: c.id, name: c.name, status: c.status }));
+    throw err;
+  }
+  const partial = campaigns.filter((c) => normalizeCampaignName(c.name).includes(wanted) || wanted.includes(normalizeCampaignName(c.name)));
+  if (partial.length === 1) return partial[0];
+  if (partial.length > 1) {
+    const err = new Error(`"${campaignName}" matches more than one campaign (${partial.map((c) => `${c.name} [${c.id}, ${c.status}]`).join("; ")}). Name one by its exact name, or pass its campaignId.`);
+    err.code = "META_V2_CAMPAIGN_AMBIGUOUS";
+    err.candidates = partial.map((c) => ({ id: c.id, name: c.name, status: c.status }));
+    throw err;
+  }
+  const err = new Error(`No campaign named "${campaignName}" exists in this ad account. Real campaigns: ${campaigns.length ? campaigns.map((c) => `${c.name} [${c.status}]`).join("; ") : "(none)"}.`);
+  err.code = "META_V2_CAMPAIGN_NOT_FOUND";
+  err.candidates = campaigns.map((c) => ({ id: c.id, name: c.name, status: c.status }));
+  throw err;
+}
+
+export async function gatherPerformanceBreakdown(accessToken, { userId, campaignId, campaignName, datePreset, since, until, compareToPriorPeriod } = {}) {
   const dateParams = resolveDateParams({ datePreset, since, until });
 
+  // campaignId wins when both are given (it is already unambiguous).
+  // A bare numeric campaignName is treated as an id, not a name.
+  if (campaignName && !campaignId && /^\d+$/.test(String(campaignName).trim())) {
+    campaignId = String(campaignName).trim();
+    campaignName = undefined;
+  }
+  if (campaignName && !campaignId) {
+    const campaign = await resolveCampaignByName(accessToken, { userId, campaignName });
+    return gatherForOneCampaign(accessToken, campaign.id, dateParams, compareToPriorPeriod);
+  }
   if (campaignId) {
     return gatherForOneCampaign(accessToken, campaignId, dateParams, compareToPriorPeriod);
   }
@@ -533,8 +666,22 @@ export async function gatherPerformanceBreakdown(accessToken, { userId, campaign
     return gatherForOneCampaign(accessToken, activeCampaigns[0].id, dateParams, compareToPriorPeriod);
   }
   if (activeCampaigns.length === 0) {
-    const err = new Error("campaignId was not given, and no ACTIVE campaign exists to resolve automatically — name a specific campaign (including a paused one) to get its breakdown.");
+    // Stream D — the old code threw here even when the account HAS
+    // campaigns, just none ACTIVE (the exact Test 2 shape: one paused
+    // campaign, user asking about "the campaign"). Exactly one campaign
+    // of ANY status is still unambiguous — use it. Otherwise list the
+    // real names so the next turn can pass campaignName instead of
+    // throwing a bare "name a campaign" with nothing to name.
+    if (campaigns.length === 1) {
+      return gatherForOneCampaign(accessToken, campaigns[0].id, dateParams, compareToPriorPeriod);
+    }
+    const err = new Error(
+      campaigns.length
+        ? `campaignId was not given, and no ACTIVE campaign exists to resolve automatically. Name one specific campaign — real campaigns: ${campaigns.map((c) => `${c.name} [${c.status}]`).join("; ")}.`
+        : "campaignId was not given, and no campaign exists in this ad account at all — name a specific campaign to get its breakdown."
+    );
     err.code = "META_V2_CAMPAIGN_ID_REQUIRED";
+    err.candidates = campaigns.map((c) => ({ id: c.id, name: c.name, status: c.status }));
     throw err;
   }
   if (compareToPriorPeriod) {

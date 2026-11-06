@@ -276,19 +276,40 @@ export function deriveEmptyArrayFieldsIfMissing(strategy) {
 // standard verifyUserProvidedBudget (policy.js) already uses to validate
 // a USER_PROVIDED claim, just applied the other direction: deriving the
 // missing value FROM the message instead of only checking a claimed one
-// against it. Deliberately narrow (currency-prefixed, "/day"-suffixed, or
-// the ENTIRE message is just a bare number — never a stray digit
+// against it. Deliberately narrow (currency-prefixed, "/day"-suffixed — never a stray digit
 // mid-sentence) and capped at 6 digits so it can never mistake a long
 // Pixel/ad-account id pasted into the chat for a budget.
-const USER_MESSAGE_BUDGET_PATTERN = /(?:\b(?:pkr|rs\.?|usd)\s*|\$\s*)([\d][\d,]{0,5})\b|\b([\d][\d,]{0,5})\s*(?:\/|per\s+)\s*day\b|^\s*([\d][\d,]{0,5})\s*(?:\/day)?\s*$/i;
-export function deriveBudgetFromUserMessageIfMissing(strategy, userMessage) {
+//
+// Stream C: the bare-number alternative is GONE from the pattern. A bare number
+// ("3") is ambiguous between a creative position and a budget — the pattern alone
+// cannot tell them apart, and guessing wrong silently set a PKR 3/day budget live.
+// Bare numbers are only ever a budget when the caller passes { allowBareNumber: true },
+// which the orchestrator dispatcher (resolvePendingQuestionAnswer) sets ONLY when
+// budget is the SOLE open question and no creative question is pending. Every other
+// caller must pass nothing (default false). Currency-prefixed ("PKR 500", "Rs.500",
+// "$500") and "/day"-suffixed ("600/day", "600 per day") forms are unambiguous and
+// keep working exactly as before, including inside compound messages.
+const USER_MESSAGE_BUDGET_PATTERN = /(?:\b(?:pkr|rs\.?|usd)\s*|\$\s*)([\d][\d,]{0,5})\b|\b([\d][\d,]{0,5})\s*(?:\/|per\s+)\s*day\b/i;
+const USER_MESSAGE_BARE_NUMBER_PATTERN = /^\s*([\d][\d,]{0,5})\s*\.?\s*$/;
+export function deriveBudgetFromUserMessageIfMissing(strategy, userMessage, opts = {}) {
   if (strategy.budget_daily !== null && strategy.budget_daily !== undefined) return strategy;
   if (typeof userMessage !== "string") return strategy;
   const match = USER_MESSAGE_BUDGET_PATTERN.exec(userMessage);
-  if (!match) return strategy;
-  const amount = Number((match[1] || match[2] || match[3]).replace(/,/g, ""));
-  if (!Number.isFinite(amount) || amount <= 0) return strategy;
-  return { ...strategy, budget_daily: amount, budget_basis: "USER_PROVIDED" };
+  if (match) {
+    const amount = Number((match[1] || match[2]).replace(/,/g, ""));
+    if (!Number.isFinite(amount) || amount <= 0) return strategy;
+    return { ...strategy, budget_daily: amount, budget_basis: "USER_PROVIDED" };
+  }
+  // Bare-number fallback: ONLY when the caller has established (from stored open
+  // questions, never from the message text) that budget is the only question open.
+  if (opts.allowBareNumber === true) {
+    const bare = USER_MESSAGE_BARE_NUMBER_PATTERN.exec(userMessage);
+    if (!bare) return strategy;
+    const amount = Number(bare[1].replace(/,/g, ""));
+    if (!Number.isFinite(amount) || amount <= 0) return strategy;
+    return { ...strategy, budget_daily: amount, budget_basis: "USER_PROVIDED" };
+  }
+  return strategy;
 }
 
 // Live bug (round 15): even after strengthening this field's tool
@@ -423,6 +444,24 @@ export function validateStrategyStructure(strategy) {
         fail("creative_strategy.layout", `creative_strategy.layout must be one of: ${validLayouts.join(", ")}.`);
       } else if (strategy.creative_strategy.layout === "CAROUSEL" && strategy.creative_strategy.source !== "PRODUCT_IMAGE") {
         fail("creative_strategy.layout", `creative_strategy.layout "CAROUSEL" is only supported for creative_strategy.source "PRODUCT_IMAGE" — got "${strategy.creative_strategy.source}".`);
+      }
+      // Stream A — identity fields are backend-populated (P-A5): the
+      // model is never required to supply them, but if it does, they
+      // must at least be the right SHAPE. Truth is enforced later by
+      // checkCreativeProductMatchPolicy (policy.js), which compares
+      // them against the backend-resolved creative — never here, and
+      // never by trusting them.
+      if (strategy.creative_strategy.postId !== undefined && (typeof strategy.creative_strategy.postId !== "string" || !strategy.creative_strategy.postId.trim())) {
+        fail("creative_strategy.postId", 'creative_strategy.postId, when present, must be a non-empty string (a real post id from the candidate list).');
+      }
+      if (strategy.creative_strategy.caption !== undefined && typeof strategy.creative_strategy.caption !== "string") {
+        fail("creative_strategy.caption", "creative_strategy.caption, when present, must be a string (the resolved post's real caption).");
+      }
+      if (strategy.creative_strategy.linkedProduct !== undefined && strategy.creative_strategy.linkedProduct !== null) {
+        const lp = strategy.creative_strategy.linkedProduct;
+        if (typeof lp !== "object" || typeof lp.name !== "string" || !lp.name.trim()) {
+          fail("creative_strategy.linkedProduct", "creative_strategy.linkedProduct, when present, must be an object with a non-empty string \"name\".");
+        }
       }
     }
   }
