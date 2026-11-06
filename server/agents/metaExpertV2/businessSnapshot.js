@@ -25,6 +25,7 @@ import * as meta from "../../integrations/meta/api.js";
 import * as wc from "../../integrations/woocommerce/api.js";
 import * as shopify from "../../integrations/shopify/api.js";
 import { trace } from "./diagnostics.js";
+import { findBestProductMatch, scoreAllProductsAgainstText } from "./productMatching.js";
 
 // Stream A — was 12, which is the SAME bug class as the 5-post cap:
 // matchLinkedProduct() (below) and parseRequestedProduct()
@@ -36,7 +37,7 @@ import { trace } from "./diagnostics.js";
 // majority of this platform's small-business stores — is now fully
 // covered. Residual gap, documented not hidden: a store with >50
 // products can still have a product outside this list; for that case
-// the caption-substring match in postMatchesProduct() still works when
+// the token match in postMatchesProduct() still works when
 // the name is known from the user's own words, and a targeted
 // store-search lookup is a follow-up, not smuggled in here.
 const MAX_PRODUCTS = 50;
@@ -459,41 +460,37 @@ async function gatherMetaHistory(userId, accessToken, primaryAdAccountId) {
 const CAPTION_EXCERPT_LENGTH = 140;
 
 // Deterministic, mechanical WooCommerce/Shopify product match — a
-// case-insensitive substring check of each product's own name against
+// TOKEN match (productMatching.js) of each product's own name against
 // the post/Reel's real caption text. Never an LLM guess: if a product's
-// exact name doesn't literally appear in the caption, this returns no
+// name doesn't match the caption under the token rule, this returns no
 // match rather than inferring one. Used so a creative-selection strategy
 // can honestly say "this post is about product X" only when that's
 // mechanically true, never invented.
 // Stream A — exported (was module-private) so executor.js can recompute
 // the linked product from the LIVE caption at execution time (P-A6)
-// with the exact same literal rule, never a duplicated one.
+// with the exact same rule, never a duplicated one.
 export function matchLinkedProduct(captionText, sampleProducts) {
   if (!captionText || !Array.isArray(sampleProducts) || !sampleProducts.length) return null;
-  const lowerCaption = captionText.toLowerCase();
-  const match = sampleProducts.find((p) => p.name && lowerCaption.includes(p.name.toLowerCase()));
+  const match = findBestProductMatch(captionText, sampleProducts);
   return match ? { name: match.name, price: match.price ?? null, category: match.category ?? null } : null;
 }
 
 // Stream A — derives WHICH product the user is talking about, from their
 // own raw words, against the store's REAL catalogue only. Returns the
-// product's real name, or null. Never guesses: if no real product name
-// literally appears in the message, there is no requested product and
-// every downstream check treats that as "no product constraint" rather
-// than inventing one. Longest-name-first so a specific product
-// ("Maybelline Serum Matte Lipstick") beats a generic shorter product
-// name ("Lipstick") when both are real catalogue entries.
+// product's real name, or null. Never guesses: if no real product
+// matches the message under the token rule (productMatching.js), there
+// is no requested product and every downstream check treats that as "no
+// product constraint" rather than inventing one. Best-match-first so a
+// specific product ("Maybelline Moisturizing Serum Lipstick Matte")
+// beats a generic shorter product name ("Lipstick") when both are real
+// catalogue entries — and so the user's own shorter wording of a
+// product ("Maybelline Serum Matte Lipstick") still recognises it,
+// which the old exact-full-name rule could not do (live bug, Nov 6
+// 2026: the deep product search never ran for exactly that reason).
 export function deriveRequestedProductFromMessage(userMessage, sampleProducts) {
   if (typeof userMessage !== "string" || !Array.isArray(sampleProducts) || !sampleProducts.length) return null;
-  const normalizedMessage = userMessage.toLowerCase().replace(/\s+/g, " ").trim();
-  const names = sampleProducts
-    .map((p) => p.name)
-    .filter((n) => typeof n === "string" && n.trim())
-    .sort((a, b) => b.length - a.length);
-  for (const name of names) {
-    if (normalizedMessage.includes(name.toLowerCase().replace(/\s+/g, " ").trim())) return name;
-  }
-  return null;
+  const match = findBestProductMatch(userMessage, sampleProducts);
+  return match ? match.name : null;
 }
 
 // A Reel is really just an Instagram VIDEO whose permalink path says so —
@@ -795,6 +792,18 @@ export async function gatherBusinessSnapshot(userId, { userMessage } = {}) {
     ),
   };
 
+  // Product-matching diagnosis (Nov 6 2026 fix): the old exact-name
+  // rule silently returned null and the deep search never ran, with
+  // nothing in the logs to show why. Log the derived product AND, when
+  // it is null, the closest-scoring candidates — a future miss is
+  // diagnosable from this line alone. Behind the META_EXPERT_V2_TRACE
+  // flag via trace() itself; scoring <=50 products is negligible.
+  const productMatchScores = typeof userMessage === "string"
+    ? scoreAllProductsAgainstText(userMessage, business.sampleProducts)
+    : [];
+  const requestedProductScore = requestedProduct
+    ? productMatchScores.find((entry) => entry.product.name === requestedProduct)?.score || null
+    : null;
   trace("gatherBusinessSnapshot", {
     userId,
     version: snapshot.version,
@@ -803,6 +812,12 @@ export async function gatherBusinessSnapshot(userId, { userMessage } = {}) {
     pageCount: metaAssets.pages.items.length, defaultPageResolution: metaAssets.defaultPage.resolution,
     pixelCount: metaAssets.pixels.items.length, defaultPixelResolution: metaAssets.defaultPixel.resolution,
     campaignCount: metaHistory.campaignCount,
+    requestedProduct: requestedProduct || null,
+    requestedProductMatchedTokens: requestedProductScore?.matchedTokens || [],
+    requestedProductMatchedCount: requestedProductScore?.matchedCount ?? 0,
+    requestedProductWantedCount: requestedProductScore?.wantedCount ?? 0,
+    productCandidatesConsidered: business.sampleProducts.length,
+    topProductCandidates: productMatchScores.slice(0, 3).map((entry) => ({ name: entry.product.name, matched: entry.score.matchedCount, wanted: entry.score.wantedCount, required: entry.score.required })),
   });
   return snapshot;
 }
