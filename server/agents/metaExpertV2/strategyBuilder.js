@@ -7,9 +7,9 @@
 // fails after that is a genuine unresolved business issue, returned once
 // as a single clean, customer-safe explanation — never fed back into
 // another LLM attempt.
-import { gatherBusinessSnapshot, getStoreCountryForFallback } from "./businessSnapshot.js";
+import { gatherBusinessSnapshot, getStoreCountryForFallback, searchContentForProduct } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
-import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, formatCarouselCreativeLines, toCreativeCandidateRefs } from "./creativeResolution.js";
+import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, formatCarouselCreativeLines, toCreativeCandidateRefs, parseRequestedProduct, postMatchesProduct, formatCreativeNotFoundQuestion, matchCreativeCandidateId, messageIsBareCreativeAffirmation } from "./creativeResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
   normalizeStrategyEnumAliases, deriveCtaIfMissing, deriveApprovalRequiredIfMissing,
@@ -23,10 +23,13 @@ import {
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
   checkCreativeSourceAvailabilityPolicy, deriveReasoningSummaryIfMissing,
   checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
+  checkCreativeProductMatchPolicy,
   checkExplicitActionModeMisroutePolicy, userMessageContainsUrl,
+  fingerprintStrategy,
 } from "./policy.js";
-import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES } from "./strategyStore.js";
+import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES, insertFailedAttempt } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
+import { cryptoRandom } from "../../middleware.js";
 import { getConnection, learnConnectionDefault } from "../../integrations/manager.js";
 
 const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"];
@@ -38,7 +41,19 @@ const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instag
 // unrelated error) — built into V2 from day one instead of discovered
 // after a live incident. Every OTHER field keeps the plain "any key
 // present in requestedChanges overrides the prior value" merge.
+// Stream C: returns { merged, discarded } — every field the merge silently dropped
+// or reverted is now a named entry, never a silent loss. discarded[] entries:
+//   { field, requestedValue, priorValue, reason }
+// Reasons: "asset_not_in_explicitAssetChanges" (ASSET_FIELDS revert),
+//   "content_selector_dropped_source_or_layout_changed",
+//   "content_selector_dropped_action_type_changed".
+// The caller (runBuildOrRevise) surfaces `discarded` in the result (and in the
+// stored row's resolvedAssets.discardedFields when the build succeeds) and
+// in the failed-attempt row when it is rejected (§3.1). A discarded field is NOT
+// itself a rejection — the revision may still be valid without it — but it must
+// never again be presented to the user as applied.
 function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
+  const discarded = [];
   const merged = { ...prior.strategy, ...requestedChanges };
   for (const field of ASSET_FIELDS) {
     if (explicitAssetChanges.has(field)) continue;
@@ -58,6 +73,9 @@ function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
     // at build time (never reaches storage half-resolved), so this
     // exception is scoped to pixel alone.
     if (field === "pixel" && !prior.resolvedAssets?.pixelId) continue;
+    if (requestedChanges?.[field] !== undefined && JSON.stringify(requestedChanges[field]) !== JSON.stringify(prior.strategy[field])) {
+      discarded.push({ field, requestedValue: requestedChanges[field], priorValue: prior.strategy[field], reason: "asset_not_in_explicitAssetChanges" });
+    }
     merged[field] = prior.strategy[field];
   }
   // Round 33 sweep finding: content_selector isn't in ASSET_FIELDS above —
@@ -94,10 +112,18 @@ function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
     const priorLayout = prior.strategy.creative_strategy?.layout || "SINGLE";
     const newLayout = merged.creative_strategy?.layout || "SINGLE";
     if (priorActionType !== newActionType || priorSource !== newSource || priorLayout !== newLayout) {
+      if (prior.strategy.content_selector !== undefined) {
+        discarded.push({
+          field: "content_selector",
+          requestedValue: prior.strategy.content_selector,
+          priorValue: prior.strategy.content_selector,
+          reason: priorActionType !== newActionType ? "content_selector_dropped_action_type_changed" : "content_selector_dropped_source_or_layout_changed",
+        });
+      }
       delete merged.content_selector;
     }
   }
-  return merged;
+  return { merged, discarded };
 }
 
 // A strategy that only reasons about a fixed piece of content ("boost my
@@ -203,12 +229,111 @@ function formatGoalAlignmentNote(strategy) {
 // (still the more human-readable lead) with the id alongside for real
 // disambiguation, never the id alone dropping the name a user actually
 // recognizes.
-function assetSummaryValue(name, id, emptyLabel) {
-  if (name && id) return `${name} (${id})`;
-  return name || id || emptyLabel;
+// Stream D — a Meta-side display name is arbitrary user text and can be a
+// URL ("https://beautybees.pk/") or a duplicate of another field. It must
+// NEVER be rendered where an identifier belongs. A URL-looking name is
+// dropped entirely (the id alone identifies the asset); a name is only
+// ever a human-readable label next to a real id.
+function isUrlLikeName(value) {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  if (/^https?:\/\//i.test(v)) return true;
+  if (/^www\./i.test(v)) return true;
+  // Bare domain: "beautybees.pk", "beautybees.pk/" — but NOT a plain word
+  // with no dot ("Beautybeespk"), which is a legitimate display name.
+  if (/^[a-z0-9-]+(\.[a-z0-9-]+)+\/?$/i.test(v)) return true;
+  return false;
 }
 
-function formatRecommendation(strategy, names, resolved, creative) {
+function isNumericMetaId(value) {
+  return typeof value === "string" ? /^\d+$/.test(value.trim()) : typeof value === "number" && Number.isInteger(value);
+}
+
+function assetSummaryValue(name, id, emptyLabel) {
+  const safeId = isNumericMetaId(id) ? String(id).trim() : (id || null);
+  // Test-stage fix (round 43 vs Stream D): a name is only a problem when
+  // it stands ALONE as the identifier — that was the live bug (a Pixel
+  // named "https://beautybees.pk/" rendering identically to the
+  // Destination URL line, id nowhere visible). With a real id present,
+  // the name is a useful human label AND the id is what disambiguates:
+  // "BeautyBees.pk (222)" tells the user which of two near-identical
+  // Pages this is, while a bare "222" hides it. Stream D's version
+  // dropped URL-like names even beside an id, which both hid the label
+  // and broke the round-43 tests. The no-id case below is unchanged: a
+  // bare URL-like name with no id is still never rendered.
+  if (safeId) return name ? `${name} (${safeId})` : safeId;
+  // A URL-looking name with no id is NOT a value — it is the absence of
+  // one. Returning it would print "Pixel: https://…" with no id, the
+  // exact live bug. Fall through to the empty label.
+  return emptyLabel;
+}
+
+// Pixel-specific: the label is always "Pixel <id>" (never a name alone),
+// and the three states a user must be able to tell apart are spelled out:
+// resolved / connected-but-unresolved / none connected at all.
+export function pixelSummaryValue({ pixelName, pixelId, anyPixelExists, pixelAmbiguous }) {
+  const safeId = isNumericMetaId(pixelId) ? String(pixelId).trim() : null;
+  // Same round-43 correction as assetSummaryValue above: with a real id,
+  // the name is shown beside it whatever it looks like
+  // ("https://beautybees.pk/ (1241102478031429)" is distinguishable from
+  // the Destination URL line precisely BECAUSE the id is there); only a
+  // name with NO id is ever suppressed.
+  if (safeId) return pixelName ? `${pixelName} (${safeId})` : safeId;
+  if (pixelAmbiguous) return "(multiple Pixels connected — none chosen yet)";
+  if (anyPixelExists) return "(connected, but not resolved for this campaign)";
+  return "(none — no Pixel connected, so purchases cannot be tracked)";
+}
+
+// Stream C: the Creative line is backend-rendered from the RESOLVED creative
+// (real id + real caption/product + real date), never from the model's free-text
+// creative_strategy.description — a description can claim anything ("Maybelline
+// post") while the resolved id points at a different real post (Patrick Ta).
+// When no creative is resolved yet, the line says so plainly and names the open
+// question instead of inventing a description.
+function formatCreativeLine(strategy, creative) {
+  if (!creative) {
+    const open = (strategy.unresolved_questions || []).find((q) => q.startsWith("Which ") || q.startsWith("To confirm —"));
+    // Stream D (test stage): the open question is rendered here a SECOND
+    // time (the questions list below already strips it) — without the
+    // strip, markdown inside the question (e.g. a post caption carrying
+    // "**Sale**") leaked into the recommendation verbatim.
+    return open ? `Creative: Not yet chosen — ${stripMarkdownForDisplay(open)}` : "Creative: Not yet chosen";
+  }
+  if (creative.source === "EXISTING_PAGE_POST" || creative.source === "EXISTING_INSTAGRAM_POST") {
+    const label = creative.source === "EXISTING_PAGE_POST" ? "Facebook post" : "Instagram post";
+    // Stream D (test stage): same leak for a RESOLVED post — the caption
+    // excerpt is real Meta data, but the recommendation is plain text, so
+    // markdown markers in it would show literally. Stripped at render
+    // time only; the stored caption is untouched.
+    const caption = creative.captionExcerpt ? `"${stripMarkdownForDisplay(creative.captionExcerpt)}"` : "(no caption)";
+    const date = creative.publishedDate ? `, posted ${creative.publishedDate}` : "";
+    return `Creative: ${label} ${caption} (id ${creative.contentId}${date})`;
+  }
+  if (creative.source === "PRODUCT_IMAGE" && creative.layout !== "CAROUSEL") {
+    return `Creative: Product image "${creative.productName || "unknown product"}" (id ${creative.productId || creative.contentId || "unknown"}${creative.price ? `, ${creative.price}` : ""})`;
+  }
+  if (creative.layout === "CAROUSEL") return "Creative: Carousel — see card list below.";
+  return `Creative: ${stripMarkdownForDisplay(strategy.creative_strategy?.description || creative.source)}`;
+}
+
+// Stream D — formatRecommendation renders the customer-facing reply. Its
+// own lines are plain text, but reasoning_summary/assumptions/unresolved
+// questions/creative description are MODEL-AUTHORED and can arrive with
+// raw markdown (**bold**, ## headings, `code`, [text](url)). Strip the
+// markers at render time only — the stored strategy keeps the original
+// text, so validation/diagnostics still see exactly what the model sent.
+// Deliberately narrow: this removes formatting characters, never words.
+function stripMarkdownForDisplay(value) {
+  if (typeof value !== "string") return value;
+  return value
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/(^|\n)#{1,6}\s+/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/(^|\n)\s*[-*]\s+/g, "$1• ");
+}
+
+function formatRecommendation(strategy, names, resolved, creative, opts = {}) {
   if (strategy.mode === "explicit_action") {
     const actionLabel = {
       BOOST_FACEBOOK_POST: "boost your most recent Facebook post",
@@ -227,19 +352,24 @@ function formatRecommendation(strategy, names, resolved, creative) {
       ``,
       `Ad Account: ${assetSummaryValue(names.adAccountName, resolved?.adAccountId, "(not resolved)")}`,
       `Facebook Page: ${assetSummaryValue(names.pageName, resolved?.pageId, "(not resolved)")}`,
-      `Pixel: ${assetSummaryValue(names.pixelName, resolved?.pixelId, "(none)")}`,
+      `Pixel: ${pixelSummaryValue(opts.pixelState || { pixelName: names.pixelName, pixelId: resolved?.pixelId, anyPixelExists: Boolean(resolved?.pixelId), pixelAmbiguous: false })}`,
       `Destination URL: ${strategy.destination_url || "(not set)"}`,
+      formatCreativeLine(strategy, creative),
       `Budget: ${budgetLine}`,
       `Status: Paused (won't spend until you approve)`,
       ``,
       `Why:`,
-      strategy.reasoning_summary,
+      stripMarkdownForDisplay(strategy.reasoning_summary),
     ];
     if (strategy.unresolved_questions?.length) {
       lines.push(``, `Before I can build this, I need you to confirm:`);
-      for (const q of strategy.unresolved_questions) lines.push(`- ${q}`);
+      for (const q of strategy.unresolved_questions) lines.push(`- ${stripMarkdownForDisplay(q)}`);
     } else {
       lines.push(``, `Approve this to proceed.`);
+    }
+    if (opts.discardedFields?.length) {
+      lines.push(``, `Not applied — I couldn't change these as asked:`);
+      for (const d of opts.discardedFields) lines.push(`- ${d.field}: kept the previous value (${d.reason}).`);
     }
     return lines.join("\n");
   }
@@ -260,7 +390,17 @@ function formatRecommendation(strategy, names, resolved, creative) {
     `Strategy: ${strategy.targeting_approach.replace(/_/g, " ").toLowerCase()}`,
     `Placements: ${placementsLabel}`,
     `Optimization: ${strategy.optimization_event.replace(/_/g, " ").toLowerCase()}`,
-    `Creative: ${strategy.creative_strategy.description}`,
+    formatCreativeLine(strategy, creative),
+    // Stream A — backend-rendered creative facts (never the model's
+    // prose alone): the real post id, its real caption excerpt, and the
+    // real linked product if any. This is what the user actually
+    // approves — a fabrication that survived every earlier check would
+    // still be visible here as the wrong caption/product before any
+    // money is spent. Only rendered when a post creative was actually
+    // resolved; otherwise the description line above stands alone.
+    ...(creative && (creative.source === "EXISTING_PAGE_POST" || creative.source === "EXISTING_INSTAGRAM_POST")
+      ? [`Creative post: ${creative.source === "EXISTING_PAGE_POST" ? "Facebook" : "Instagram"} post ${creative.postId || creative.contentId}${creative.captionExcerpt ? ` — "${creative.captionExcerpt}"` : ""}${creative.linkedProduct?.name ? ` (about: ${creative.linkedProduct.name})` : " (no product linked to this post)"}`]
+      : []),
     // Round 48 — deterministic, backend-rendered card list for a carousel
     // (never the model's own free-text description alone) so the stated
     // default rule and the real per-card name/price actually reach the
@@ -275,27 +415,70 @@ function formatRecommendation(strategy, names, resolved, creative) {
     // always appear here, not just when freshly resolved this turn.
     `Ad Account: ${assetSummaryValue(names.adAccountName, resolved?.adAccountId, "(not resolved)")}`,
     `Facebook Page: ${assetSummaryValue(names.pageName, resolved?.pageId, "(not resolved)")}`,
-    `Pixel: ${assetSummaryValue(names.pixelName, resolved?.pixelId, "(none)")}`,
+    `Pixel: ${pixelSummaryValue(opts.pixelState || { pixelName: names.pixelName, pixelId: resolved?.pixelId, anyPixelExists: Boolean(resolved?.pixelId), pixelAmbiguous: false })}`,
     `Destination URL: ${strategy.destination_url || "(not set)"}`,
   );
   if (names.instagramUsername) lines.push(`Instagram: @${names.instagramUsername}`);
   lines.push(`Status: Paused (won't spend until you approve)`);
-  lines.push(``, `Why:`, strategy.reasoning_summary);
+  lines.push(``, `Why:`, stripMarkdownForDisplay(strategy.reasoning_summary));
   if (strategy.assumptions?.length) {
     lines.push(``, `Assumptions made:`);
-    for (const a of strategy.assumptions) lines.push(`- ${a}`);
+    for (const a of strategy.assumptions) lines.push(`- ${stripMarkdownForDisplay(a)}`);
   }
   if (strategy.unresolved_questions?.length) {
     lines.push(``, `Before I can build this, I need you to confirm:`);
-    for (const q of strategy.unresolved_questions) lines.push(`- ${q}`);
+    for (const q of strategy.unresolved_questions) lines.push(`- ${stripMarkdownForDisplay(q)}`);
   } else {
     lines.push(``, `Approve this strategy or tell me what you'd like changed.`);
+  }
+  if (opts.discardedFields?.length) {
+    lines.push(``, `Not applied — I couldn't change these as asked:`);
+    for (const d of opts.discardedFields) lines.push(`- ${d.field}: kept the previous value (${d.reason}).`);
   }
   return lines.join("\n");
 }
 
-async function runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput, revisionOf, priorStored, freshResearchRequired }) {
+// Stream C (§1.3 fallback): derive the dispatcher's "which question is this
+// answer for?" verdict from the STORED prior row when no explicit claimedBy
+// was passed (model tool calls never pass one — see runBuildOrRevise). The
+// verdict is "creative" only when a creative question is genuinely open on
+// the prior row (stored creativeCandidates, or a pendingCreative) AND this
+// turn's message matches one of the candidates that question showed — the
+// same matcher the dispatcher uses, with the same shown-ids scoping. Any
+// other message (or no prior row) yields null, and verifyUserProvidedBudget
+// behaves exactly as before.
+function deriveClaimedByFromPriorStored(priorStored, userMessage) {
+  if (!priorStored || typeof userMessage !== "string") return null;
+  const resolvedAssets = priorStored.resolvedAssets || {};
+  const candidates = resolvedAssets.creativeCandidates;
+  if ((!Array.isArray(candidates) || !candidates.length) && !resolvedAssets.pendingCreative) return null;
+  const pendingQuestion = Array.isArray(resolvedAssets.pendingQuestions)
+    ? resolvedAssets.pendingQuestions.find((q) => q.kind === "creative_candidates" || q.kind === "pending_creative")
+    : null;
+  const refs = Array.isArray(candidates) && candidates.length
+    ? candidates
+    : [{ id: resolvedAssets.pendingCreative.candidate.id, label: resolvedAssets.pendingCreative.candidate.captionExcerpt || resolvedAssets.pendingCreative.candidate.name || null }];
+  // Same scoping rule as resolveCreativeSelection: a pending_creative
+  // entry names only the single candidate being confirmed; a fresh pick
+  // refers to the full list (refs), never just that one id.
+  const matched = matchCreativeCandidateId(userMessage, refs, {
+    questionPending: true,
+    candidateIdsShown: pendingQuestion?.kind === "pending_creative" ? refs.map((r) => r.id) : (pendingQuestion?.candidateIds || null),
+  });
+  return matched ? "creative" : null;
+}
+
+async function runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput, revisionOf, priorStored, freshResearchRequired, claimedBy }) {
   const explicitAssetChanges = new Set(Array.isArray(explicitAssetChangesInput) ? explicitAssetChangesInput.filter((f) => ASSET_FIELDS.includes(f)) : []);
+  // Stream C: the model's own tool-call parameters can never write
+  // pendingQuestions — it is backend-authored only (runBuildOrRevise writes
+  // it at storage time; the orchestrator pre-loops read it). Strip any
+  // model-supplied value here, before the merge, same as explicitAssetChanges
+  // is allow-listed — mergeForRevision must never merge it in.
+  if (requestedChanges && typeof requestedChanges === "object") {
+    const { pendingQuestions: _ignoredPendingQuestions, pendingQuestion: _ignoredPendingQuestion, ...rest } = requestedChanges;
+    requestedChanges = rest;
+  }
   // Diagnostic (round 31 live bug: a revise_strategy call answering an
   // open Pixel-ambiguity question kept re-hitting the SAME question in a
   // loop) — the raw call parameters, before any merge/normalization, so a
@@ -305,14 +488,28 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     trace("revise_strategy request", { conversationId, revisionOf, requestedChangesPixelRef: requestedChanges?.pixel?.ref ?? null, explicitAssetChangesInput: explicitAssetChangesInput || [] });
   }
 
-  let merged = priorStored ? mergeForRevision(priorStored, requestedChanges, explicitAssetChanges) : requestedChanges;
+  const { merged: mergedFromRevision, discarded: mergeDiscarded } = priorStored
+    ? mergeForRevision(priorStored, requestedChanges, explicitAssetChanges)
+    : { merged: requestedChanges, discarded: [] };
+  let merged = mergedFromRevision;
+
+  // Stream C: the dispatcher's verdict for this turn ("creative" | "budget" |
+  // null) — threaded from the orchestrator pre-loops via the claimedBy
+  // parameter. Model tool calls cannot pass it (orchestrator-only parameter,
+  // never model-settable — see reviseStrategy below), so when it is absent,
+  // derive the same verdict here from the STORED prior row: if a creative
+  // question is open on the prior row and this message matches one of its
+  // shown candidates, the bare number belongs to the creative question — a
+  // USER_PROVIDED budget claim for that same number is then downgraded by
+  // verifyUserProvidedBudget below instead of verified.
+  const effectiveClaimedBy = claimedBy ?? deriveClaimedByFromPriorStored(priorStored, userMessage);
 
   // Budget provenance verification (Step 4) — BEFORE anything downstream
   // trusts an USER_PROVIDED claim. Checked against the RAW requestedChanges
   // (this call's own assertion), not the merged object, so a revision that
   // silently carries forward an ALREADY-verified USER_PROVIDED budget
   // (this turn didn't even mention budget) isn't re-flagged.
-  merged = verifyUserProvidedBudget(requestedChanges, merged, userMessage);
+  merged = verifyUserProvidedBudget(requestedChanges, merged, userMessage, { claimedBy: effectiveClaimedBy });
 
   const { strategy: aliasNormalized, appliedAliases } = normalizeStrategyEnumAliases(merged);
   const ctaResolved = deriveCtaIfMissing(aliasNormalized);
@@ -329,7 +526,21 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // answered, in a loop. Safe to fill in ONLY because the number comes
   // straight from the user's own current message (see
   // deriveBudgetFromUserMessageIfMissing's comment) — never invented.
-  const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage);
+  // Stream C (§1.2): a bare number is a budget ONLY when budget is the sole
+  // open question on the PRIOR row (no creative question pending, exactly one
+  // open question, and it is the budget question). A fresh build has no prior
+  // row, so a first-turn bare "500" alone is NOT a budget — the model itself
+  // must set budget_daily/USER_PROVIDED in the same call (verified separately
+  // by verifyUserProvidedBudget above). This is intentional: on a fresh build
+  // there is no stored budget question to answer.
+  const priorQuestions = priorStored?.strategy?.unresolved_questions || [];
+  const budgetIsSoleOpenQuestion = priorStored
+    && priorStored.strategy?.budget_daily == null
+    && !priorStored.resolvedAssets?.creativeCandidates?.length
+    && !priorStored.resolvedAssets?.pendingCreative
+    && priorQuestions.length === 1
+    && priorQuestions[0] === "What daily budget would you like for this?";
+  const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage, { allowBareNumber: budgetIsSoleOpenQuestion });
   // Live bug (round 22): "Missing required field 'countries'" hard-
   // rejected an otherwise-complete strategy — locations (e.g. "Pakistan")
   // was present, countries (the real ISO codes) was not. Only fires when
@@ -420,7 +631,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     // take an extra round to root-cause. Any future occurrence is now
     // immediately diagnosable from the trace log instead of guessing.
     trace("strategy rejected (structural)", { conversationId, errors: structural.errors, locations: normalized.locations, countries: normalized.countries });
-    return { ok: false, unresolved: buildUnresolvedIssue(structural.errors) };
+    // Stream C (§3.1): a rejected revision leaves a stored trace — the next
+    // turn can tell "asked, rejected, never applied" from "never asked".
+    // A failed attempt never supersedes and never becomes the active
+    // strategy (separate table; getMostRecentStrategyForConversation reads
+    // only meta_v2_strategies).
+    const attemptId = insertFailedAttempt({ userId, conversationId, revisionOf: priorStored?.id || null, requestedChanges, discardedFields: mergeDiscarded, errors: structural.errors, userMessage });
+    return { ok: false, unresolved: buildUnresolvedIssue(structural.errors), attemptId };
   }
 
   // Step 6: research is only refreshed when genuinely needed/requested —
@@ -428,7 +645,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // PRIOR strategy was already built from (still a real, once-fetched
   // trusted snapshot, just not re-fetched again this call).
   const needsFreshSnapshot = !priorStored || freshResearchRequired === true;
-  const snapshot = needsFreshSnapshot ? await gatherBusinessSnapshot(userId) : priorStored.snapshot;
+  const snapshot = needsFreshSnapshot ? await gatherBusinessSnapshot(userId, { userMessage }) : priorStored.snapshot;
 
   // Round 35 fix — verify a claimed destination_url against the user's
   // own current words before trusting it (same discipline as
@@ -568,12 +785,119 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const explicitActionCreativeSource = normalized.mode === "explicit_action"
     ? { BOOST_FACEBOOK_POST: "EXISTING_PAGE_POST", BOOST_INSTAGRAM_POST: "EXISTING_INSTAGRAM_POST" }[normalized.action_type] || null
     : null;
+  // Stream A — stash the MODEL's own creative identity values BEFORE
+  // anything overwrites them (P-A5, below): checkCreativeProductMatchPolicy
+  // (P-A4) must compare these pre-overwrite values against the
+  // backend-resolved creative, never the overwritten ones.
+  const modelAssertedCreative = {
+    postId: normalized.creative_strategy?.postId,
+    caption: normalized.creative_strategy?.caption,
+    linkedProduct: normalized.creative_strategy?.linkedProduct,
+  };
+  // Test-stage fix (round 44 re-pick): on a revise, `normalized` is the
+  // MERGED strategy, so creative_strategy.postId/caption here are usually
+  // INHERITED from the prior confirmed creative — not asserted by the
+  // model this turn. When the user re-picks ("actually use 2."), the
+  // resolution correctly returns 111_2, but the P-A4 check then compared
+  // the stale inherited 111_5 against it and hard-rejected a genuine
+  // re-pick as a fabrication. A value identical to the prior confirmed
+  // creative is staleness, not fabrication — the user's verified re-pick
+  // supersedes it, so it is not a model assertion at all. Only a value
+  // that is NEITHER the prior creative NOR the resolved one reaches the
+  // P-A4 check (a real fabrication still fires there). The caption is
+  // cleared with the postId: it belongs to the same stale identity.
+  if (priorCreative && modelAssertedCreative.postId
+    && (modelAssertedCreative.postId === priorCreative.postId || modelAssertedCreative.postId === priorCreative.contentId)) {
+    modelAssertedCreative.postId = undefined;
+    modelAssertedCreative.caption = undefined;
+  }
+  // Stream A — build-time safety net (layer 2). The snapshot-time search
+  // (businessSnapshot.js) only knows the product named in the SNAPSHOT
+  // call's own message; the product may instead have been named in an
+  // earlier turn (now sitting in business_goal / creative_strategy.
+  // description) or this may be a revise reusing a stale
+  // priorStored.snapshot. If a real product is named, the snapshot's
+  // candidates contain no post about it, and this exact product was NOT
+  // already deep-searched for this snapshot (productSearch.searched),
+  // search now and merge any matches into a shallow copy of the
+  // snapshot passed to resolveCreativeSelection below. The stored
+  // snapshot row is NOT mutated — the merged copy lives only for this
+  // call; the next fresh snapshot re-derives it. If the search finds
+  // nothing, resolveCreativeSelection's not-found branch (P-A3c) asks
+  // the user — this block never asks anything itself.
+  let snapshotForCreative = snapshot;
+  {
+    const sourceForSearch = normalized.mode === "campaign" ? normalized.creative_strategy?.source : explicitActionCreativeSource;
+    if ((sourceForSearch === "EXISTING_PAGE_POST" || sourceForSearch === "EXISTING_INSTAGRAM_POST")) {
+      const requestedProductForSearch = parseRequestedProduct({ strategy: normalized, userMessage, snapshot });
+      if (requestedProductForSearch) {
+        const section = sourceForSearch === "EXISTING_PAGE_POST" ? snapshot?.recentContent?.facebookPosts : snapshot?.recentContent?.instagramPosts;
+        const alreadySearched = section?.productSearch?.searched === true && section?.productSearch?.requestedProduct === requestedProductForSearch;
+        const alreadyShownMatch = (section?.items || []).some((i) => postMatchesProduct(i, requestedProductForSearch));
+        if (!alreadySearched && !alreadyShownMatch) {
+          const deep = await searchContentForProduct({
+            accessToken,
+            pageId: snapshot?.metaAssets?.defaultPage?.id || null,
+            instagramAccountId: snapshot?.metaAssets?.instagram?.account?.accountId || null,
+            platform: sourceForSearch === "EXISTING_PAGE_POST" ? "facebook" : "instagram",
+            productName: requestedProductForSearch,
+            sampleProducts: snapshot?.business?.sampleProducts || [],
+          });
+          const key = sourceForSearch === "EXISTING_PAGE_POST" ? "facebookPosts" : "instagramPosts";
+          const priorItems = section?.items || [];
+          const seen = new Set(priorItems.map((i) => i.id));
+          const mergedItems = [...priorItems];
+          for (const m of deep.matched) {
+            if (!seen.has(m.id)) { mergedItems.push(m); seen.add(m.id); }
+          }
+          snapshotForCreative = {
+            ...snapshot,
+            recentContent: {
+              ...snapshot.recentContent,
+              [key]: {
+                ...section,
+                items: mergedItems,
+                productSearch: { searched: true, requestedProduct: requestedProductForSearch, matched: deep.matched.length > 0, postsScanned: deep.postsScanned, pagesFetched: deep.pagesFetched, reachedBound: deep.reachedBound },
+              },
+            },
+          };
+        }
+      }
+    }
+  }
+  // Stream C (§2.1/§2.4): the prior row's stored creative pending-question
+  // entry — the ONLY "a question was asked" anchor for selector verification
+  // and pendingCreative promotion below. Read ONLY from priorStored, never
+  // from the row being built now (a question asked THIS turn cannot be
+  // answered by THIS turn's message — the model's own tool-call parameters
+  // can never write this record).
+  const priorPendingQuestions = Array.isArray(priorStored?.resolvedAssets?.pendingQuestions)
+    ? priorStored.resolvedAssets.pendingQuestions : null;
+  const creativePendingQuestion = priorPendingQuestions
+    ? priorPendingQuestions.find((q) => q.kind === "creative_candidates" || q.kind === "pending_creative") || null
+    : null;
+  const priorCreativeCandidates = priorStored?.resolvedAssets?.creativeCandidates || null;
+  // Promotion of a pendingCreative requires the prior row to actually have
+  // an open pending-creative confirmation question (kind "pending_creative"
+  // in its stored record). Rows stored before Stream C have no record at
+  // all — for those, the presence of the pendingCreative itself is the
+  // record (it only exists because the confirmation question was asked).
+  // A bare "yes" with a destination-URL question ALSO open claims neither
+  // (the dispatcher's ambiguousAffirmation rule, orchestrator/index.js):
+  // an embedded, subject-naming phrase ("use that post") still promotes,
+  // but a bare word does not.
+  const urlQuestionOpenOnPrior = (priorStored?.strategy?.unresolved_questions || [])
+    .some((q) => q.startsWith("This campaign needs a destination website URL"));
+  const pendingCreativeQuestion = Boolean(priorPendingCreative)
+    && (priorPendingQuestions === null || creativePendingQuestion?.kind === "pending_creative")
+    && !(urlQuestionOpenOnPrior && messageIsBareCreativeAffirmation(userMessage));
   const creativeResolution = normalized.mode === "campaign"
-    ? resolveCreativeSelection({ strategy: normalized, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage })
+    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates })
     : explicitActionCreativeSource
       ? resolveCreativeSelection({
           strategy: { ...normalized, mode: "campaign", creative_strategy: { source: explicitActionCreativeSource, description: normalized.business_goal || "" } },
-          snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage,
+          snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage,
+          pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction: true,
         })
       : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (creativeResolution.creativeError) {
@@ -587,13 +911,42 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // "switch to PRODUCT_IMAGE" — that makes no sense for a boost action,
   // so it's deliberately NOT reused here).
   if (explicitActionCreativeSource && !creativeResolution.creative && !creativeResolution.ambiguousCandidates.length
-    && !creativeResolution.pendingCreative && !creativeResolution.creativeError) {
+    && !creativeResolution.pendingCreative && !creativeResolution.creativeError && !creativeResolution.creativeNotFound) {
     const isInstagram = explicitActionCreativeSource === "EXISTING_INSTAGRAM_POST";
     resolutionErrors.push({
       field: "content_selector",
       message: `No recent ${isInstagram ? "Instagram" : "Facebook"} posts were found to boost — check the connected ${isInstagram ? "Instagram account" : "Facebook Page"}.`,
       code: "META_V2_CONTENT_NOT_FOUND",
     });
+  }
+  // Stream A — backend-populated identity (P-A5): whatever the model
+  // wrote in creative_strategy.postId/caption/linkedProduct is
+  // overwritten from the backend-resolved candidate (or deleted when
+  // nothing resolved). The model's own values are never trusted — a
+  // disagreement is caught by checkCreativeProductMatchPolicy (P-A4),
+  // which runs later against the PRE-overwrite values stashed above in
+  // modelAssertedCreative, so the comparison must happen before this
+  // overwrite — see the call-site note in P-A4.
+  // Guarded on normalized.creative_strategy existing: explicit_action
+  // strategies deliberately carry no creative_strategy at all, and
+  // inventing a sourceless one here would corrupt that shape — their
+  // resolved creative identity already lives in resolvedAssets.creative.
+  if (creativeResolution.creative && (creativeResolution.creative.source === "EXISTING_PAGE_POST" || creativeResolution.creative.source === "EXISTING_INSTAGRAM_POST") && normalized.creative_strategy) {
+    const c = creativeResolution.creative;
+    normalized = {
+      ...normalized,
+      creative_strategy: {
+        ...normalized.creative_strategy,
+        postId: c.postId || c.contentId,
+        caption: c.caption || null,
+        linkedProduct: c.linkedProduct || null,
+      },
+    };
+  } else if (normalized.creative_strategy) {
+    // Nothing resolved (or a non-post source): never leave a stale or
+    // model-asserted identity sitting on the strategy.
+    const { postId: _droppedPostId, caption: _droppedCaption, linkedProduct: _droppedLinkedProduct, ...rest } = normalized.creative_strategy;
+    normalized = { ...normalized, creative_strategy: rest };
   }
   if (traceEnabled) {
     trace("creative resolution", {
@@ -634,6 +987,9 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // prefix pruning discipline as the two above (see
   // formatCreativeConfirmationQuestion, creativeResolution.js).
   const isCreativeConfirmationQuestion = (q) => q.startsWith("To confirm — you'd like to use");
+  // Stream A — the not-found question (formatCreativeNotFoundQuestion,
+  // creativeResolution.js), same stable-prefix pruning discipline.
+  const isCreativeNotFoundQuestion = (q) => q.startsWith("I couldn't find a ");
   const isPrimaryTextQuestion = (q) => q.startsWith('What ad text would you like for the "');
   // Round 35 fix (live bug — Meta error 100/3858720: "Your campaign
   // objective requires an external website URL"). An existing Facebook/
@@ -656,6 +1012,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
         if (q === "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?") return !resolved.pixelId;
         if (isCreativeCandidatesQuestion(q)) return creativeResolution.ambiguousCandidates.length > 0;
         if (isCreativeConfirmationQuestion(q)) return Boolean(creativeResolution.pendingCreative);
+        if (isCreativeNotFoundQuestion(q)) return Boolean(creativeResolution.creativeNotFound);
         if (isPrimaryTextQuestion(q)) return creativeResolution.needsPrimaryTextQuestion;
         if (isDestinationUrlQuestion(q)) return needsDestinationUrl;
         return true;
@@ -701,6 +1058,18 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     // explicit_action) source resolveCreativeSelection itself resolved
     // against — already correct without needing creativeQuestionSource.
     const question = formatCreativeConfirmationQuestion(creativeResolution.pendingCreative.source, creativeResolution.pendingCreative.candidate, creativeResolution.pendingCreative.totalCandidates);
+    normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
+  }
+
+  // Stream A — a real product was named but no post about it exists
+  // among the posts checked. A real unresolved question (same mechanism
+  // as the ambiguous-candidates question above): it sets
+  // approval_required and blocks execute_strategy via the existing gate
+  // (orchestrator/index.js) until answered. Never a silent substitution,
+  // never a rejection — the user may legitimately choose PRODUCT_IMAGE
+  // or ask for older posts.
+  if (creativeResolution.creativeNotFound) {
+    const question = formatCreativeNotFoundQuestion(creativeResolution.creativeNotFound.source, creativeResolution.creativeNotFound);
     normalized = { ...normalized, unresolved_questions: [...new Set([...(normalized.unresolved_questions || []), question])], approval_required: true };
   }
 
@@ -863,6 +1232,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const creativeSourceErrors = [
     ...checkCreativeSourceAvailabilityPolicy(normalized, snapshot),
     ...checkLiteralCreativeSourceSubstitutionPolicy(normalized, userMessage, snapshot),
+    // Stream A — identity: the resolved creative must actually be about
+    // the product the user asked for (P-A4). Same "genuine business
+    // decision, not a mechanical patch" reasoning as the two above — a
+    // mismatch is rejected, never auto-repaired. modelAssertedCreative
+    // is the PRE-overwrite model values (P-A5), not the overwritten
+    // strategy fields.
+    ...checkCreativeProductMatchPolicy(normalized, userMessage, snapshot, creativeResolution.creative, modelAssertedCreative),
   ];
   const audienceErrors = checkAudienceQualityPolicy(normalized, businessSignals);
   const budgetErrors = checkBudgetPolicy(normalized);
@@ -909,7 +1285,10 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
 
   if (errors.length) {
     trace("strategy rejected (policy/resolution)", { conversationId, errors });
-    return { ok: false, unresolved: buildUnresolvedIssue(errors) };
+    // Stream C (§3.1): same failed-attempt audit row as the structural
+    // rejection above — a rejected revision is stored, never silently lost.
+    const attemptId = insertFailedAttempt({ userId, conversationId, revisionOf: priorStored?.id || null, requestedChanges, discardedFields: mergeDiscarded, errors, userMessage });
+    return { ok: false, unresolved: buildUnresolvedIssue(errors), attemptId };
   }
 
   // Persisted the SAME way resolved.pixelCandidates already is
@@ -935,10 +1314,121 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // creativeCandidates null while pending means the ONLY way to settle it
   // is the dedicated affirmation check inside resolveCreativeSelection —
   // never a re-guess).
-  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative };
-  const recommendationText = formatRecommendation(normalized, names, resolved, creativeResolution.creative);
+  // Stream C (§2.1): the structured pending-question record, stored inside
+  // the existing resolvedAssetsJson (no migration). Rebuilt from the FINAL
+  // unresolved_questions on every stored row, so entries whose question is
+  // no longer open are pruned by construction. Entries carried forward keep
+  // their ORIGINAL askedStrategyId/askedAt — a revision that merely carries
+  // a question forward must not refresh them (otherwise "asked after" could
+  // never be satisfied). New entries record THIS row's id (generated here
+  // and passed to insertStrategy below, so the record names the row that
+  // actually asked) and now as askedAt; the turn boundary itself is
+  // enforced by reading this record ONLY from priorStored, never from the
+  // row being built. Model-authored questions (anything not matching a
+  // known mechanical kind) get no entry.
+  const newStrategyId = cryptoRandom();
+  const priorPendingQuestionEntries = Array.isArray(priorStored?.resolvedAssets?.pendingQuestions)
+    ? priorStored.resolvedAssets.pendingQuestions : [];
+  const pendingQuestionsForStorage = [];
+  for (const q of normalized.unresolved_questions || []) {
+    let kind = null;
+    let candidateIds = null;
+    let candidateLabels = null;
+    let questionSource = null;
+    if (isCreativeCandidatesQuestion(q)) {
+      kind = "creative_candidates";
+      questionSource = creativeQuestionSource || null;
+      const refs = toCreativeCandidateRefs(creativeQuestionSource, creativeResolution.ambiguousCandidates);
+      candidateIds = refs.map((r) => r.id);
+      candidateLabels = refs.map((r) => r.label);
+    } else if (isCreativeConfirmationQuestion(q)) {
+      kind = "pending_creative";
+      questionSource = creativeResolution.pendingCreative?.source || null;
+      const c = creativeResolution.pendingCreative?.candidate;
+      candidateIds = c ? [c.id] : [];
+      candidateLabels = c ? [c.captionExcerpt || c.name || null] : [];
+    } else if (q === "What daily budget would you like for this?") {
+      kind = "budget";
+    } else if (q.startsWith("This campaign needs a destination website URL")) {
+      kind = "destination_url";
+    } else if (isPrimaryTextQuestion(q)) {
+      kind = "primary_text";
+    } else if (q === "This ad account has multiple Meta Pixels connected and none is set as the default — which one should track purchases for this campaign?") {
+      kind = "pixel";
+    } else {
+      continue;
+    }
+    const carried = priorPendingQuestionEntries.find((e) => e.kind === kind && e.question === q);
+    pendingQuestionsForStorage.push(carried || {
+      kind, question: q, askedStrategyId: newStrategyId, askedAt: new Date().toISOString(),
+      candidateIds, candidateLabels, source: questionSource,
+    });
+  }
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative, pendingQuestions: pendingQuestionsForStorage, discardedFields: mergeDiscarded };
+  const recommendationText = formatRecommendation(normalized, names, resolved, creativeResolution.creative, { discardedFields: mergeDiscarded, pixelState: { pixelName: names.pixelName, pixelId: resolved.pixelId, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } });
+  // Stream B (P0, build-once): an identical rebuild must NOT insert a new
+  // row. Before this, every successful build_strategy/revise_strategy call
+  // inserted a fresh 'proposed' row and superseded the previous one — so a
+  // model that re-called build_strategy (same turn or a later turn; the
+  // per-turn counters reset every orchestrate() call) minted a new
+  // strategyId each time, and the live test saw build_strategy called 5
+  // times for one request. The fingerprint is computed on the NORMALIZED
+  // strategy (after all derive*/normalization), so harmless restatement
+  // differences (enum aliases, a defaulted CTA) do not defeat the dedup,
+  // while any real change (budget, audience, creative, destination URL —
+  // Patch 0 extended the fingerprint to cover those) does. Only dedups
+  // against an EXECUTABLE prior row: an 'executed' prior row is never
+  // returned as a fresh build (the already-executed gate owns that case),
+  // and a 'failed'/'rejected'/'superseded' prior row has nothing worth
+  // reusing. A dedup returns the EXISTING row verbatim — same strategyId,
+  // same recommendationText — so the model can present it and wait for
+  // approval, and the persisted approval (Patch 1) on that row, if any,
+  // is untouched: nothing changed, so there is nothing to re-approve.
+  // Genuine changes never reach this branch as identical — they go through
+  // the normal insert below as a revision (revisionOf set), which is the
+  // correct path for a real change.
+  if (priorStored && EXECUTABLE_STATUSES.has(priorStored.status)) {
+    const priorFingerprint = fingerprintStrategy(priorStored.strategy);
+    const newFingerprint = fingerprintStrategy(normalized);
+    if (priorFingerprint === newFingerprint) {
+      trace("strategy build deduped (identical to active strategy)", { conversationId, strategyId: priorStored.id });
+      return { ok: true, strategyId: priorStored.id, recommendationText: priorStored.recommendationText, strategy: priorStored.strategy, resolved: priorStored.resolvedAssets, deduplicated: true, discardedFields: mergeDiscarded };
+    }
+  }
+  // Stream C (§3.5) — no-op guard, AFTER Stream B's fingerprint dedup above
+  // (dedup first: an identical rebuild returns the existing row as
+  // deduplicated). A revision that passes all checks yet changes nothing —
+  // e.g. the change was reverted by mergeForRevision into an identical value
+  // without tripping checkRevisionSubstantive — must not insert a new row
+  // (which would supersede the prior row and let the model report success
+  // for a change that never happened). Returns the EXISTING row, marked
+  // noOp, with the real reason. requestedChanges === {} is explicitly
+  // exempt: the pendingCreative promotion path calls revise_strategy with
+  // {} deliberately, and promoting a pending creative changes nothing in
+  // the strategy fields while being a genuine, legitimate effect.
+  // NOTE: after the dedup above, this only ever fires when dedup did not —
+  // in practice for a revision of an EXECUTED prior row (dedup only covers
+  // EXECUTABLE statuses). That is the intended composition.
+  if (priorStored && Object.keys(requestedChanges || {}).length > 0) {
+    const priorFingerprint = fingerprintStrategy(priorStored.strategy);
+    const newFingerprint = fingerprintStrategy(normalized);
+    const creativeUnchanged = JSON.stringify(creativeResolution.creative ?? null) === JSON.stringify(priorStored.resolvedAssets?.creative ?? null);
+    if (priorFingerprint === newFingerprint && creativeUnchanged) {
+      const notApplied = [
+        ...Object.keys(requestedChanges).map((field) => ({ field, reason: "value_unchanged_after_revision" })),
+        ...mergeDiscarded,
+      ];
+      return {
+        ok: true, noOp: true, strategyId: priorStored.id,
+        recommendationText: priorStored.recommendationText
+          + `\n\nNo change applied — the requested revision left every field exactly as it was (${notApplied.map((n) => n.field).join(", ")}). Nothing was updated; tell me what you'd like changed and I'll apply it.`,
+        strategy: priorStored.strategy, resolved: priorStored.resolvedAssets,
+        notApplied, discardedFields: mergeDiscarded,
+      };
+    }
+  }
   const stored = insertStrategy({
-    userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
+    id: newStrategyId, userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
     resolved: resolvedForStorage, names, snapshotVersion: snapshot.version, snapshot, recommendationText, revisionOf,
   });
 
@@ -950,7 +1440,7 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // is NOT the same as a hard validation failure (`ok: false`) — the
   // strategy is still fully stored and presentable, just not silently
   // approved.
-  return { ok: true, strategyId: stored.id, recommendationText, strategy: normalized, resolved: resolvedForStorage };
+  return { ok: true, strategyId: stored.id, recommendationText, strategy: normalized, resolved: resolvedForStorage, discardedFields: mergeDiscarded };
 }
 
 // Round 38 fix (the actual "rebuild blast radius" bug — round 34's and
@@ -1004,12 +1494,23 @@ export async function buildStrategy({ userId, conversationId, accessToken, strat
   const priorStored = conversationId ? getMostRecentStrategyForConversation(userId, conversationId) : null;
   if (priorStored && (EXECUTABLE_STATUSES.has(priorStored.status) || priorStored.status === "executed")) {
     const requestedChanges = diffAgainstPrior(strategy, priorStored.strategy);
+    // Stream C (§3.5): the model restated the whole strategy identically —
+    // return the prior row as a no-op directly, never run the full pipeline
+    // just to re-insert an identical row. Marked deduplicated as well as
+    // noOp: this is the same outcome Stream B's fingerprint dedup in
+    // runBuildOrRevise returns for an identical rebuild (existing row,
+    // existing recommendation text, no new row), and the two paths must
+    // report it identically — an identical rebuild that reaches this
+    // early return used to come back without the flag.
+    if (Object.keys(requestedChanges).length === 0) {
+      return { ok: true, noOp: true, deduplicated: true, strategyId: priorStored.id, recommendationText: priorStored.recommendationText, strategy: priorStored.strategy, resolved: priorStored.resolvedAssets, notApplied: [] };
+    }
     return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: priorStored.id, priorStored, freshResearchRequired: true });
   }
   return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges: strategy, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: null, priorStored: null, freshResearchRequired: true });
 }
 
-export async function reviseStrategy({ userId, conversationId, accessToken, strategyId, requestedChanges, freshResearchRequired, explicitAssetChanges, userMessage }) {
+export async function reviseStrategy({ userId, conversationId, accessToken, strategyId, requestedChanges, freshResearchRequired, explicitAssetChanges, userMessage, claimedBy }) {
   const prior = getStoredStrategy(userId, strategyId);
   if (!prior) {
     return { ok: false, unresolved: { field: "strategyId", issue: `strategyId "${strategyId}" does not match any strategy you own — it may be from a different conversation or doesn't exist.`, allIssues: [] } };
@@ -1037,5 +1538,5 @@ export async function reviseStrategy({ userId, conversationId, accessToken, stra
   if (!EXECUTABLE_STATUSES.has(prior.status) && prior.status !== "executed") {
     return { ok: false, unresolved: { field: "strategyId", issue: `This strategy is no longer active (status: ${prior.status}) and can't be revised.`, allIssues: [] } };
   }
-  return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: strategyId, priorStored: prior, freshResearchRequired });
+  return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: strategyId, priorStored: prior, freshResearchRequired, claimedBy });
 }

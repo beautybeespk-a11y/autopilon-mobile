@@ -10,6 +10,7 @@
 // safety limit on the same ad accounts (spending real money either way) —
 // but can be tuned independently via META_EXPERT_V2_MAX_*.
 import crypto from "node:crypto";
+import { parseRequestedProduct, postMatchesProduct } from "./creativeResolution.js";
 
 export const MAX_SUGGESTED_DAILY_BUDGET =
   Number(process.env.META_EXPERT_V2_MAX_SUGGESTED_DAILY_BUDGET) ||
@@ -67,8 +68,14 @@ function userMessageContainsAmount(userMessage, amount) {
 // carries a prior, ALREADY-verified USER_PROVIDED budget forward unchanged
 // must not be re-flagged just because this turn's message doesn't happen
 // to repeat a number it already established validly earlier.
-export function verifyUserProvidedBudget(rawStrategy, mergedStrategy, userMessage) {
+//
+// Stream C: opts.claimedBy is resolvePendingQuestionAnswer()'s verdict for this turn
+// ("creative" | "budget" | null). A USER_PROVIDED budget whose amount equals the bare
+// number the dispatcher already claimed for the creative question is NOT verified —
+// the digits are in the message, but they are the answer to a different question.
+export function verifyUserProvidedBudget(rawStrategy, mergedStrategy, userMessage, opts = {}) {
   if (rawStrategy.budget_basis !== "USER_PROVIDED") return mergedStrategy;
+  if (opts.claimedBy === "creative") return { ...mergedStrategy, budget_basis: "HEURISTIC_STARTING_TEST" };
   if (userMessageContainsAmount(userMessage, mergedStrategy.budget_daily)) return mergedStrategy;
   return { ...mergedStrategy, budget_basis: "HEURISTIC_STARTING_TEST" };
 }
@@ -565,6 +572,75 @@ export function checkCreativeSourceAvailabilityPolicy(strategy, snapshot) {
   return errors;
 }
 
+// Stream A — identity check, defense in depth behind
+// resolveCreativeSelection's own product-match enforcement
+// (creativeResolution.js). That function is the primary guard; this one
+// catches what it cannot see:
+//   (a) a creative resolved and STORED before this fix, reused verbatim
+//       on a later call (the reuse branch now checks too, but a row
+//       that reaches here through any other path is still caught);
+//   (b) a model-supplied creative_strategy.postId/caption (schema
+//       fields added in P-A5) that disagrees with the backend-resolved
+//       creative — i.e. the model asserting a different post/product
+//       than the one actually resolved. Model-supplied values are never
+//       trusted (strategyBuilder.js overwrites them from the resolved
+//       candidate); a disagreement is a hard rejection, not a silent
+//       overwrite, because it means the model's reasoning is about a
+//       different creative than the one that would be executed.
+//   (c) a resolved creative whose caption/linkedProduct does not match
+//       the requested product parsed from goal/description/user message.
+// A failure here is a genuine rejection (buildUnresolvedIssue), never
+// an auto-repair and never an unresolved question: the not-found
+// question is resolveCreativeSelection's job, and reaching this check
+// with a mismatch means the selection step itself produced a wrong
+// creative — there is nothing for the user to answer that would fix
+// that except rebuilding with the right post.
+// modelAssertedCreative is the PRE-overwrite model values stashed by
+// strategyBuilder.js (P-A5) — the policy check must compare those, not
+// the post-overwrite strategy. When omitted (direct callers), it falls
+// back to reading strategy.creative_strategy.
+export function checkCreativeProductMatchPolicy(strategy, userMessage, snapshot, resolvedCreative, modelAssertedCreative) {
+  const errors = [];
+  const source = strategy.creative_strategy?.source;
+  if (source !== "EXISTING_PAGE_POST" && source !== "EXISTING_INSTAGRAM_POST") return errors;
+  if (!resolvedCreative) return errors;
+
+  const requestedProduct = parseRequestedProduct({ strategy, userMessage, snapshot });
+  if (requestedProduct && !postMatchesProduct(
+    { caption: resolvedCreative.caption, captionExcerpt: resolvedCreative.captionExcerpt, linkedProduct: resolvedCreative.linkedProduct },
+    requestedProduct
+  )) {
+    errors.push({
+      field: "creative_strategy",
+      message: `The resolved creative is not about "${requestedProduct}" — its caption does not mention that product and no matching product is linked to it. Never present a post about a different product as if it were about "${requestedProduct}". Pick a real post whose caption is actually about "${requestedProduct}", or ask the user (an unresolved question) if no such post exists among the posts checked.`,
+    });
+    return errors;
+  }
+
+  // Model-asserted identity vs backend-resolved identity. Either field
+  // absent on the model side is fine (they are backend-populated,
+  // optional fields — P-A5); a present-but-different value is not.
+  const asserted = modelAssertedCreative || strategy.creative_strategy || {};
+  const assertedPostId = asserted.postId;
+  if (typeof assertedPostId === "string" && assertedPostId && assertedPostId !== resolvedCreative.postId && assertedPostId !== resolvedCreative.contentId) {
+    errors.push({
+      field: "creative_strategy.postId",
+      message: `The strategy asserts creative post "${assertedPostId}", but the backend-resolved creative is "${resolvedCreative.postId || resolvedCreative.contentId}". A post id must come from the real candidate list already shown this conversation — never asserted from the model's own text.`,
+    });
+  }
+  const assertedCaption = asserted.caption;
+  if (typeof assertedCaption === "string" && assertedCaption.trim() && resolvedCreative.caption) {
+    const normalize = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+    if (normalize(assertedCaption) !== normalize(resolvedCreative.caption)) {
+      errors.push({
+        field: "creative_strategy.caption",
+        message: "The strategy asserts a caption for the creative that does not match the resolved post's real caption. The caption is backend evidence from Meta, never model text — use the resolved post's real caption.",
+      });
+    }
+  }
+  return errors;
+}
+
 // Live bug (creative-selection follow-up #2): checkCreativeSourceAvailabilityPolicy
 // above only guards a source the model already CLAIMED — it does nothing
 // when the model never attempted the platform the user literally asked
@@ -693,16 +769,65 @@ export const COMPARABLE_SCALAR_FIELDS = new Set([
   "gender", "age_min", "age_max", "targeting_approach", "placements", "budget_daily",
   "budget_basis", "bid_strategy", "cta",
 ]);
+// Stream C: the scalar set is unchanged, but a revision that claims to reconsider
+// creative_strategy / locations / countries / destination_url / content_selector
+// and leaves them byte-identical is now rejected exactly like a scalar no-change —
+// previously `continue` let every one of these through, which is how "changed the
+// creative" could be reported while the stored creative_strategy never moved.
+// Deep equality is JSON.stringify equality (same as diffAgainstPrior): key order
+// inside creative_strategy/content_selector objects matters, so callers must pass
+// the objects as stored, not re-keyed copies. A field whose key is ABSENT from
+// requestedChanges is still never checked (unrelated fields carry forward by design).
+export const COMPARABLE_DEEP_FIELDS = new Set([
+  "creative_strategy", "locations", "countries", "destination_url", "content_selector",
+]);
+function valuesDeepEqual(a, b) {
+  return JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+}
 export function checkRevisionSubstantive({ priorStrategy, newStrategy, requestedChanges = {} }) {
   const errors = [];
   const unchanged = [];
+  const comparable = [];
   for (const field of Object.keys(requestedChanges)) {
-    if (!COMPARABLE_SCALAR_FIELDS.has(field)) continue; // locations/countries/creative_strategy are array/object fields — not compared here
-    const before = priorStrategy?.[field];
-    const after = newStrategy?.[field];
-    if (before === after) unchanged.push(field);
+    // A field counts as changed when the revision genuinely attempted a
+    // different value (requested !== prior) OR the stored result actually
+    // moved (new !== prior). Either leg alone is enough: a requested value
+    // that a verification gate then cleared (e.g. an unverified
+    // destination_url) is a real attempted change whose veto is reported
+    // by that gate itself — it must not ALSO be reported here as
+    // "left exactly as they were".
+    // Test-stage fix (was: error if ANY requested field was unchanged):
+    // a revision that really changes some fields while faithfully
+    // restating others (round-44 identical content_selector, a rebuild
+    // restating creative_strategy, a later turn re-asserting an
+    // already-verified destination_url alongside a budget change) is
+    // substantive as a whole. Only a revision whose EVERY claimed field
+    // is unchanged is a cosmetic no-change.
+    const requestedValue = requestedChanges[field];
+    const priorValue = priorStrategy?.[field];
+    const newValue = newStrategy?.[field];
+    let changed;
+    if (field === "creative_strategy") {
+      // Description is prose about the creative, not the creative itself:
+      // a description-only "change" that leaves the source (and the
+      // resolved creative) untouched is not a substantive creative change
+      // — that is the Maybelline-relabel shape. Compare the load-bearing
+      // identity (source/layout) on both legs.
+      const identity = (v) => (v && typeof v === "object" ? { source: v.source ?? null, layout: v.layout ?? null } : v ?? null);
+      changed = !valuesDeepEqual(identity(requestedValue), identity(priorValue)) || !valuesDeepEqual(identity(newValue), identity(priorValue));
+    } else if (COMPARABLE_SCALAR_FIELDS.has(field)) {
+      changed = requestedValue !== priorValue || newValue !== priorValue;
+    } else if (COMPARABLE_DEEP_FIELDS.has(field)) {
+      changed = !valuesDeepEqual(requestedValue, priorValue) || !valuesDeepEqual(newValue, priorValue);
+    } else {
+      // Any other field (reasoning_summary, evidence_used, assumptions, …) is
+      // prose/evidence, not a claimed reconsideration — still never checked.
+      continue;
+    }
+    comparable.push(field);
+    if (!changed) unchanged.push(field);
   }
-  if (unchanged.length) {
+  if (comparable.length && unchanged.length === comparable.length) {
     errors.push({
       field: "requestedChanges",
       message: `The user asked to reconsider ${unchanged.join(", ")}, but the revised strategy left ${unchanged.length > 1 ? "those fields" : "that field"} exactly as they were — a revision must actually change the value or explicitly justify keeping it (real evidence in reasoning_summary/evidence_used for why the current value is still correct), never cosmetic prose only.`,
@@ -752,10 +877,62 @@ export function messageIndicatesExecutionApproval(text) {
   return EXECUTION_APPROVAL_PATTERN.test(text) || BARE_APPROVAL_WORD_PATTERN.test(text);
 }
 
+// Stream B: the executor's own check (executor.js) must not treat a bare
+// "yes"/"ok"/"sure" as fresh execution approval. Those words are consumable:
+// the same message may have just confirmed a destination URL or a pending
+// creative (orchestrator/index.js's destinationUrlJustAutoConfirmedThisTurn /
+// pendingCreativeJustAutoConfirmedThisTurn), and the executor cannot see
+// those per-turn flags. Strong words ("approve", "proceed", "run it", …)
+// name execution itself and are never a URL/creative answer. Bare
+// affirmations still count as approval ONLY through the orchestrator gate
+// (where consumption was already checked) and the confirmation-card resume
+// (where the click itself is the approval) — never as a fresh signal here.
+export function messageIndicatesStrongExecutionApproval(text) {
+  if (typeof text !== "string") return false;
+  return EXECUTION_APPROVAL_PATTERN.test(text);
+}
+
+// Extended (Stream B): the fingerprint is now the approval binding — it must
+// cover every field whose change would make a prior "approve" no longer mean
+// the same thing. COMPARABLE_SCALAR_FIELDS alone missed creative_strategy,
+// destination_url and content_selector: a creative swap or URL change
+// fingerprinted identically to the approved strategy (live bug: post #5
+// relabelled as a Maybelline post). Object fields are hashed via stable
+// JSON (sorted keys) so key order never changes the fingerprint.
+function stableJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value ?? null);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const keys = Object.keys(value).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableJson(value[k])}`).join(",")}}`;
+}
+
 export function fingerprintStrategy(strategy = {}) {
   const normalized = {};
   for (const field of COMPARABLE_SCALAR_FIELDS) normalized[field] = strategy[field] ?? null;
   normalized.locations = [...(strategy.locations || [])].sort();
   normalized.countries = [...(strategy.countries || [])].sort();
+  // Approval-relevant fields COMPARABLE_SCALAR_FIELDS deliberately omits.
+  normalized.mode = strategy.mode ?? null;
+  normalized.action_type = strategy.action_type ?? null;
+  normalized.creative_strategy = strategy.creative_strategy ? stableJson(strategy.creative_strategy) : null;
+  normalized.content_selector = strategy.content_selector ? stableJson(strategy.content_selector) : null;
+  normalized.destination_url = strategy.destination_url ?? null;
+  normalized.goal_alignment = strategy.goal_alignment ? stableJson(strategy.goal_alignment) : null;
+  // Stream B (Patch 4.5): business_goal is the request's identity — two
+  // requests with different goals but identical strategy fields must not
+  // dedup as the same build.
+  normalized.business_goal = strategy.business_goal ?? null;
+  // Test-stage fix (round 31/40 Pixel tests): the asset refs are part of
+  // the strategy's identity too. Without them, a revision whose ONLY
+  // change is the Pixel (or ad account/Page/catalog) fingerprinted
+  // identically to the prior row, so Stream B's dedup returned the prior
+  // row verbatim and the resolved asset change was silently lost — the
+  // Pixel stayed null even though resolution itself had succeeded. The
+  // same omission meant an approval survived an asset swap, which the
+  // approval binding above must also forbid: approving a campaign with
+  // Pixel A and then swapping to Pixel B must not keep the approval.
+  for (const field of ["ad_account", "facebook_page", "pixel", "catalog", "instagram_identity"]) {
+    normalized[field] = strategy[field] ? stableJson(strategy[field]) : null;
+  }
   return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 16);
 }

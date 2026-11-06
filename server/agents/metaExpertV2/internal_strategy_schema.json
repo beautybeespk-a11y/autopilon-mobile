@@ -52,6 +52,23 @@
       "properties": {
         "source": { "type": "string", "enum": ["EXISTING_PAGE_POST", "EXISTING_INSTAGRAM_POST", "PRODUCT_IMAGE", "GENERATED_IMAGE", "GENERATED_VIDEO", "USER_ATTACHED_MEDIA"] },
         "description": { "type": "string" },
+        "postId": {
+          "type": "string",
+          "description": "Backend-populated ONLY — the real id of the resolved existing post (EXISTING_PAGE_POST / EXISTING_INSTAGRAM_POST). Never supplied by the model from its own text; strategyBuilder.js overwrites whatever is here with the backend-resolved candidate, and policy.js rejects a disagreement. Omit entirely when source is not an existing post."
+        },
+        "caption": {
+          "type": "string",
+          "description": "Backend-populated ONLY — the resolved post's real caption from Meta. Never model-written. Used by the executor to re-validate the post immediately before creating the ad."
+        },
+        "linkedProduct": {
+          "type": "object",
+          "description": "Backend-populated ONLY — the real store product whose name literally appears in the resolved post's caption (businessSnapshot.js matchLinkedProduct), or null. Never guessed.",
+          "properties": {
+            "name": { "type": "string" },
+            "price": { "type": ["string", "number", "null"] },
+            "category": { "type": ["string", "null"] }
+          }
+        },
         "layout": {
           "type": "string",
           "enum": ["SINGLE", "CAROUSEL"],

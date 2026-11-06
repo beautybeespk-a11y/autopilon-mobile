@@ -18,9 +18,10 @@ import * as meta from "../../integrations/meta/api.js";
 import { getTool } from "../../tools/registry.js";
 import { buildTargeting } from "../../tools/meta/campaigns.js";
 import { publishEvent } from "../../automation/triggers.js";
-import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign } from "./policy.js";
-import { MIN_CAROUSEL_CARDS, MAX_CAROUSEL_CARDS } from "./creativeResolution.js";
-import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
+import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign, messageIndicatesStrongExecutionApproval, fingerprintStrategy, checkCreativeProductMatchPolicy } from "./policy.js";
+import { MIN_CAROUSEL_CARDS, MAX_CAROUSEL_CARDS, postMatchesProduct } from "./creativeResolution.js";
+import { matchLinkedProduct } from "./businessSnapshot.js";
+import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, recordStrategyApproval, hasValidApproval, findStaleApprovalFingerprint, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 import { logger } from "../../config/logger.js";
 
@@ -74,6 +75,67 @@ function buildOptimizationFields(strategy, resolvedPixelId) {
   const metaGoal = CONVERSION_EVENT_TO_META_GOAL[strategy.optimization_event];
   if (!metaGoal) return { optimization_goal: strategy.optimization_event || "LINK_CLICKS" };
   return { optimization_goal: metaGoal, promoted_object: { pixel_id: resolvedPixelId, custom_event_type: strategy.optimization_event } };
+}
+
+// Stream B — failure classification for the executeStrategy() catch below.
+// The old code had exactly one carve-out (Meta 100/3858558, budget below
+// the PKR 250 minimum) and burned every other failure to 'failed', which
+// removes the strategy from EXECUTABLE_STATUSES and forces a full rebuild
+// for problems a single revise_strategy could fix — or for transient Meta
+// errors that would succeed on a plain retry. Classification:
+//   - "retryable": transient, nothing about the strategy is wrong. Keep
+//     'proposed'; a retry of the SAME approved strategy (same fingerprint,
+//     persisted approval still valid) may proceed without re-approval.
+//   - "revisable": Meta rejected a specific, fixable field. Keep 'proposed'
+//     so revise_strategy can fix exactly that field; the error message must
+//     name the fix (callers surface err.message). Approval is NOT
+//     re-granted: if the revise changes the fingerprint, a fresh approval
+//     is required (invariant I2); if it changes nothing, Patch 4 dedups
+//     and the persisted approval stands.
+//   - "terminal": the strategy can never execute as stored AND no revise
+//     can repair it (account/Page gone, currency changed, structurally
+//     wrong execution tool/action). Mark 'failed' — the honest terminal
+//     state, and the user needs a fresh build.
+//   - "unknown": anything unclassified. Keep 'proposed' (do NOT burn it)
+//     but log loudly: burning an unknown error hides the real cause behind
+//     a rebuild, while keeping it proposed risks a retry loop — bounded by
+//     the orchestrator's per-turn gates (Patch 2) and by the fact that a
+//     retry still needs approval (Patch 1). If unknown errors recur in
+//     production, classify them explicitly here instead of widening this
+//     branch silently.
+// Meta error codes/subcodes come from metaFetch (server/integrations/meta/
+// api.js), which preserves err.code/err.subcode from Meta's own payload;
+// executeNow() (server/orchestrator/executor.js) already forwards them.
+// Non-Meta errors (fetch TypeError, ECONNRESET, timeouts) carry no code.
+const META_RETRYABLE_CODES = new Set([4, 17, 32, 500, 503]);
+const META_REVISABLE_SUBCODES = new Map([
+  // [subcode, fix hint appended to the surfaced message]
+  [3858558, "Raise budget_daily to at least the minimum Meta requires for this account currency, then approve the revised strategy."],
+  [2490408, "Change optimization_event (or recommended_objective) to a combination Meta accepts for this objective, then approve the revised strategy."],
+  [1870227, "This is an internal targeting error (advantage_audience) — report it; do not ask the user to change anything."],
+  [3858720, "Set a real destination_url and call-to-action for this objective, then approve the revised strategy."],
+  [1815520, "The creative has no usable link for this optimization — pick a different creative or optimization_event, then approve the revised strategy."],
+  [1815857, "Change bid_strategy to LOWEST_COST_WITHOUT_CAP (no bid_amount), then approve the revised strategy."],
+  [2238146, "This is an internal creative/CTA placement error — report it; do not ask the user to change anything."],
+]);
+export function classifyExecutionFailure(err) {
+  if (!err || typeof err !== "object") return { outcome: "unknown", reason: "Unknown execution failure." };
+  // Thrown by this file's own pre-dispatch / re-verification checks with a
+  // META_V2_* code, or by fetch itself — never a Meta field rejection.
+  if (typeof err.code === "string" && String(err.code).startsWith("META_V2_")) {
+    if (err.code === "META_V2_WRONG_EXECUTION_TOOL" || err.code === "META_V2_ACTION_NOT_SUPPORTED") return { outcome: "terminal", reason: err.message };
+    return { outcome: "terminal", reason: err.message };
+  }
+  if (err instanceof TypeError || err.code === "ECONNRESET" || err.code === "ETIMEDOUT" || err.code === "ENOTFOUND" || /fetch failed|network|timed out|socket hang up/i.test(err.message || "")) {
+    return { outcome: "retryable", reason: `${err.message} (transient — nothing about the strategy itself failed; retry the same approved strategy.)` };
+  }
+  if (err.code === 429 || META_RETRYABLE_CODES.has(err.code)) {
+    return { outcome: "retryable", reason: `${err.message} (transient Meta error — retry the same approved strategy.)` };
+  }
+  if (err.code === 100 && META_REVISABLE_SUBCODES.has(err.subcode)) {
+    return { outcome: "revisable", reason: `${err.message} ${META_REVISABLE_SUBCODES.get(err.subcode)}` };
+  }
+  return { outcome: "unknown", reason: err.message };
 }
 
 // Live bug (round 31, third recurrence): "You can't use the selected
@@ -192,6 +254,78 @@ async function attachCampaignCreative(stored, accessToken, adAccountId, adSetId,
       ? `creative_strategy.source "${source}" isn't supported for automatic ad attach yet — the campaign and ad set were created (paused), but you'll need to add the actual ad creative manually in Ads Manager.`
       : "No creative was resolved for this strategy — the campaign and ad set were created (paused), but no ad was attached.";
     return { adId: null, creativeId: null, attached: false, skippedReason };
+  }
+
+  // Stream A (test stage, P-A10 case 4) — execution-time product-match
+  // backstop. The build-time P-A4 check is the primary defense, but a row
+  // stored BEFORE it shipped (or otherwise fabricated) can still carry a
+  // creative about a different product than the strategy's goal names.
+  // Re-run the same policy here, against the stored strategy/snapshot/
+  // creative, before any ad is created: a Patrick Ta post stored under a
+  // Maybelline goal must refuse here, not reach Meta. Runs BEFORE the
+  // live-caption re-validation below (which only compares the live
+  // caption to the stored one — it cannot see that the stored one was
+  // wrong for the goal in the first place). The throw propagates through
+  // executeCampaignMode's existing cleanup (campaign deleted, original
+  // error rethrown unchanged), exactly like the caption-mismatch throw.
+  if (creative.source === "EXISTING_PAGE_POST" || creative.source === "EXISTING_INSTAGRAM_POST") {
+    const productMatchErrors = checkCreativeProductMatchPolicy(strategy, "", stored.snapshot || null, creative, null);
+    if (productMatchErrors.length) {
+      const err = new Error(`Creative verification failed: ${productMatchErrors[0].message} No ad was created.`);
+      err.code = "META_V2_CREATIVE_MISMATCH";
+      throw err;
+    }
+  }
+
+  // Stream A — execution-time re-validation of WHAT the post is about,
+  // not just which id it has. The resolved creative was verified at
+  // build/revise time against the snapshot then; the post may since have
+  // been edited or deleted on Facebook, or the stored row may predate
+  // the anti-fabrication checks entirely. Re-read the LIVE post from
+  // Meta and compare its real caption (and linked product, recomputed
+  // the same literal way) against what the strategy claims. A mismatch
+  // throws BEFORE createAdCreative — no ad is ever created from a post
+  // that no longer says what the strategy claims it says. The throw
+  // propagates through executeCampaignMode's existing cleanup (campaign
+  // deleted, original error rethrown unchanged).
+  if (creative.source === "EXISTING_PAGE_POST" || creative.source === "EXISTING_INSTAGRAM_POST") {
+    const liveCaption = creative.source === "EXISTING_PAGE_POST"
+      ? (await meta.getPagePost(accessToken, pageId, creative.contentId)).message || null
+      : (await meta.getInstagramMedia(accessToken, creative.contentId)).caption || null;
+    const normalize = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    // Back-compat: rows stored before P-A3 carry no caption at all. A
+    // missing stored caption means "cannot verify what was never
+    // stored" — the object_story_id read-back below is still enforced,
+    // and the failure mode is a loud refusal to proceed on a stale row
+    // only when the strategy ALSO names a product (the case that can
+    // actually be fabricated). A row with no stored caption and no
+    // requested product proceeds on the id check alone, exactly as
+    // before — do not invent a caption to compare against.
+    const storedCaption = creative.caption || null;
+    if (storedCaption && normalize(liveCaption) !== normalize(storedCaption)) {
+      const err = new Error(`Creative verification failed: the live ${creative.source === "EXISTING_PAGE_POST" ? "Facebook post" : "Instagram post"} (${creative.contentId}) no longer has the caption this strategy was built on — it may have been edited or replaced since. Rebuild the strategy so the creative is re-resolved from current data; no ad was created.`);
+      err.code = "META_V2_CREATIVE_MISMATCH";
+      throw err;
+    }
+    if (storedCaption && creative.linkedProduct?.name) {
+      const liveItem = { caption: liveCaption, captionExcerpt: liveCaption ? liveCaption.slice(0, 140) : null, linkedProduct: null };
+      // linkedProduct is recomputed from the LIVE caption against the
+      // store's real products (same literal rule as the snapshot, via the
+      // statically imported matchLinkedProduct — never a duplicated rule),
+      // not trusted from the stored row: a caption edited to be about a
+      // different product must fail here even if the stored row still
+      // claims the old one.
+      const sampleProducts = stored.snapshot?.business?.sampleProducts || [];
+      if (!stored.snapshot?.business?.sampleProducts) {
+        logger.warn("meta_expert_v2.execute_strategy.creative_revalidation_no_snapshot_products", { strategyId: stored.id, contentId: creative.contentId });
+      }
+      liveItem.linkedProduct = matchLinkedProduct(liveCaption, sampleProducts);
+      if (!postMatchesProduct(liveItem, creative.linkedProduct.name)) {
+        const err = new Error(`Creative verification failed: the live post (${creative.contentId}) is no longer about "${creative.linkedProduct.name}" — its caption changed since this strategy was built. Rebuild the strategy so the creative is re-resolved from current data; no ad was created.`);
+        err.code = "META_V2_CREATIVE_MISMATCH";
+        throw err;
+      }
+    }
   }
 
   let creativeFields;
@@ -760,7 +894,9 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   // with no default — strategyBuilder.js) means resolvedAssets is
   // genuinely incomplete (pixelId null); executing anyway reaches Meta
   // with a broken promoted_object and a confusing rejection instead of
-  // this clear one.
+  // this clear one. The approval half of that gate is now also enforced
+  // here — see the approval check below; this function never executes on
+  // gate trust alone.
   if (Array.isArray(stored.strategy.unresolved_questions) && stored.strategy.unresolved_questions.length > 0) {
     const err = new Error(`This strategy still has an unresolved question: "${stored.strategy.unresolved_questions[0]}" — build a revised strategy answering it before executing.`);
     err.code = "META_V2_UNRESOLVED_QUESTION";
@@ -799,7 +935,66 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     throw err;
   }
 
-  markStrategyApproved(stored.id);
+  // Stream B (P0): the executor's OWN approval check — defense in depth that
+  // no longer trusts the orchestrator gate alone. The gate
+  // (checkV2ExecutionApprovalGate, orchestrator/index.js) is a pre-dispatch
+  // nudge; this function is also reachable directly (tool wrapper, resume
+  // path, tests), and the gate's per-turn flags (a "yes" already consumed
+  // by a destination-URL / pending-creative confirmation) are invisible
+  // here. Approval is accepted from exactly two sources, and is always
+  // BOUND to this strategy's current fingerprint (invariant I1/I2):
+  //
+  //   (a) Persisted approval: status 'approved' AND approvalFingerprint
+  //       still matches fingerprintStrategy(stored.strategy). This is the
+  //       ONLY signal available on the confirmation-card resume path —
+  //       resumeAfterConfirmation() re-dispatches with userMessage ===
+  //       undefined, so a message-only check would break every card click.
+  //       It is recorded by recordStrategyApproval() at card-click /
+  //       typed-approve resume time (orchestrator/executor.js, Patch 5b),
+  //       never here.
+  //   (b) Fresh strong approval in THIS message: messageIndicatesStrong
+  //       ExecutionApproval(userMessage) — "approve"/"proceed"/"run it"/
+  //       "launch it"/etc. A bare "yes"/"ok"/"sure" is deliberately NOT
+  //       enough here: it may have been consumed by a URL/creative
+  //       confirmation this turn, and this function cannot tell. Bare
+  //       affirmations still work through the normal path — the
+  //       orchestrator gate (which CAN see the consumption flags) lets the
+  //       model call the tool, runTool() shows the confirmation card, and
+  //       the card click records persisted approval via (a).
+  //
+  // This check runs AFTER the unresolved_questions and executed-ancestor
+  // checks above: "approve" must never answer an open business question,
+  // and must never silently authorise a second campaign. Nothing below
+  // this point may call markStrategyApproved() unconditionally again.
+  const currentFingerprint = fingerprintStrategy(stored.strategy);
+  const hasPersistedApproval = hasValidApproval(stored);
+  const hasFreshStrongApproval = messageIndicatesStrongExecutionApproval(userMessage);
+  if (!hasPersistedApproval && !hasFreshStrongApproval) {
+    // "Approved, then changed": the revised row itself never carries a stale
+    // fingerprint (a revise inserts a NEW row with approvalFingerprint NULL),
+    // so the signal lives on the nearest approved ancestor — see
+    // findStaleApprovalFingerprint() (strategyStore.js). The same-row case
+    // (status 'approved' with a stale fingerprint, e.g. approval recorded
+    // then the row's strategy JSON changed in place) is kept as an OR.
+    const ancestorFingerprint = findStaleApprovalFingerprint(userId, stored);
+    const wasApprovedButChanged =
+      (typeof stored.approvalFingerprint === "string" &&
+        stored.approvalFingerprint.length > 0 &&
+        stored.approvalFingerprint !== currentFingerprint) ||
+      (typeof ancestorFingerprint === "string" &&
+        ancestorFingerprint.length > 0 &&
+        ancestorFingerprint !== currentFingerprint);
+    const err = new Error(
+      wasApprovedButChanged
+        ? "This strategy was approved before, but it has changed since — please review the updated recommendation and approve it again before I create anything."
+        : "This strategy has not been approved yet. Present (or re-present) the recommendation and wait for the user to explicitly approve THIS strategy — e.g. \"approve\" or \"proceed\" — before calling execute_strategy again. A bare \"yes\" on its own is not enough here: it may have been confirming something else (a destination URL, a creative choice), so ask for an explicit approval word."
+    );
+    err.code = "META_V2_APPROVAL_REQUIRED";
+    throw err;
+  }
+  if (hasFreshStrongApproval && !hasPersistedApproval) {
+    recordStrategyApproval(stored.id, currentFingerprint, "chat-strong");
+  }
 
   try {
     setStrategyStatus(stored.id, "executing");
@@ -810,10 +1005,14 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     const [adAccounts, pages] = await Promise.all([meta.listAdAccounts(accessToken), meta.listPages(accessToken)]);
     const adAccount = adAccounts.find((a) => a.id === stored.resolvedAssets.adAccountId);
     if (!adAccount) {
-      throw new Error(`The ad account this strategy was built for (${stored.resolvedAssets.adAccountId}) is no longer connected — build a new strategy.`);
+      const err = new Error(`The ad account this strategy was built for (${stored.resolvedAssets.adAccountId}) is no longer connected — build a new strategy.`);
+      err.code = "META_V2_ASSET_NO_LONGER_CONNECTED";
+      throw err;
     }
     if (!pages.some((p) => p.id === stored.resolvedAssets.pageId)) {
-      throw new Error(`The Facebook Page this strategy was built for (${stored.resolvedAssets.pageId}) is no longer connected — build a new strategy.`);
+      const err = new Error(`The Facebook Page this strategy was built for (${stored.resolvedAssets.pageId}) is no longer connected — build a new strategy.`);
+      err.code = "META_V2_ASSET_NO_LONGER_CONNECTED";
+      throw err;
     }
 
     // Hard guard (round 30): the currency this strategy was built/revised
@@ -831,7 +1030,9 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     // already-approved strategy with no way to fix itself.
     const builtForCurrency = stored.resolvedAssets.adAccountCurrency;
     if (builtForCurrency && builtForCurrency !== adAccount.currency) {
-      throw new Error(`This strategy was built for a ${builtForCurrency} ad account, but the ad account's real currency is now ${adAccount.currency} — refusing to execute rather than risk spending the wrong amount. Build a new strategy to pick up the current currency.`);
+      const err = new Error(`This strategy was built for a ${builtForCurrency} ad account, but the ad account's real currency is now ${adAccount.currency} — refusing to execute rather than risk spending the wrong amount. Build a new strategy to pick up the current currency.`);
+      err.code = "META_V2_CURRENCY_MISMATCH";
+      throw err;
     }
 
     // Diagnostic logging (round 31) — which branch actually ran, so a live
@@ -850,21 +1051,39 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
       : `Campaign and ad set are created and PAUSED — no ad was attached yet.${executionResult.creativeSkippedReason ? ` ${executionResult.creativeSkippedReason}` : ""}`;
     return { ...executionResult, nextStep };
   } catch (err) {
-    // Live bug: Meta's real Ad Set creation rejected an approved strategy
-    // with "(#100/3858558) To avoid zero results, your budget must be at
-    // least PKR250.00" — a genuinely recoverable, budget-only problem
-    // Meta itself already quantified. markStrategyFailed below moves the
-    // strategy out of EXECUTABLE_STATUSES entirely, so
-    // getActiveStrategyForConversation would no longer find it — forcing
-    // the user back through a full build_strategy from scratch just to
-    // raise one number. For this specific, identifiable Meta rejection,
-    // keep the strategy 'proposed' instead so a plain "revise the budget
-    // to X" reaches it through the normal revise_strategy path.
-    if (err.code === 100 && err.subcode === 3858558) {
+    // Stream B: the old code kept only Meta 100/3858558 in 'proposed' and
+    // burned everything else to 'failed' — including transient Meta errors
+    // and validation rejections a single revise_strategy could fix. That
+    // forced a full rebuild for a one-field fix and hid the real cause.
+    // classifyExecutionFailure() (above) decides: retryable/revisable/
+    // unknown keep the strategy 'proposed' so it can be retried or revised;
+    // only genuinely terminal failures mark it 'failed'. The strategy's
+    // status was set to 'executing' at the top of the try, so every path
+    // here must explicitly reset it — never leave a row stuck in
+    // 'executing'. The persisted approval (Patch 1) is untouched here:
+    // a retry of the same fingerprint reuses it; a revise that changes
+    // the fingerprint invalidates it.
+    const classification = classifyExecutionFailure(err);
+    if (classification.outcome === "terminal") {
+      markStrategyFailed(stored.id, classification.reason);
+    } else {
       setStrategyStatus(stored.id, "proposed");
-      throw err;
+      if (classification.outcome === "unknown") {
+        logger.error("meta_expert_v2.execute_strategy.unclassified_failure_kept_proposed", {
+          strategyId: stored.id, code: err.code ?? null, subcode: err.subcode ?? null, message: err.message,
+        });
+      } else {
+        logger.warn("meta_expert_v2.execute_strategy.failure_kept_proposed", {
+          strategyId: stored.id, outcome: classification.outcome, code: err.code ?? null, subcode: err.subcode ?? null,
+        });
+      }
     }
-    markStrategyFailed(stored.id, err.message);
+    if (classification.reason !== err.message) {
+      const wrapped = new Error(classification.reason);
+      wrapped.code = err.code;
+      wrapped.subcode = err.subcode;
+      throw wrapped;
+    }
     throw err;
   }
 }

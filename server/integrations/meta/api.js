@@ -397,7 +397,17 @@ export async function createAd(accessToken, adAccountId, fields) {
 // can honestly report (Meta doesn't cheaply expose a total count for
 // posts/media the way campaigns' list does).
 const DEFAULT_RECENT_POSTS_LIMIT = 25;
-export async function listPagePosts(accessToken, pageId, limit = DEFAULT_RECENT_POSTS_LIMIT) {
+// Stream A (live bug: a product post older than the 5 newest was invisible,
+// then got fabricated from a wrong post) — BOUND for opt-in product search:
+// at most 4 pages x 25 posts = 100 posts scanned per platform. 100 covers
+// many months of posting for a small business; worst case is 4 extra Graph
+// calls, only when a product was actually named and not found on page 1.
+// A Page posting more than 100 times since the product post is honestly
+// reported as "not found in the last 100 posts", never silently truncated
+// to the 5 newest.
+export const MAX_PRODUCT_SEARCH_PAGES = 4;
+export const PRODUCT_SEARCH_PAGE_SIZE = DEFAULT_RECENT_POSTS_LIMIT;
+export async function listPagePosts(accessToken, pageId, limit = DEFAULT_RECENT_POSTS_LIMIT, options = {}) {
   // getPageAccessToken now THROWS (META_PAGE_TOKEN_UNAVAILABLE) instead
   // of ever returning null — this call either gets a genuine Page token
   // or never reaches the fetch below at all. Previously this fell back
@@ -423,9 +433,28 @@ export async function listPagePosts(accessToken, pageId, limit = DEFAULT_RECENT_
   // matches /token/i regardless of its value, which would have silently
   // hidden this exact diagnostic.
   logger.info("meta_api.list_page_posts.request", { pageId, credentialSource: "page", limit });
-  const data = await metaFetch(`/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}&limit=${limit}`, { accessToken: pageToken });
-  logger.info("meta_api.list_page_posts.response", { pageId, postCount: (data.data || []).length, hasMore: Boolean(data.paging?.next), raw: data });
-  return { items: data.data || [], hasMore: Boolean(data.paging?.next) };
+  // Stream A — options.maxPages (default 1) is the ONLY change to the
+  // default path: maxPages === 1 behaves byte-for-byte as before (one
+  // page, { items, hasMore }). Callers doing a product search pass
+  // maxPages: MAX_PRODUCT_SEARCH_PAGES and follow Meta's own paging.next
+  // cursor (metaFetch already accepts absolute URLs, and paging.next
+  // already carries its own access_token, so it is never overwritten).
+  // pagesFetched/totalScanned are returned so the caller can honestly
+  // report "checked the last N posts" instead of implying "that's all".
+  const maxPages = Number.isInteger(options.maxPages) && options.maxPages > 0 ? options.maxPages : 1;
+  const items = [];
+  let next = `/${pageId}/posts?fields=id,message,created_time,permalink_url,attachments{media_type,url,media}&limit=${limit}`;
+  let pagesFetched = 0;
+  let hasMore = false;
+  while (next && pagesFetched < maxPages) {
+    const data = await metaFetch(next, { accessToken: pageToken });
+    items.push(...(data.data || []));
+    pagesFetched += 1;
+    next = data.paging?.next || null;
+    hasMore = Boolean(next);
+  }
+  logger.info("meta_api.list_page_posts.response", { pageId, postCount: items.length, pagesFetched, hasMore, raw: undefined });
+  return { items, hasMore, pagesFetched, totalScanned: items.length };
 }
 
 // A Page's Instagram Business Account isn't the Page itself — it's a
@@ -470,9 +499,23 @@ export async function getInstagramAccountId(accessToken, pageId) {
 // fix here, not "fetch everything." See listPagePosts' own comment for
 // the full reasoning; {items, hasMore} is the same shape for the same
 // "let the caller tell a cap applied" purpose.
-export async function listInstagramPosts(accessToken, igAccountId, limit = DEFAULT_RECENT_POSTS_LIMIT) {
-  const data = await metaFetch(`/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count&limit=${limit}`, { accessToken });
-  return { items: data.data || [], hasMore: Boolean(data.paging?.next) };
+export async function listInstagramPosts(accessToken, igAccountId, limit = DEFAULT_RECENT_POSTS_LIMIT, options = {}) {
+  // Stream A — same opt-in maxPages paging as listPagePosts above:
+  // default 1 page (unchanged behaviour), product-search callers pass
+  // maxPages: MAX_PRODUCT_SEARCH_PAGES to follow paging.next.
+  const maxPages = Number.isInteger(options.maxPages) && options.maxPages > 0 ? options.maxPages : 1;
+  const items = [];
+  let next = `/${igAccountId}/media?fields=id,caption,media_type,media_url,permalink,timestamp,like_count,comments_count&limit=${limit}`;
+  let pagesFetched = 0;
+  let hasMore = false;
+  while (next && pagesFetched < maxPages) {
+    const data = await metaFetch(next, { accessToken });
+    items.push(...(data.data || []));
+    pagesFetched += 1;
+    next = data.paging?.next || null;
+    hasMore = Boolean(next);
+  }
+  return { items, hasMore, pagesFetched, totalScanned: items.length };
 }
 
 // Meta Pixels (conversion tracking) live under the ad account, not the
@@ -564,6 +607,24 @@ export async function getAd(accessToken, adId) {
 // what was sent, rather than trusting the create call's response alone.
 export async function getAdCreative(accessToken, creativeId) {
   return metaFetch(`/${creativeId}?fields=id,name,object_story_id,object_story_spec`, { accessToken });
+}
+
+// Stream A — live caption re-read for ONE post, used ONLY by executor.js's
+// attachCampaignCreative re-validation (never by the LLM path): confirms
+// the post Meta still holds under this id still says what the strategy
+// claims it says, immediately before an ad is created from it. Same page
+// token requirement as listPagePosts (getPageAccessToken THROWS if it
+// cannot be obtained — never silently falls back to the user token).
+export async function getPagePost(accessToken, pageId, postId) {
+  const pageToken = await getPageAccessToken(accessToken, pageId);
+  return metaFetch(`/${postId}?fields=id,message,created_time,permalink_url`, { accessToken: pageToken });
+}
+
+// Stream A — Instagram equivalent of getPagePost above: one media object,
+// live caption included. No page token involved (IG media is read with the
+// user token, same as listInstagramPosts).
+export async function getInstagramMedia(accessToken, mediaId) {
+  return metaFetch(`/${mediaId}?fields=id,caption,timestamp,permalink,media_type`, { accessToken });
 }
 
 // Ad-account-scoped, same shape as the existing listCampaigns — ad sets

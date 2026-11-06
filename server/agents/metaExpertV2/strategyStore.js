@@ -5,6 +5,7 @@
 import db from "../../db.js";
 import { cryptoRandom } from "../../middleware.js";
 import { trace } from "./diagnostics.js";
+import { fingerprintStrategy } from "./policy.js";
 
 export const EXECUTABLE_STATUSES = new Set(["proposed", "approved"]);
 
@@ -25,13 +26,17 @@ function row(r) {
 // concept or a revision, never two simultaneously-live proposals a stale
 // id could later be confused between (same reasoning as V1's
 // meta_campaign_plans supersede behavior).
-export function insertStrategy({ userId, conversationId, mode, strategy, resolved, names, snapshotVersion, snapshot, recommendationText, revisionOf = null }) {
+export function insertStrategy({ id: providedId = null, userId, conversationId, mode, strategy, resolved, names, snapshotVersion, snapshot, recommendationText, revisionOf = null }) {
   const now = new Date().toISOString();
   if (conversationId) {
     db.prepare("UPDATE meta_v2_strategies SET status = 'superseded', updatedAt = ? WHERE userId = ? AND conversationId = ? AND status IN ('proposed','approved')")
       .run(now, userId, conversationId);
   }
-  const id = cryptoRandom();
+  // Stream C: the caller may supply the row id (runBuildOrRevise generates
+  // it before building resolvedAssets.pendingQuestions, so a question's
+  // askedStrategyId names the row that actually asked it). Otherwise a
+  // fresh id is generated here, exactly as before.
+  const id = providedId || cryptoRandom();
   const resolvedAssets = { ...resolved, ...names };
   db.prepare(
     `INSERT INTO meta_v2_strategies
@@ -49,6 +54,38 @@ export function insertStrategy({ userId, conversationId, mode, strategy, resolve
 
 export function getStoredStrategy(userId, strategyId) {
   return row(db.prepare("SELECT * FROM meta_v2_strategies WHERE id = ? AND userId = ?").get(strategyId, userId));
+}
+
+// Stream C (§3.1): a failed build/revise attempt is stored, never silently
+// lost — the next turn can tell "asked, rejected, never applied" from "never
+// asked". A failed attempt never supersedes and never becomes the "most
+// recent" strategy: getMostRecentStrategyForConversation reads only
+// meta_v2_strategies, so failed attempts are invisible to it by
+// construction (this is why a separate table is required — a
+// status='rejected' row in meta_v2_strategies could be mistaken for live
+// context by buildStrategy's redirect).
+export function insertFailedAttempt({ userId, conversationId, revisionOf = null, requestedChanges, discardedFields = [], errors, userMessage }) {
+  const id = cryptoRandom();
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO meta_v2_strategy_attempts
+      (id, userId, conversationId, revisionOf, attemptedAt, requestedChangesJson, discardedFieldsJson, errorsJson, userMessage)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, userId, conversationId || null, revisionOf || null, now,
+    JSON.stringify(requestedChanges || {}), JSON.stringify(discardedFields || []),
+    JSON.stringify(errors || []), typeof userMessage === "string" ? userMessage.slice(0, 2000) : null);
+  return id;
+}
+
+export function listFailedAttemptsForConversation(userId, conversationId, limit = 10) {
+  return db.prepare(
+    "SELECT * FROM meta_v2_strategy_attempts WHERE userId = ? AND conversationId = ? ORDER BY attemptedAt DESC, rowid DESC LIMIT ?"
+  ).all(userId, conversationId, limit).map((r) => ({
+    ...r,
+    requestedChanges: JSON.parse(r.requestedChangesJson || "{}"),
+    discardedFields: JSON.parse(r.discardedFieldsJson || "[]"),
+    errors: JSON.parse(r.errorsJson || "[]"),
+  }));
 }
 
 export function getActiveStrategyForConversation(userId, conversationId) {
@@ -166,9 +203,63 @@ export function setStrategyStatus(strategyId, status) {
   db.prepare("UPDATE meta_v2_strategies SET status = ?, updatedAt = ? WHERE id = ?").run(status, new Date().toISOString(), strategyId);
 }
 
+// DEPRECATED for the execute path — use recordStrategyApproval(); kept for campaignEditor.js (edit flow) only.
 export function markStrategyApproved(strategyId) {
   const now = new Date().toISOString();
   db.prepare("UPDATE meta_v2_strategies SET status = 'approved', approvedAt = ?, updatedAt = ? WHERE id = ?").run(now, now, strategyId);
+}
+
+// Stream B — record an approval BOUND to the exact strategy content approved.
+// Replaces the old bare markStrategyApproved() for the execute path: status
+// alone must never again mean "approved" without saying what was approved.
+// Callers: executeStrategy() itself (fresh strong approval in this message),
+// resumeAfterConfirmation() via recordExecutionApprovalForStrategy() below
+// (card click / typed-approve resume). A later revise that changes the
+// fingerprint leaves approvalFingerprint stale by design — hasValidApproval()
+// below then returns false and a fresh approval is required (invariant I2).
+export function recordStrategyApproval(strategyId, fingerprint, via) {
+  const now = new Date().toISOString();
+  db.prepare("UPDATE meta_v2_strategies SET status = 'approved', approvalFingerprint = ?, approvedVia = ?, approvedAt = ?, updatedAt = ? WHERE id = ?")
+    .run(fingerprint, via || null, now, now, strategyId);
+}
+
+// Stream B — walk the revisionOf chain for a STALE approval: the nearest
+// ancestor row that was ever approved, and the fingerprint it was approved
+// with. A revise inserts a NEW row (status 'proposed', approvalFingerprint
+// NULL — insertStrategy never copies the approval columns), so the revised
+// row itself never carries a stale fingerprint; the "approved, then changed"
+// signal only exists on the ancestor. Used by executeStrategy() to tell
+// the user their earlier approval no longer covers the revised strategy
+// (instead of the generic "not approved yet"). Same 20-hop bound as
+// getExecutedAncestorStrategy (whose const is declared just above these
+// helpers in strategyStore.js), for the same pathological-chain reason.
+export function findStaleApprovalFingerprint(userId, stored) {
+  let current = stored;
+  let hops = 0;
+  while (current?.revisionOf && hops < MAX_REVISION_CHAIN_WALK) {
+    const parent = getStoredStrategy(userId, current.revisionOf);
+    if (!parent) return null;
+    if (typeof parent.approvalFingerprint === "string" && parent.approvalFingerprint.length > 0) return parent.approvalFingerprint;
+    current = parent;
+    hops++;
+  }
+  return null;
+}
+
+// Stream B — the ONLY approval predicate executeStrategy() may trust.
+// True only when the row is 'approved' AND the fingerprint recorded at
+// approval time still matches the CURRENT strategy content. A revise that
+// changes any fingerprinted field (Patch 0) invalidates it, even though
+// status may still read 'approved' until the next insert supersedes the row.
+export function hasValidApproval(stored) {
+  if (!stored || stored.status !== "approved") return false;
+  if (!stored.approvalFingerprint) return false;
+  return stored.approvalFingerprint === fingerprintStrategy(stored.strategy);
+}
+
+export function clearStrategyApproval(strategyId) {
+  db.prepare("UPDATE meta_v2_strategies SET approvalFingerprint = NULL, approvedVia = NULL, updatedAt = ? WHERE id = ?")
+    .run(new Date().toISOString(), strategyId);
 }
 
 export function markStrategyExecuted(strategyId, executionResult) {
