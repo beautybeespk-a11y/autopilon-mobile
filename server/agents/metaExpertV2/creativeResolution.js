@@ -30,6 +30,8 @@
 // source, but this resolver returns unsupportedSource:true for them so the
 // executor can create the Campaign + Ad Set while honestly skipping the ad
 // attach, rather than silently pretending it's not needed.
+import { productNameMatchesText, findBestProductMatch } from "./productMatching.js";
+
 const OUT_OF_SCOPE_SOURCES = new Set(["GENERATED_IMAGE", "GENERATED_VIDEO", "USER_ATTACHED_MEDIA"]);
 
 function eligibleFacebookCandidates(snapshot) {
@@ -288,24 +290,27 @@ export function userMessageContainsText(userMessage, text) {
 }
 
 // Stream A — the anti-fabrication core. A normalized item "is about" a
-// requested product iff EITHER (a) its full caption literally contains
-// the product name (case/whitespace-insensitive substring — the same
-// discipline as matchLinkedProduct in businessSnapshot.js and
-// userMessageContainsText above, never fuzzy/semantic), OR (b) its
-// linkedProduct (a real store product whose name literally appears in
-// that caption) is that product. Both signals are backend-computed from
-// real data; neither trusts the model's description. `productName` is
-// expected already normalized (lowercase, single spaces); a raw name is
-// normalized here too so callers cannot get it wrong.
+// requested product iff EITHER (a) its full caption matches the product
+// name under the TOKEN rule (productMatching.js — the same rule as
+// matchLinkedProduct in businessSnapshot.js, never fuzzy/semantic),
+// OR (b) its linkedProduct (a real store product matched to that
+// caption by the same token rule) is that product — checked in either
+// direction, mirroring the old substring-either-way rule, tokenised.
+// Both signals are backend-computed from real data; neither trusts the
+// model's description. `productName` is a real catalogue name; a raw
+// name is normalized inside the token rule, so callers cannot get it
+// wrong. The old exact-full-name substring rule is gone: a caption
+// saying "Maybelline Serum Matte Lipstick" IS about the catalogue
+// product "Maybelline Moisturizing Serum Lipstick Matte" (live bug,
+// Nov 6 2026), while a Patrick Ta or Huda Beauty caption still is not.
 export function postMatchesProduct(candidate, productName) {
   if (!candidate || typeof productName !== "string" || !productName.trim()) return false;
-  const normalize = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
-  const wanted = normalize(productName);
-  if (!wanted) return false;
-  const linkedName = candidate.linkedProduct?.name ? normalize(candidate.linkedProduct.name) : null;
-  if (linkedName && (linkedName === wanted || linkedName.includes(wanted) || wanted.includes(linkedName))) return true;
+  const linkedName = candidate.linkedProduct?.name || null;
+  if (linkedName) {
+    if (productNameMatchesText(productName, linkedName) || productNameMatchesText(linkedName, productName)) return true;
+  }
   const caption = candidate.caption || candidate.captionExcerpt || "";
-  return normalize(caption).includes(wanted);
+  return productNameMatchesText(productName, caption);
 }
 
 // Stream A — parses WHICH product the creative must be about, from the
@@ -315,27 +320,21 @@ export function postMatchesProduct(candidate, productName) {
 //   3. strategy.creative_strategy.description (what the strategy claims
 //      the creative is about — used ONLY to catch the model naming a
 //      product and then picking a post that isn't about it).
-// In every case the name must literally match a REAL store product
-// (snapshot.business.sampleProducts) — a free-text phrase that matches
-// no real product yields null, never a guessed product. Returns the
-// real product name, or null when no product is named anywhere. Null
-// means "no product constraint" — every downstream check skips
-// gracefully, it is never an error on its own.
+// In every case the text must match a REAL store product
+// (snapshot.business.sampleProducts) under the token rule
+// (productMatching.js) — a free-text phrase that matches no real
+// product yields null, never a guessed product. Returns the real
+// product name, or null when no product is named anywhere. Null means
+// "no product constraint" — every downstream check skips gracefully, it
+// is never an error on its own.
 export function parseRequestedProduct({ strategy, userMessage, snapshot }) {
   const products = snapshot?.business?.sampleProducts || [];
   if (!products.length) return null;
-  const normalize = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
-  const names = products
-    .map((p) => p.name)
-    .filter((n) => typeof n === "string" && n.trim())
-    .sort((a, b) => b.length - a.length);
   const texts = [userMessage, strategy?.business_goal, strategy?.creative_strategy?.description]
-    .filter((t) => typeof t === "string" && t.trim())
-    .map(normalize);
+    .filter((t) => typeof t === "string" && t.trim());
   for (const text of texts) {
-    for (const name of names) {
-      if (text.includes(normalize(name))) return name;
-    }
+    const match = findBestProductMatch(text, products);
+    if (match) return match.name;
   }
   return null;
 }
@@ -579,8 +578,8 @@ function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, 
   // callers — strategyBuilder.js's contentId assignment, executor.js —
   // read it). caption is the FULL caption (businessSnapshot.js stores
   // it); captionExcerpt is what the user is shown. linkedProduct is
-  // null when no real store product literally appears in the caption —
-  // null is honest, never a guessed product. A row stored BEFORE this
+  // null when no real store product matches the caption under the token
+  // rule — null is honest, never a guessed product. A row stored BEFORE this
   // change has none of these fields; every consumer must treat them as
   // optional (see executor.js's back-compat rule).
   // Stream C — provenance (see the function header): how this creative was

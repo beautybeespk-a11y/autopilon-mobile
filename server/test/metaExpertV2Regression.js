@@ -21,7 +21,7 @@ process.env.META_EXPERT_V2 = "true";
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
-const { gatherBusinessSnapshot } = await import("../agents/metaExpertV2/businessSnapshot.js");
+const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy, pixelSummaryValue } = await import("../agents/metaExpertV2/strategyBuilder.js");
@@ -30,6 +30,7 @@ const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaE
 const { messageIndicatesExecutionApproval, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { productNameMatchesText, findBestProductMatch } = await import("../agents/metaExpertV2/productMatching.js");
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
@@ -6789,16 +6790,23 @@ async function run() {
   // Maybelline post was 7th. The snapshot only ever looked at 5, found no
   // Maybelline post, and the agent relabelled a Patrick Ta post as
   // Maybelline instead of saying it couldn't find one.
+  // PR #2 (Nov 6 2026): the mock catalogue name is now the REAL store
+  // name — "Maybelline Moisturizing Serum Lipstick Matte" — while the
+  // user's words and the 7th post's caption use the shorter real-world
+  // phrase "Maybelline Serum Matte Lipstick". The old test mocked the
+  // catalogue name as the short phrase too, so all three strings agreed
+  // word-for-word and the exact-name rule passed by construction; this
+  // test now proves the token rule bridges the real wording gap.
   await check("[Stream A] Maybelline post older than the 5 newest: snapshot searches deeper, and with no match at all the strategy asks a not-found question — never relabels a wrong post", async () => {
     const userId = makeUser(`stream-a-maybelline-deep-${stamp}@example.com`);
     connectMeta(userId);
     connectWooCommerce(userId);
     const conversationId = `conv-${cryptoRandom()}`;
     const maybellineProduct = {
-      id: 2, name: "Maybelline Serum Matte Lipstick", price: "1250", categories: [{ name: "Makeup" }],
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
       images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
       permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
-      short_description: "Maybelline Serum Matte Lipstick.",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
     };
     const posts = [
       { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
@@ -6842,7 +6850,7 @@ async function run() {
       assert.equal(built.ok, true, JSON.stringify(built.unresolved));
       assert.equal(built.strategy.unresolved_questions.length, 1, `exactly ONE creative question must be asked — never a silent pick, never a second question: ${JSON.stringify(built.strategy.unresolved_questions)}`);
       const question = built.strategy.unresolved_questions[0];
-      assert.match(question, /Maybelline Serum Matte Lipstick/, "the question must name the product it couldn't find");
+      assert.match(question, /Maybelline Moisturizing Serum Lipstick Matte/, "the question must name the product it couldn't find");
       assert.match(question, /couldn't find/i, "the question must say plainly that no matching post was found");
       assert.match(question, /checked 6 recent post/, "the question must name how many posts were checked");
       assert.ok(!question.includes("717559728109412_122198698658941601"), "the question must never name the Patrick Ta post id as if it were the answer");
@@ -6856,16 +6864,160 @@ async function run() {
     }
   });
 
+  // --- PR #2 (Nov 6 2026) — token/keyword product matching --------------
+  // Live bug: the store's real product is "Maybelline Moisturizing Serum
+  // Lipstick Matte", but the user typed "Maybelline Serum Matte
+  // Lipstick" and the post's caption says the same short phrase — so the
+  // old exact-full-name rule returned null at every layer, the deep
+  // search never ran, and the agent fell back to the 5 newest posts.
+  await check("[PR #2] token matching: user words, catalogue name and caption may all word the product differently — and a wrong product must never match", async () => {
+    const real = "Maybelline Moisturizing Serum Lipstick Matte";
+    const patrick = "Patrick Ta Double-Take Crème & Powder Blush Duo";
+    const huda = "Huda Beauty Liquid Matte Mousse";
+    const catalogue = [
+      { id: 2, name: real, price: "1250" },
+      { id: 3, name: patrick, price: "2500" },
+      { id: 4, name: huda, price: "1700" },
+      { id: 1, name: "Vitamin C Serum", price: "1800" },
+    ];
+    // The real case, all three wordings: catalogue / user words / caption.
+    assert.equal(productNameMatchesText(real, "Maybelline Serum Matte Lipstick — PKR 1,250, shop now!"), true, "the short caption must match the full catalogue name");
+    assert.equal(productNameMatchesText(real, "Maybelline serum lipstick, matte finish, PKR 1250"), true, "a differently-worded caption must still match");
+    assert.equal(productNameMatchesText(real, "create a website purchases campaign for Maybelline Serum Matte Lipstick"), true, "the user's short phrase must match the full catalogue name");
+    assert.equal(productNameMatchesText(real, "Maybelline Moisturizing Serum Lipstick Matte"), true, "the full name itself must still match");
+    // A different product from the same brand shares tokens but is NOT
+    // this product — "SuperStay" shares only 3 of the 5 tokens.
+    assert.equal(productNameMatchesText(real, "Maybelline SuperStay Matte Lipstick — long-lasting colour"), false, "a different Maybelline lipstick must never match");
+    // Wrong products, even at the same price, must never match.
+    assert.equal(productNameMatchesText(real, "Patrick Ta Double-Take Crème & Powder Blush Duo: Price 1250"), false, "a Patrick Ta post priced 1250 must never match a Maybelline request");
+    assert.equal(productNameMatchesText(real, "Huda Beauty Liquid Matte Mousse: Velvet Color"), false, "a Huda Beauty post must never match a Maybelline request");
+    // A bare price, a single word, or a brand alone must never match.
+    assert.equal(productNameMatchesText(real, "Maybelline"), false, "the brand alone must never match a multi-token product");
+    assert.equal(productNameMatchesText(real, "lipstick"), false, "one generic word alone must never match");
+    assert.equal(productNameMatchesText(real, "1250"), false, "a bare price must never match");
+    assert.equal(productNameMatchesText(real, "Maybelline lipstick matte"), false, "three of five tokens is not enough — all but one are required");
+    // Short catalogue names still need all their tokens.
+    assert.equal(productNameMatchesText("Vitamin C Serum", "Vitamin C Serum for daily use"), true, "a 3-token name must match in full");
+    assert.equal(productNameMatchesText("Vitamin C Serum", "serum"), false, "one token of a 3-token name must never match");
+    // Best-match derivation: short user words find the real product,
+    // a brand alone finds nothing, and a near-full phrase finds its own.
+    assert.equal(findBestProductMatch("create a website purchases campaign for Maybelline Serum Matte Lipstick", catalogue)?.name, real, "short user words must derive the real product");
+    assert.equal(findBestProductMatch("use the Maybelline post", catalogue), null, "a brand alone must derive no product");
+    assert.equal(findBestProductMatch("Patrick Ta Double-Take Crème Powder Blush Duo", catalogue)?.name, patrick, "a near-full Patrick Ta phrase must derive the Patrick Ta product");
+    assert.equal(findBestProductMatch("use the Patrick Ta blush duo post", catalogue), null, "too few tokens must derive no product, never the closest one");
+    // Caption -> linked product, same rule.
+    assert.equal(matchLinkedProduct("Maybelline Serum Matte Lipstick — PKR 1,250, shop now!", catalogue)?.name, real, "the short caption must link to the real product");
+    assert.equal(matchLinkedProduct("Patrick Ta Double-Take Crème & Powder Blush Duo: Luxury Flush", catalogue)?.name, patrick, "the full Patrick Ta caption must link to the Patrick Ta product");
+    assert.equal(matchLinkedProduct("Weekend sale — everything must go", catalogue), null, "an unrelated caption must link to nothing");
+    assert.equal(deriveRequestedProductFromMessage("create a website purchases campaign for Maybelline Serum Matte Lipstick", catalogue), real, "derive must return the real catalogue name for the user's short phrase");
+    assert.equal(deriveRequestedProductFromMessage("use the Maybelline post", catalogue), null, "derive must return null for a brand alone");
+  });
+
+  await check("[PR #2] (a2) short user words + real catalogue name: build resolves the 7th post end to end, never a Patrick Ta post", async () => {
+    const userId = makeUser(`pr2-maybelline-build-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-moisturizing-serum-lipstick-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-moisturizing-serum-lipstick-matte/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+      { id: "717559728109412_6", message: "Weekend sale", created_time: "2026-10-20T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/6" },
+      { id: "717559728109412_7", message: "Maybelline Serum Matte Lipstick — PKR 1,250, shop now!", created_time: "2026-10-15T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct] }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({
+          business_goal: "create a website purchases campaign for Maybelline Serum Matte Lipstick",
+          creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the Facebook post about Maybelline Serum Matte Lipstick as the ad." },
+          destination_url: "https://example.com",
+        }),
+        userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.equal(built.resolved.creative?.contentId, "717559728109412_7", "the resolved creative must be the 7th post — the real Maybelline post, found by the deep search");
+      assert.equal(built.resolved.creative?.linkedProduct?.name, "Maybelline Moisturizing Serum Lipstick Matte", "the resolved creative must link to the real catalogue product");
+      assert.ok(!built.strategy.unresolved_questions.some((q) => /couldn't find/i.test(q)), "no not-found question may be asked when the post was found");
+      assert.ok(!built.strategy.unresolved_questions.some((q) => q.includes("717559728109412_122198698658941601")), "no question may name the Patrick Ta post as the creative");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[PR #2] (a3) caption wording differs again: 'Maybelline serum lipstick, matte finish, PKR 1250' still matches, and the not-found branch is reached (searched:true) when nothing matches", async () => {
+    const userId = makeUser(`pr2-maybelline-variant-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const maybellineProduct = {
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+      images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-moisturizing-serum-lipstick-matte.jpg" }],
+      permalink: "https://beautybees.pk/product/maybelline-moisturizing-serum-lipstick-matte/",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+    };
+    const posts = [
+      { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
+      { id: "717559728109412_2", message: "Huda Beauty new drop", created_time: "2026-10-27T09:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/2" },
+      { id: "717559728109412_122198698658941601", message: "Patrick Ta blush — Major Headlines", created_time: "2026-10-27T08:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/3" },
+      { id: "717559728109412_4", message: "Patrick Ta bronzer tutorial", created_time: "2026-10-26T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/4" },
+      { id: "717559728109412_5", message: "Patrick Ta glow look", created_time: "2026-10-25T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/5" },
+      { id: "717559728109412_6", message: "Weekend sale", created_time: "2026-10-20T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/6" },
+      { id: "717559728109412_7", message: "Maybelline serum lipstick, matte finish, PKR 1250", created_time: "2026-10-15T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts, postsPageSize: 5 };
+
+    // Variant caption still matches at snapshot level.
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct] }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId, { userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick" });
+      const fb = snapshot.recentContent.facebookPosts;
+      assert.equal(fb.productSearch.searched, true, "the deep search must run for the short user phrase");
+      assert.equal(fb.productSearch.requestedProduct, "Maybelline Moisturizing Serum Lipstick Matte", "the search must run for the REAL catalogue name");
+      assert.equal(fb.productSearch.matched, true, "the variant caption must match");
+      const seventh = fb.items.find((i) => i.id === "717559728109412_7");
+      assert.ok(seventh, "the 7th post must be present in the snapshot items");
+      assert.equal(seventh.linkedProduct?.name, "Maybelline Moisturizing Serum Lipstick Matte", "the variant caption must link to the real product");
+    } finally {
+      restoreFetch();
+    }
+
+    // No match at all: the not-found branch is reached with honest metadata.
+    const postsWithoutMaybelline = posts.slice(0, 6);
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...metaOpts, posts: postsWithoutMaybelline }, wcProducts: [...DEFAULT_WC_PRODUCTS, maybellineProduct] }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId, { userMessage: "create a website purchases campaign for Maybelline Serum Matte Lipstick" });
+      const fb = snapshot.recentContent.facebookPosts;
+      assert.equal(fb.productSearch.searched, true, "the deep search must have run — searched:true proves the not-found branch was reached, not silently skipped");
+      assert.equal(fb.productSearch.matched, false, "no post may match when none is about the product");
+      assert.equal(fb.productSearch.postsScanned, 6, "the search must report how many posts it actually checked");
+      assert.equal(fb.productSearch.reachedBound, false, "6 posts is below the bound — the search ran out of history, it did not stop at the limit");
+      assert.equal(fb.productSearch.requestedProduct, "Maybelline Moisturizing Serum Lipstick Matte", "the searched product must be the real catalogue name");
+      assert.ok(!fb.items.some((i) => i.linkedProduct?.name === "Maybelline Moisturizing Serum Lipstick Matte"), "no shown post may link to the product when none is about it");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {
     const userId = makeUser(`stream-a-patrick-ta-${stamp}@example.com`);
     connectMeta(userId);
     connectWooCommerce(userId);
     const conversationId = `conv-${cryptoRandom()}`;
     const maybellineProduct = {
-      id: 2, name: "Maybelline Serum Matte Lipstick", price: "1250", categories: [{ name: "Makeup" }],
+      id: 2, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
       images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
       permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
-      short_description: "Maybelline Serum Matte Lipstick.",
+      short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
     };
     const posts = [
       { id: "717559728109412_1", message: "Huda Beauty lipstick shade guide", created_time: "2026-10-27T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/1" },
@@ -6927,7 +7079,7 @@ async function run() {
       null
     );
     assert.ok(policyErrors.length >= 1, "the policy must refuse a fabricated Patrick Ta creative under a Maybelline goal");
-    assert.match(policyErrors[0].message, /Maybelline Serum Matte Lipstick/, "the refusal must name the requested product");
+    assert.match(policyErrors[0].message, /Maybelline Moisturizing Serum Lipstick Matte/, "the refusal must name the requested product");
     assert.match(policyErrors[0].message, /not about/i, "the refusal must say the post is not about that product");
 
     // Case 4 — execution backstop: a stored Patrick Ta creative under a
@@ -6957,7 +7109,7 @@ async function run() {
         () => executeStrategy({ userId, conversationId: conversationId3, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId, userMessage: "approve" }),
         (err) => {
           assert.equal(err.code, "META_V2_CREATIVE_MISMATCH");
-          assert.match(err.message, /Maybelline Serum Matte Lipstick/);
+          assert.match(err.message, /Maybelline Moisturizing Serum Lipstick Matte/);
           return true;
         }
       );
