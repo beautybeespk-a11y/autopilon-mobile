@@ -25,7 +25,7 @@ import * as meta from "../../integrations/meta/api.js";
 import * as wc from "../../integrations/woocommerce/api.js";
 import * as shopify from "../../integrations/shopify/api.js";
 import { trace } from "./diagnostics.js";
-import { findBestProductMatch, scoreAllProductsAgainstText } from "./productMatching.js";
+import { findBestProductMatch, scoreAllProductsAgainstText, distinctiveTokens } from "./productMatching.js";
 
 // Stream A — was 12, which is the SAME bug class as the 5-post cap:
 // matchLinkedProduct() (below) and parseRequestedProduct()
@@ -38,8 +38,12 @@ import { findBestProductMatch, scoreAllProductsAgainstText } from "./productMatc
 // covered. Residual gap, documented not hidden: a store with >50
 // products can still have a product outside this list; for that case
 // the token match in postMatchesProduct() still works when
-// the name is known from the user's own words, and a targeted
-// store-search lookup is a follow-up, not smuggled in here.
+// the name is known from the user's own words — and PR #3 (Nov 6 2026)
+// adds a targeted store-search fallback in gatherBusinessSnapshot
+// (searchCatalogueForProduct, below): when nothing in this sample
+// matches the user's message, the store itself is asked by keyword
+// before concluding "no product named". WooCommerce only — Shopify's
+// REST list API has no keyword-search parameter to ask with.
 const MAX_PRODUCTS = 50;
 // Round 49 (live bug) — was 3, which is the SAME bug class as the
 // unweighted-mean rollup below wearing a different hat: a blended figure
@@ -493,6 +497,61 @@ export function deriveRequestedProductFromMessage(userMessage, sampleProducts) {
   return match ? match.name : null;
 }
 
+// PR #3 (Nov 6 2026) — targeted catalogue search. sampleProducts is
+// only the 50 most recent products, so a real product older than that
+// can never be recognised by deriveRequestedProductFromMessage —
+// investigation 2's secondary finding. When the sample matches nothing,
+// ask the store itself by keyword (WooCommerce /products?search=...)
+// before concluding "no product named". The search is only a
+// candidate fetch: the returned products are still verified against
+// the user's message under the SAME token rule (findBestProductMatch),
+// so a loosely-matching search hit can never become the requested
+// product on its own. Returns [] on any failure — a failed search
+// degrades to exactly the old sample-only behaviour, never an error.
+// Runs only when the message has >= 2 distinctive tokens (a bare
+// "yes" / "3" cannot name a product) and only when the sample matched
+// nothing, so the common case costs no extra call at all.
+//
+// Search terms are the message's distinctive tokens MINUS generic
+// campaign/chat words — WooCommerce's `search` ANDs its terms, so
+// "create a website purchases campaign for Maybelline Serum Matte
+// Lipstick" as-is would require "create" and "website" in the
+// product's own title and find nothing. Dropping those words only
+// broadens the search (fewer AND terms); the token rule above is the
+// precision, so a broader search can never invent a product. Pure
+// numbers are dropped too — they are prices ("1250"), not name words.
+const TARGETED_SEARCH_STOP_WORDS = new Set([
+  "create", "campaign", "website", "purchases", "purchase", "sales", "sale",
+  "ad", "ads", "facebook", "instagram", "post", "reel", "creative",
+  "use", "using", "link", "budget", "day", "daily", "please", "make",
+  "run", "launch", "new", "best", "top", "recent", "latest", "my", "me",
+  "i", "a", "want", "need", "get", "show", "how", "did", "do", "last",
+  "week", "what", "which", "when", "compare", "results", "performance",
+  "spend", "much", "many",
+]);
+export async function searchCatalogueForProduct(userId, userMessage) {
+  const wooConn = getConnection(userId, "woocommerce");
+  if (!wooConn) return [];
+  const m = JSON.parse(wooConn.meta || "{}");
+  if (!m.siteUrl || !m.consumerKey) return [];
+  const keywords = distinctiveTokens(userMessage).filter((t) => !TARGETED_SEARCH_STOP_WORDS.has(t) && !/^\d+$/.test(t));
+  if (keywords.length < 2) return [];
+  let accessToken;
+  try {
+    accessToken = requireValidToken(userId, "woocommerce");
+  } catch {
+    return [];
+  }
+  const result = await attempt(() => wc.listProducts(m.siteUrl, m.consumerKey, accessToken, { search: keywords.join(" "), per_page: 10, orderby: "date", order: "desc" }));
+  if (result.status !== "exists" || !Array.isArray(result.value)) return [];
+  return result.value.map((p) => ({
+    id: String(p.id), name: p.name, price: p.price, category: p.categories?.[0]?.name || null,
+    imageUrl: p.images?.[0]?.src || null,
+    permalink: p.permalink || null,
+    shortDescription: stripHtmlAndTruncate(p.short_description, PRODUCT_TEXT_EXCERPT_LENGTH),
+  }));
+}
+
 // A Reel is really just an Instagram VIDEO whose permalink path says so —
 // the Graph API doesn't expose a dedicated "is this a Reel" field on the
 // plain media fields this snapshot fetches, so this is read off the one
@@ -774,7 +833,27 @@ export async function gatherBusinessSnapshot(userId, { userMessage } = {}) {
   // recent content (the fetch needs it to search deeper). A null here
   // just means "no product named in this message" — gatherRecentContent
   // then behaves exactly as before.
-  const requestedProduct = deriveRequestedProductFromMessage(userMessage, business.sampleProducts);
+  // PR #3 — if the 50-product sample matched nothing, ask the store
+  // itself by keyword before concluding no product was named. A found
+  // product is APPENDED to the snapshot's sampleProducts (marked
+  // foundByTargetedSearch) so every downstream layer — parseRequested-
+  // Product, matchLinkedProduct, postMatchesProduct, the build-time
+  // safety net — recognises it exactly like a sampled product, with no
+  // second code path. The token rule still decides: a search hit that
+  // doesn't match the message under that rule is ignored.
+  let requestedProduct = deriveRequestedProductFromMessage(userMessage, business.sampleProducts);
+  let requestedProductViaTargetedSearch = false;
+  if (!requestedProduct && typeof userMessage === "string") {
+    const targeted = await searchCatalogueForProduct(userId, userMessage);
+    if (targeted.length) {
+      const match = findBestProductMatch(userMessage, targeted);
+      if (match) {
+        business.sampleProducts = [...business.sampleProducts, { ...match, foundByTargetedSearch: true }];
+        requestedProduct = match.name;
+        requestedProductViaTargetedSearch = true;
+      }
+    }
+  }
   const recentContent = await gatherRecentContent(accessToken, metaAssets.defaultPage.id, metaAssets.instagram.account, business.sampleProducts, requestedProduct);
 
   const snapshot = {
@@ -813,6 +892,7 @@ export async function gatherBusinessSnapshot(userId, { userMessage } = {}) {
     pixelCount: metaAssets.pixels.items.length, defaultPixelResolution: metaAssets.defaultPixel.resolution,
     campaignCount: metaHistory.campaignCount,
     requestedProduct: requestedProduct || null,
+    requestedProductViaTargetedSearch,
     requestedProductMatchedTokens: requestedProductScore?.matchedTokens || [],
     requestedProductMatchedCount: requestedProductScore?.matchedCount ?? 0,
     requestedProductWantedCount: requestedProductScore?.wantedCount ?? 0,

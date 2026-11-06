@@ -1301,10 +1301,38 @@ const MAX_CREATIVE_REVISION_NUDGES = 1;
 // no longer collapse the reopened list (resolveCreativeSelection ignores
 // content_selector for that message), but the instruction to make one is
 // still wrong and still worth not giving.
-function checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy, hasV2Tools, revisedThisTurn }) {
-  if (!hasV2Tools || !hasActiveV2Strategy || revisedThisTurn) return null;
+export function checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy, hasV2Tools, revisedThisTurn, builtThisTurn = false, activeStrategy = null }) {
+  if (!hasV2Tools || !hasActiveV2Strategy || revisedThisTurn || builtThisTurn) return null;
   if (typeof userMessage !== "string" || !CREATIVE_SELECTION_INTENT_PATTERNS.test(userMessage)) return null;
   if (messageRequestsCreativeOptionsList(userMessage)) return null;
+  // PR #3 (Nov 6 2026) — the gate as written fired on EVERY final
+  // decision when an active strategy existed, including a first-turn
+  // presentation of a strategy built THIS turn. On a first turn there
+  // is nothing legitimate to revise — the only revise available is a
+  // self-pick, which PR #1 banned — so the gate hard-stopped the very
+  // reply it was supposed to protect, with a canned message that
+  // carried zero information about whether the search had worked
+  // (live Test 1 failure, both PR #1 and PR #2 re-tests). The gate now
+  // fires ONLY when a revise is genuinely the required next step:
+  //   * builtThisTurn — a build_strategy succeeded this turn.
+  //     Presenting the strategy that was JUST built is not a creative
+  //     *change*.
+  //   * resolved creative (and the message is not a change request) —
+  //     presenting an already-chosen creative is not a change either.
+  //     A change/update request still requires a revise, so the
+  //     anti-fabrication protection is not lost for genuine changes.
+  //   * the only open creative question is a not-found question —
+  //     "I couldn't find a post about X" has nothing to revise; the
+  //     correct action is to present that question as the final reply.
+  // An open candidates question ("Which of these...") or confirmation
+  // question ("To confirm —...") on a strategy NOT built this turn
+  // still fires the gate when the model finalises without revising —
+  // that is the genuine case: the user answered, or the creative must
+  // change, and only revise_strategy can apply it.
+  if (activeStrategy?.resolvedAssets?.creative && matchedCreativeSelectionPatternLabel(userMessage) !== "change/update/optimize the creative") return null;
+  const openQuestions = activeStrategy?.strategy?.unresolved_questions || [];
+  const openCreativeQuestions = openQuestions.filter((q) => typeof q === "string" && (q.startsWith("Which ") || q.startsWith("To confirm —") || q.startsWith("I couldn't find a ")));
+  if (openCreativeQuestions.length > 0 && openCreativeQuestions.every((q) => q.startsWith("I couldn't find a "))) return null;
   // Stream B: the old text ordered the model to call revise_strategy with
   // creative fields "with what the business snapshot actually supports" —
   // a direct instruction to self-pick. The gate's real job is narrower:
@@ -2848,12 +2876,22 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
       // strategy's creative fields.
       {
         const revisedThisTurn = (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0;
+        // PR #3 — a build_strategy that succeeded THIS turn (status
+        // "completed", result valid:true — a valid:false rejection built
+        // nothing presentable) means the active strategy is a fresh
+        // presentation, not a creative change; the gate must not fire
+        // on it. Derived from v2ToolLastOutcome, the same map the
+        // rejected-outcome gate below already reads — no new state.
+        const buildOutcomeThisTurn = v2ToolLastOutcome.get("meta_expert_v2.build_strategy");
+        const builtThisTurn = buildOutcomeThisTurn?.status === "completed" && buildOutcomeThisTurn?.result?.valid === true;
         const activeV2Strategy = getActiveStrategyForConversation(userId, conversationId);
         const creativeRevisionMessage = checkCreativeRevisionRequiredGate({
           userMessage,
           hasActiveV2Strategy: Boolean(activeV2Strategy),
           hasV2Tools,
           revisedThisTurn,
+          builtThisTurn,
+          activeStrategy: activeV2Strategy,
         });
         // TEMPORARY diagnostic instrumentation (live bug: production still
         // shows get_business_snapshot -> final with no revise_strategy call
@@ -2870,6 +2908,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           activeV2StrategyConversationId: activeV2Strategy?.conversationId || null,
           hasV2Tools,
           reviseStrategyAlreadyCalledThisTurn: revisedThisTurn,
+          buildStrategySucceededThisTurn: builtThisTurn,
           gateRan: true,
           gateDecision: !creativeRevisionMessage
             ? "allow"
@@ -3195,12 +3234,30 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace[trace.length - 1].state = "done";
           trace.push(traceStep("error", `${call.toolName} already called once this turn — reusing that result.`, "done"));
           toolResults.push({ toolName: call.toolName, error: `Blocked duplicate call this turn — ${priorSummary}` });
+          // PR #3 (c) — this nudge used to say 'Respond now with type
+          // "final"' unconditionally, but the creative-revision gate
+          // refuses exactly that final when a revise is still the
+          // required next step — a blocked duplicate call pushed the
+          // model toward a final the next gate would hard-stop. When
+          // the creative gate WOULD fire on the next final (active
+          // strategy, creative intent, nothing built or revised this
+          // turn), redirect to build/revise first instead.
+          let creativeGateWouldFire = false;
+          if (call.toolName === "meta_expert_v2.get_business_snapshot") {
+            const buildOutcomeNow = v2ToolLastOutcome.get("meta_expert_v2.build_strategy");
+            const builtNow = buildOutcomeNow?.status === "completed" && buildOutcomeNow?.result?.valid === true;
+            const revisedNow = (v2ToolCallCounts.get("meta_expert_v2.revise_strategy") || 0) > 0;
+            const activeNow = getActiveStrategyForConversation(userId, conversationId);
+            creativeGateWouldFire = Boolean(checkCreativeRevisionRequiredGate({ userMessage, hasActiveV2Strategy: Boolean(activeNow), hasV2Tools, revisedThisTurn: revisedNow, builtThisTurn: builtNow, activeStrategy: activeNow }));
+          }
           conversationForModel = [
             ...conversationForModel,
             { role: "assistant", content: JSON.stringify(decision) },
             {
               role: "user",
-              content: `"${call.toolName}" can only be called once per turn, and it was already called once this turn — ${priorSummary} Do not call "${call.toolName}" again. Respond now with type "final" using that result — or, only for a genuinely valid build_strategy/revise_strategy result, present it and wait for the user's explicit approval before calling meta_expert_v2.execute_strategy.`,
+              content: creativeGateWouldFire
+                ? `"${call.toolName}" can only be called once per turn, and it was already called once this turn — ${priorSummary} Do not call "${call.toolName}" again. Do NOT respond with type "final" yet — a creative-selection answer cannot be finalised until the strategy has been built or revised this turn. Call build_strategy (for a fresh request) or revise_strategy (with the user's pick) first, then present it.`
+                : `"${call.toolName}" can only be called once per turn, and it was already called once this turn — ${priorSummary} Do not call "${call.toolName}" again. Respond now with type "final" using that result — or, only for a genuinely valid build_strategy/revise_strategy result, present it and wait for the user's explicit approval before calling meta_expert_v2.execute_strategy.`,
             },
           ];
           continue;
