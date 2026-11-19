@@ -612,7 +612,17 @@ const MAX_COMPARISON_DELTA_NUDGES = 1;
 // a provable lie. Comparison is exact on the parsed number (1,299 ==
 // 1299.00); prices are catalogue facts, not estimates, so there is no
 // tolerance to argue about.
-const PRICE_CURRENCY_PATTERN = /(?:Rs\.?|PKR|₨)\s*([\d,]+(?:\.\d{1,2})?)/gi;
+// Round 61 (Nov 20 2026 — the morning after PR #9 deployed): the live
+// reply that slipped through wrote the price number-first, "1700 PKR",
+// and the pattern below only matched currency-BEFORE-number, so the gate
+// saw zero stated prices and never fired. The pattern now matches the
+// currency on either side of the number; findRecommendationPriceMismatches
+// takes the number from whichever group matched. The skip rules are
+// unchanged and were re-verified for number-first forms ("550 PKR/day"
+// still skips — the after-text /day check applies after the match, which
+// now ends after "PKR" — and "was 1,700 PKR" still skips, the was-before
+// check looking at the text before the digits).
+const PRICE_CURRENCY_PATTERN = /(?:(?:Rs\.?|PKR|₨)\s*([\d,]+(?:\.\d{1,2})?)|([\d,]+(?:\.\d{1,2})?)\s*(?:Rs\.?|PKR|₨))/gi;
 const PRICE_MENTION_SPAN_CHARS = 60;
 const PRICE_MENTION_MIN_TOKENS = 3;
 const PRICE_PRODUCT_PROXIMITY_CHARS = 120;
@@ -685,7 +695,9 @@ function findRecommendationPriceMismatches(message, sampleProducts) {
   if (!mentionsByProduct.length) return [];
   const mismatches = [];
   for (const match of message.matchAll(PRICE_CURRENCY_PATTERN)) {
-    const numericText = match[1];
+    // Round 61: the currency may sit on either side of the number
+    // ("PKR 1700" or "1700 PKR") — the number is whichever group matched.
+    const numericText = match[1] ?? match[2];
     const stated = Number(numericText.replace(/,/g, ""));
     if (!Number.isFinite(stated)) continue;
     const priceStart = match.index;

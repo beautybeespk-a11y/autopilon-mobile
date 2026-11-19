@@ -7756,6 +7756,103 @@ async function run() {
     }
   });
 
+  // --- Round 61 (price gate missed number-first prices) ------------------
+  // Live bug (Nov 20 2026, the morning after PR #9 deployed): in a NEW
+  // chat the owner asked "which product should I use as the creative?"
+  // and the agent recommended the Huda Beauty Liquid Matte Mousse with
+  // "Price: 1700 PKR" — number-first — while the live store price is
+  // Rs 1,299. PR #9's gate only matched currency-BEFORE-number
+  // ("PKR 1700"), so it saw zero stated prices and never fired; the
+  // round-60 checks had the same blind spot (every case was
+  // currency-first). The pattern now matches the currency on either side
+  // of the number, and the gate-level checks below use the EXACT Nov-20
+  // reply verbatim — the one that slipped through.
+  const liveReply61 = `Based on the products available in your store and recent relevant content, I recommend using the "Huda Beauty Liquid Matte Mousse" for your ad creative. The product has notable appeal with its features described as a velvet color and weightless feel, which enhances its attractiveness to potential customers.\n\nHere's the product's essential information for the ad creative:\n\n- **Name**: Huda Beauty Liquid Matte Mousse\n- **Price**: 1700 PKR\n- **Image**: ![Huda Beauty Liquid Matte Mousse](https://beautybees.pk/wp-content/uploads/2026/10/01-The-Matte-Mousse-Collection_PACKSHOT.webp)\n- **Link**: [View Product](https://www.facebook.com/122189156030941601/posts/122198701286941601)\n\nShould I proceed with building a campaign using this product as the creative?`;
+
+  await check("[round 61] the price gate trips on the EXACT Nov-20 live reply (Huda at 1700 PKR, number-first) and passes the correct reply", () => {
+    const tripped = priceGate(liveReply61);
+    assert.ok(typeof tripped === "string" && tripped.includes("Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream"), "the number-first stale price must trip the gate");
+    assert.ok(tripped.includes("1299"), "the nudge must name the correct live price, so the model can fix its reply");
+    assert.ok(tripped.includes("1700 PKR"), "the nudge must quote the stated number-first price back");
+
+    // The correct price, written either way round, passes.
+    assert.equal(priceGate(liveReply61.replace("1700 PKR", "1299 PKR")), null, "the live price written number-first must pass");
+    assert.equal(priceGate(liveReply61.replace("1700 PKR", "Rs 1,299")), null, "the live price written currency-first must pass too");
+
+    // The same stale number in every other currency form must also trip.
+    assert.ok(typeof priceGate(liveReply61.replace("1700 PKR", "Rs 1,700")) === "string", "Rs 1,700 must trip the gate");
+    assert.ok(typeof priceGate(liveReply61.replace("1700 PKR", "1,700 Rs")) === "string", "1,700 Rs must trip the gate");
+    assert.ok(typeof priceGate(liveReply61.replace("1700 PKR", "₨ 1700")) === "string", "₨ 1700 must trip the gate");
+    assert.ok(typeof priceGate(liveReply61.replace("1700 PKR", "1700 ₨")) === "string", "1700 ₨ must trip the gate");
+  });
+
+  await check("[round 61] the price gate still never flags a budget, discount, struck-through old price, or threshold when written number-first", () => {
+    assert.equal(priceGate("Your daily budget is 550 PKR/day. I recommend the Huda Beauty Liquid Matte Mousse as the creative."), null, "a number-first daily budget next to a product name must never trip the gate");
+    assert.equal(priceGate("Budget: 550 PKR/day (as you specified)"), null, "the number-first budget line on its own must never trip the gate");
+    assert.equal(priceGate("Buy 3 and get 500 PKR off the Huda Beauty Liquid Matte Mousse."), null, "a number-first discount amount must never trip the gate");
+    assert.equal(priceGate("The Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream is Rs 1,299 (was 1,700 PKR)."), null, "a number-first struck-through old price must never trip the gate");
+    assert.equal(priceGate("Free shipping over 1,700 PKR on the Huda Beauty Liquid Matte Mousse."), null, "a number-first free-shipping threshold must never trip the gate");
+  });
+
+  await check("[round 61] orchestrate: the EXACT Nov-20 reply (1700 PKR) is nudged and corrected to the live 1299 — never reaching the user", async () => {
+    const userId = makeUser(`round61-price-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const posts = [
+      { id: "717559728109412_9", message: "Huda Beauty Liquid Matte Mousse — Rs 1700, shop now!", created_time: "2026-11-10T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/9" },
+    ];
+    const metaOpts = { ...metaOpts59, posts };
+    const wcProducts = [huda60Product, ...filler59Products.slice(0, 3)];
+    mockFetch(scriptedFetch({
+      metaOpts, wcProducts, wcSearchHandler: () => [],
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText(liveReply61),
+        finalText("I recommend the Huda Beauty Liquid Matte Mousse as the creative. Price: 1299 PKR."),
+      ],
+    }));
+    try {
+      const userMessage = "which product should I use as the creative?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("1299"), `the final reply must carry the live price: ${result.reply}`);
+      assert.ok(!result.reply.includes("1700"), `the stale price must never reach the user: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 61] orchestrate: a second number-first stale price is rewritten in place from the live catalogue price — the recommendation still reaches the user, corrected", async () => {
+    const userId = makeUser(`round61-price-rewrite-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const posts = [
+      { id: "717559728109412_9", message: "Huda Beauty Liquid Matte Mousse — Rs 1700, shop now!", created_time: "2026-11-10T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/9" },
+    ];
+    const metaOpts = { ...metaOpts59, posts };
+    const wcProducts = [huda60Product, ...filler59Products.slice(0, 3)];
+    mockFetch(scriptedFetch({
+      metaOpts, wcProducts, wcSearchHandler: () => [],
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText(liveReply61),
+        finalText(liveReply61),
+      ],
+    }));
+    try {
+      const userMessage = "which product should I use as the creative?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("1299 PKR"), `the deterministic rewrite must put the live price in, in the same number-first form: ${result.reply}`);
+      assert.ok(!result.reply.includes("1700"), `the stale price must never reach the user, even on the second offense: ${result.reply}`);
+      assert.ok(result.reply.includes("Huda Beauty Liquid Matte Mousse"), "the recommendation itself must survive — only the wrong number is rewritten");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {
     const userId = makeUser(`stream-a-patrick-ta-${stamp}@example.com`);
     connectMeta(userId);
