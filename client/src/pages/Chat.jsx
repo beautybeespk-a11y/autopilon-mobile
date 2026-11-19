@@ -137,6 +137,12 @@ export default function Chat() {
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [providerErr, setProviderErr] = useState(null);
+  // Round 58 — non-provider chat errors (e.g. "Agent not found") used to
+  // be rendered under the provider banner above, which misled the owner
+  // into thinking his AI key was missing when it was fine. Only a real
+  // 503 (provider misconfigured) may use that banner; everything else
+  // gets this neutral one.
+  const [chatErr, setChatErr] = useState(null);
   const [attachment, setAttachment] = useState(null); // { title, extractedText, note } | { title, isImage, id, previewUrl }
   const [attachUploading, setAttachUploading] = useState(false);
   const [attachError, setAttachError] = useState(null);
@@ -178,6 +184,14 @@ export default function Chat() {
     setActiveId(id);
     const d = await api.get(`/chat/conversations/${id}/messages`);
     setMessages(d.messages.map((m) => ({ ...m, ...(m.meta || {}) })));
+    // Round 58 — the dropdown never re-synced to the conversation actually
+    // open: messages were posted with whatever agent the dropdown held,
+    // which is how a stale selection 404'd a whole turn as "Agent not
+    // found" (the server now falls back to the conversation's agent, but
+    // the client should post the right id in the first place). The API
+    // returns the conversation's agentId; adopt it when present. Plain
+    // chats (no agentId) leave the dropdown untouched.
+    if (d.conversation?.agentId) setAgentId(d.conversation.agentId);
   };
 
   const clearAttachment = () => {
@@ -187,7 +201,7 @@ export default function Chat() {
     });
   };
 
-  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); clearAttachment(); };
+  const newConversation = () => { setActiveId(null); setMessages([]); setProviderErr(null); setChatErr(null); clearAttachment(); };
 
   const onPickFile = async (e) => {
     const file = e.target.files?.[0];
@@ -279,6 +293,7 @@ export default function Chat() {
     if ((!content && !hasAttachment) || sending) return;
     setInput("");
     setProviderErr(null);
+    setChatErr(null);
     const displayContent = hasAttachment ? `📎 ${attachment.title}${content ? `\n\n${content}` : ""}` : content;
     setMessages((m) => [...m, { id: "tmp-" + Date.now(), role: "user", content: displayContent }]);
     setSending(true);
@@ -299,8 +314,12 @@ export default function Chat() {
       if (voiceSettings?.autoPlay) setJustRepliedId(assistantId);
       loadConversations();
     } catch (err) {
-      if (err.status === 503) setProviderErr(err.detail || "AI provider not configured");
-      else setProviderErr(err.message);
+      // Round 58 — only a real 503 (provider misconfigured) may use the
+      // provider banner; a 404 "Agent not found" (or any other error) is a
+      // plain chat error, not a provider problem, and saying so cost the
+      // owner days of chasing a key that was fine.
+      if (err.status === 503) { setProviderErr(err.detail || "AI provider not configured"); setChatErr(null); }
+      else { setProviderErr(null); setChatErr(err.message || "Something went wrong."); }
       if (err.data?.conversationId) setActiveId(err.data.conversationId);
     } finally {
       setSending(false);
@@ -426,6 +445,11 @@ export default function Chat() {
         {providerErr && (
           <div className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-500">
             <AlertTriangle size={16} /> AI provider not configured — {providerErr}
+          </div>
+        )}
+        {chatErr && (
+          <div className="mx-4 mb-2 flex items-center gap-2 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-500">
+            <AlertTriangle size={16} /> Something went wrong — {chatErr}
           </div>
         )}
         {voiceError && (

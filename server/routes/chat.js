@@ -4,7 +4,7 @@ import { requireAuth, cryptoRandom, logActivity } from "../middleware.js";
 import { providerStatus, listProviderOptions } from "../ai/provider.js";
 import { handleIncomingMessage } from "../orchestrator/conversationService.js";
 import { aiRateLimit, aiConcurrencyLimit } from "../orchestrator/rateLimiter.js";
-import { canAccessAgent } from "../orchestrator/agentManager.js";
+import { resolveMessageAgentId } from "../orchestrator/chatAgentResolution.js";
 
 const router = Router();
 router.use(requireAuth);
@@ -56,9 +56,19 @@ router.post("/message", aiLimiter, aiConcurrency, async (req, res) => {
   // limit) before this check existed. 404, not 403, to match every other
   // agent-access check in the app — never confirm an unauthorized agentId
   // actually exists.
+  // Round 58: resolveMessageAgentId keeps that same 404 for a genuine
+  // authorization refusal, but when the posted id doesn't exist in the DB
+  // at all (a stale client-side selection — the dropdown never re-syncs to
+  // the open conversation) AND the message continues an existing
+  // conversation the user owns, it falls back to that conversation's own
+  // stored agentId instead of failing the whole turn with "Agent not
+  // found". The fallback is logged so a stale selection is still visible.
+  let effectiveAgentId = agentId || null;
   if (agentId) {
-    const agent = db.prepare("SELECT * FROM agents WHERE id = ?").get(agentId);
-    if (!agent || !canAccessAgent(userId, agent)) return res.status(404).json({ error: "Agent not found" });
+    const resolved = resolveMessageAgentId({ userId, agentId, conversationId });
+    if (resolved.error) return res.status(404).json({ error: resolved.error });
+    effectiveAgentId = resolved.agentId;
+    if (resolved.fellBack) console.warn("[chat/message] posted agentId stale — fell back to the conversation's agent", { userId, postedAgentId: agentId, conversationId, agentId: effectiveAgentId });
   }
 
   let convId = conversationId;
@@ -66,7 +76,7 @@ router.post("/message", aiLimiter, aiConcurrency, async (req, res) => {
     convId = cryptoRandom();
     const title = (content?.trim() || attachmentTitle || "New conversation").slice(0, 48);
     db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(convId, userId, agentId || null, title, now, now);
+      .run(convId, userId, effectiveAgentId, title, now, now);
     logActivity(db, userId, "conversation_started", `Started "${title}"`);
   } else {
     const owns = db.prepare("SELECT id FROM conversations WHERE id = ? AND userId = ?").get(convId, userId);
@@ -75,7 +85,7 @@ router.post("/message", aiLimiter, aiConcurrency, async (req, res) => {
 
   try {
     const { reply, trace, toolResults, confirmation, assistantMessageId } = await handleIncomingMessage({
-      userId, agentId: agentId || null, conversationId: convId, content: content || "",
+      userId, agentId: effectiveAgentId, conversationId: convId, content: content || "",
       attachmentTitle: hasAttachment ? attachmentTitle : null,
       attachmentText: hasAttachment ? attachmentText : null,
       attachmentImageId: hasAttachment ? attachmentImageId : null,

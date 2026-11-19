@@ -9,6 +9,7 @@
 // another LLM attempt.
 import { gatherBusinessSnapshot, getStoreCountryForFallback, searchContentForProduct } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
+import { checkAccountHealthCached } from "./accountHealth.js";
 import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, formatCarouselCreativeLines, toCreativeCandidateRefs, parseRequestedProduct, postMatchesProduct, formatCreativeNotFoundQuestion, matchCreativeCandidateId, messageIsBareCreativeAffirmation } from "./creativeResolution.js";
 import {
   validateStrategyStructure, validateStrategyAgainstContext,
@@ -157,6 +158,17 @@ function objectiveLabel(objective) {
     OUTCOME_SALES: "Website Purchases", OUTCOME_TRAFFIC: "Traffic", OUTCOME_LEADS: "Leads",
     OUTCOME_ENGAGEMENT: "Engagement", OUTCOME_AWARENESS: "Awareness", OUTCOME_APP_PROMOTION: "App Promotion",
   }[objective] || objective;
+}
+
+// Round 58 — the campaign name the executor creates in Meta (executor.js)
+// as ONE shared formula, so the name the user approves in the recommendation
+// text can never drift from the name that actually lands in Ads Manager.
+// business_goal is the user's own goal text (e.g. "Website Purchases"); the
+// objective is the raw enum Meta itself uses, defaulting exactly the way
+// executeExplicitAction does when a strategy carries no objective.
+export function campaignNameForStrategy(strategy) {
+  const objective = strategy.recommended_objective || "OUTCOME_ENGAGEMENT";
+  return `${strategy.business_goal} — ${objective}`;
 }
 
 const BUDGET_BASIS_EXPLANATION = {
@@ -350,6 +362,10 @@ function formatRecommendation(strategy, names, resolved, creative, opts = {}) {
     const lines = [
       `I'll ${actionLabel}.`,
       ``,
+      // Round 58 — the campaign name, exactly as it will be created in Meta
+      // (campaignNameForStrategy, shared with the executor) — the user
+      // approves a name they can actually see, never a nameless strategy.
+      `Campaign: ${campaignNameForStrategy(strategy)}`,
       `Ad Account: ${assetSummaryValue(names.adAccountName, resolved?.adAccountId, "(not resolved)")}`,
       `Facebook Page: ${assetSummaryValue(names.pageName, resolved?.pageId, "(not resolved)")}`,
       `Pixel: ${pixelSummaryValue(opts.pixelState || { pixelName: names.pixelName, pixelId: resolved?.pixelId, anyPixelExists: Boolean(resolved?.pixelId), pixelAmbiguous: false })}`,
@@ -381,6 +397,10 @@ function formatRecommendation(strategy, names, resolved, creative, opts = {}) {
   const lines = [
     `Based on your store, Meta account, and available business data, I recommend:`,
     ``,
+    // Round 58 — the campaign name, exactly as it will be created in Meta
+    // (campaignNameForStrategy, shared with the executor) — the user
+    // approves a name they can actually see, never a nameless strategy.
+    `Campaign: ${campaignNameForStrategy(strategy)}`,
     `Goal: ${objectiveLabel(strategy.recommended_objective)}`,
   ];
   if (goalAlignmentNote) lines.push(goalAlignmentNote);
@@ -468,7 +488,7 @@ function deriveClaimedByFromPriorStored(priorStored, userMessage) {
   return matched ? "creative" : null;
 }
 
-async function runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput, revisionOf, priorStored, freshResearchRequired, claimedBy }) {
+async function runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput, revisionOf, priorStored, freshResearchRequired, claimedBy, claimedCreativeId }) {
   const explicitAssetChanges = new Set(Array.isArray(explicitAssetChangesInput) ? explicitAssetChangesInput.filter((f) => ASSET_FIELDS.includes(f)) : []);
   // Stream C: the model's own tool-call parameters can never write
   // pendingQuestions — it is backend-authored only (runBuildOrRevise writes
@@ -713,6 +733,28 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const { resolved, names, resolutionErrors, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } =
     await resolveStrategyAssets(normalized, { userId, accessToken, priorResolved, explicitAssetChanges, snapshot, userMessage });
 
+  // Round 58 / Phase 1 — account health check (accountHealth.js): before
+  // building anything on top of resolved assets, verify the account is
+  // actually healthy. Nov 6 2026: the ad account was disabled for a
+  // past-due payment and nobody knew for days while code fixes were
+  // chased, because the agent built the whole campaign first and only
+  // failed at the last Meta write with a cryptic error. A proven problem
+  // (disabled account, missing scope, unlinked Page, vanished Pixel)
+  // stops the build here with a plain-language issue the owner can act
+  // on. Only for strategies that will create a campaign (campaign mode or
+  // explicit action), only when an ad account was resolved at all
+  // (not-connected keeps the existing handling), and only when asset
+  // resolution itself didn't already fail — those errors are reported
+  // first below. The check is cached (healthy 5 min, unhealthy 60 s),
+  // so a healthy account costs zero extra Meta calls on most turns.
+  if ((normalized.mode === "campaign" || normalized.mode === "explicit_action") && resolved.adAccountId && !resolutionErrors.length) {
+    const health = await checkAccountHealthCached({ userId, accessToken, adAccountId: resolved.adAccountId, pageId: resolved.pageId, pixelId: resolved.pixelId });
+    if (!health.ok) {
+      trace("account health check failed — stopping before building", { adAccountId: resolved.adAccountId, issues: health.issues.map((i) => i.code) });
+      return { ok: false, unresolved: buildUnresolvedIssue(health.issues.map((i) => ({ field: i.field, message: i.message }))), attemptId: null };
+    }
+  }
+
   // Creative selection (Phase 1 follow-up: attach a real ad, not just a
   // Campaign + Ad Set) — same resolution shape as Pixel above: explicit
   // pick wins, then the prior strategy's ALREADY-RESOLVED choice is reused
@@ -892,12 +934,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     && (priorPendingQuestions === null || creativePendingQuestion?.kind === "pending_creative")
     && !(urlQuestionOpenOnPrior && messageIsBareCreativeAffirmation(userMessage));
   const creativeResolution = normalized.mode === "campaign"
-    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates })
+    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, claimedCreativeId })
     : explicitActionCreativeSource
       ? resolveCreativeSelection({
           strategy: { ...normalized, mode: "campaign", creative_strategy: { source: explicitActionCreativeSource, description: normalized.business_goal || "" } },
           snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage,
-          pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction: true,
+          pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction: true, claimedCreativeId,
         })
       : { creative: null, ambiguousCandidates: [], creativeError: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (creativeResolution.creativeError) {
@@ -1510,7 +1552,7 @@ export async function buildStrategy({ userId, conversationId, accessToken, strat
   return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges: strategy, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: null, priorStored: null, freshResearchRequired: true });
 }
 
-export async function reviseStrategy({ userId, conversationId, accessToken, strategyId, requestedChanges, freshResearchRequired, explicitAssetChanges, userMessage, claimedBy }) {
+export async function reviseStrategy({ userId, conversationId, accessToken, strategyId, requestedChanges, freshResearchRequired, explicitAssetChanges, userMessage, claimedBy, claimedCreativeId }) {
   const prior = getStoredStrategy(userId, strategyId);
   if (!prior) {
     return { ok: false, unresolved: { field: "strategyId", issue: `strategyId "${strategyId}" does not match any strategy you own — it may be from a different conversation or doesn't exist.`, allIssues: [] } };
@@ -1538,5 +1580,5 @@ export async function reviseStrategy({ userId, conversationId, accessToken, stra
   if (!EXECUTABLE_STATUSES.has(prior.status) && prior.status !== "executed") {
     return { ok: false, unresolved: { field: "strategyId", issue: `This strategy is no longer active (status: ${prior.status}) and can't be revised.`, allIssues: [] } };
   }
-  return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: strategyId, priorStored: prior, freshResearchRequired, claimedBy });
+  return runBuildOrRevise({ userId, conversationId, accessToken, requestedChanges, userMessage, explicitAssetChangesInput: explicitAssetChanges, revisionOf: strategyId, priorStored: prior, freshResearchRequired, claimedBy, claimedCreativeId });
 }

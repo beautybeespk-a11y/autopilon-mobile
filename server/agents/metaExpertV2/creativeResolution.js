@@ -488,6 +488,19 @@ export function matchCreativeCandidateId(userMessage, candidates, opts = {}) {
 // EMBEDDED_URL_REUSE_PATTERN, and the alternative is the whole-message-only
 // bug this round exists to fix.
 const PENDING_CREATIVE_AFFIRMATION_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|that'?s (the )?right one|that one)[.!]?\s*$/i;
+// Round 58 — "yes 1" (an affirmation word plus the number 1) confirms the
+// single shown post. A pendingCreative is by construction ONE post the agent
+// just showed ("To confirm — you'd like to use this post … Reply "yes" to
+// confirm") — position 1 is the only position that exists, so "yes 1" is an
+// affirmation of that one post, not a pick from a list. Whole-message-only,
+// same discipline as the bare pattern above: a compound message ("yes 1 and
+// yes beautybees.pk") does NOT match here — the dispatcher's
+// matchCreativeCandidateId already handles the multi-candidate list path for
+// those. Only "1": "yes 2" names a post that was never shown in a
+// confirmation and must never promote. This is the same word list as the
+// bare pattern (deliberately NOT "ok" — "ok 1" stays unmatched, matching the
+// bare pattern's own caution about weak acknowledgments).
+const PENDING_CREATIVE_AFFIRMED_PICK_PATTERN = /^\s*(yes|yep|yup|correct|right|confirmed?|that'?s (the )?right one|that one)[,!]?\s*1[.!]?\s*$/i;
 const EMBEDDED_CREATIVE_REUSE_PATTERN = /\b(use (?:the )?same (?:post|creative|image|photo|reel|video)|use that (?:post|creative|image|photo|reel|video)|same (?:post|creative|image|photo|reel|video)|that post|that creative)\b/i;
 // Stream C: the bare-word branch now requires opts.pendingCreativeQuestion === true —
 // i.e. the stored active strategy has an open pending-creative confirmation question
@@ -501,7 +514,8 @@ export function messageAffirmsPendingCreative(userMessage, opts = {}) {
   if (typeof userMessage !== "string") return false;
   if (EMBEDDED_CREATIVE_REUSE_PATTERN.test(userMessage)) return true;
   if (opts.pendingCreativeQuestion !== true) return false;
-  return PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage);
+  return PENDING_CREATIVE_AFFIRMATION_PATTERN.test(userMessage)
+    || PENDING_CREATIVE_AFFIRMED_PICK_PATTERN.test(userMessage);
 }
 
 // Stream C: the bare-affirmation shape on its own (exported so the orchestrator
@@ -662,7 +676,7 @@ function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, 
 // candidate list is itself the "a question was asked" evidence (the list
 // only exists because the question was asked), so verification still works
 // for legacy rows. Rows WITH a record use the record's candidateIds.
-export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction }) {
+export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction, claimedCreativeId }) {
   const source = strategy.creative_strategy?.source;
   const empty = { creative: null, ambiguousCandidates: [], creativeError: null, creativeNotFound: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (strategy.mode === "explicit_action" || !source) return empty;
@@ -748,8 +762,21 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
   // a bare "yes" must not be claimable by another open question this turn
   // (strategyBuilder.js computes the flag from priorStored). A non-affirming
   // reply still returns the SAME pendingCreative unchanged.
+  // Round 58: the dispatcher claim is threaded in as claimedCreativeId
+  // (orchestrator/index.js's resolvePendingQuestionAnswer, via
+  // reviseStrategy) — the dispatcher already verified the claim against the
+  // user's own raw message with matchCreativeCandidateId, scoped to the
+  // single pending candidate (creativeCandidates is null while a pick is
+  // pending, so the claim can only ever name that one post). A claim
+  // naming the pending candidate promotes exactly like an affirmation —
+  // this is what lets a bare "1" (and any other dispatcher-claimed form,
+  // e.g. the post's own id) settle the confirmation without the model
+  // having to call revise_strategy. The claim must name THIS pending
+  // candidate exactly; a claim naming any other id never promotes.
   if (!contentSelectorProvidedThisCall && priorPendingCreative && priorPendingCreative.source === source) {
-    if (pendingCreativeQuestion === true && messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: true })) {
+    const claimedPendingCandidate = typeof claimedCreativeId === "string" && claimedCreativeId.length > 0
+      && claimedCreativeId === priorPendingCreative.candidate.id;
+    if (pendingCreativeQuestion === true && (messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: true }) || claimedPendingCandidate)) {
       return finalizeChosenCreative({ source, chosen: priorPendingCreative.candidate, strategy, userMessage, empty, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } });
     }
     return { ...empty, pendingCreative: priorPendingCreative };
