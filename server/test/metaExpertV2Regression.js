@@ -21,7 +21,7 @@ process.env.META_EXPERT_V2 = "true";
 const db = (await import("../db.js")).default;
 const { cryptoRandom } = await import("../middleware.js");
 const { saveConnection, updateConnectionMeta, getConnection } = await import("../integrations/manager.js");
-const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage, searchCatalogueForProduct } = await import("../agents/metaExpertV2/businessSnapshot.js");
+const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage, searchCatalogueForProduct, resolveNamedProductForCreativeAnswer, targetedSearchKeywords } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy, pixelSummaryValue, campaignNameForStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
@@ -370,7 +370,7 @@ const DEFAULT_WC_PRODUCTS = [{
   short_description: "A brightening serum with 15% Vitamin C for daily use.",
 }];
 
-function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_PRODUCTS, wcSearchProducts = null }) {
+function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_PRODUCTS, wcSearchProducts = null, wcSearchHandler = null }) {
   let chatIndex = 0;
   const metaHandler = metaRouter(metaOpts);
   return async (url, options = {}) => {
@@ -387,7 +387,15 @@ function scriptedFetch({ chatResponses, metaOpts = {}, wcProducts = DEFAULT_WC_P
         // PR #3 — the targeted catalogue search passes ?search=...; a test
         // can give it a different answer from the plain 50-product list
         // (a product outside the sample). Default: same list as before.
-        if (u.searchParams.get("search") && wcSearchProducts !== null) return jsonResponse(wcSearchProducts);
+        if (u.searchParams.get("search")) {
+          // Round 59 — a test can instead simulate REAL WooCommerce AND
+          // semantics (return [] unless ALL search terms appear in the
+          // title). The unconditional wcSearchProducts answer above is
+          // exactly what hid the Nov 19 live bug ("beautybees.pk" in the
+          // message poisoned the search, but the mock answered anyway).
+          if (wcSearchHandler) return jsonResponse(wcSearchHandler(u.searchParams.get("search")));
+          if (wcSearchProducts !== null) return jsonResponse(wcSearchProducts);
+        }
         return jsonResponse(wcProducts);
       }
       if (u.pathname.endsWith("/products/categories")) return jsonResponse([{ name: "Skincare" }]);
@@ -7377,6 +7385,246 @@ async function run() {
     // The guard: a message that cannot name a product never searches.
     assert.deepEqual(await searchCatalogueForProduct(userId, "yes"), [], "a bare affirmation must never trigger a catalogue search");
     assert.deepEqual(await searchCatalogueForProduct(userId, "3"), [], "a bare number must never trigger a catalogue search");
+  });
+
+  // --- Round 59 (name-based creative search) ---------------------------
+  // Live bug (Nov 19 2026): "Create a Website Purchases campaign for
+  // Maybelline Serum Matte Lipstick, 550 per day, beautybees.pk" showed
+  // the 50 newest products, and answering "Maybelline Serum Matte
+  // Lipstick" re-sent the identical 50-item list. Two breaks: (1) the
+  // targeted search was poisoned by "beautybees.pk" — "beautybees" and
+  // "pk" became AND terms WooCommerce could never match; (2) the revise
+  // turn had no name-resolution path at all (matcher scoped to shown
+  // candidates, stale snapshot, no PRODUCT_IMAGE handling, verification
+  // would reject an unshown pick). The AND-semantics mock below is the
+  // point: the old unconditional wcSearchProducts mock answered for ANY
+  // query, which is exactly what hid break (1).
+  const maybelline59Product = {
+    id: 6015, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "1250", categories: [{ name: "Makeup" }],
+    images: [{ src: "https://beautybees.pk/wp-content/uploads/maybelline-serum-matte.jpg" }],
+    permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+    short_description: "Maybelline Moisturizing Serum Lipstick Matte.",
+  };
+  // 50 filler products, most recent first — Maybelline is NOT among them.
+  // Every filler has a real image, so all 50 are PRODUCT_IMAGE candidates.
+  const filler59Products = Array.from({ length: 50 }, (_, i) => ({
+    id: 100 + i, name: `Filler Product ${i + 1}`, price: "999", categories: [{ name: "Makeup" }],
+    images: [{ src: `https://store.example.com/wp-content/uploads/filler-${i + 1}.jpg` }],
+    permalink: `https://beautybees.pk/product/filler-${i + 1}/`,
+    short_description: `Filler product ${i + 1}.`,
+  }));
+  // Real WooCommerce AND semantics: a search returns a product only when
+  // EVERY term appears in its title.
+  const wcAndSearch59 = (products) => (query) => {
+    const terms = String(query || "").toLowerCase().split(/\s+/).filter(Boolean);
+    return products.filter((p) => terms.every((t) => p.name.toLowerCase().includes(t)));
+  };
+  const toSnapshotProduct59 = (p) => ({
+    id: String(p.id), name: p.name, price: p.price, category: p.categories?.[0]?.name || null,
+    imageUrl: p.images?.[0]?.src || null, permalink: p.permalink || null,
+    shortDescription: p.short_description || null,
+  });
+  const metaOpts59 = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [], postsPageSize: 5 };
+
+  await check("[round 59] searchCatalogueForProduct: a store URL in the message no longer poisons the targeted search (live 'beautybees.pk' case)", async () => {
+    const userId = makeUser(`round59-search-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    let capturedSearch = null;
+    const handler = (query) => {
+      capturedSearch = query;
+      return wcAndSearch59([maybelline59Product])(query);
+    };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: handler }));
+    try {
+      const found = await searchCatalogueForProduct(userId, "Create a Website Purchases campaign for Maybelline Serum Matte Lipstick, 550 per day, beautybees.pk");
+      assert.equal(capturedSearch, "maybelline serum matte lipstick", "the search query must contain only product words — no 'beautybees'/'pk' from the store URL");
+      assert.equal(found.length, 1, "the targeted search must return the real product");
+      assert.equal(found[0].id, "6015", "the returned product must be the Maybelline lipstick");
+      // The keyword rule itself, unit-level: the URL contributes nothing.
+      assert.deepEqual(targetedSearchKeywords("Create a Website Purchases campaign for Maybelline Serum Matte Lipstick, 550 per day, beautybees.pk"), ["maybelline", "serum", "matte", "lipstick"], "URL/domain tokens must be stripped before tokenising");
+      // A full product URL is stripped ENTIRELY (slug included) — it must
+      // never contribute search terms, poisoned or otherwise; the name in
+      // the message is what searches, not the link.
+      assert.deepEqual(targetedSearchKeywords("use https://beautybees.pk/product/maybelline-serum-matte-lipstick/ please"), [], "a full https URL must be stripped too");
+      assert.deepEqual(targetedSearchKeywords("Maybelline Serum Matte Lipstick beautybees.pk"), ["maybelline", "serum", "matte", "lipstick"], "a bare domain after the name must not add terms either");
+      assert.deepEqual(targetedSearchKeywords("Maybelline Serum Matte Lipstick"), ["maybelline", "serum", "matte", "lipstick"], "a clean name is unchanged");
+    } finally {
+      restoreFetch();
+    }
+    // The guards still hold: a message that cannot name a product never searches.
+    assert.deepEqual(await searchCatalogueForProduct(userId, "yes"), [], "a bare affirmation must never trigger a catalogue search");
+    assert.deepEqual(await searchCatalogueForProduct(userId, "3"), [], "a bare number must never trigger a catalogue search");
+  });
+
+  await check("[round 59] snapshot with the live message (URL + budget in it): targeted search still finds the product and the deep post search still finds the Oct 2 post", async () => {
+    const userId = makeUser(`round59-snapshot-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const posts = [
+      { id: "717559728109412_7", message: "Maybelline Serum Matte Lipstick – Comfortable Color, Zero Dryness 💄 Price 1250 Each", created_time: "2026-10-02T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/7" },
+    ];
+    const metaOpts = { ...metaOpts59, posts };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline59Product]) }));
+    try {
+      const snapshot = await gatherBusinessSnapshot(userId, { userMessage: "Create a Website Purchases campaign for Maybelline Serum Matte Lipstick, 550 per day, beautybees.pk" });
+      const found = snapshot.business.sampleProducts.find((p) => p.name === "Maybelline Moisturizing Serum Lipstick Matte");
+      assert.ok(found, "the targeted search must append the real product to the snapshot's sampleProducts");
+      assert.equal(found.foundByTargetedSearch, true, "the appended product must be marked as found by the targeted search");
+      assert.equal(snapshot.recentContent.facebookPosts.productSearch.requestedProduct, "Maybelline Moisturizing Serum Lipstick Matte", "the snapshot must derive the real product");
+      assert.equal(snapshot.recentContent.facebookPosts.productSearch.matched, true, "the deep post search must then find the Oct 2 post");
+      const seventh = snapshot.recentContent.facebookPosts.items.find((i) => i.id === "717559728109412_7");
+      assert.ok(seventh, "the Oct 2 post must be present in the snapshot items");
+      assert.equal(seventh.linkedProduct?.name, "Maybelline Moisturizing Serum Lipstick Matte", "the Oct 2 post must link to the real product");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 59] revise answering a PRODUCT_IMAGE creative question by name: a product outside the newest 50 resolves instead of re-listing", async () => {
+    const userId = makeUser(`round59-revise-by-name-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline59Product]) }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." }, destination_url: "https://beautybees.pk" }),
+        userMessage: "I want more website sales, link it to https://beautybees.pk",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const question = built.strategy.unresolved_questions.find((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?"));
+      assert.ok(question, "sanity: the build must ask the 50-candidate creative question");
+      assert.ok(!question.includes("Maybelline"), "sanity: Maybelline must NOT be among the shown candidates");
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: {}, userMessage: "Maybelline Serum Matte Lipstick",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative?.productId, "6015", "the named product must resolve as the creative");
+      assert.equal(answered.resolved.creative?.source, "PRODUCT_IMAGE", "the resolved creative must be the product image");
+      assert.equal(answered.resolved.pendingCreative, null, "must resolve outright, not sit pending");
+      assert.deepEqual(answered.strategy.unresolved_questions.filter((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?")), [], "the creative question must clear, not re-list");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 59] orchestrate: answering the creative question by name resolves via the pre-loop even when the model never calls revise_strategy", async () => {
+    const userId = makeUser(`round59-auto-revise-by-name-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline59Product]) }));
+    let built;
+    try {
+      built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." }, destination_url: "https://beautybees.pk" }),
+        userMessage: "I want more website sales, link it to https://beautybees.pk",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(!built.strategy.unresolved_questions.find((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?"))?.includes("Maybelline"), "sanity: Maybelline must NOT be among the shown candidates");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline59Product]),
+      chatResponses: [
+        finalText("Great, I've set that product as the creative."),
+        finalText("Great, I've set that product as the creative.\nCreative: Maybelline Moisturizing Serum Lipstick Matte (id 6015)"),
+      ],
+    }));
+    try {
+      const userMessage = "Maybelline Serum Matte Lipstick";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revise, `the auto-revise must dispatch a REAL revise_strategy call even though the model never called any tool itself: ${JSON.stringify(result.toolResults)}`);
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(active?.resolvedAssets.creative?.productId, "6015", "the named product must actually be saved as the creative in storage, not just narrated");
+      assert.equal(active?.resolvedAssets.creative?.source, "PRODUCT_IMAGE", "the saved creative must be the product image");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?")), "the creative question must be cleared");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 59] resolveCreativeSelection: a selector pick equal to claimedCreativeId verifies even when the product was not in the shown list", () => {
+    const fillerRefs = filler59Products.map((p) => ({ id: String(p.id), label: p.name }));
+    const snapshot = {
+      business: { sampleProducts: [...filler59Products.map(toSnapshotProduct59), toSnapshotProduct59(maybelline59Product)] },
+      recentContent: { facebookPosts: { items: [] }, instagramPosts: { items: [] } },
+    };
+    const result = resolveCreativeSelection({
+      strategy: {
+        mode: "campaign",
+        business_goal: "I want more website sales",
+        creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." },
+        content_selector: { confirmedId: "6015" },
+      },
+      snapshot, priorCreative: null, priorPendingCreative: null, contentSelectorProvidedThisCall: true,
+      userMessage: "Maybelline Serum Matte Lipstick",
+      pendingQuestion: { kind: "creative_candidates", candidateIds: fillerRefs.map((r) => r.id) },
+      pendingCreativeQuestion: false, priorCreativeCandidates: fillerRefs, claimedCreativeId: "6015",
+    });
+    assert.equal(result.creative?.productId, "6015", "the claimed pick must resolve as the creative");
+    assert.equal(result.creative?.source, "PRODUCT_IMAGE", "the resolved creative must be the product image");
+    assert.equal(result.pendingCreative, null, "must resolve outright, not sit pending");
+    assert.deepEqual(result.ambiguousCandidates, [], "must not fall back to ambiguity");
+    // The negative: the same pick with NO claim still fails verification
+    // (the round-34 discipline is untouched — a model guess can never
+    // become a confirmed pick on its own).
+    const unclaimed = resolveCreativeSelection({
+      strategy: {
+        mode: "campaign",
+        business_goal: "I want more website sales",
+        creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." },
+        content_selector: { confirmedId: "6015" },
+      },
+      snapshot, priorCreative: null, priorPendingCreative: null, contentSelectorProvidedThisCall: true,
+      userMessage: "Maybelline Serum Matte Lipstick",
+      pendingQuestion: { kind: "creative_candidates", candidateIds: fillerRefs.map((r) => r.id) },
+      pendingCreativeQuestion: false, priorCreativeCandidates: fillerRefs, claimedCreativeId: null,
+    });
+    assert.equal(unclaimed.creative, null, "an unclaimed pick must NOT resolve");
+    assert.ok(unclaimed.pendingCreative, "an unclaimed pick must sit pending, exactly as before");
+  });
+
+  await check("[round 59] revise answering a PRODUCT_IMAGE creative question with a name that matches nothing: an honest not-found line, not the same 50-item list", async () => {
+    const userId = makeUser(`round59-not-found-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline59Product]) }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." }, destination_url: "https://beautybees.pk" }),
+        userMessage: "I want more website sales, link it to https://beautybees.pk",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: {}, userMessage: "Nonexistent Fancy Product Name",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative, null, "nothing must resolve");
+      // Round 59 fingerprint fix: a revision whose ONLY change is the open
+      // questions must NOT dedup back to the prior row — without
+      // unresolved_questions in the fingerprint, this revise fingerprinted
+      // identically and the not-found line never reached the user.
+      assert.notEqual(answered.strategyId, built.strategyId, "a questions-only change is still a change — must store a new row, not dedup");
+      assert.notEqual(answered.deduplicated, true, "must not be deduplicated");
+      const notFound = answered.strategy.unresolved_questions.find((q) => q.startsWith("I couldn't find a product called"));
+      assert.ok(notFound, `must surface an honest not-found line, got: ${JSON.stringify(answered.strategy.unresolved_questions)}`);
+      assert.ok(notFound.includes("Nonexistent Fancy Product Name"), "the line must name what the user asked for");
+      assert.deepEqual(answered.strategy.unresolved_questions.filter((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?")), [], "must NOT re-list the 50 candidates");
+    } finally {
+      restoreFetch();
+    }
   });
 
   await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {

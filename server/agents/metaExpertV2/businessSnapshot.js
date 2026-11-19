@@ -528,13 +528,36 @@ const TARGETED_SEARCH_STOP_WORDS = new Set([
   "i", "a", "want", "need", "get", "show", "how", "did", "do", "last",
   "week", "what", "which", "when", "compare", "results", "performance",
   "spend", "much", "many",
+  // Round 59 — bare TLD/host words from a store URL typed into the
+  // message ("beautybees.pk" -> "pk"; "https://..." -> "https"). See
+  // targetedSearchKeywords below.
+  "pk", "com", "www", "http", "https",
 ]);
+// Round 59 (Nov 19 2026) — a store URL in the message poisons the
+// targeted search: "… for Maybelline Serum Matte Lipstick, 550 per day,
+// beautybees.pk" yields keywords [maybelline, serum, matte, lipstick,
+// beautybees, pk] and WooCommerce's AND search finds nothing (the real
+// title contains neither "beautybees" nor "pk"), so the agent fell back
+// to listing the 50 newest products — and the deep post search never ran.
+// Strip URL-like substrings (full http(s) URLs and bare domains ending
+// in a common TLD) BEFORE tokenising, so a domain never contributes
+// search terms at all. The TLD list is deliberately narrow: a dotted
+// brand such as "e.l.f" ends in ".f", never a listed TLD, so it survives.
+// Shared by searchCatalogueForProduct below and by the "does this message
+// look like a product name?" check in strategyBuilder.js — one rule, one
+// place.
+const URL_LIKE_RE = /\bhttps?:\/\/\S+|\b[\w-]+\.(?:pk|com|net|org|io|co|shop|store)\b/gi;
+export function targetedSearchKeywords(userMessage) {
+  if (typeof userMessage !== "string") return [];
+  return distinctiveTokens(userMessage.replace(URL_LIKE_RE, " "))
+    .filter((t) => !TARGETED_SEARCH_STOP_WORDS.has(t) && !/^\d+$/.test(t));
+}
 export async function searchCatalogueForProduct(userId, userMessage) {
   const wooConn = getConnection(userId, "woocommerce");
   if (!wooConn) return [];
   const m = JSON.parse(wooConn.meta || "{}");
   if (!m.siteUrl || !m.consumerKey) return [];
-  const keywords = distinctiveTokens(userMessage).filter((t) => !TARGETED_SEARCH_STOP_WORDS.has(t) && !/^\d+$/.test(t));
+  const keywords = targetedSearchKeywords(userMessage);
   if (keywords.length < 2) return [];
   let accessToken;
   try {
@@ -550,6 +573,34 @@ export async function searchCatalogueForProduct(userId, userMessage) {
     permalink: p.permalink || null,
     shortDescription: stripHtmlAndTruncate(p.short_description, PRODUCT_TEXT_EXCERPT_LENGTH),
   }));
+}
+
+// Round 59 — resolves a product NAMED in a plain-chat answer to a
+// PRODUCT_IMAGE creative question ("Maybelline Serum Matte Lipstick") to
+// the real catalogue product, including one older than the newest-50
+// sample. Sample first (no network when the product is already sampled),
+// then the targeted store search — both verified under the SAME token
+// rule (findBestProductMatch), so a loosely-matching search hit can never
+// become the pick. Returns { product, matched }: `product` is the
+// image-bearing product to use as the creative (null when none — a real
+// product with no image can never become a PRODUCT_IMAGE ad), `matched`
+// is whether ANY real catalogue product matched under the token rule at
+// all (ignoring image) — the caller needs the distinction to tell "no
+// such product" (honest not-found) from "real product, no image" (leave
+// the existing list behaviour alone). Never throws: any failure degrades
+// to { product: null, matched: false }.
+export async function resolveNamedProductForCreativeAnswer(userId, userMessage, sampleProducts) {
+  if (typeof userMessage !== "string") return { product: null, matched: false };
+  const sample = Array.isArray(sampleProducts) ? sampleProducts : [];
+  const sampleMatch = findBestProductMatch(userMessage, sample);
+  if (sampleMatch) {
+    return { product: sampleMatch.imageUrl ? sampleMatch : null, matched: true };
+  }
+  const targeted = await searchCatalogueForProduct(userId, userMessage);
+  if (!targeted.length) return { product: null, matched: false };
+  const match = findBestProductMatch(userMessage, targeted);
+  if (!match) return { product: null, matched: false };
+  return { product: match.imageUrl ? match : null, matched: true };
 }
 
 // A Reel is really just an Instagram VIDEO whose permalink path says so —

@@ -7,7 +7,7 @@
 // fails after that is a genuine unresolved business issue, returned once
 // as a single clean, customer-safe explanation — never fed back into
 // another LLM attempt.
-import { gatherBusinessSnapshot, getStoreCountryForFallback, searchContentForProduct } from "./businessSnapshot.js";
+import { gatherBusinessSnapshot, getStoreCountryForFallback, searchContentForProduct, resolveNamedProductForCreativeAnswer, targetedSearchKeywords } from "./businessSnapshot.js";
 import { resolveStrategyAssets } from "./assetResolution.js";
 import { checkAccountHealthCached } from "./accountHealth.js";
 import { resolveCreativeSelection, formatCreativeCandidatesQuestion, formatCreativeConfirmationQuestion, formatPrimaryTextQuestion, formatCarouselCreativeLines, toCreativeCandidateRefs, parseRequestedProduct, postMatchesProduct, formatCreativeNotFoundQuestion, matchCreativeCandidateId, messageIsBareCreativeAffirmation } from "./creativeResolution.js";
@@ -933,8 +933,61 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   const pendingCreativeQuestion = Boolean(priorPendingCreative)
     && (priorPendingQuestions === null || creativePendingQuestion?.kind === "pending_creative")
     && !(urlQuestionOpenOnPrior && messageIsBareCreativeAffirmation(userMessage));
+  // Round 59 — a PRODUCT_IMAGE creative question answered by NAMING the
+  // product (live bug, Nov 19 2026: "Maybelline Serum Matte Lipstick"
+  // re-listed the same 50 products). Two halves, both here so they cover
+  // the model-called revise as well as the orchestrator pre-loop:
+  // (b) a pre-loop claim (claimedCreativeId) names a product the snapshot
+  // doesn't contain — merge it into snapshotForCreative so
+  // resolveCreativeSelection can find it instead of rejecting the pick
+  // as "not one of the real creative candidates already shown"; (a2) a
+  // model-called revise with no selector: resolve the name from the raw
+  // message (sample first, then the targeted store search — same token
+  // rule everywhere) and synthesise the pick + claim, exactly as the
+  // pre-loop does. A name that matches NO real product, on a message
+  // that actually looks like a bare product name (2+ product keywords,
+  // no question mark, no digits, short), becomes namedProductNotFound —
+  // an honest not-found question instead of a silent re-list. A message
+  // that doesn't look like a bare name (compound reply, question,
+  // budget/price in it) falls through to the existing ambiguity path,
+  // never a wrong not-found. Appending never mutates the stored snapshot
+  // (snapshotForCreative is a fresh shallow copy for this call).
+  let effectiveClaimedCreativeId = claimedCreativeId;
+  let namedProductNotFound = null;
+  if (normalized.mode === "campaign" && normalized.creative_strategy?.source === "PRODUCT_IMAGE") {
+    const sampleProductsForCreative = snapshotForCreative.business?.sampleProducts || [];
+    const appendNamedProduct = (product) => {
+      const current = snapshotForCreative.business?.sampleProducts || [];
+      if (current.some((p) => String(p.id) === String(product.id))) return;
+      snapshotForCreative = {
+        ...snapshotForCreative,
+        business: { ...(snapshotForCreative.business || {}), sampleProducts: [...current, { ...product, foundByTargetedSearch: true }] },
+      };
+    };
+    if (typeof claimedCreativeId === "string" && claimedCreativeId) {
+      const alreadyInSnapshot = sampleProductsForCreative.some((p) => String(p.id) === claimedCreativeId);
+      if (!alreadyInSnapshot) {
+        const { product: resolved } = await resolveNamedProductForCreativeAnswer(userId, userMessage, sampleProductsForCreative);
+        if (resolved && String(resolved.id) === claimedCreativeId) appendNamedProduct(resolved);
+      }
+    }
+    if (!contentSelectorProvidedThisCall
+      && creativePendingQuestion?.kind === "creative_candidates"
+      && !priorCreative && !priorPendingCreative) {
+      const { product: named, matched } = await resolveNamedProductForCreativeAnswer(userId, userMessage, sampleProductsForCreative);
+      if (named) {
+        appendNamedProduct(named);
+        normalized = { ...normalized, content_selector: { confirmedId: String(named.id) } };
+        effectiveClaimedCreativeId = String(named.id);
+      } else if (!matched && typeof userMessage === "string"
+        && targetedSearchKeywords(userMessage).length >= 2
+        && !/[?]/.test(userMessage) && !/\d/.test(userMessage) && userMessage.trim().length <= 120) {
+        namedProductNotFound = userMessage.trim();
+      }
+    }
+  }
   const creativeResolution = normalized.mode === "campaign"
-    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, claimedCreativeId })
+    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, claimedCreativeId: effectiveClaimedCreativeId, namedProductNotFound })
     : explicitActionCreativeSource
       ? resolveCreativeSelection({
           strategy: { ...normalized, mode: "campaign", creative_strategy: { source: explicitActionCreativeSource, description: normalized.business_goal || "" } },
