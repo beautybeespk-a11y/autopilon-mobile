@@ -52,10 +52,14 @@ export function metaOAuthStatus() {
 // the approved Test 1 paused campaign failed twice with Meta error
 // 200/1487194 ("Permission Error") at exactly that call, while the token
 // (valid, long-lived) held all five scopes above. pages_manage_ads is a
-// standard permission, available with Standard Access for app roles, so
-// requesting it does not trigger the whole-request rejection the
-// instagram_basic lesson warns about — but it only takes effect on a fresh
-// reconnect; tokens issued before this change need one more reconnect.
+// standard permission, available with Standard Access for app roles — BUT
+// requesting it DOES risk the whole-request rejection the instagram_basic
+// lesson warns about when the scope is not attached to the app in the Meta
+// developer console: confirmed live Nov 6 2026, the first reconnect after
+// this change failed with "Invalid Scopes" until the scope was added to the
+// app's "Create & manage ads" use case there, and only then did reconnect
+// succeed. It also only takes effect on a fresh reconnect; tokens issued
+// before this change need one more reconnect.
 const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"];
 
 export function buildAuthorizationUrl(state) {
