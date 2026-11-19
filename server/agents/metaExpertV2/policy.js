@@ -961,6 +961,18 @@ export function fingerprintStrategy(strategy = {}) {
   for (const field of COMPARABLE_SCALAR_FIELDS) normalized[field] = strategy[field] ?? null;
   normalized.locations = [...(strategy.locations || [])].sort();
   normalized.countries = [...(strategy.countries || [])].sort();
+  // Round 59 (Nov 19 2026): unresolved_questions is part of the
+  // strategy's identity too. Without it, a revision whose ONLY change is
+  // the open questions — e.g. answering a creative question with a name
+  // that matches nothing, which should surface an honest not-found
+  // question instead of the candidate list — fingerprinted identically
+  // to the prior row, so Stream B's dedup returned the prior row verbatim
+  // and the new question never reached the user. The same omission the
+  // Pixel fix (round 31/40) already corrected for asset refs: the
+  // fingerprint must cover every field whose change would make a prior
+  // "approve" no longer mean the same thing, and a new open question is
+  // exactly that. Sorted: question order is incidental, never identity.
+  normalized.unresolved_questions = [...(strategy.unresolved_questions || [])].sort();
   // Approval-relevant fields COMPARABLE_SCALAR_FIELDS deliberately omits.
   normalized.mode = strategy.mode ?? null;
   normalized.action_type = strategy.action_type ?? null;

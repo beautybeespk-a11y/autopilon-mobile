@@ -676,7 +676,7 @@ function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, 
 // candidate list is itself the "a question was asked" evidence (the list
 // only exists because the question was asked), so verification still works
 // for legacy rows. Rows WITH a record use the record's candidateIds.
-export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction, claimedCreativeId }) {
+export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction, claimedCreativeId, namedProductNotFound }) {
   const source = strategy.creative_strategy?.source;
   const empty = { creative: null, ambiguousCandidates: [], creativeError: null, creativeNotFound: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (strategy.mode === "explicit_action" || !source) return empty;
@@ -817,6 +817,26 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
         },
       };
     }
+  }
+
+  // Round 59 — the user answered a PRODUCT_IMAGE creative question by
+  // naming a product that matches nothing in the store (namedProductNotFound,
+  // set by strategyBuilder.js when the name resolution found no real
+  // product at all): say so honestly instead of re-listing the same 50
+  // candidates. Surfaced by the caller's existing creativeNotFound
+  // handling (formatCreativeNotFoundQuestion below).
+  if (namedProductNotFound && source === "PRODUCT_IMAGE") {
+    return {
+      ...empty,
+      creativeNotFound: {
+        source,
+        requestedProduct: namedProductNotFound,
+        postsChecked: 0,
+        pagesFetched: 0,
+        reachedBound: false,
+        searched: true,
+      },
+    };
   }
 
   if (!productCandidates.length) {
@@ -976,7 +996,21 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
     const latestPickVerified = Boolean(explicitAction)
       && chosen.id === productCandidates[0]?.id
       && /\b(?:boost|use)\b[^.]{0,40}\b(?:latest|most recent|newest)\b/i.test(userMessage || "");
-    if (verifiedId !== chosen.id && !latestPickVerified) {
+    // Round 59 — a selector pick whose id equals the dispatcher/pre-loop
+    // claim (claimedCreativeId) is verified by construction: the claim
+    // was produced by matching the user's own raw words against a REAL
+    // catalogue product under the token rule (resolveNamedProductFor-
+    // CreativeAnswer, businessSnapshot.js) — the same standard
+    // findBestProductMatch applies everywhere else — never by the model
+    // asserting an id. claimedCreativeId is orchestrator-only (never a
+    // model-settable tool parameter), so accepting it here cannot let a
+    // model guess become a confirmed pick. Without this, a pick of a
+    // product the user named — which by definition was never shown in
+    // the candidate list — fails matchCreativeCandidateId's shown-ids
+    // verification and lands in pendingCreative forever.
+    const claimedPickVerified = typeof claimedCreativeId === "string" && claimedCreativeId.length > 0
+      && claimedCreativeId === chosen.id;
+    if (verifiedId !== chosen.id && !latestPickVerified && !claimedPickVerified) {
       // Round 51 — totalCandidates carried through so formatCreativeConfirmationQuestion
       // can offer a "see the other N" escape hatch (see its own comment).
       // productCandidates.length is always >= 2 here: productCandidates.length === 1
@@ -1063,6 +1097,11 @@ export function formatCreativeConfirmationQuestion(source, candidate, totalCandi
 // P-A7's note: a user explicitly asking for older posts should trigger
 // a freshResearchRequired revise, which re-runs the snapshot search).
 export function formatCreativeNotFoundQuestion(source, notFound) {
+  // Round 59 — a named product that matches nothing in the store: the
+  // honest line is about the product, not about posts.
+  if (source === "PRODUCT_IMAGE") {
+    return `I couldn't find a product called "${notFound.requestedProduct}" in your store — check the name, or pick a number from the list.`;
+  }
   const label = { EXISTING_PAGE_POST: "Facebook post", EXISTING_INSTAGRAM_POST: "Instagram post" }[source] || "post";
   const boundNote = notFound.reachedBound
     ? ` I checked the last ${notFound.postsChecked} posts (the search limit) — an older post about it could still exist beyond those.`

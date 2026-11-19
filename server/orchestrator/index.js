@@ -18,7 +18,7 @@ import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strat
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
 import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList, messageIsBareCreativeAffirmation } from "../agents/metaExpertV2/creativeResolution.js";
 import { requireValidToken } from "../integrations/manager.js";
-import { gatherBusinessSnapshot } from "../agents/metaExpertV2/businessSnapshot.js";
+import { gatherBusinessSnapshot, resolveNamedProductForCreativeAnswer } from "../agents/metaExpertV2/businessSnapshot.js";
 
 const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search + multiple reads + report generation
 
@@ -2153,6 +2153,70 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         } catch (err) {
           v2Trace("auto-revise creative failed (error)", { conversationId, error: err.message });
         }
+      }
+    }
+  }
+
+  // Round 59 — name-based creative answer (live bug, Nov 19 2026): the
+  // user answered a PRODUCT_IMAGE creative question by NAMING the product
+  // ("Maybelline Serum Matte Lipstick") instead of picking a number, id
+  // or label. The dispatcher claim above is null for that shape —
+  // matchCreativeCandidateId only matches candidates already shown, and
+  // only by literal label substring — so the pre-loop above never fires,
+  // and without this the model re-lists the same 50 candidates forever.
+  // Resolve the name against the REAL catalogue (sample first, then the
+  // targeted store search — same token rule everywhere) and save it
+  // exactly like a dispatcher claim: content_selector + claimedCreativeId
+  // (never model-settable; runBuildOrRevise merges the product into the
+  // snapshot and resolveCreativeSelection accepts the claim as verified).
+  // Fires only on an open creative-CANDIDATES list question for
+  // PRODUCT_IMAGE — never while a single pick is pending confirmation
+  // (that state has creativeCandidates null by design, so this can't
+  // fire there). A message that names no real product resolves nothing
+  // here — the model's own revise call then reaches runBuildOrRevise's
+  // honest not-found branch instead of silently re-listing.
+  if (hasV2Tools && conversationId && pendingAnswer.creativeId == null) {
+    const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
+    const resolvedAssets = activeStrategy?.resolvedAssets || {};
+    const creativeCandidates = resolvedAssets.creativeCandidates;
+    const creativeListQuestionOpen = Array.isArray(resolvedAssets.pendingQuestions)
+      && resolvedAssets.pendingQuestions.some((q) => q.kind === "creative_candidates");
+    if (activeStrategy && resolvedAssets.creative == null && !resolvedAssets.pendingCreative
+      && Array.isArray(creativeCandidates) && creativeCandidates.length > 0
+      && activeStrategy.strategy?.creative_strategy?.source === "PRODUCT_IMAGE"
+      && creativeListQuestionOpen) {
+      try {
+        const { product: named } = await resolveNamedProductForCreativeAnswer(
+          userId, userMessage, activeStrategy.snapshot?.business?.sampleProducts || []);
+        if (named) {
+          const accessToken = requireValidToken(userId, "meta_ads");
+          const revised = await reviseStrategyV2({
+            userId, conversationId, accessToken, strategyId: activeStrategy.id,
+            requestedChanges: { content_selector: { confirmedId: String(named.id) } },
+            userMessage,
+            claimedCreativeId: String(named.id),
+          });
+          if (revised.ok) {
+            otherFieldAutoRevisedThisTurn = true;
+            trace.push(traceStep("tool", "Auto-saved the creative you just chose (meta_expert_v2.revise_strategy)", "done"));
+            toolResults.push({ toolName: "meta_expert_v2.revise_strategy", result: { valid: true, strategyId: revised.strategyId, recommendationText: revised.recommendationText } });
+            // Same append-in-place pattern as the pre-loop above — the
+            // note stacks with any earlier pre-loop's note for this same
+            // message instead of overwriting it.
+            const lastIdx = conversationForModel.length - 1;
+            const last = conversationForModel[lastIdx];
+            if (last?.role === "user" && typeof last.content === "string") {
+              conversationForModel = [
+                ...conversationForModel.slice(0, lastIdx),
+                { ...last, content: `${last.content}\n\n[System note: this message's chosen creative (id ${named.id}) has already been saved to the active strategy via revise_strategy — no need to call it again for this. Updated recommendation: ${revised.recommendationText} If this message also indicates approval, you may now call meta_expert_v2.execute_strategy.]` },
+              ];
+            }
+          } else {
+            v2Trace("auto-revise creative by name failed (rejected)", { conversationId, issue: revised.unresolved?.issue });
+          }
+        }
+      } catch (err) {
+        v2Trace("auto-revise creative by name failed (error)", { conversationId, error: err.message });
       }
     }
   }
