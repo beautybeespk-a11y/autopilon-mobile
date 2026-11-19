@@ -12,7 +12,7 @@ import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
 import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy, getStoredStrategy } from "../agents/metaExpertV2/strategyStore.js";
-import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign, fingerprintStrategy as fingerprintStrategyV2 } from "../agents/metaExpertV2/policy.js";
+import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, messageIndicatesStrongExecutionApproval, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign, fingerprintStrategy as fingerprintStrategyV2 } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
@@ -445,6 +445,130 @@ function checkComparisonRequestedButMissingGate({ decision, hasV2Tools, userMess
   if (latestBreakdownResult?.comparison) return null;
   return 'You asked a question that compares two periods, but your reply reports only a single-period total — no actual period-over-period comparison was performed this turn. Call meta_expert_v2.get_performance_breakdown with a specific campaignId AND compareToPriorPeriod: true now, and answer using the real current-vs-prior totals and deltas it returns — never a single total presented as if it answered a comparison question.';
 }
+
+// Round 57 (Test 2 live bug — deltas copied, not computed): the delta
+// COMPUTATION in performanceBreakdown.js is correct (it computes
+// percentChange from the real current/prior totals and rates, and the
+// round-53 tests pin it) — but nothing ever verified the REPLY's delta
+// figures against it. In live testing the model reported byte-identical
+// deltas across two runs with different underlying numbers (spend
+// +343.70%, CTR +15.93%, frequency +63.81% — the frequency figure
+// matching NEITHER run's ratio, +64.58% and +20.00%): it copied delta
+// percentages from conversation history instead of the tool result's
+// comparison.deltas. The existing gates only check that A backing tool
+// was called, never that the percentages match what it returned. This
+// gate closes that hole at the same layer: when a real comparison was
+// performed this turn, any delta percentage the final reply states for a
+// NAMED metric must match the tool's computed delta for that metric.
+// A percentage only counts as a STATED DELTA when it carries an explicit
+// sign ("+343.70%", "-8.25%") or a direction word just before it ("rose
+// 15.93%", "down 20%") — a plain percentage ("CTR 4.08%") is a RATE, not
+// a delta, and is never compared, so a reply that only quotes rates
+// passes untouched. Tolerance is 0.5 percentage points: quoting the
+// tool's deltas verbatim differs by at most 0.01 (rounding), and
+// honestly recomputing from the displayed rounded totals by at most
+// ~0.3 — while the live copied frequency delta was 0.77 points off the
+// displayed-totals figure in the good run and 43.81 off in the bad one.
+// A copy that lands within 0.5 points of the true delta is
+// undetectable by value alone — accepted residual, documented here
+// rather than silently: the nudge hands the model the exact correct
+// values either way, so even a borderline false positive self-corrects.
+const COMPARISON_DELTA_LABELS = [
+  { pattern: /\bspend\b/i, key: "spendPct", name: "spend" },
+  { pattern: /\bpurchases?\b|\borders?\b/i, key: "purchasesPct", name: "purchases" },
+  { pattern: /\bcpa\b/i, key: "cpaPct", name: "CPA" },
+  { pattern: /\broas\b/i, key: "roasPct", name: "ROAS" },
+  { pattern: /\bctr\b/i, key: "ctrPct", name: "CTR" },
+  { pattern: /\bfrequency\b/i, key: "frequencyPct", name: "frequency" },
+  { pattern: /\bcpc\b/i, key: "cpcPct", name: "CPC" },
+  { pattern: /\bcpm\b/i, key: "cpmPct", name: "CPM" },
+  { pattern: /\bcvr\b/i, key: "cvrPct", name: "CVR" },
+  { pattern: /\baov\b/i, key: "aovPct", name: "AOV" },
+];
+const DELTA_TOLERANCE_PP = 0.5;
+const DELTA_LABEL_PROXIMITY_CHARS = 40;
+const DELTA_DIRECTION_WORDS = /\b(up|down|rose|risen|fell|fallen|increased|decreased|grew|grown|shrank|shrunk|higher|lower|jumped|dropped|climbed|change|changed|delta)\b/i;
+const DELTA_DIRECTION_DOWN_WORDS = /\b(down|fell|fallen|decreased|shrank|shrunk|lower|dropped)\b/i;
+export function checkComparisonDeltaMismatchGate({ decision, hasV2Tools, latestBreakdownResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  const deltas = latestBreakdownResult?.comparison?.deltas;
+  if (!deltas || typeof deltas !== "object") return null;
+  const message = decision.message;
+  const mismatches = [];
+  for (const match of message.matchAll(/([+-]?)(\d+(?:\.\d+)?)\s*%/g)) {
+    const value = Number(match[2]);
+    if (!Number.isFinite(value)) continue;
+    const tokenStart = match.index;
+    // Is this a stated DELTA? Explicit sign, or a direction word in the
+    // ~14 chars before the number. A plain "4.08%" is a rate — skip.
+    let stated = null;
+    if (match[1] === "+") stated = value;
+    else if (match[1] === "-") stated = -value;
+    else {
+      const before = message.slice(Math.max(0, tokenStart - 14), tokenStart);
+      if (!DELTA_DIRECTION_WORDS.test(before)) continue;
+      stated = DELTA_DIRECTION_DOWN_WORDS.test(before) ? -value : value;
+    }
+    // Attribute it to the nearest metric label. A label BEFORE the value
+    // wins over one after it: in the natural "Spend +343.70%, CTR
+    // +15.93%" list form, the NEXT metric's label sits only a couple of
+    // characters after the previous metric's value, so nearest-by-distance
+    // alone mis-attributes +343.70% to CTR. Only when no label precedes
+    // the value within 40 chars (e.g. "up 343.70% on spend") is a
+    // following label used.
+    let nearest = null;
+    let nearestBeforeDistance = Infinity;
+    let nearestAfterDistance = Infinity;
+    let nearestAfter = null;
+    for (const label of COMPARISON_DELTA_LABELS) {
+      for (const labelMatch of message.matchAll(new RegExp(label.pattern.source, "gi"))) {
+        if (labelMatch.index + labelMatch[0].length <= tokenStart) {
+          const distance = tokenStart - (labelMatch.index + labelMatch[0].length);
+          if (distance <= DELTA_LABEL_PROXIMITY_CHARS && distance < nearestBeforeDistance) {
+            nearest = label;
+            nearestBeforeDistance = distance;
+          }
+        } else if (labelMatch.index >= tokenStart + match[0].length) {
+          const distance = labelMatch.index - (tokenStart + match[0].length);
+          if (distance <= DELTA_LABEL_PROXIMITY_CHARS && distance < nearestAfterDistance) {
+            nearestAfter = label;
+            nearestAfterDistance = distance;
+          }
+        }
+      }
+    }
+    if (!nearest) nearest = nearestAfter;
+    if (!nearest) continue;
+    const computed = deltas[nearest.key];
+    if (typeof computed !== "number") continue; // null delta (zero base) — nothing to verify against
+    if (Math.abs(stated - computed) > DELTA_TOLERANCE_PP) {
+      mismatches.push({ name: nearest.name, stated, computed });
+    }
+  }
+  if (!mismatches.length) return null;
+  const lines = mismatches.map((m) => `  - ${m.name}: you wrote ${m.stated >= 0 ? "+" : ""}${m.stated}% — the real comparison returns ${m.computed >= 0 ? "+" : ""}${m.computed.toFixed(2)}%`).join("\n");
+  const correct = COMPARISON_DELTA_LABELS
+    .filter((l) => typeof deltas[l.key] === "number")
+    .map((l) => `${l.name} ${deltas[l.key] >= 0 ? "+" : ""}${deltas[l.key].toFixed(2)}%`)
+    .join(", ");
+  return `Your reply states period-over-period deltas that do NOT match the real comparison this turn's meta_expert_v2.get_performance_breakdown call actually returned:\n${lines}\nQuote the tool result's comparison.deltas verbatim — never restate delta percentages from an earlier message, and never recompute them from rounded figures. The real deltas are: ${correct}.`;
+}
+
+// Round 57 — deterministic fallback for the delta gate above: on the
+// second offense the reply is built from the tool result's own computed
+// deltas, never from the model's words, so the user still gets the real
+// comparison instead of a refusal.
+function formatVerifiedComparisonReply(latestBreakdownResult) {
+  const comparison = latestBreakdownResult?.comparison;
+  const deltas = comparison?.deltas;
+  if (!deltas || typeof deltas !== "object") return null;
+  const fmt = (v) => (typeof v === "number" ? `${v >= 0 ? "+" : ""}${v.toFixed(2)}%` : "n/a");
+  const currentLabel = comparison.currentRange?.label || "the current period";
+  const priorLabel = comparison.priorRange?.label || "the prior period";
+  const lines = COMPARISON_DELTA_LABELS.map((l) => `${l.name}: ${fmt(deltas[l.key])}`).join("\n");
+  return `Here's the period-over-period comparison from the real data (${currentLabel} vs ${priorLabel}):\n${lines}`;
+}
+const MAX_COMPARISON_DELTA_NUDGES = 1;
 
 // Round 47 (live production bug): "change the campaign budget to 750/day"
 // after a campaign was already created got a "final" reply presenting the
@@ -922,10 +1046,25 @@ function findPendingV2ExecuteConfirmation({ userId, conversationId }) {
 // campaign_edit proposal — never interferes with an ordinary campaign
 // strategy's own approval flow, which checkV2ExecutionApprovalGate above
 // still owns entirely, untouched.
-export function checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage }) {
+export function checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn = false, pendingCreativeJustAutoConfirmedThisTurn = false }) {
   const active = getActiveStrategyForConversation(userId, conversationId);
   if (!active || active.strategy?.mode !== "campaign_edit") return null;
-  if (!messageIndicatesExecutionApprovalV2(userMessage)) {
+  // Round 57: this used the WEAK check (messageIndicatesExecutionApprovalV2)
+  // — a bare whole-message "yes"/"ok"/"sure" counted as approval. Those
+  // words are consumable answers to other open questions (a destination-URL
+  // or pending-creative confirmation), exactly the collision the executor's
+  // own check already refuses — so a bare "yes" answering another question
+  // could approve a live ad-set edit. Now uses the STRONG check, the same
+  // one execute_strategy's defense-in-depth uses, plus the same consumption
+  // flags the execute gate already takes: a message spent confirming a URL
+  // or a creative is never also edit approval. The strong pattern was
+  // extended in the same round to cover "apply it"/"apply the edit"/
+  // "yes, apply it" — the approval language this gate's own error message
+  // suggests, which previously matched NEITHER check.
+  if (destinationUrlJustAutoConfirmedThisTurn || pendingCreativeJustAutoConfirmedThisTurn) {
+    return "This message was just used to confirm the destination URL or the creative for this campaign — that confirmation has been saved, but it is NOT approval to apply the edit, and apply_campaign_edit has been blocked. Tell the user plainly: the edit has NOT been applied yet, and they need to say \"approve\" (or \"yes, apply it\") separately to actually apply it.";
+  }
+  if (!messageIndicatesStrongExecutionApproval(userMessage)) {
     return 'The user has not explicitly approved this campaign edit in their latest message. Present (or re-present) the proposed changes and wait for clear approval language (e.g. "approve", "proceed", "yes, apply it") before calling meta_expert_v2.apply_campaign_edit.';
   }
   return null;
@@ -1576,18 +1715,6 @@ export function resolvePendingQuestionAnswer({ activeStrategy, userMessage }) {
   const budgetQuestionOpen = activeStrategy.strategy?.budget_daily == null
     || questions.includes("What daily budget would you like for this?");
   const pendingEntries = Array.isArray(resolvedAssets.pendingQuestions) ? resolvedAssets.pendingQuestions : [];
-  const openQuestionKinds = new Set(
-    pendingEntries.map((e) => e.kind)
-      .concat(questions.map((q) => {
-        if (q.startsWith("Which ") && q.includes("should I use as the ad's creative?")) return "creative_candidates";
-        if (q.startsWith("To confirm — you'd like to use")) return "pending_creative";
-        if (q === "What daily budget would you like for this?") return "budget";
-        if (q.startsWith("This campaign needs a destination website URL")) return "destination_url";
-        if (q.startsWith('What ad text would you like for the "')) return "primary_text";
-        if (q.includes("Meta Pixels connected")) return "pixel";
-        return "other";
-      }))
-  );
 
   // A bare affirmation with two open affirmation-questions (pending creative +
   // destination URL) claims neither — recorded here so both pre-loops skip it.
@@ -1622,15 +1749,37 @@ export function resolvePendingQuestionAnswer({ activeStrategy, userMessage }) {
   }
 
   // 2. Budget SECOND, and only from a signal that names money. A bare number is
-  //    a budget ONLY if (a) no creative question is pending (enforced above:
+  //    a budget whenever (a) no creative question is pending (enforced above:
   //    bareNumberClaimedBy would already be "creative"), AND (b) either the
-  //    message carries a currency prefix / "/day" suffix, OR budget is the SOLE
-  //    open question kind. "3" with a creative question pending never reaches here.
+  //    message carries a currency prefix / "/day" suffix, OR it is just the
+  //    bare number on its own and cannot plausibly be a creative position:
+  //    no creative question is pending at all, or the number is at least
+  //    100. Round 57: the old rule ALSO required budget to be the SOLE
+  //    open question kind — that re-broke the live "500" case the moment
+  //    any other question was still open (which, before this round's
+  //    creative/destination fixes, was always: the answers never landed,
+  //    so the questions never closed). The sole-kind condition is
+  //    redundant now that creative claims FIRST — except for one hole it
+  //    used to cover: a SMALL out-of-range number ("3" for a 2-candidate
+  //    list) is far more plausibly a mistyped position than a real budget,
+  //    and claiming it as PKR 3/day is the exact Stream C trap. The 100
+  //    floor closes that hole without re-breaking "500": below PKR 100/day
+  //    is below any real Meta minimum daily budget (the live test budgets
+  //    are 500-700), while a real candidate list never numbers 100
+  //    options — so a bare number >= 100 beside an open creative question
+  //    can only be a budget. No other open field can be answered by a
+  //    bare number at all (a destination needs a URL/domain, a Pixel
+  //    needs a >=10-digit id in pixelCandidates, ad copy is free text and
+  //    its pre-loop explicitly excludes a dispatcher-claimed bare number).
+  //    "3" with a creative question pending still never reaches here as
+  //    a budget — it claims nothing and the question is re-asked.
   if (budgetQuestionOpen && claims.bareNumberClaimedBy !== "creative") {
+    const bareNumberMatch = /^\s*(\d+)\s*\.?\s*$/.exec(userMessage);
+    const bareNumberValue = bareNumberMatch ? Number(bareNumberMatch[1]) : null;
     const extracted = deriveBudgetFromUserMessageIfMissing(
       { budget_daily: null },
       userMessage,
-      { allowBareNumber: openQuestionKinds.size === 1 && openQuestionKinds.has("budget") }
+      { allowBareNumber: !creativeQuestionPending || (bareNumberValue != null && bareNumberValue >= 100) }
     );
     if (typeof extracted.budget_daily === "number") {
       claims.budgetDaily = extracted.budget_daily;
@@ -1908,6 +2057,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let performanceDataClaimNudges = 0;
   let periodMislabelNudges = 0;
   let comparisonMissingNudges = 0;
+  let comparisonDeltaNudges = 0;
   let diagnosisClaimNudges = 0;
   let falseActionClaimNudges = 0;
 
@@ -2729,6 +2879,33 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
           trace, toolResults, usage: usageTotals,
         };
       }
+      // Round 57 — see checkComparisonDeltaMismatchGate's own header
+      // comment. Same nudge-then-honest-fallback shape as the
+      // comparison-missing gate above, with one difference: the numbers
+      // ARE real and already fetched, so on the second offense the reply
+      // is built deterministically from the tool result's own deltas
+      // instead of letting a copied figure reach the customer.
+      const comparisonDeltaMessage = checkComparisonDeltaMismatchGate({
+        decision, hasV2Tools, latestBreakdownResult,
+      });
+      if (comparisonDeltaMessage && comparisonDeltaNudges < MAX_COMPARISON_DELTA_NUDGES) {
+        comparisonDeltaNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: comparisonDeltaMessage },
+        ];
+        continue;
+      }
+      if (comparisonDeltaMessage) {
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "A period-comparison reply stated deltas that did not match the real comparison — overridden with the verified figures.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: formatVerifiedComparisonReply(latestBreakdownResult) || "I wasn't able to verify the comparison figures in my reply — could you repeat the request and I'll pull the real current-vs-prior numbers again?",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
       // Round 55 (Phase 3B) — see checkFalseActionClaimGate's own header
       // comment. No tool exists this round that pauses/disables/changes a
       // budget, so this claim can never be true, no matter what. One
@@ -3381,7 +3558,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         // above: a gate-blocked attempt here doesn't consume the once-per-
         // turn dispatch budget, only a genuine apply attempt that reaches
         // runTool() below does.
-        const editGateError = checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage });
+        const editGateError = checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage, destinationUrlJustAutoConfirmedThisTurn, pendingCreativeJustAutoConfirmedThisTurn });
         if (editGateError) {
           outcome = { status: "failed", error: editGateError };
         }

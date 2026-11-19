@@ -420,6 +420,21 @@ export function matchCreativeCandidateId(userMessage, candidates, opts = {}) {
     if (Number.isInteger(position) && position >= 1 && position <= shownCandidates.length) return shownCandidates[position - 1].id;
   }
 
+  // Round 57 (answer-handling fix): an affirmation word directly before
+  // the number ("yes 1", "yes, 1", "ok 2", "use 1") is a list pick — the
+  // live "yes 1 … and yes beautybees.pk" reply matched nothing above, so
+  // the creative question was re-asked forever. Safe where a mid-sentence
+  // bare number is not: the affirmation word anchors the number, so
+  // "budget 600" can never match (no affirmation before 600), and the
+  // position is range-checked against the candidates actually shown —
+  // "yes 500" with two candidates falls through to the budget claim
+  // instead of picking a post that was never offered.
+  const affirmedPosition = userMessage.match(/\b(?:yes|yeah|yep|yup|ok|okay|sure|use)\s*,?\s*(\d+)\b/i);
+  if (affirmedPosition) {
+    const position = Number(affirmedPosition[1]);
+    if (Number.isInteger(position) && position >= 1 && position <= shownCandidates.length) return shownCandidates[position - 1].id;
+  }
+
   // Compound answer ("3, budget 600/day"): a LEADING number followed by a
   // comma that is NOT a thousands separator is the list position. The
   // comma must not be followed by a digit — "3,000/day" is a budget of

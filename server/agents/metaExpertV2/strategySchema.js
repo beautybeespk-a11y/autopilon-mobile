@@ -285,10 +285,16 @@ export function deriveEmptyArrayFieldsIfMissing(strategy) {
 // cannot tell them apart, and guessing wrong silently set a PKR 3/day budget live.
 // Bare numbers are only ever a budget when the caller passes { allowBareNumber: true },
 // which the orchestrator dispatcher (resolvePendingQuestionAnswer) sets ONLY when
-// budget is the SOLE open question and no creative question is pending. Every other
-// caller must pass nothing (default false). Currency-prefixed ("PKR 500", "Rs.500",
-// "$500") and "/day"-suffixed ("600/day", "600 per day") forms are unambiguous and
-// keep working exactly as before, including inside compound messages.
+// the bare number was NOT already claimed as a creative pick (creative claims
+// FIRST) AND cannot plausibly be a mistyped position either: no creative question
+// is pending, or the number is at least 100 (round 57 dropped the older
+// sole-open-question-kind condition, which re-broke the live "500" case whenever
+// any other question was still open; creative-first claiming plus the 100 floor
+// is what actually disambiguates, since no other open field can be answered by a
+// bare number at all). Every other caller must pass nothing (default false).
+// Currency-prefixed ("PKR 500", "Rs.500", "$500") and "/day"-suffixed ("600/day",
+// "600 per day") forms are unambiguous and keep working exactly as before,
+// including inside compound messages.
 const USER_MESSAGE_BUDGET_PATTERN = /(?:\b(?:pkr|rs\.?|usd)\s*|\$\s*)([\d][\d,]{0,5})\b|\b([\d][\d,]{0,5})\s*(?:\/|per\s+)\s*day\b/i;
 const USER_MESSAGE_BARE_NUMBER_PATTERN = /^\s*([\d][\d,]{0,5})\s*\.?\s*$/;
 export function deriveBudgetFromUserMessageIfMissing(strategy, userMessage, opts = {}) {
@@ -301,7 +307,9 @@ export function deriveBudgetFromUserMessageIfMissing(strategy, userMessage, opts
     return { ...strategy, budget_daily: amount, budget_basis: "USER_PROVIDED" };
   }
   // Bare-number fallback: ONLY when the caller has established (from stored open
-  // questions, never from the message text) that budget is the only question open.
+  // questions and the dispatcher's creative-first claim, never from the message
+  // text alone) that this bare number was not already claimed as a creative pick.
+  // See the Stream C comment on USER_MESSAGE_BUDGET_PATTERN above.
   if (opts.allowBareNumber === true) {
     const bare = USER_MESSAGE_BARE_NUMBER_PATTERN.exec(userMessage);
     if (!bare) return strategy;
