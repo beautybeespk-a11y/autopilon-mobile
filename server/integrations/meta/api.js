@@ -556,6 +556,16 @@ export async function getAdAccount(accessToken, adAccountId) {
   return metaFetch(`/${normalizeAdAccountId(adAccountId)}?fields=id,name,account_status,currency,timezone_name,amount_spent,balance`, { accessToken });
 }
 
+// Round 58 — the granted-permission list for the token, for the account
+// health check (accountHealth.js). Meta returns
+// { data: [{ permission: "ads_read", status: "granted" }, …] } — a scope
+// the token was never granted (or that was revoked in Business Settings)
+// simply isn't in the granted set, so the caller diffs it against the
+// SCOPES the app requests (oauth.js).
+export async function listPermissions(accessToken) {
+  return metaFetch("/me/permissions", { accessToken });
+}
+
 export async function getAdSet(accessToken, adSetId) {
   return metaFetch(`/${adSetId}?fields=id,name,status,campaign_id,daily_budget,lifetime_budget,optimization_goal,billing_event,bid_strategy,targeting`, { accessToken });
 }

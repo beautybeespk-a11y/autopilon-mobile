@@ -60,7 +60,7 @@ export function metaOAuthStatus() {
 // app's "Create & manage ads" use case there, and only then did reconnect
 // succeed. It also only takes effect on a fresh reconnect; tokens issued
 // before this change need one more reconnect.
-const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"];
+export const SCOPES = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"];
 
 export function buildAuthorizationUrl(state) {
   const status = metaOAuthStatus();

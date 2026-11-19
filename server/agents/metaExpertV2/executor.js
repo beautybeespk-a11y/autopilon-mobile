@@ -22,6 +22,8 @@ import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign, messa
 import { MIN_CAROUSEL_CARDS, MAX_CAROUSEL_CARDS, postMatchesProduct } from "./creativeResolution.js";
 import { matchLinkedProduct } from "./businessSnapshot.js";
 import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, recordStrategyApproval, hasValidApproval, findStaleApprovalFingerprint, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
+import { campaignNameForStrategy } from "./strategyBuilder.js";
+import { checkAccountHealthCached } from "./accountHealth.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 import { logger } from "../../config/logger.js";
 
@@ -605,7 +607,7 @@ async function executeCampaignMode(stored, accessToken, userId, currency) {
   // budget must stay exactly what was approved; Meta reallocating a slice
   // of it on its own is exactly the kind of silent-drift a real spend
   // decision must never be subject to unasked.
-  const campaignParams = { name: `${strategy.business_goal} — ${strategy.recommended_objective}`, objective: strategy.recommended_objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
+  const campaignParams = { name: campaignNameForStrategy(strategy), objective: strategy.recommended_objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
   // Diagnostic logging (round 31 live bug: the identical Meta error
   // 100/1815857 recurred after the CBO/ABO fix above was deployed, because
   // that fix hadn't actually been deployed yet — see round 31's follow-up
@@ -756,7 +758,7 @@ async function executeExplicitAction(stored, accessToken, userId, conversationId
     err.code = "META_V2_EXPLICIT_ACTION_CTA_UNSUPPORTED";
     throw err;
   }
-  const campaignParams = { name: `${strategy.business_goal} — ${objective}`, objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
+  const campaignParams = { name: campaignNameForStrategy(strategy), objective, status: "PAUSED", isAdsetBudgetSharingEnabled: false };
   // Diagnostic logging (round 31) — see executeCampaignMode's matching log
   // lines above; kept here too so a live report is distinguishable by
   // which of the two modes actually dispatched (see the dispatch log in
@@ -861,6 +863,22 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
     const err = new Error("This is a campaign EDIT proposal, not a new strategy to execute — call meta_expert_v2.apply_campaign_edit instead.");
     err.code = "META_V2_WRONG_EXECUTION_TOOL";
     throw err;
+  }
+
+  // Round 58 / Phase 1 — account health check, re-verified at execute
+  // time: a strategy can sit in 'proposed' for days and the account can
+  // go unhealthy in between (Nov 6: disabled for a past-due payment).
+  // Same cached check as the build hook; skipped when no ad account was
+  // resolved (not-connected keeps the existing handling). Blocks with a
+  // plain-language error, never a cryptic Meta code.
+  if (stored.resolvedAssets?.adAccountId) {
+    const health = await checkAccountHealthCached({ userId, accessToken, adAccountId: stored.resolvedAssets.adAccountId, pageId: stored.resolvedAssets.pageId, pixelId: stored.resolvedAssets.pixelId });
+    if (!health.ok) {
+      const err = new Error(health.issues[0].message);
+      err.code = "META_V2_ACCOUNT_UNHEALTHY";
+      err.issues = health.issues;
+      throw err;
+    }
   }
 
   // Defense in depth — checkV2ExecutionApprovalGate in orchestrator/

@@ -24,7 +24,7 @@ const { saveConnection, updateConnectionMeta, getConnection } = await import("..
 const { gatherBusinessSnapshot, matchLinkedProduct, deriveRequestedProductFromMessage, searchCatalogueForProduct } = await import("../agents/metaExpertV2/businessSnapshot.js");
 const { gatherPerformanceBreakdown, formatRangeLabel } = await import("../agents/metaExpertV2/performanceBreakdown.js");
 const meta = await import("../integrations/meta/api.js");
-const { buildStrategy, reviseStrategy, pixelSummaryValue } = await import("../agents/metaExpertV2/strategyBuilder.js");
+const { buildStrategy, reviseStrategy, pixelSummaryValue, campaignNameForStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
 const { messageIndicatesExecutionApproval, messageIndicatesStrongExecutionApproval, extractUrlFromMessage, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
@@ -33,6 +33,8 @@ const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCrea
 const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } = await import("../agents/metaExpertV2/productMatching.js");
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
+const { checkAccountHealth, checkAccountHealthCached, clearAccountHealthCache } = await import("../agents/metaExpertV2/accountHealth.js");
+const { resolveMessageAgentId } = await import("../orchestrator/chatAgentResolution.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
 const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, orchestrate } = await import("../orchestrator/index.js");
@@ -88,6 +90,12 @@ function jsonResponse(body, status = 200) { return { ok: status < 400, status, j
 function metaRouter({
   adAccounts = [], pages = [], igByPageId = {}, pixels = [], catalogs = [], campaigns = [], posts = [], postsError = false, igPosts = [], igPostsError = false,
   pageTokenUnavailable = false, writes = [], writeError = null, corruptAdReadback = false,
+  // Round 58 (account health check) — permissions: the scopes granted on
+  // the token, as /me/permissions reports them. Defaults to ALL six scopes
+  // the app requests (oauth.js SCOPES), so every pre-existing test keeps
+  // the healthy behaviour it had before the health check existed; a test
+  // passes a shorter list to simulate a revoked/never-granted scope.
+  permissions = ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management", "pages_manage_ads"],
   // Round 49 — campaignInsights: real Meta shape per campaign id ({impressions,
   // clicks, spend, reach, actions, action_values, ...}), so a multi-campaign
   // blended-rollup test can give each campaign its OWN real numbers instead
@@ -181,6 +189,10 @@ function metaRouter({
     if (path === "/me/adaccounts") return jsonResponse({ data: adAccounts });
     if (path === "/me/accounts") return jsonResponse({ data: pages });
     if (path === "/me/businesses") return jsonResponse({ data: [] });
+    // Round 58 — /me/permissions for the account health check's scope
+    // verification (accountHealth.js): granted scopes only, Meta's real
+    // shape { data: [{ permission, status }] }.
+    if (path === "/me/permissions") return jsonResponse({ data: permissions.map((p) => ({ permission: p, status: "granted" })) });
     // Round 54 follow-up (currency gate fix) — meta.getAdAccount's
     // single-entity lookup (/act_N?fields=...,currency,...), now called
     // by performanceBreakdown.js so the breakdown's own output can carry
@@ -191,7 +203,10 @@ function metaRouter({
     const adAccountFieldsMatch = path.match(/^\/(act_\w+)$/);
     if (adAccountFieldsMatch && u.searchParams.get("fields")?.includes("currency")) {
       const acct = adAccounts.find((a) => a.id === adAccountFieldsMatch[1]);
-      return jsonResponse({ id: adAccountFieldsMatch[1], name: acct?.name || "Ad Account", account_status: 1, currency: acct?.currency || "USD" });
+      // Round 58 — respect a fixture account_status when the test sets one
+      // (e.g. 2 = disabled, for the account health check); default 1
+      // (active) keeps every pre-existing test healthy.
+      return jsonResponse({ id: adAccountFieldsMatch[1], name: acct?.name || "Ad Account", account_status: acct?.account_status ?? 1, currency: acct?.currency || "USD" });
     }
     // Test stage: composite Facebook post ids (111_1) are single-entity
     // GETs too (meta.getPagePost /{postId}) — \d+ alone never matched
@@ -12089,6 +12104,380 @@ async function run() {
     const required = match[1].split(",").map((s) => s.trim().replace(/^["']|["']$/g, "")).filter(Boolean);
     for (const scope of EXPECTED_META_SCOPES) {
       assert.ok(required.includes(scope), `debugMetaToken.js REQUIRED_SCOPES must include ${scope}; got: ${required.join(",")}`);
+    }
+  });
+
+  // --- Round 58 (Phase 0 + Phase 1) --------------------------------------
+  // Phase 0.1 — single-post "yes 1" confirmation: the agent shows ONE post
+  // as the creative and the user replies "yes 1". PR #6 left this
+  // unconsumed (only a bare "yes" or "use that post" worked) because the
+  // dispatcher claim was never threaded into resolveCreativeSelection and
+  // the creative pre-loop only fired when a candidate LIST was populated —
+  // which is never the case while a pick is pending.
+  await check("[round 58 'yes 1'] messageAffirmsPendingCreative: 'yes 1' affirms the single shown post; 'yes 2' never does; a compound message never does", () => {
+    for (const m of ["yes 1", "yes, 1", "yes 1.", "yep 1", "that one 1", "correct 1"]) {
+      assert.ok(messageAffirmsPendingCreative(m, { pendingCreativeQuestion: true }), `${m} must affirm`);
+    }
+    for (const m of ["yes 2", "yes 3", "yes 500", "ok 1", "yes 1 and yes beautybees.pk", "yes 1, budget 600/day", "1"]) {
+      assert.ok(!messageAffirmsPendingCreative(m, { pendingCreativeQuestion: true }), `${m} must NOT affirm the single shown post`);
+    }
+    assert.ok(messageAffirmsPendingCreative("yes", { pendingCreativeQuestion: true }), "a bare 'yes' still affirms");
+    assert.ok(!messageAffirmsPendingCreative("yes 1", {}), "without the pending-creative-question flag only the embedded phrases work — 'yes 1' must not promote anywhere else");
+  });
+
+  await check("[round 58 'yes 1'] reviseStrategy with 'yes 1' promotes a pendingCreative to `creative` (provenance pending_affirmed)", async () => {
+    const userId = makeUser(`v2-yes1-affirm-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.ok, true, JSON.stringify(pending.unresolved));
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending, not resolved");
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist");
+
+      // The fix: "yes 1" — an affirmation of the ONE post shown — promotes
+      // it, exactly like a bare "yes" did before.
+      const confirmed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: pending.strategyId,
+        requestedChanges: {}, userMessage: "yes 1",
+      });
+      assert.equal(confirmed.ok, true, JSON.stringify(confirmed.unresolved));
+      assert.deepEqual(confirmed.resolved.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "'yes 1' must promote the exact pending pick");
+      assert.equal(confirmed.resolved.pendingCreative, null, "must be cleared once promoted");
+      assert.deepEqual(confirmed.strategy.unresolved_questions, [], "the confirmation question must clear once affirmed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 'yes 1'] orchestrate: 'yes 1' resolves the pendingCreative via the dispatcher claim even when the model never calls revise_strategy", async () => {
+    const userId = makeUser(`v2-yes1-auto-revise-${stamp}@example.com`);
+    connectMeta(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const fivePosts = [1, 2, 3, 4, 5].map((n) => ({
+      id: `111_${n}`, message: `Post number ${n}`, created_time: `2024-03-0${n}T10:00:00+0000`,
+      permalink_url: `https://facebook.com/111/posts/${n}`, attachments: { data: [{ media_type: "photo" }] },
+    }));
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts } }));
+    let pending;
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." }, destination_url: "https://example.com" }),
+        userMessage: "use one of my facebook page posts as the ad, link it to https://example.com",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      pending = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { position: 5 } },
+        userMessage: "pixel will be the one ending on 4129 and the budget will be 600/day",
+      });
+      assert.equal(pending.resolved.creative, null, "sanity: must start pending");
+      assert.ok(pending.resolved.pendingCreative, "sanity: a real pendingCreative must exist going into the turn below");
+    } finally {
+      restoreFetch();
+    }
+
+    mockFetch(scriptedFetch({
+      metaOpts: { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: fivePosts },
+      chatResponses: [
+        finalText("Great, I've confirmed that post as the creative."),
+        finalText("Great, I've confirmed that post as the creative.\nCreative: Facebook post \"Post number 5\" (id 111_5, posted 2024-03-05T10:00:00+0000)"),
+      ],
+    }));
+    try {
+      const userMessage = "yes 1";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const revise = result.toolResults.find((r) => r.toolName === "meta_expert_v2.revise_strategy");
+      assert.ok(revise, `the auto-revise must dispatch a REAL revise_strategy call even though the model never called any tool itself: ${JSON.stringify(result.toolResults)}`);
+
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.deepEqual(active?.resolvedAssets.creative, { source: "EXISTING_PAGE_POST", contentId: "111_5", postId: "111_5", caption: "Post number 5", captionExcerpt: "Post number 5", publishedDate: "2024-03-05T10:00:00+0000", permalink: "https://facebook.com/111/posts/5", linkedProduct: null, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } }, "the pending pick must actually be promoted to `creative` in storage, not just narrated");
+      assert.equal(active?.resolvedAssets.pendingCreative, null, "pendingCreative must be cleared once promoted");
+      assert.ok(!active?.strategy.unresolved_questions.some((q) => q.startsWith("To confirm —")), "the confirmation question must be cleared");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Phase 0.2 — intermittent "AI provider not configured — Agent not
+  // found". Root cause: the route 404s whenever the posted agentId doesn't
+  // resolve, and both chat clients post the dropdown's selected agent —
+  // never re-synced to the conversation actually open — so a stale
+  // selection fails the whole turn; the client then renders ANY chat error
+  // under the provider banner, so a 404 reads as a provider problem. The
+  // server fix (chatAgentResolution.js) falls back to the conversation's
+  // own stored agent when the posted id doesn't exist at all; an agent
+  // that EXISTS but the user can't access stays a 404 (genuine
+  // authorization — never a fallback). The client half (Chat.jsx: sync
+  // the dropdown on openConversation, 503-only provider banner) is a
+  // one-line-each change verified by re-reading, not by a test — no
+  // client build exists on this VM.
+  await check("[round 58 agent fallback] resolveMessageAgentId: a valid posted agent is used as-is; a stale id falls back to the conversation's own agent", () => {
+    const userId = makeUser(`v2-agent-fallback-${stamp}@example.com`);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(conversationId, userId, agentId, "Test conversation", now, now);
+
+    assert.deepEqual(resolveMessageAgentId({ userId, agentId, conversationId }), { agentId }, "a valid agent must be returned unchanged");
+    assert.deepEqual(
+      resolveMessageAgentId({ userId, agentId: "stale-agent-that-never-existed", conversationId }),
+      { agentId, fellBack: true },
+      "a stale posted id must fall back to the conversation's own agent, not 404 the turn",
+    );
+    assert.deepEqual(
+      resolveMessageAgentId({ userId, agentId: "stale-agent-that-never-existed", conversationId: null }),
+      { error: "Agent not found" },
+      "a new conversation has nothing to fall back to — still a 404",
+    );
+    assert.deepEqual(
+      resolveMessageAgentId({ userId, agentId: "stale-agent-that-never-existed", conversationId: "conversation-that-does-not-exist" }),
+      { error: "Agent not found" },
+      "an unknown conversation has nothing to fall back to — still a 404",
+    );
+    assert.deepEqual(resolveMessageAgentId({ userId, agentId: null, conversationId }), { agentId: null }, "plain chat (no agent) resolves to null");
+  });
+
+  await check("[round 58 agent fallback] resolveMessageAgentId: an agent that EXISTS but belongs to another user never falls back — authorization is preserved", () => {
+    const ownerId = makeUser(`v2-agent-fallback-owner-${stamp}@example.com`);
+    const otherId = makeUser(`v2-agent-fallback-other-${stamp}@example.com`);
+    const othersAgent = makeAgentWithSkills(otherId, ["meta_expert_v2"]);
+    const ownAgent = makeAgentWithSkills(ownerId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const now = new Date().toISOString();
+    db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(conversationId, ownerId, ownAgent, "Test conversation", now, now);
+    // The other user's agent exists — posting it must 404, never fall back
+    // to (or reveal) anything about the owner's conversation.
+    assert.deepEqual(
+      resolveMessageAgentId({ userId: ownerId, agentId: othersAgent, conversationId }),
+      { error: "Agent not found" },
+      "another user's agent must stay a 404 even with a valid conversation to fall back to",
+    );
+    // And a stale id plus SOMEONE ELSE'S conversation must not fall back
+    // either — the conversation lookup is scoped to the posting user.
+    const strangersConversation = `conv-${cryptoRandom()}`;
+    db.prepare("INSERT INTO conversations (id, userId, agentId, title, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(strangersConversation, otherId, othersAgent, "Stranger conversation", now, now);
+    assert.deepEqual(
+      resolveMessageAgentId({ userId: ownerId, agentId: "stale-agent-that-never-existed", conversationId: strangersConversation }),
+      { error: "Agent not found" },
+      "a conversation the user doesn't own can never supply a fallback agent",
+    );
+  });
+
+  // Phase 0.3 — the strategy shows no campaign name. One shared formula
+  // (campaignNameForStrategy) is now used by the recommendation text AND
+  // by the executor, so the name the user approves can never drift from
+  // the name created in Meta.
+  await check("[round 58 campaign name] campaignNameForStrategy: the exact name the executor creates, with the explicit-action objective default", () => {
+    assert.equal(campaignNameForStrategy({ business_goal: "Website Purchases", recommended_objective: "OUTCOME_SALES" }), "Website Purchases — OUTCOME_SALES");
+    assert.equal(campaignNameForStrategy({ business_goal: "Boost my latest post" }), "Boost my latest post — OUTCOME_ENGAGEMENT", "an explicit action with no objective defaults exactly the way executeExplicitAction does");
+  });
+
+  await check("[round 58 campaign name] a built strategy's recommendation text includes the campaign name", async () => {
+    const userId = makeUser(`v2-campaign-name-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { adAccountId: "act_1", pageId: "111" } });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { adAccounts: [{ id: "act_1", name: "Beautybeespk Ads" }], pages: [{ id: "111", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Store Pixel" }] } }));
+    try {
+      const result = await buildStrategy({ userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, true, JSON.stringify(result.unresolved));
+      assert.match(result.recommendationText, /Campaign: I want more website sales — OUTCOME_SALES/, `the recommendation must show the campaign name, got: ${result.recommendationText}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // Phase 1 — account health check (accountHealth.js). The Nov 6 lesson:
+  // the ad account was disabled for a past-due payment and nobody knew
+  // for days while code fixes were chased, because the agent built the
+  // whole campaign first and only failed at the last Meta write. The
+  // check runs before build and before execute; a proven problem stops
+  // early with a plain-language warning.
+  const healthyMetaOpts = { adAccounts: [{ id: "act_1", name: "A" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }] };
+
+  await check("[round 58 account health] a healthy account passes — all four checks green", async () => {
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: healthyMetaOpts }));
+    try {
+      const result = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.deepEqual(result, { ok: true, issues: [] });
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] a disabled ad account (status 2) blocks with a plain past-due message", async () => {
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, adAccounts: [{ id: "act_1", name: "A", account_status: 2 }] } }));
+    try {
+      const result = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.equal(result.ok, false);
+      assert.equal(result.issues.length, 1, "only the account issue — the other checks are healthy");
+      assert.equal(result.issues[0].field, "ad_account");
+      assert.equal(result.issues[0].code, "META_V2_ACCOUNT_DISABLED");
+      assert.match(result.issues[0].message, /disabled/i);
+      assert.match(result.issues[0].message, /past-due/i);
+      assert.match(result.issues[0].message, /Business Settings/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] a missing scope blocks and names the missing scope", async () => {
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, permissions: ["ads_read", "ads_management", "pages_show_list", "pages_read_engagement", "business_management"] } }));
+    try {
+      const result = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.equal(result.ok, false);
+      const scopeIssue = result.issues.find((i) => i.field === "token_scopes");
+      assert.ok(scopeIssue, `a scope issue must be present: ${JSON.stringify(result.issues)}`);
+      assert.match(scopeIssue.message, /pages_manage_ads/, "the message must name the missing scope");
+      assert.match(scopeIssue.message, /Reconnect/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] an unlinked Page blocks and names the Page", async () => {
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, pageTokenUnavailable: true } }));
+    try {
+      const result = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.equal(result.ok, false);
+      const pageIssue = result.issues.find((i) => i.field === "page");
+      assert.ok(pageIssue, `a page issue must be present: ${JSON.stringify(result.issues)}`);
+      assert.match(pageIssue.message, /111/, "the message must name the Page");
+      assert.match(pageIssue.message, /isn't linked/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] a Pixel that vanished from the account blocks; no Pixel resolved at all is NOT a problem", async () => {
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, pixels: [] } }));
+    try {
+      const vanished = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.equal(vanished.ok, false);
+      assert.ok(vanished.issues.some((i) => i.field === "pixel"), `a pixel issue must be present: ${JSON.stringify(vanished.issues)}`);
+      const noPixel = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: null });
+      assert.deepEqual(noPixel, { ok: true, issues: [] }, "no Pixel resolved yet is handled by the existing no-Pixel question flow, not the health check");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] a Meta/network error on a check fails OPEN — a transient outage must not block a healthy account", async () => {
+    clearAccountHealthCache();
+    const base = scriptedFetch({ chatResponses: [], metaOpts: healthyMetaOpts });
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname === "/act_1") return jsonResponse({ error: { message: "temporary outage", code: 2 } }, 500);
+      return base(url, options);
+    });
+    try {
+      const result = await checkAccountHealth({ accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.deepEqual(result, { ok: true, issues: [] }, "the account read failed but every other check is healthy, so the build may proceed");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] the cached check returns the same result without re-calling Meta", async () => {
+    clearAccountHealthCache();
+    let calls = 0;
+    const base = scriptedFetch({ chatResponses: [], metaOpts: healthyMetaOpts });
+    mockFetch(async (url, options) => {
+      const u = new URL(url);
+      if (u.pathname === "/act_1" || u.pathname === "/me/permissions" || u.pathname.endsWith("/adspixels")) calls += 1;
+      return base(url, options);
+    });
+    try {
+      const first = await checkAccountHealthCached({ userId: "cache-user-1", accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.equal(first.ok, true);
+      const callsAfterFirst = calls;
+      assert.ok(callsAfterFirst > 0, "the first call must actually hit Meta");
+      const second = await checkAccountHealthCached({ userId: "cache-user-1", accessToken: "fake", adAccountId: "act_1", pageId: "111", pixelId: "px1" });
+      assert.deepEqual(second, first);
+      assert.equal(calls, callsAfterFirst, "the second call must be served from cache — zero extra Meta calls");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] build stops BEFORE building when the account is disabled — valid:false with the plain-language issue", async () => {
+    clearAccountHealthCache();
+    const userId = makeUser(`v2-health-build-block-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { adAccountId: "act_1", pageId: "111" } });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, adAccounts: [{ id: "act_1", name: "A", account_status: 2 }] } }));
+    try {
+      const result = await buildStrategy({ userId, conversationId: `conv-${cryptoRandom()}`, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(result.ok, false, "the build must stop, not build on a disabled account");
+      // buildUnresolvedIssue carries the FIRST issue's own field (ad_account)
+      // — the specific problem, consistent with every other unresolved field.
+      assert.equal(result.unresolved.field, "ad_account");
+      assert.match(result.unresolved.issue, /disabled/i);
+      assert.match(result.unresolved.issue, /past-due/i);
+      assert.match(result.unresolved.issue, /Business Settings/i);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 58 account health] execute stops BEFORE creating anything when the account went unhealthy after the build", async () => {
+    clearAccountHealthCache();
+    const userId = makeUser(`v2-health-execute-block-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    updateConnectionMeta(userId, "meta_ads", { defaults: { adAccountId: "act_1", pageId: "111" } });
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, writes } }));
+    let built;
+    try {
+      built = await buildStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategy: baseStrategy(), userMessage: "I want more sales on my website" });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally {
+      restoreFetch();
+    }
+    // The account goes unhealthy AFTER the build (the Nov 6 shape: a
+    // strategy can sit in 'proposed' for days). The healthy result from
+    // the build is cached, so clear it — otherwise the execute hook would
+    // (correctly) serve the cached healthy result.
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: { ...healthyMetaOpts, adAccounts: [{ id: "act_1", name: "A", account_status: 2 }], writes } }));
+    try {
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
+        (err) => err.code === "META_V2_ACCOUNT_UNHEALTHY" && /disabled/i.test(err.message) && /past-due/i.test(err.message),
+        "execute must throw the plain-language account error, never a cryptic Meta code",
+      );
+      assert.equal(writes.length, 0, "nothing may be created when the account is unhealthy");
+    } finally {
+      restoreFetch();
     }
   });
 

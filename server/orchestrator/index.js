@@ -2099,16 +2099,34 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   if (hasV2Tools && conversationId && pendingAnswer.creativeId != null) {
     const activeStrategy = getActiveStrategyForConversation(userId, conversationId);
     const creativeCandidates = activeStrategy?.resolvedAssets?.creativeCandidates;
-    if (activeStrategy && activeStrategy.resolvedAssets?.creative == null && Array.isArray(creativeCandidates) && creativeCandidates.length) {
+    const pendingCreative = activeStrategy?.resolvedAssets?.pendingCreative;
+    // Round 58: the list branch below needs creativeCandidates — but while
+    // a pick is PENDING, creativeCandidates is deliberately null (see
+    // strategyBuilder.js: the ONLY way to settle a pending pick is the
+    // dedicated affirmation check, never a re-guess). The dispatcher's
+    // claim (resolvePendingQuestionAnswer) already scopes to the single
+    // pending candidate in that state, so a claim naming exactly that
+    // candidate is a verified confirmation of it — route it through the
+    // same revise call, but with requestedChanges {} and the claim threaded
+    // as claimedCreativeId (never as a content_selector: a selector pick
+    // would be re-verified against the FULL candidate list inside
+    // resolveCreativeSelection and fail for any pending pick that came
+    // from a list position other than 1). A claim naming any OTHER id
+    // never reaches this branch.
+    const pendingClaimMatches = Boolean(pendingCreative)
+      && pendingAnswer.creativeId === pendingCreative.candidate.id;
+    if (activeStrategy && activeStrategy.resolvedAssets?.creative == null
+      && ((Array.isArray(creativeCandidates) && creativeCandidates.length) || pendingClaimMatches)) {
       const matchedCreativeId = pendingAnswer.creativeId;
       if (matchedCreativeId) {
         try {
           const accessToken = requireValidToken(userId, "meta_ads");
           const revised = await reviseStrategyV2({
             userId, conversationId, accessToken, strategyId: activeStrategy.id,
-            requestedChanges: { content_selector: { confirmedId: matchedCreativeId } },
+            requestedChanges: pendingClaimMatches ? {} : { content_selector: { confirmedId: matchedCreativeId } },
             userMessage,
             claimedBy: pendingAnswer.bareNumberClaimedBy,
+            claimedCreativeId: pendingClaimMatches ? matchedCreativeId : undefined,
           });
           if (revised.ok) {
             otherFieldAutoRevisedThisTurn = true;
