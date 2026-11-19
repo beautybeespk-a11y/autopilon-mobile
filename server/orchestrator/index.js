@@ -17,6 +17,7 @@ import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
 import { deriveBudgetFromUserMessageIfMissing } from "../agents/metaExpertV2/strategySchema.js";
 import { matchCreativeCandidateId, messageAffirmsPendingCreative, messageRequestsCreativeOptionsList, messageIsBareCreativeAffirmation } from "../agents/metaExpertV2/creativeResolution.js";
+import { distinctiveTokens } from "../agents/metaExpertV2/productMatching.js";
 import { requireValidToken } from "../integrations/manager.js";
 import { gatherBusinessSnapshot, resolveNamedProductForCreativeAnswer } from "../agents/metaExpertV2/businessSnapshot.js";
 
@@ -569,6 +570,198 @@ function formatVerifiedComparisonReply(latestBreakdownResult) {
   return `Here's the period-over-period comparison from the real data (${currentLabel} vs ${priorLabel}):\n${lines}`;
 }
 const MAX_COMPARISON_DELTA_NUDGES = 1;
+
+// Round 60 (stale price live bug — Nov 19 2026): in a NEW chat the owner
+// asked "which product should I use as the creative?" and the agent
+// recommended the Huda Beauty Liquid Matte Mousse with "Price: PKR 1700
+// each" — while the live store price is Rs 1,299 (the price WAS 1,700
+// before and has since changed). The same stale 1,700 had already been
+// caught and fixed in the 11.11 sale captions on Nov 13. Two price paths
+// exist and only one is safe: the candidate list is rendered by backend
+// code from the snapshot's live sampleProducts (it showed 1,299 in the
+// same session, twice), while the recommendation prose is model free text
+// — the model HAD 1,299 in context and still wrote 1,700, most likely
+// picked up from an old Facebook post caption (the agent itself said the
+// product "has recently been featured in your Facebook posts", and
+// captions carry prices — the Oct 2 Maybelline caption says "Price 1250
+// Each"). Nothing stopped it: there is no price check anywhere under
+// server/ (grep "price" over this file returns zero hits), and the tool
+// description's NEVER-invent list doesn't include prices — performance
+// figures got a guard in round 54 and deltas got
+// checkComparisonDeltaMismatchGate in round 57, but a price typed by
+// hand in prose had neither the instruction nor the gate. This gate
+// closes that hole at the same layer, mirroring the delta gate: when a
+// snapshot was fetched this turn, any currency-marked price the final
+// reply states next to a product name from that snapshot must match the
+// snapshot's price for that product, exactly.
+//
+// What counts as a STATED PRICE: a number carrying a currency marker
+// (Rs/PKR/₨) — the candidate list's bare "(id 6362, 1299)" numbers never
+// match, so the safe list path is untouched. Skipped, never verified:
+// a daily/monthly budget ("PKR 550/day", "PKR 550 per day", or anything
+// with "budget" just before it), a discount ("Rs 500 off", "Save Rs
+// 500"), a struck-through old price ("was Rs 7,500"), and a threshold
+// ("free shipping over Rs 7,500") — none of those is a claim about the
+// product's current price. A price is only attributed to a product when
+// a cluster of that product's distinctive name tokens (at least 3, or
+// all of them for a short name, within a 60-char span — the same floor
+// as the token-matching rule) sits within 120 chars of it, and that
+// product is the uniquely nearest one; a tie, or a product named
+// nowhere near the price, fails open — the gate can only verify what it
+// can attribute, and an unverifiable price is the model's business, not
+// a provable lie. Comparison is exact on the parsed number (1,299 ==
+// 1299.00); prices are catalogue facts, not estimates, so there is no
+// tolerance to argue about.
+const PRICE_CURRENCY_PATTERN = /(?:Rs\.?|PKR|₨)\s*([\d,]+(?:\.\d{1,2})?)/gi;
+const PRICE_MENTION_SPAN_CHARS = 60;
+const PRICE_MENTION_MIN_TOKENS = 3;
+const PRICE_PRODUCT_PROXIMITY_CHARS = 120;
+const PRICE_BUDGET_SKIP_BEFORE_CHARS = 25;
+const PRICE_WAS_SKIP_BEFORE_CHARS = 15;
+const PRICE_THRESHOLD_SKIP_BEFORE_CHARS = 15;
+
+function escapeRegExpForPriceGate(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// Spans in `message` where enough distinctive tokens of `productName`
+// cluster together to count as the product being named there. A mention
+// is a SET of tokens, not the full name word-for-word: the live reply
+// said "Huda Beauty Liquid Matte Mousse" while the catalogue name is
+// "Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream".
+function findProductNameMentions(message, productName) {
+  const wanted = distinctiveTokens(productName);
+  if (!wanted.length) return [];
+  const required = Math.min(PRICE_MENTION_MIN_TOKENS, wanted.length);
+  const lower = message.toLowerCase();
+  const hits = [];
+  for (const token of wanted) {
+    const re = new RegExp(`\\b${escapeRegExpForPriceGate(token)}\\b`, "g");
+    for (const m of lower.matchAll(re)) {
+      hits.push({ token, index: m.index, end: m.index + m[0].length });
+    }
+  }
+  if (!hits.length) return [];
+  hits.sort((a, b) => a.index - b.index);
+  const spans = [];
+  for (let i = 0; i < hits.length; i++) {
+    const start = hits[i].index;
+    const cluster = [hits[i]];
+    for (let j = i + 1; j < hits.length && hits[j].index <= start + PRICE_MENTION_SPAN_CHARS; j++) {
+      cluster.push(hits[j]);
+    }
+    if (new Set(cluster.map((h) => h.token)).size >= required) {
+      spans.push({ start, end: Math.max(...cluster.map((h) => h.end)) });
+    }
+  }
+  return spans;
+}
+
+function formatPriceLike(originalNumeric, value) {
+  const hasCommas = originalNumeric.includes(",");
+  const decimals = originalNumeric.includes(".") ? originalNumeric.split(".")[1].length : 0;
+  let out = hasCommas ? Number(value).toLocaleString("en-US") : String(value);
+  if (decimals > 0) {
+    const [intPart, decPart] = out.split(".");
+    out = `${intPart}.${(decPart || "").padEnd(decimals, "0").slice(0, decimals)}`;
+  }
+  return out;
+}
+
+// The shared scan behind both the gate and the deterministic fallback:
+// every currency-marked price in the reply that can be attributed to
+// exactly one snapshot product, whose stated number differs from that
+// product's live catalogue price. Returns the mismatches with the exact
+// matched text and its index, so the fallback can rewrite them in place.
+function findRecommendationPriceMismatches(message, sampleProducts) {
+  const products = (Array.isArray(sampleProducts) ? sampleProducts : [])
+    .filter((p) => p && typeof p.name === "string" && p.name.trim() && Number.isFinite(Number(p.price)));
+  if (!products.length || typeof message !== "string" || !message) return [];
+  const mentionsByProduct = products.map((product) => ({
+    product,
+    cataloguePrice: Number(product.price),
+    mentions: findProductNameMentions(message, product.name),
+  })).filter((entry) => entry.mentions.length > 0);
+  if (!mentionsByProduct.length) return [];
+  const mismatches = [];
+  for (const match of message.matchAll(PRICE_CURRENCY_PATTERN)) {
+    const numericText = match[1];
+    const stated = Number(numericText.replace(/,/g, ""));
+    if (!Number.isFinite(stated)) continue;
+    const priceStart = match.index;
+    const priceEnd = match.index + match[0].length;
+    // Not a current-price claim: a budget, a discount, a struck-through
+    // old price, or a threshold — never verified, never flagged.
+    const after = message.slice(priceEnd, priceEnd + 12);
+    if (/^\s*(\/(day|month|week)|per\s+(day|month|week)\b|a\s+(day|month|week)\b)/i.test(after)) continue;
+    if (/^\s*off\b/i.test(after)) continue;
+    const before = message.slice(Math.max(0, priceStart - PRICE_BUDGET_SKIP_BEFORE_CHARS), priceStart);
+    if (/\b(budget|save|saved|saving|discount)\b/i.test(before)) continue;
+    const wasBefore = message.slice(Math.max(0, priceStart - PRICE_WAS_SKIP_BEFORE_CHARS), priceStart);
+    if (/\bwas\b/i.test(wasBefore)) continue;
+    const thresholdBefore = message.slice(Math.max(0, priceStart - PRICE_THRESHOLD_SKIP_BEFORE_CHARS), priceStart);
+    if (/\b(over|above|under|below)\b/i.test(thresholdBefore)) continue;
+    // Attribute to the uniquely nearest named product, if any is close.
+    let nearest = null;
+    let nearestDistance = Infinity;
+    let tied = false;
+    for (const entry of mentionsByProduct) {
+      let distance = Infinity;
+      for (const span of entry.mentions) {
+        if (priceStart < span.end && span.start < priceEnd) distance = 0;
+        else distance = Math.min(distance, Math.abs(priceStart - span.end), Math.abs(span.start - priceEnd));
+      }
+      if (distance < nearestDistance) {
+        nearest = entry;
+        nearestDistance = distance;
+        tied = false;
+      } else if (distance === nearestDistance) {
+        tied = true;
+      }
+    }
+    if (!nearest || tied || nearestDistance > PRICE_PRODUCT_PROXIMITY_CHARS) continue;
+    if (stated === nearest.cataloguePrice) continue;
+    mismatches.push({
+      productName: nearest.product.name,
+      stated,
+      correct: nearest.cataloguePrice,
+      index: priceStart,
+      statedText: match[0],
+      correctedText: match[0].replace(numericText, formatPriceLike(numericText, nearest.cataloguePrice)),
+    });
+  }
+  return mismatches;
+}
+
+export function checkRecommendationPriceMismatchGate({ decision, hasV2Tools, latestSnapshotResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  const sampleProducts = latestSnapshotResult?.business?.sampleProducts;
+  if (!Array.isArray(sampleProducts) || !sampleProducts.length) return null;
+  const mismatches = findRecommendationPriceMismatches(decision.message, sampleProducts);
+  if (!mismatches.length) return null;
+  const lines = mismatches.map((m) => `  - ${m.productName}: you wrote ${m.statedText} — the live store price is ${m.correctedText}`).join("\n");
+  const correct = [...new Map(mismatches.map((m) => [m.productName, m])).values()]
+    .map((m) => `${m.productName} ${m.correctedText}`)
+    .join(", ");
+  return `Your reply states a product price that does NOT match the live store price this turn's meta_expert_v2.get_business_snapshot call actually returned:\n${lines}\nQuote prices ONLY from business.sampleProducts' price for that product — never a price from a post caption, an old message, or memory. Post captions can carry stale prices. The live prices are: ${correct}.`;
+}
+
+// Round 60 — deterministic fallback for the price gate above: on the
+// second offense the reply is rebuilt from the tool result's own prices
+// by rewriting the wrong numbers in place, so the user still gets the
+// recommendation — with the live prices — instead of a refusal.
+function formatVerifiedPricesReply(decision, latestSnapshotResult) {
+  const sampleProducts = latestSnapshotResult?.business?.sampleProducts;
+  if (!Array.isArray(sampleProducts) || !sampleProducts.length || typeof decision?.message !== "string") return null;
+  const mismatches = findRecommendationPriceMismatches(decision.message, sampleProducts);
+  if (!mismatches.length) return null;
+  let corrected = decision.message;
+  for (const m of [...mismatches].sort((a, b) => b.index - a.index)) {
+    corrected = corrected.slice(0, m.index) + m.correctedText + corrected.slice(m.index + m.statedText.length);
+  }
+  return corrected;
+}
+const MAX_RECOMMENDATION_PRICE_NUDGES = 1;
 
 // Round 47 (live production bug): "change the campaign budget to 750/day"
 // after a campaign was already created got a "final" reply presenting the
@@ -2058,6 +2251,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let periodMislabelNudges = 0;
   let comparisonMissingNudges = 0;
   let comparisonDeltaNudges = 0;
+  let recommendationPriceNudges = 0;
   let diagnosisClaimNudges = 0;
   let falseActionClaimNudges = 0;
 
@@ -2906,6 +3100,12 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         .filter((r) => r.toolName === "meta_expert_v2.get_performance_breakdown" && r.result)
         .map((r) => r.result)
         .pop() || null;
+      // Round 60 — the price gate below reads the SAME turn's snapshot,
+      // hoisted here alongside the breakdown result for the same reason.
+      const latestSnapshotResult = toolResults
+        .filter((r) => r.toolName === "meta_expert_v2.get_business_snapshot" && r.result)
+        .map((r) => r.result)
+        .pop() || null;
       const performanceDataClaimGateMessage = checkPerformanceDataClaimWithoutCallGate({
         decision, hasV2Tools, calledToolNames, priorAssistantFigures,
       });
@@ -2985,6 +3185,32 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         if (planId) setPlanStatus(planId, "failed");
         return {
           reply: formatVerifiedComparisonReply(latestBreakdownResult) || "I wasn't able to verify the comparison figures in my reply — could you repeat the request and I'll pull the real current-vs-prior numbers again?",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
+      // Round 60 — see checkRecommendationPriceMismatchGate's own header
+      // comment. Same nudge-then-honest-fallback shape as the delta gate
+      // above, with one difference: the reply is otherwise fine, so on
+      // the second offense the wrong numbers are rewritten in place from
+      // the tool result's own prices instead of replacing the whole reply.
+      const recommendationPriceMessage = checkRecommendationPriceMismatchGate({
+        decision, hasV2Tools, latestSnapshotResult,
+      });
+      if (recommendationPriceMessage && recommendationPriceNudges < MAX_RECOMMENDATION_PRICE_NUDGES) {
+        recommendationPriceNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: recommendationPriceMessage },
+        ];
+        continue;
+      }
+      if (recommendationPriceMessage) {
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "A reply stated a product price that did not match the live store price — overridden with the verified prices.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: formatVerifiedPricesReply(decision, latestSnapshotResult) || "I wasn't able to verify the product price in my reply — could you repeat the request and I'll pull the real current store price again?",
           trace, toolResults, usage: usageTotals,
         };
       }

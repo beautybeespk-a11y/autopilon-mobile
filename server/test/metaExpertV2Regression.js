@@ -37,7 +37,7 @@ const { checkAccountHealth, checkAccountHealthCached, clearAccountHealthCache } 
 const { resolveMessageAgentId } = await import("../orchestrator/chatAgentResolution.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, checkRecommendationPriceMismatchGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
@@ -6913,7 +6913,7 @@ async function run() {
     const catalogue = [
       { id: 2, name: real, price: "1250" },
       { id: 3, name: patrick, price: "2500" },
-      { id: 4, name: huda, price: "1700" },
+      { id: 4, name: huda, price: "1299" },
       { id: 1, name: "Vitamin C Serum", price: "1800" },
     ];
     // The real case, all three wordings: catalogue / user words / caption.
@@ -7313,7 +7313,7 @@ async function run() {
     const catalogue = [
       { id: 2, name: real, price: "1250" },
       { id: 3, name: "Patrick Ta Double-Take Crème & Powder Blush Duo", price: "2500" },
-      { id: 4, name: "Huda Beauty Liquid Matte Mousse", price: "1700" },
+      { id: 4, name: "Huda Beauty Liquid Matte Mousse", price: "1299" },
       { id: 1, name: "Vitamin C Serum", price: "1800" },
     ];
     // Realistic caption: marketing copy + hashtags, NO plain-text product name.
@@ -7622,6 +7622,135 @@ async function run() {
       assert.ok(notFound, `must surface an honest not-found line, got: ${JSON.stringify(answered.strategy.unresolved_questions)}`);
       assert.ok(notFound.includes("Nonexistent Fancy Product Name"), "the line must name what the user asked for");
       assert.deepEqual(answered.strategy.unresolved_questions.filter((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?")), [], "must NOT re-list the 50 candidates");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Round 60 (stale price in free-text prose) -------------------------
+  // Live bug (Nov 19 2026): in a NEW chat the owner asked "which product
+  // should I use as the creative?" and the agent recommended the Huda
+  // Beauty Liquid Matte Mousse with "Price: PKR 1700 each" — while the
+  // live store price is Rs 1,299 (the price WAS 1,700 before and has
+  // since changed; the same stale 1,700 had already been caught and
+  // fixed in the 11.11 captions on Nov 13). Two price paths: the
+  // candidate list is rendered by backend code from the snapshot's live
+  // sampleProducts (it showed 1,299 in the same session, twice), while
+  // the recommendation prose is model free text — the model HAD 1,299 in
+  // context and still wrote 1,700, most likely from an old post caption.
+  // Nothing stopped it: no price check existed anywhere under server/,
+  // and the tool description's NEVER-invent list didn't include prices.
+  // checkRecommendationPriceMismatchGate (orchestrator/index.js) closes
+  // that hole, mirroring the round-57 delta gate: a currency-marked price
+  // stated next to a snapshot product's name must match that product's
+  // live catalogue price, exactly.
+  const huda60Product = {
+    id: 6362, name: "Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream", price: "1299",
+    categories: [{ name: "Lip Colors & Essentials" }],
+    images: [{ src: "https://beautybees.pk/wp-content/uploads/2026/10/01-The-Matte-Mousse-Collection_PACKSHOT.webp" }],
+    permalink: "https://beautybees.pk/product/huda-beauty-liquid-matte-mousse-soft-blur-lip-cream/",
+    short_description: "Weightless, soft-blur matte lip cream.",
+  };
+  const huda60Snapshot = () => ({ business: { sampleProducts: [toSnapshotProduct59(huda60Product), ...filler59Products.slice(0, 3).map(toSnapshotProduct59)] } });
+  const priceGate = (message, snapshot = huda60Snapshot()) => checkRecommendationPriceMismatchGate({
+    decision: { type: "final", message }, hasV2Tools: true, latestSnapshotResult: snapshot,
+  });
+
+  await check("[round 60] the snapshot tool description tells the model to quote prices only from sampleProducts, never from captions", () => {
+    const tool = getTool("meta_expert_v2.get_business_snapshot");
+    assert.ok(tool?.description?.includes("quote ONLY business.sampleProducts' price"), "the price rule must be in the tool description the model actually sees");
+    assert.ok(tool.description.includes("Post captions can carry stale prices"), "the description must say why captions can't be trusted for prices");
+  });
+
+  await check("[round 60] the price gate trips on the EXACT live stale price (Huda at PKR 1700 vs live 1299) and passes the correct reply", () => {
+    // The live reply, near-verbatim (Nov 19 2026, new chat).
+    const liveReply = `Based on the current data, I recommend using the "Huda Beauty Liquid Matte Mousse" as the creative for your campaign. This product has recently been featured in your Facebook posts and fits well with the beauty niche.\n\nHere are the key details:\n- **Product Name**: Huda Beauty Liquid Matte Mousse\n- **Price**: PKR 1700 each\n- **Category**: Lip Colors & Essentials\n- **Image**: ![Huda Beauty Liquid Matte Mousse](https://beautybees.pk/wp-content/uploads/2026/10/01-The-Matte-Mousse-Collection_PACKSHOT.webp)\n- **Permalink**: [View Product](https://beautybees.pk/product/huda-beauty-liquid-matte-mousse-soft-blur-lip-cream/)\n\nIf you'd like to proceed with this product for your ad creative, please let me know!`;
+    const tripped = priceGate(liveReply);
+    assert.ok(typeof tripped === "string" && tripped.includes("Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream"), "the stale price must trip the gate");
+    assert.ok(tripped.includes("1299"), "the nudge must name the correct live price, so the model can fix its reply");
+    assert.ok(tripped.includes("sampleProducts"), "the nudge must point at the one trusted price source");
+
+    // The same reply with the live price passes — including the comma form.
+    assert.equal(priceGate(liveReply.replace("PKR 1700", "PKR 1299")), null, "the live price quoted verbatim must pass");
+    assert.equal(priceGate(liveReply.replace("PKR 1700", "Rs 1,299")), null, "Rs 1,299 with a comma must pass too");
+    assert.equal(priceGate(liveReply.replace("PKR 1700", "Rs 1299.00")), null, "Rs 1299.00 must pass too — same number, different formatting");
+
+    // A short catalogue name still attributes: "Vitamin C Serum" is 3 tokens.
+    const vitaminSnapshot = { business: { sampleProducts: [toSnapshotProduct59({ id: 1, name: "Vitamin C Serum", price: "1800", categories: [{ name: "Skincare" }], images: [{ src: "https://store.example.com/vitamin-c.jpg" }], permalink: "https://store.example.com/product/vitamin-c-serum/", short_description: "Serum." })] } };
+    assert.equal(priceGate("I recommend the Vitamin C Serum — Rs 1,800.", vitaminSnapshot), null, "a correct price for a 3-token product must pass");
+    assert.ok(typeof priceGate("I recommend the Vitamin C Serum — Rs 1,700.", vitaminSnapshot) === "string", "a wrong price for a 3-token product must trip the gate");
+  });
+
+  await check("[round 60] the price gate never flags a budget, a discount, a struck-through old price, or a threshold — only a current-price claim", () => {
+    assert.equal(priceGate("Your daily budget is PKR 550/day. I recommend the Huda Beauty Liquid Matte Mousse as the creative."), null, "a daily budget next to a product name must never trip the gate");
+    assert.equal(priceGate("Budget: PKR 550/day (as you specified)"), null, "the budget line on its own must never trip the gate");
+    assert.equal(priceGate("Buy 3 and get Rs 500 off the Huda Beauty Liquid Matte Mousse."), null, "a discount amount must never trip the gate");
+    assert.equal(priceGate("The Huda Beauty Liquid Matte Mousse Soft Blur Lip Cream is Rs 1,299 (was Rs 7,500)."), null, "a struck-through old price must never trip the gate");
+    assert.equal(priceGate("Free shipping over Rs 7,500 on the Huda Beauty Liquid Matte Mousse."), null, "a free-shipping threshold must never trip the gate");
+    // And the guard rails: no snapshot, non-V2 tools, no product named.
+    assert.equal(checkRecommendationPriceMismatchGate({ decision: { type: "final", message: "The Huda Beauty Liquid Matte Mousse costs PKR 1700." }, hasV2Tools: true, latestSnapshotResult: null }), null, "with no snapshot this turn there is nothing to verify against");
+    assert.equal(checkRecommendationPriceMismatchGate({ decision: { type: "final", message: "The Huda Beauty Liquid Matte Mousse costs PKR 1700." }, hasV2Tools: true, latestSnapshotResult: {} }), null, "an empty snapshot must fail open, never flag");
+    assert.equal(checkRecommendationPriceMismatchGate({ decision: { type: "final", message: "The Huda Beauty Liquid Matte Mousse costs PKR 1700." }, hasV2Tools: false, latestSnapshotResult: huda60Snapshot() }), null, "without V2 tools the gate never fires");
+    assert.equal(priceGate("The price is PKR 1700."), null, "a price with no product named near it cannot be attributed, so it fails open");
+    assert.equal(checkRecommendationPriceMismatchGate({ decision: { type: "tool_call", toolName: "meta_expert_v2.get_business_snapshot", message: "The Huda Beauty Liquid Matte Mousse costs PKR 1700." }, hasV2Tools: true, latestSnapshotResult: huda60Snapshot() }), null, "only a final reply is ever gated");
+  });
+
+  await check("[round 60] orchestrate: a reply quoting the stale caption price (1700) is nudged and corrected to the live 1299 — never reaching the user", async () => {
+    const userId = makeUser(`round60-price-nudge-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    // The stale-price vector, live-shaped: a post published when the
+    // price was 1,700, its caption carrying the old number.
+    const posts = [
+      { id: "717559728109412_9", message: "Huda Beauty Liquid Matte Mousse — Rs 1700, shop now!", created_time: "2026-11-10T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/9" },
+    ];
+    const metaOpts = { ...metaOpts59, posts };
+    const wcProducts = [huda60Product, ...filler59Products.slice(0, 3)];
+    mockFetch(scriptedFetch({
+      metaOpts, wcProducts, wcSearchHandler: () => [],
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("I recommend the Huda Beauty Liquid Matte Mousse as the creative. Price: PKR 1700 each."),
+        finalText("I recommend the Huda Beauty Liquid Matte Mousse as the creative. Price: PKR 1299."),
+      ],
+    }));
+    try {
+      const userMessage = "which product should I use as the creative?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("1299"), `the final reply must carry the live price: ${result.reply}`);
+      assert.ok(!result.reply.includes("1700"), `the stale price must never reach the user: ${result.reply}`);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 60] orchestrate: a second stale price is rewritten in place from the live catalogue price — the recommendation still reaches the user, corrected", async () => {
+    const userId = makeUser(`round60-price-rewrite-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const posts = [
+      { id: "717559728109412_9", message: "Huda Beauty Liquid Matte Mousse — Rs 1700, shop now!", created_time: "2026-11-10T10:00:00+0000", permalink_url: "https://facebook.com/717559728109412/posts/9" },
+    ];
+    const metaOpts = { ...metaOpts59, posts };
+    const wcProducts = [huda60Product, ...filler59Products.slice(0, 3)];
+    mockFetch(scriptedFetch({
+      metaOpts, wcProducts, wcSearchHandler: () => [],
+      chatResponses: [
+        toolCall("meta_expert_v2.get_business_snapshot", {}),
+        finalText("I recommend the Huda Beauty Liquid Matte Mousse as the creative. Price: PKR 1700 each."),
+        finalText("I recommend the Huda Beauty Liquid Matte Mousse as the creative. Price: PKR 1700 each."),
+      ],
+    }));
+    try {
+      const userMessage = "which product should I use as the creative?";
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.ok(result.reply.includes("1299"), `the deterministic rewrite must put the live price in: ${result.reply}`);
+      assert.ok(!result.reply.includes("1700"), `the stale price must never reach the user, even on the second offense: ${result.reply}`);
+      assert.ok(result.reply.includes("Huda Beauty Liquid Matte Mousse"), "the recommendation itself must survive — only the wrong number is rewritten");
     } finally {
       restoreFetch();
     }
