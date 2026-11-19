@@ -243,15 +243,22 @@ function metaRouter({
         return jsonResponse({ id, name: record.body.name, status: record.body.status, adset_id: corruptAdReadback ? "0000000000000" : record.body.adset_id, campaign_id: adSetRecord?.body?.campaign_id || null, creative: { id: record.body.creative?.creative_id } });
       }
       if (record.path.endsWith("/adcreatives")) {
-        // Round 46 — call_to_action now echoed back too (previously
-        // dropped here), reflecting exactly what was actually POSTed:
-        // top-level for object_story_id/EXISTING_INSTAGRAM_POST creatives,
-        // or nested inside object_story_spec.link_data for PRODUCT_IMAGE —
-        // whichever the real request body actually carried. Needed so the
-        // executor's own read-back verification (executor.js) is tested
-        // against a real echo, not a mock that silently strips the field
-        // the bug was about in the first place.
-        return jsonResponse({ id, name: record.body.name, object_story_id: record.body.object_story_id || null, object_story_spec: record.body.object_story_spec || null, call_to_action: record.body.call_to_action || null });
+        // Round 56 (CTA read-back fix) — honour the fields= parameter the
+        // way the real Graph API does: only the fields actually requested
+        // are returned. Previously this handler echoed call_to_action
+        // unconditionally (Round 46), which hid the live Nov 19 bug where
+        // getAdCreative never requested call_to_action at all — so the
+        // executor's verification always read (none) for existing-post
+        // creatives while every test passed. A request with no fields=
+        // keeps the old full-echo behaviour (no production caller does
+        // that; getAdCreative always sends fields=).
+        const full = { id, name: record.body.name, object_story_id: record.body.object_story_id || null, object_story_spec: record.body.object_story_spec || null, call_to_action: record.body.call_to_action || null };
+        const requested = u.searchParams.get("fields");
+        if (!requested) return jsonResponse(full);
+        const wanted = new Set(requested.split(",").map((f) => f.trim()).filter(Boolean));
+        const out = {};
+        for (const [key, value] of Object.entries(full)) if (wanted.has(key)) out[key] = value;
+        return jsonResponse(out);
       }
       if (record.path.endsWith("/adsets")) return jsonResponse({ id, ...record.body });
       if (record.path.endsWith("/campaigns")) return jsonResponse({ id, ...record.body });
@@ -10639,6 +10646,53 @@ async function run() {
           return true;
         }
       );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[Executor CTA, round 56] EXISTING_PAGE_POST execute_strategy succeeds against a field-honouring Meta mock — the live Nov 19 failure: getAdCreative never requested call_to_action, so the read-back always saw (none) and the verification threw after Meta had already accepted everything", async () => {
+    const userId = makeUser(`v2-cta-readback-fields-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const readbackUrls = [];
+    mockFetch(scriptedFetch({
+      chatResponses: [],
+      metaOpts: {
+        adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST],
+      },
+    }));
+    const originalFetchForThisTest = global.fetch;
+    mockFetch(async (url, options = {}) => {
+      if ((options.method || "GET") === "GET") readbackUrls.push(String(url));
+      return originalFetchForThisTest(url, options);
+    });
+    try {
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: 500, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use the recent Facebook post." }, destination_url: "https://beautybees.pk" }),
+        userMessage: "I want more sales on my website, link it to https://beautybees.pk",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" });
+
+      assert.equal(executed.status, "PAUSED");
+      assert.equal(executed.creativeAttached, true, JSON.stringify(executed));
+      assert.ok(executed.adId, "a real ad id must be returned");
+      assert.ok(executed.creativeId, "a real creative id must be returned");
+
+      // The cheaper assertion: getAdCreative's own read-back GET must
+      // request call_to_action in fields= — the exact omission that caused
+      // the live failure. Without it, the field-honouring mock returns no
+      // call_to_action and the executor throws "readback call_to_action
+      // (none) does not match the requested CTA (SHOP_NOW)".
+      const creativeReadback = readbackUrls.find((url) => {
+        const parsed = new URL(url);
+        return parsed.pathname.replace(/^\/v[\d.]+/, "") === `/${executed.creativeId}`;
+      });
+      assert.ok(creativeReadback, `a GET read-back of the created creative (${executed.creativeId}) must have happened: ${readbackUrls.join(", ")}`);
+      const requestedFields = new URL(creativeReadback).searchParams.get("fields") || "";
+      assert.ok(requestedFields.split(",").includes("call_to_action"), `getAdCreative must request call_to_action in fields= (got: ${requestedFields})`);
     } finally {
       restoreFetch();
     }

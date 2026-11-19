@@ -605,8 +605,13 @@ export async function getAd(accessToken, adId) {
 // instagram_user_id+source_instagram_media_id for a boosted post, or the
 // link_data image_hash/link for a product-image ad) genuinely matches
 // what was sent, rather than trusting the create call's response alone.
+// call_to_action is requested too — the executor's CTA verification reads
+// it back for existing-post creatives, and the live Nov 19 failure was
+// exactly this field missing from fields=: Meta only returns fields you
+// explicitly ask for, so the check always read (none) and always threw,
+// even though the create call had sent a real SHOP_NOW CTA Meta accepted.
 export async function getAdCreative(accessToken, creativeId) {
-  return metaFetch(`/${creativeId}?fields=id,name,object_story_id,object_story_spec`, { accessToken });
+  return metaFetch(`/${creativeId}?fields=id,name,object_story_id,object_story_spec,call_to_action`, { accessToken });
 }
 
 // Stream A — live caption re-read for ONE post, used ONLY by executor.js's
