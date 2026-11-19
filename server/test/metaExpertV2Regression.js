@@ -27,15 +27,15 @@ const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy, pixelSummaryValue } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
-const { messageIndicatesExecutionApproval, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
+const { messageIndicatesExecutionApproval, messageIndicatesStrongExecutionApproval, extractUrlFromMessage, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
-const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative } = await import("../agents/metaExpertV2/creativeResolution.js");
+const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative, matchCreativeCandidateId } = await import("../agents/metaExpertV2/creativeResolution.js");
 const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } = await import("../agents/metaExpertV2/productMatching.js");
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
@@ -8527,6 +8527,104 @@ async function run() {
     }
   });
 
+  // --- Deltas copied, not computed (round 57, Test 2 live bug) ------------
+  // The computation in performanceBreakdown.js is correct — the round-53
+  // test above pins it — but nothing ever verified the REPLY's delta
+  // figures against it. In live testing the model reported byte-identical
+  // deltas across two runs with different underlying numbers (spend
+  // +343.70%, CTR +15.93%, frequency +63.81% — the frequency figure
+  // matching NEITHER run's ratio), i.e. it copied delta percentages from
+  // conversation history instead of the tool result's comparison.deltas.
+  // checkComparisonDeltaMismatchGate (orchestrator/index.js) closes that
+  // hole: a final reply stating a delta for a named metric must match
+  // the tool's computed delta for that metric, within 0.5 points.
+
+  await check("[Comparison deltas, round 57] the delta gate trips on the EXACT live copied frequency delta (+63.81% vs the real +64.58%) and passes a correct reply — rates are never mistaken for deltas", () => {
+    const breakdown = {
+      comparison: {
+        currentRange: { label: "Oct 3-9, 2026" },
+        priorRange: { label: "Sep 26-Oct 2, 2026" },
+        deltas: { spendPct: 343.7, purchasesPct: null, cpaPct: 10.5, roasPct: 5.2, ctrPct: 15.93, frequencyPct: 64.58, cpcPct: 6.1, cpmPct: 23.4, cvrPct: 2.2, aovPct: 0 },
+      },
+    };
+    // The live re-run's reply, near-verbatim: spend and CTR happen to be
+    // right, frequency is the copied figure from the earlier run.
+    const copied = checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "Spend is up +343.70%, CTR +15.93%, frequency +63.81%." },
+      hasV2Tools: true, latestBreakdownResult: breakdown,
+    });
+    assert.ok(typeof copied === "string" && copied.includes("frequency"), "the copied frequency delta must trip the gate");
+    assert.ok(copied.includes("64.58"), "the nudge must name the correct computed value, so the model can fix its reply");
+    assert.ok(!copied.includes("spend:"), "a delta that DOES match must never be flagged alongside the wrong one");
+
+    assert.equal(checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "Spend is up +343.70%, CTR +15.93%, frequency +64.58%." },
+      hasV2Tools: true, latestBreakdownResult: breakdown,
+    }), null, "deltas quoted verbatim from the tool result must pass");
+
+    assert.equal(checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "CTR 4.08% vs 3.52% last week, frequency 2.37 vs 1.44." },
+      hasV2Tools: true, latestBreakdownResult: breakdown,
+    }), null, "plain rate percentages are not deltas and must never trip the gate");
+
+    assert.equal(checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "Up 343.70% on spend, CTR up 15.93%." },
+      hasV2Tools: true, latestBreakdownResult: breakdown,
+    }), null, "an unsigned delta with a direction word, correctly attributed to its label, must pass");
+
+    assert.equal(checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "Spend is up +343.70%." },
+      hasV2Tools: true, latestBreakdownResult: {},
+    }), null, "with no comparison performed this turn there is nothing to verify against");
+
+    // A null computed delta (zero base — purchases 8 vs 0) cannot be
+    // verified, so a stated purchases delta is left alone, never flagged.
+    assert.equal(checkComparisonDeltaMismatchGate({
+      decision: { type: "final", message: "Purchases +100%." },
+      hasV2Tools: true, latestBreakdownResult: breakdown,
+    }), null, "a metric whose computed delta is null must be skipped, never false-flagged");
+  });
+
+  await check("[Comparison deltas, round 57] two runs with different underlying data compute DIFFERENT deltas — never byte-identical copies", async () => {
+    async function runComparison(currentRow, priorRow) {
+      let insightsCalls = 0;
+      mockFetch(async (url) => {
+        const u = new URL(url);
+        const path = u.pathname.replace(/^\/v[\d.]+/, "");
+        if (path === `/${CAMPAIGN_ID}` && u.searchParams.get("fields")?.includes("account_id")) return jsonResponse(perfCampaignDetails()[CAMPAIGN_ID]);
+        if (path === "/act_1" && u.searchParams.get("fields")?.includes("currency")) return jsonResponse({ id: "act_1", currency: "USD" });
+        if (path.endsWith("/adsets") || path.endsWith("/ads")) return jsonResponse({ data: [] });
+        if (path.endsWith("/insights")) {
+          const level = u.searchParams.get("level");
+          if (level === "adset" || level === "ad") return jsonResponse({ data: [] });
+          insightsCalls += 1;
+          return jsonResponse({ data: [insightsCalls === 1 ? currentRow : priorRow] });
+        }
+        return jsonResponse({ error: { message: `Unmocked GET path in test: ${path}` } }, 400);
+      });
+      try {
+        return await gatherPerformanceBreakdown("fake-token", { campaignId: CAMPAIGN_ID, since: "2026-10-08", until: "2026-10-14", compareToPriorPeriod: true });
+      } finally {
+        restoreFetch();
+      }
+    }
+    const row = (overrides) => ({
+      spend: "1000", clicks: "100", impressions: "10000", reach: "9000", frequency: "1.1",
+      actions: [{ action_type: "purchase", value: "10" }], action_values: [{ action_type: "purchase", value: "2000" }],
+      date_start: "2026-10-08", date_stop: "2026-10-14", ...overrides,
+    });
+    const priorRow = row({ spend: "500", clicks: "50", impressions: "5000", reach: "4500", actions: [{ action_type: "purchase", value: "5" }], action_values: [{ action_type: "purchase", value: "1000" }], date_start: "2026-10-01", date_stop: "2026-10-07" });
+    const first = await runComparison(row(), priorRow);
+    // Second run: same prior week, different current week — spend 750
+    // (not 1000) and a tighter reach (8000, not 9000), so both the spend
+    // and the frequency deltas genuinely change.
+    const second = await runComparison(row({ spend: "750", reach: "8000" }), priorRow);
+    assert.equal(first.comparison.deltas.spendPct, 100, "first run: spend doubled (500 -> 1000)");
+    assert.equal(second.comparison.deltas.spendPct, 50, "second run: spend up by half (500 -> 750)");
+    assert.notEqual(first.comparison.deltas.frequencyPct, second.comparison.deltas.frequencyPct, "the frequency delta must change too — the exact figure the live bug copied byte-identically");
+    assert.notDeepEqual(first.comparison.deltas, second.comparison.deltas, "the two runs' delta sets must never be byte-identical copies of each other");
+  });
+
   await check("[Performance breakdown, round 53/54] no campaignId and no ACTIVE campaign at all — genuinely nothing to resolve automatically, refused rather than guessed", async () => {
     // Stream D: a SINGLE paused campaign now resolves automatically (the
     // Test 2 shape), so the still-throwing case needs TWO paused campaigns.
@@ -10527,6 +10625,172 @@ async function run() {
     }
   });
 
+  // --- Answer handling (round 57) ---------------------------------------
+  // Live bug: when the agent asked an open question (which creative, or
+  // the destination URL) and the user answered in natural multi-part
+  // language — "yes 1 … and yes beautybees.pk" — the answer was NOT
+  // consumed: the creative matcher only recognised a bare number, "N)"/"N."
+  // or a leading "N,", and the URL extractor only recognised an http(s)://
+  // URL. The agent re-asked, or treated it as a new message. Separately,
+  // a bare budget number ("500") stopped working the moment any other
+  // question was still open (the sole-open-kind rule), which — before this
+  // round's fixes — was always, since the answers never landed. Three
+  // narrow fixes, each proven here: an affirmation-prefixed position
+  // ("yes 1") in matchCreativeCandidateId, a schemeless-domain branch in
+  // extractUrlFromMessage, and a bare-number budget rule that relies on
+  // creative-first claiming plus a 100 floor instead of the sole-kind
+  // condition (see the dispatcher's own comment for why "3" still never
+  // becomes a PKR 3/day budget when a creative question is pending).
+
+  await check("[Answer handling, round 57] matchCreativeCandidateId recognises an affirmation-prefixed pick (\"yes 1\") — and still never misreads a budget", () => {
+    const candidates = [
+      { id: "111_1", label: "New Vitamin C Serum drop!" },
+      { id: "111_2", label: "Spring skincare routine tips" },
+    ];
+    const opts = { questionPending: true, candidateIdsShown: ["111_1", "111_2"] };
+    assert.equal(matchCreativeCandidateId("yes 1 … and yes beautybees.pk", candidates, opts), "111_1", "the live multi-part reply must pick post #1");
+    assert.equal(matchCreativeCandidateId("yes, 2", candidates, opts), "111_2");
+    assert.equal(matchCreativeCandidateId("ok 1", candidates, opts), "111_1");
+    assert.equal(matchCreativeCandidateId("use 2", candidates, opts), "111_2");
+    assert.equal(matchCreativeCandidateId("2", candidates, opts), "111_2", "a bare number still works");
+    assert.equal(matchCreativeCandidateId("2.", candidates, opts), "111_2", "an explicit marker still works");
+    assert.equal(matchCreativeCandidateId("budget 600", candidates, opts), null, "a number after 'budget' is never a pick");
+    assert.equal(matchCreativeCandidateId("yes 500", candidates, opts), null, "an out-of-range affirmed number is not a pick — it falls through to the budget claim");
+    assert.equal(matchCreativeCandidateId("2.5", candidates, opts), null, "a decimal is never a list position");
+  });
+
+  await check("[Answer handling, round 57] extractUrlFromMessage recognises a bare domain (\"beautybees.pk\") — and never an email, a filename, or a version", () => {
+    assert.equal(extractUrlFromMessage("yes 1 … and yes beautybees.pk"), "https://beautybees.pk", "the live multi-part reply must yield the store domain, normalised to https://");
+    assert.equal(extractUrlFromMessage("use beautybees.pk please"), "https://beautybees.pk");
+    assert.equal(extractUrlFromMessage("beautybees.pk/shop"), "https://beautybees.pk/shop", "a path after the bare domain is kept");
+    assert.equal(extractUrlFromMessage("Use https://beautybees.pk"), "https://beautybees.pk", "a full URL is unchanged");
+    assert.equal(extractUrlFromMessage("email me at moazzam@gmail.com"), null, "an email address is not a destination URL");
+    assert.equal(extractUrlFromMessage("see file.txt for details"), null, "a filename is not a domain");
+    assert.equal(extractUrlFromMessage("version 2.0 is out"), null, "a version number is not a domain");
+  });
+
+  await check("[Answer handling, round 57] resolvePendingQuestionAnswer consumes the live multi-part reply and a bare budget — without reopening the PKR 3/day trap", () => {
+    const candidates = [
+      { id: "111_1", label: "New Vitamin C Serum drop!" },
+      { id: "111_2", label: "Spring skincare routine tips" },
+    ];
+    const creativeQuestion = "Which of these posts should I use as the ad's creative?";
+    const destinationQuestion = "This campaign needs a destination website URL for the ad — what URL would you like it to link to?";
+    const budgetQuestion = "What daily budget would you like for this?";
+    const multiOpen = {
+      resolvedAssets: {
+        creative: null, creativeCandidates: candidates, pendingCreative: null,
+        pendingQuestions: [
+          { kind: "creative_candidates", question: creativeQuestion, candidateIds: ["111_1", "111_2"] },
+          { kind: "destination_url", question: destinationQuestion },
+          { kind: "budget", question: budgetQuestion },
+        ],
+      },
+      strategy: { budget_daily: null, unresolved_questions: [creativeQuestion, destinationQuestion, budgetQuestion] },
+    };
+    const multi = resolvePendingQuestionAnswer({ activeStrategy: multiOpen, userMessage: "yes 1 … and yes beautybees.pk" });
+    assert.equal(multi.creativeId, "111_1", "the multi-part reply must claim post #1 for creative");
+    assert.equal(multi.budgetDaily, null, "nothing in that reply is a budget");
+    assert.equal(multi.destinationUrl, null, "the dispatcher never claims the URL itself — the destination pre-loop reads the raw message for it");
+
+    const bare500 = resolvePendingQuestionAnswer({ activeStrategy: multiOpen, userMessage: "500" });
+    assert.equal(bare500.budgetDaily, 500, "a bare 500 must be accepted as the budget even with other questions still open");
+    assert.equal(bare500.creativeId, null, "500 is out of range for 2 candidates, so it is not a creative pick");
+
+    const bare2 = resolvePendingQuestionAnswer({ activeStrategy: multiOpen, userMessage: "2" });
+    assert.equal(bare2.creativeId, "111_2", "a bare 2 with a creative question pending is a post pick, never a budget");
+    assert.equal(bare2.budgetDaily, null);
+
+    const bare3 = resolvePendingQuestionAnswer({ activeStrategy: multiOpen, userMessage: "3" });
+    assert.equal(bare3.creativeId, null, "3 is out of range for 2 candidates — not a pick");
+    assert.equal(bare3.budgetDaily, null, "3 is below the 100 floor with a creative question pending — never a PKR 3/day budget");
+
+    const bare150 = resolvePendingQuestionAnswer({ activeStrategy: multiOpen, userMessage: "150" });
+    assert.equal(bare150.budgetDaily, 150, "a bare number at or above the 100 floor is a budget even with a creative question pending");
+
+    const budgetOnly = {
+      resolvedAssets: {
+        creative: null, creativeCandidates: [], pendingCreative: null,
+        pendingQuestions: [{ kind: "budget", question: budgetQuestion }],
+      },
+      strategy: { budget_daily: null, unresolved_questions: [budgetQuestion] },
+    };
+    assert.equal(resolvePendingQuestionAnswer({ activeStrategy: budgetOnly, userMessage: "3" }).budgetDaily, 3, "with NO creative question pending, a bare number is the budget answer whatever its size — the old sole-kind behaviour, preserved");
+  });
+
+  await check("[Answer handling, round 57] the live multi-part reply (\"yes 1 … and yes beautybees.pk\") is consumed end to end, both questions clear, and a later bare \"500\" is then accepted as the budget", async () => {
+    const userId = makeUser(`v2-answer-multipart-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const secondPost = { id: "111_2", message: "Spring skincare routine tips", created_time: "2024-02-01T10:00:00+0000", permalink_url: "https://facebook.com/111/posts/2", attachments: { data: [{ media_type: "photo" }] } };
+    const metaOpts = { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [CREATIVE_TEST_POST, secondPost] };
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts }));
+    try {
+      // All three questions genuinely open at once: 2 real posts with no
+      // pick, no destination_url, no budget_daily.
+      const built = await buildStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        strategy: baseStrategy({ budget_daily: undefined, creative_strategy: { source: "EXISTING_PAGE_POST", description: "Use one of my Facebook page posts as the ad." } }),
+        userMessage: "I want more sales on my website",
+      });
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "creative question must be open");
+      assert.ok(built.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "destination question must be open");
+      assert.ok(built.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "budget question must be open");
+    } finally { restoreFetch(); }
+
+    // Test stage: the first reply mentions the creative and the URL
+    // without quoting the stored lines, so the Stream C fidelity gate
+    // (§3.4b) nudges once; the follow-up quotes both stored lines. A
+    // third identical reply covers a second nudge, if one fires.
+    const storedLines = "Creative: Facebook post \"New Vitamin C Serum drop!\" (id 111_1, posted 2024-03-03T10:00:00+0000)\nDestination URL: https://beautybees.pk";
+    mockFetch(scriptedFetch({
+      metaOpts,
+      chatResponses: [
+        finalText("Got it — post 1 it is, and I'll link it to beautybees.pk. What budget would you like?"),
+        finalText(`Got it — post 1 it is, and I'll link it to beautybees.pk. What budget would you like?\n${storedLines}`),
+        finalText(`Got it — post 1 it is, and I'll link it to beautybees.pk. What budget would you like?\n${storedLines}`),
+      ],
+    }));
+    try {
+      const userMessage = "yes 1 … and yes beautybees.pk";
+      await orchestrate({ userId, agentId, conversationId, userMessage, history: [{ role: "user", content: userMessage }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.resolvedAssets.creative?.contentId, "111_1", "the multi-part reply must resolve the creative to post #1");
+      assert.equal(updated.strategy.destination_url, "https://beautybees.pk", "the schemeless domain in the same reply must be saved as the destination, normalised to https://");
+      assert.ok(!updated.strategy.unresolved_questions.some((q) => q.startsWith("Which ")), "the already-answered creative question must be cleared, not re-asked");
+      assert.ok(!updated.strategy.unresolved_questions.some((q) => q.startsWith("This campaign needs a destination website URL")), "the already-answered destination question must be cleared, not re-asked");
+      assert.ok(updated.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "only the budget question — genuinely unanswered in that message — stays open");
+    } finally { restoreFetch(); }
+
+    // Turn 2 — the budget, as a bare number, on a turn where it is the
+    // only question left. Test stage: same fidelity-nudge shape as turn 1.
+    mockFetch(scriptedFetch({
+      metaOpts,
+      chatResponses: [
+        finalText("Got it — PKR 500/day it is. Reply 'approve' whenever you're ready."),
+        finalText(`Got it — PKR 500/day it is.\nBudget: PKR 500/day\n${storedLines}\nReply 'approve' whenever you're ready.`),
+        finalText(`Got it — PKR 500/day it is.\nBudget: PKR 500/day\n${storedLines}\nReply 'approve' whenever you're ready.`),
+      ],
+    }));
+    try {
+      await orchestrate({
+        userId, agentId, conversationId, userMessage: "500",
+        history: [
+          { role: "user", content: "yes 1 … and yes beautybees.pk" },
+          { role: "assistant", content: "Got it — post 1 it is, and I'll link it to beautybees.pk. What budget would you like?" },
+          { role: "user", content: "500" },
+        ],
+        agentSystemPrompt: "You are the Meta Ads Manager V2.",
+      });
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.strategy.budget_daily, 500, "a bare 500 must be accepted as the budget");
+      assert.deepEqual(updated.strategy.unresolved_questions, [], "with every question genuinely answered, nothing is left to re-ask");
+    } finally { restoreFetch(); }
+  });
+
   await check("[Executor CTA] a Meta rejection of the call_to_action/link surfaces with Meta's own real error message — never swallowed, never silently retried", async () => {
     const userId = makeUser(`v2-cta-rejected-${stamp}@example.com`);
     connectMeta(userId);
@@ -11442,6 +11706,73 @@ async function run() {
         () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "sounds good, thanks" }),
         (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
       );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Edit approval must be real approval (round 57) --------------------
+  // The edit gate and apply_campaign_edit's own defense-in-depth check
+  // both used the WEAK approval check: a bare whole-message "yes"/"ok"/
+  // "sure" counted as approval. Those words are consumable answers to
+  // other open questions (a destination-URL or pending-creative
+  // confirmation) — exactly the collision execute_strategy's own strong
+  // check already refuses — so a bare "yes" answering another question
+  // could approve a live ad-set edit. Both now use the STRONG check, the
+  // gate also enforces the same consumption flags the execute gate takes,
+  // and the strong pattern covers "apply it"/"apply the edit"/
+  // "yes, apply it" — the approval language the gate's own error message
+  // suggests, which previously matched NEITHER check.
+
+  await check("[campaign edit, round 57] a bare \"yes\"/\"ok\"/\"sure\" never approves an edit — only real approval language does, including \"yes, apply it\"", async () => {
+    const userId = makeUser(`v2-edit-strong-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      const gate = (userMessage, extra = {}) => checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage, ...extra });
+      assert.ok(gate("yes"), "a bare yes must be blocked — it could be answering another open question");
+      assert.ok(gate("ok"), "a bare ok must be blocked");
+      assert.ok(gate("sure"), "a bare sure must be blocked");
+      assert.ok(gate("sounds good, thanks"), "vague agreement must be blocked");
+      assert.equal(gate("approve"), null, "explicit approval must clear the gate");
+      assert.equal(gate("proceed"), null);
+      assert.equal(gate("yes, apply it"), null, "the gate's own suggested language must actually work");
+      assert.equal(gate("apply the edit"), null);
+      assert.equal(gate("apply it"), null);
+      assert.ok(gate("approve", { destinationUrlJustAutoConfirmedThisTurn: true }), "an approve on a turn whose message was just spent confirming the destination URL must be blocked");
+      assert.ok(gate("approve", { pendingCreativeJustAutoConfirmedThisTurn: true }), "an approve on a turn whose message was just spent confirming the creative must be blocked");
+      assert.equal(messageIndicatesStrongExecutionApproval("yes"), false, "the strong check itself must never accept a bare yes");
+      assert.equal(messageIndicatesStrongExecutionApproval("yes, apply it"), true);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[campaign edit, round 57] apply_campaign_edit refuses a bare \"yes\" but applies on \"yes, apply it\"", async () => {
+    const userId = makeUser(`v2-edit-apply-yes-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts([]) }));
+    try {
+      await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 20 });
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 35 }, userMessage: "change the budget to 35/day",
+      });
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "yes" }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
+      );
+      const applied = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "yes, apply it",
+      });
+      assert.equal(applied.appliedChanges.budget_daily, 35, "the gate's own suggested approval language must actually apply the edit");
     } finally {
       restoreFetch();
     }

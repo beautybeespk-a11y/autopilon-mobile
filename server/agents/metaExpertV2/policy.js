@@ -183,10 +183,52 @@ export function userMessageConfirmsAssetChoice(userMessage, { id, name } = {}) {
 // trusted, so a wrong or partial extraction here can never ship on its
 // own say-so.
 const USER_MESSAGE_URL_PATTERN = /https?:\/\/[^\s,;()"'<>]+/i;
+// Round 57 (answer-handling fix): a bare domain typed without a scheme
+// ("beautybees.pk") is the same unambiguous signal as a full URL — the
+// user typed the store's own domain, not a paraphrase. Previously only
+// an http(s):// URL was ever extracted, so "yes 1 … and yes
+// beautybees.pk" never closed the destination-URL question: the
+// affirmation matcher is whole-message-only and the typed text had no
+// scheme to match. The schemeless branch accepts only a standalone
+// domain-shaped token whose top-level domain is on a small allowlist —
+// never a version number, a price, or a filename ("v2.0", "Rs.500",
+// "file.txt" all fail the allowlist) — never a token containing "@" (an
+// email address is not a destination), and normalises to https://
+// before returning, since the executor sends the destination as the CTA
+// link value and Meta requires a full URL. verifyDestinationUrl below
+// independently re-checks the returned value against the same raw
+// message (scheme-stripped literal substring), so a wrong extraction
+// can never ship on its own say-so.
+const SCHEMELESS_DOMAIN_TLDS = new Set([
+  "com", "net", "org", "io", "co", "me", "app", "store", "shop", "online",
+  "site", "xyz", "dev", "ai", "pk", "uk", "ca", "au", "in", "ae", "sa",
+  "us", "edu", "gov", "biz", "info", "tech", "link", "club", "live", "fun",
+  "world", "today", "digital", "agency", "cloud", "pro", "vip", "top",
+  "de", "fr", "es", "it", "nl", "se", "no", "dk", "fi", "pl", "nz", "za",
+  "ng", "ke", "eg", "tr", "br", "mx", "jp", "kr", "cn", "sg", "my", "id",
+  "th", "vn", "ph",
+]);
+const SCHEMELESS_DOMAIN_TOKEN_PATTERN = /[^\s,;()"'<>]+/g;
+function extractSchemelessDomainFromMessage(userMessage) {
+  SCHEMELESS_DOMAIN_TOKEN_PATTERN.lastIndex = 0;
+  let tokenMatch;
+  while ((tokenMatch = SCHEMELESS_DOMAIN_TOKEN_PATTERN.exec(userMessage)) !== null) {
+    const token = tokenMatch[0].replace(/[.,;:!?]+$/, "");
+    if (!token || token.includes("@") || token.includes("://")) continue;
+    const hostAndPath = token.match(/^([a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+)(\/[^\s]*)?$/i);
+    if (!hostAndPath) continue;
+    const host = hostAndPath[1];
+    const tld = host.split(".").pop().toLowerCase();
+    if (!SCHEMELESS_DOMAIN_TLDS.has(tld)) continue;
+    return `https://${token}`;
+  }
+  return null;
+}
 export function extractUrlFromMessage(userMessage) {
   if (typeof userMessage !== "string") return null;
   const match = USER_MESSAGE_URL_PATTERN.exec(userMessage);
-  return match ? match[0].replace(/[.,;:!?]+$/, "") : null;
+  if (match) return match[0].replace(/[.,;:!?]+$/, "");
+  return extractSchemelessDomainFromMessage(userMessage);
 }
 
 // Only fires when THIS call is the one actually asserting a destination_url
@@ -860,7 +902,15 @@ export function buildUnresolvedIssue(errors) {
 // principle as V1's checkExecutionApprovalGate but independent (V2 has its
 // own active-strategy lookup, see strategyStore.js's
 // getActiveStrategyForConversation).
-const EXECUTION_APPROVAL_PATTERN = /\b(approve|approved|proceed|run it|launch it|go ahead|do it|confirm(ed)?|create it|build it|make it live|start it)\b|\byes[,.]?\s+(create|launch|run|build|do)\s+it\b/i;
+const EXECUTION_APPROVAL_PATTERN = /\b(approve|approved|proceed|run it|launch it|go ahead|do it|confirm(ed)?|create it|build it|make it live|start it|apply (?:it|the edit|this edit|that edit|the changes?|these changes))\b|\byes[,.]?\s+(create|launch|run|build|do|apply)\s+it\b/i;
+// Round 57: the apply-phrasing above ("apply it", "apply the edit",
+// "yes, apply it") is in this SHARED pattern deliberately — the campaign
+// edit gate's own error message has always suggested exactly "yes, apply
+// it" as valid approval language, yet neither the weak nor the strong
+// check ever matched it, so a user following the gate's own instruction
+// was blocked. Adding it here makes it valid for BOTH the edit gate and
+// execute_strategy's strong check: "apply it" as a reply to a
+// recommendation is explicit go-ahead language either way.
 // Live bug (round 20): the model's own execute_strategy-blocked message
 // suggests exactly "Please confirm your approval by stating 'approve' or
 // 'run it.'" — but a natural short reply of just "run" (no "it") doesn't

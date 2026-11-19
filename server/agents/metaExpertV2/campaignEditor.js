@@ -36,7 +36,7 @@
 //      actually applied it before ever calling this a success.
 import * as meta from "../../integrations/meta/api.js";
 import { toMetaBudgetMinorUnits, buildV2Targeting } from "./executor.js";
-import { MAX_EXECUTABLE_DAILY_BUDGET, buildUnresolvedIssue, messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2 } from "./policy.js";
+import { MAX_EXECUTABLE_DAILY_BUDGET, buildUnresolvedIssue, messageIndicatesStrongExecutionApproval } from "./policy.js";
 import {
   insertStrategy, getStoredStrategy, getActiveStrategyForConversation, getMostRecentExecutedStrategyForConversation,
   getExecutedAncestorStrategy, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed,
@@ -293,9 +293,12 @@ export async function applyCampaignEdit({ userId, conversationId, accessToken, s
   // index.js) already blocks this before the tool is even dispatched;
   // this function is also reachable directly. Same explicit,
   // this-turn-only approval discipline as execute_strategy's own
-  // defense-in-depth check.
-  if (!messageIndicatesExecutionApprovalV2(userMessage)) {
-    const err = new Error("This campaign edit has not been explicitly approved in the user's latest message — ask for clear approval language (e.g. \"approve\") before applying it.");
+  // defense-in-depth check: the STRONG check only — a bare "yes"/"ok"/
+  // "sure" is a consumable answer to another open question, never fresh
+  // approval to change a live ad set. (Round 57: this used the weak
+  // check, so a bare "yes" approved the edit here and at the gate.)
+  if (!messageIndicatesStrongExecutionApproval(userMessage)) {
+    const err = new Error("This campaign edit has not been explicitly approved in the user's latest message — ask for clear approval language (e.g. \"approve\" or \"yes, apply it\") before applying it.");
     err.code = "META_V2_EDIT_NOT_APPROVED";
     throw err;
   }
