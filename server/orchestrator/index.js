@@ -11,7 +11,7 @@ import { resolveOrgId } from "./voiceUsage.js";
 import { getActivePlanForConversation } from "../agents/metaExpert/planner.js";
 import { messageIndicatesExecutionApproval, fingerprintPlan } from "../agents/metaExpert/policy.js";
 import { normalizePlanEnumAliases } from "../agents/metaExpert/planSchema.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy, getStoredStrategy } from "../agents/metaExpertV2/strategyStore.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, getMostRecentExecutedStrategyForConversation, getExecutedAncestorStrategy, getStoredStrategy, hasValidApproval, recordStrategyApproval } from "../agents/metaExpertV2/strategyStore.js";
 import { messageIndicatesExecutionApproval as messageIndicatesExecutionApprovalV2, messageIndicatesStrongExecutionApproval, PERFORMANCE_CLAIM_WORDS, messageAffirmsSuggestedUrl, extractUrlFromMessage, messageAcknowledgesSeparateCampaign, fingerprintStrategy as fingerprintStrategyV2 } from "../agents/metaExpertV2/policy.js";
 import { trace as v2Trace } from "../agents/metaExpertV2/diagnostics.js";
 import { reviseStrategy as reviseStrategyV2 } from "../agents/metaExpertV2/strategyBuilder.js";
@@ -1147,7 +1147,22 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
   if (pendingCreativeJustAutoConfirmedThisTurn) {
     return "This message was just used to confirm the pending creative for this campaign — that confirmation has been saved, but it is NOT approval to execute the campaign, and execute_strategy has been blocked. Tell the user plainly: the creative is confirmed, the campaign has NOT been created yet, and they need to say \"approve\" (or similar) separately to actually launch it. Present the now-complete, updated recommendation and wait for that explicit, separate approval before calling execute_strategy again.";
   }
-  if (!messageIndicatesExecutionApprovalV2(userMessage)) {
+  // Round 62 (Nov 20 2026, live approval loop): approval given on an
+  // EARLIER turn must still count — the old check demanded approval
+  // language in the very latest message, so approving and then answering
+  // an open question wiped the approval and the loop never ended. A
+  // persisted approval that is still VALID for the active row (status
+  // 'approved' AND fingerprint still matches the current content —
+  // hasValidApproval, strategyStore.js) now passes this check exactly
+  // like fresh approval language. A bare "yes" still never counts on its
+  // own (it can only ever become approval through a recorded card click
+  // or a strong-approval turn), and a strategy that changed materially
+  // since approval has a stale fingerprint, so hasValidApproval is false
+  // and fresh approval is still required. The consumption blocks above
+  // (destination URL / pending creative just confirmed THIS turn) still
+  // run first, so a message spent confirming something else is never
+  // also approval.
+  if (!messageIndicatesExecutionApprovalV2(userMessage) && !hasValidApproval(active)) {
     return 'The user has not explicitly approved the current strategy in their latest message. Present (or re-present) the recommendation and wait for clear approval language (e.g. "approve", "proceed", "run it", "yes, create it") before calling this tool.';
   }
   // Live bug: budget_daily is deliberately nullable at build time (the
@@ -1211,6 +1226,18 @@ export function checkV2ExecutionApprovalGate({ userId, conversationId, userMessa
     // resolve a genuine answer before this gate is ever reached, so this
     // exact confusion is unique to pendingCreative's affirmation-vs-
     // approval overlap.
+    // Round 62 (Nov 20 2026, live approval loop): this gate is the real
+    // dispatch boundary in chat — the executor's own recording (executor.js)
+    // never runs when the gate blocks first — so an "approve" that arrives
+    // while a question is still open must be RECORDED here, not lost:
+    // strong approval language only ("approve"/"proceed"/"run it" — never
+    // a bare "yes"), bound to this row's exact fingerprint. The next
+    // revise carries it forward when only the questions changed (see
+    // strategyBuilder.js), so the user approves once and the answered
+    // strategy executes. Recorded for BOTH unresolved variants below.
+    if (messageIndicatesStrongExecutionApproval(userMessage)) {
+      recordStrategyApproval(active.id, fingerprintStrategyV2(active.strategy), "gate-approve-blocked");
+    }
     if (active.resolvedAssets?.pendingCreative) {
       return `This strategy still has an unresolved question that must be answered first: "${active.strategy.unresolved_questions[0]}" — "approve" only confirms EXECUTION, it does NOT confirm the creative. Ask the user to explicitly confirm the creative itself first (e.g. "yes", "use that post", "correct"), which will save it via meta_expert_v2.revise_strategy — only then call execute_strategy again with a separate approval.`;
     }

@@ -246,6 +246,28 @@ export function findStaleApprovalFingerprint(userId, stored) {
   return null;
 }
 
+// Round 62 — the nearest row in the revisionOf chain (starting with the
+// row itself) that was ever approved, returned as the ROW, not just its
+// fingerprint: the approval carry-forward (strategyBuilder.js) needs the
+// ancestor's stored strategy to compare material fingerprints, which a
+// bare fingerprint string cannot give back. A row whose status is no
+// longer 'approved' (superseded by a later revision, executed, rejected)
+// still counts if its approvalFingerprint is set — supersede/execute
+// change the row's status, never the approval it recorded; the caller
+// still verifies that approvalFingerprint matches the ancestor's own
+// stored strategy before trusting it.
+export function findNearestApprovedAncestor(userId, stored) {
+  let current = stored;
+  let hops = 0;
+  while (current && hops <= MAX_REVISION_CHAIN_WALK) {
+    if (typeof current.approvalFingerprint === "string" && current.approvalFingerprint.length > 0) return current;
+    if (!current.revisionOf) return null;
+    current = getStoredStrategy(userId, current.revisionOf);
+    hops++;
+  }
+  return null;
+}
+
 // Stream B — the ONLY approval predicate executeStrategy() may trust.
 // True only when the row is 'approved' AND the fingerprint recorded at
 // approval time still matches the CURRENT strategy content. A revise that

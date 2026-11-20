@@ -998,3 +998,35 @@ export function fingerprintStrategy(strategy = {}) {
   }
   return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 16);
 }
+
+// Round 62 (Nov 20 2026, live approval loop): the fingerprint above is
+// the approval binding for a strategy's EXACT content — including its
+// open questions (round 59). That is correct for "approve this exact
+// recommendation", but it makes approval evaporate the moment a question
+// is ANSWERED: answering the ad-text question changes unresolved_questions,
+// so the fingerprint changes, so the approval recorded one turn earlier
+// (while the question was still open) no longer matches — and the user
+// has to approve all over again, forever, once per answered question.
+// The MATERIAL fingerprint is the same hash with ONLY the question-answering
+// surface removed: the open questions themselves, and the ad-text answer
+// (content_selector.primaryTextAnswer) — copy the user supplied verbatim
+// to answer one, never a change to the deal they approved (budget,
+// audience, product, destination URL, assets). Everything else in
+// content_selector — the pick itself (confirmedId/position) — stays
+// fingerprinted, so picking a DIFFERENT creative after approval still
+// voids it, exactly as a budget or audience change does. Approval may be
+// carried forward across a revise exactly when the material fingerprints
+// match; any real change still invalidates it and forces a fresh approval.
+// Deliberately NOT used for the dedup (which must stay exact) or for
+// hasValidApproval (which must stay bound to the exact content).
+export function materialFingerprintStrategy(strategy = {}) {
+  const { unresolved_questions: _openQuestions, content_selector, ...rest } = strategy;
+  const material = { ...rest };
+  if (content_selector && typeof content_selector === "object" && !Array.isArray(content_selector)) {
+    const { primaryTextAnswer: _answeredText, ...selectorRest } = content_selector;
+    material.content_selector = selectorRest;
+  } else if (content_selector !== undefined) {
+    material.content_selector = content_selector;
+  }
+  return fingerprintStrategy(material);
+}
