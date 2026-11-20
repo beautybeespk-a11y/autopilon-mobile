@@ -63,6 +63,21 @@ function userMessageContainsAmount(userMessage, amount) {
   return normalized.includes(String(Math.trunc(amount)));
 }
 
+// Round 63 — the bare-number answer to a creative question, as a number.
+// The whole message is just a number (optionally preceded by an
+// affirmation word — "yes 40", "ok 40" — the same pick forms
+// matchCreativeCandidateId recognises), or nothing. A compound message
+// ("3, budget 600/day") is NOT a bare-number answer: it names its budget
+// explicitly, so it returns null and the /day amount is judged on its own.
+const BARE_NUMBER_ANSWER_PATTERN = /^\s*(?:(?:yes|yeah|yep|yup|ok|okay|sure|use)\s*,?\s*)?([\d][\d,]*)\s*\.?\s*$/i;
+export function bareNumberAnswerFromMessage(userMessage) {
+  if (typeof userMessage !== "string") return null;
+  const match = BARE_NUMBER_ANSWER_PATTERN.exec(userMessage);
+  if (!match) return null;
+  const value = Number(match[1].replace(/,/g, ""));
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 // Only fires when THIS call is the one actually asserting USER_PROVIDED
 // (checked against the raw, pre-merge input) — a revision that silently
 // carries a prior, ALREADY-verified USER_PROVIDED budget forward unchanged
@@ -73,10 +88,43 @@ function userMessageContainsAmount(userMessage, amount) {
 // ("creative" | "budget" | null). A USER_PROVIDED budget whose amount equals the bare
 // number the dispatcher already claimed for the creative question is NOT verified —
 // the digits are in the message, but they are the answer to a different question.
+//
+// Round 63 (live bug, Nov 20 2026): merely downgrading the basis was not
+// enough. The old code returned the strategy with budget_basis changed to
+// HEURISTIC_STARTING_TEST but budget_daily left at the pick number — so
+// "40" (product #40, Manyo Herb Green Cleansing Oil) still stood as a
+// PKR 40/day budget, just under a different label, and nothing downstream
+// rejects a small heuristic budget. A budget that IS the bare creative
+// pick is cleared entirely (budget_daily: null), so the budget question
+// stays open and the agent has to ask for a real budget. The compound
+// case is untouched: "3, budget 600/day" has no bare-number answer (the
+// message is not just a number), so a genuine /day amount survives.
+// opts.blockedBareNumber is the number the creative pre-loop already
+// spent as a pick earlier this same turn (strategyBuilder.js records it
+// on the stored row): a later revise in that turn re-reading the same
+// raw message as a budget is the same misread, one call later.
 export function verifyUserProvidedBudget(rawStrategy, mergedStrategy, userMessage, opts = {}) {
   if (rawStrategy.budget_basis !== "USER_PROVIDED") return mergedStrategy;
+  const bareAnswer = bareNumberAnswerFromMessage(userMessage);
+  const amount = mergedStrategy.budget_daily;
+  // A bare number is only ever a pick when it could BE a list position:
+  // with at most 50 candidates, "150" or "500" beside an open creative
+  // question is a real budget (the round-57 >=100 rule), never a pick.
+  // opts.creativeCandidateCount is the prior row's shown list size (1
+  // while a single pick awaits confirmation); claimedBy === "creative"
+  // already implies the dispatcher range-checked the pick, so it needs
+  // no count of its own.
+  const bareAnswerIsPlausiblePick = bareAnswer != null
+    && Number.isInteger(opts.creativeCandidateCount) && opts.creativeCandidateCount > 0
+    && bareAnswer <= opts.creativeCandidateCount;
+  const spentAsCreativePick = bareAnswer != null && bareAnswer === amount
+    && (opts.claimedBy === "creative" || (opts.creativeQuestionOpen === true && bareAnswerIsPlausiblePick));
+  const blockedPick = opts.blockedBareNumber != null && amount === opts.blockedBareNumber;
+  if (spentAsCreativePick || blockedPick) {
+    return { ...mergedStrategy, budget_daily: null, budget_basis: "HEURISTIC_STARTING_TEST" };
+  }
   if (opts.claimedBy === "creative") return { ...mergedStrategy, budget_basis: "HEURISTIC_STARTING_TEST" };
-  if (userMessageContainsAmount(userMessage, mergedStrategy.budget_daily)) return mergedStrategy;
+  if (userMessageContainsAmount(userMessage, amount)) return mergedStrategy;
   return { ...mergedStrategy, budget_basis: "HEURISTIC_STARTING_TEST" };
 }
 

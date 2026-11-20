@@ -27,7 +27,7 @@ const meta = await import("../integrations/meta/api.js");
 const { buildStrategy, reviseStrategy, pixelSummaryValue, campaignNameForStrategy } = await import("../agents/metaExpertV2/strategyBuilder.js");
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
-const { messageIndicatesExecutionApproval, messageIndicatesStrongExecutionApproval, extractUrlFromMessage, fingerprintStrategy: fingerprintStrategyForTest } = await import("../agents/metaExpertV2/policy.js");
+const { messageIndicatesExecutionApproval, messageIndicatesStrongExecutionApproval, extractUrlFromMessage, fingerprintStrategy: fingerprintStrategyForTest, verifyUserProvidedBudget } = await import("../agents/metaExpertV2/policy.js");
 const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative, matchCreativeCandidateId } = await import("../agents/metaExpertV2/creativeResolution.js");
 const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } = await import("../agents/metaExpertV2/productMatching.js");
@@ -12177,6 +12177,303 @@ async function run() {
       assert.equal(updated.resolvedAssets.creative?.contentId, "111_3", "the leading 3 must resolve to post #3");
       assert.equal(updated.strategy.budget_daily, 600, "the /day budget token must be saved as 600");
       assert.deepEqual(updated.strategy.unresolved_questions, [], "both questions must be cleared");
+    } finally { restoreFetch(); }
+  });
+
+  // --- Round 63 — a product number must never become the daily budget --
+  // Live bug, Nov 20 2026 (after PR #11 was live): fresh chat, user says
+  // "create a website purchase campaign" with NO budget in the first
+  // message. The agent lists 50 products and asks for a daily budget.
+  // User replies "40" — product #40, Manyo Herb Green Cleansing Oil
+  // (id 6203, Rs 2700). The agent set Budget: PKR 40/day instead of
+  // asking for the budget separately. The dispatcher (Stream C) already
+  // claims "40" for the creative question, and the creative pre-loop
+  // already saves the pick — the hole is the model's OWN revise call
+  // later in that SAME turn: by then the creative question is already
+  // cleared, so the budget question looks like the sole open question
+  // and the same raw "40" is re-read as a budget answer — either because
+  // the model asserts budget_daily: 40 / USER_PROVIDED (verified by
+  // userMessageContainsAmount, which the pick number itself satisfies),
+  // or because deriveBudgetFromUserMessageIfMissing's bare-number
+  // fallback fires on a now-"sole" budget question. The existing "3"
+  // test never caught it: its model makes NO tool call, so the second
+  // revise never happens. These tests replay the live shape with the
+  // model revise present.
+  const manyo63Product = {
+    id: 6203, name: "Manyo Herb Green Cleansing Oil", price: "2700", categories: [{ name: "Skincare" }],
+    images: [{ src: "https://store.example.com/wp-content/uploads/manyo-herb-green-cleansing-oil.jpg" }],
+    permalink: "https://beautybees.pk/product/manyo-herb-green-cleansing-oil/",
+    short_description: "Herb green cleansing oil.",
+  };
+  const manyo63NoDescProduct = { ...manyo63Product, short_description: "" };
+  const liveAdText63 = "Manyo Herb Green Cleansing Oil — Rs 2,700 — Shop now at beautybees.pk";
+  const wcProducts63 = [...filler59Products.slice(0, 39), manyo63Product, ...filler59Products.slice(39, 49)];
+  const wcProducts63NoDesc = [...filler59Products.slice(0, 39), manyo63NoDescProduct, ...filler59Products.slice(39, 49)];
+  const strategy63 = (overrides = {}) => baseStrategy({
+    business_goal: "Website Purchases", age_min: 18, age_max: 45, budget_daily: undefined,
+    creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." },
+    destination_url: "https://beautybees.pk", ...overrides,
+  });
+  const isCreativeQuestion63 = (q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?");
+  const isAdTextQuestion63 = (q) => q.startsWith('What ad text would you like for the "');
+  const buildWith40Question63 = async (userId, conversationId, products = wcProducts63) => {
+    const built = await buildStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      strategy: strategy63(), userMessage: "create a website purchase campaign",
+    });
+    assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    const question = built.strategy.unresolved_questions.find(isCreativeQuestion63);
+    assert.ok(question, "sanity: the build must ask the 50-candidate creative question");
+    assert.ok(question.includes('40) "Manyo Herb Green Cleansing Oil"'), "sanity: Manyo must be candidate #40 in the list");
+    assert.ok(built.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "sanity: the budget question must be open too");
+    assert.ok(built.strategy.budget_daily == null, `sanity: no budget yet — the first message named none: got ${built.strategy.budget_daily} basis ${built.strategy.budget_basis}`);
+    return built;
+  };
+  // The orchestrator creative pre-loop's own revise, exactly as it sends
+  // it: a content_selector pick, claimedBy "creative", raw message "40".
+  const pickManyo40PreLoop63 = async (userId, conversationId, strategyId) => {
+    const picked = await reviseStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId,
+      requestedChanges: { content_selector: { confirmedId: "6203" } }, userMessage: "40", claimedBy: "creative",
+    });
+    assert.equal(picked.ok, true, JSON.stringify(picked.unresolved));
+    // The pick is stored as content_selector.confirmedId. Whether it is
+    // already a resolved creative depends on the product: with a real
+    // short description it resolves outright; without one (the no-desc
+    // fixture) the creative only resolves once ad text exists, and the
+    // ad-text question is open instead — both are the designed states.
+    assert.equal(picked.strategy.content_selector?.confirmedId, "6203", `sanity: the pre-loop pick must store Manyo as the pick: got ${JSON.stringify(picked.strategy.content_selector)}`);
+    assert.ok(picked.resolved.creative?.productId === "6203" || picked.strategy.unresolved_questions.some(isAdTextQuestion63), `sanity: the pick must either resolve outright or leave the ad-text question open: creative ${JSON.stringify(picked.resolved.creative)} pending ${JSON.stringify(picked.resolved.pendingCreative)}`);
+    assert.ok(picked.strategy.budget_daily == null, `sanity: the pre-loop pick must not set a budget: got ${picked.strategy.budget_daily}`);
+    return picked;
+  };
+
+  await check("[round 63] verifyUserProvidedBudget clears a budget that IS the bare creative pick — and keeps a real compound budget", () => {
+    const claimed = verifyUserProvidedBudget(
+      { budget_basis: "USER_PROVIDED", budget_daily: 40 },
+      { budget_daily: 40, budget_basis: "USER_PROVIDED" }, "40", { claimedBy: "creative" });
+    assert.equal(claimed.budget_daily, null, "\"40\" claimed for the creative question must never become a PKR 40/day budget");
+    const compound = verifyUserProvidedBudget(
+      { budget_basis: "USER_PROVIDED", budget_daily: 600 },
+      { budget_daily: 600, budget_basis: "USER_PROVIDED" }, "3, budget 600/day", { claimedBy: "creative" });
+    assert.equal(compound.budget_daily, 600, "a genuine /day budget in the same compound message must survive — only the pick number is cleared");
+  });
+
+  await check("[round 63] dispatcher: \"40\" with the 50-product list and budget open claims the creative only — never the budget", async () => {
+    const userId = makeUser(`round63-dispatcher-40-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(active, "sanity: an active strategy must be stored");
+      const answer = resolvePendingQuestionAnswer({ activeStrategy: active, userMessage: "40" });
+      assert.equal(answer.creativeId, "6203", "\"40\" must claim product #40 (Manyo, id 6203)");
+      assert.equal(answer.budgetDaily, null, "\"40\" must claim nothing for the budget");
+      assert.equal(answer.bareNumberClaimedBy, "creative", "the bare number belongs to the creative question");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] the live \"40\" case, model path A: a same-turn revise asserting PKR 40/day after the pre-loop pick must NOT set the budget", async () => {
+    const userId = makeUser(`round63-model-asserts-40-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      const picked = await pickManyo40PreLoop63(userId, conversationId, built.strategyId);
+      // The live model's own call, later in the SAME turn: it re-reads
+      // the raw "40" as a budget and asserts it as USER_PROVIDED. The
+      // revise may be rejected as a no-change revision (nothing actually
+      // changed — the budget was never set) or accepted with the budget
+      // cleared; either way the stored budget must stay unset.
+      await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { budget_daily: 40, budget_basis: "USER_PROVIDED" }, userMessage: "40",
+      });
+      const stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(stored.strategy.budget_daily == null, `budget must still be unset — "40" is product #40, never PKR 40/day: got ${stored.strategy.budget_daily}`);
+      assert.equal(stored.resolvedAssets.creative?.productId, "6203", "the creative must still be Manyo");
+      assert.ok(stored.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "the budget question must stay open — the agent must ask for it");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] the live \"40\" case, model path B: asserting the pick number as a budget with NO basis must not set it either", async () => {
+    const userId = makeUser(`round63-model-asserts-40-nobasis-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      const picked = await pickManyo40PreLoop63(userId, conversationId, built.strategyId);
+      await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { budget_daily: 40 }, userMessage: "40",
+      });
+      const stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(stored.strategy.budget_daily == null, `budget must still be unset — a bare-number budget claim with no basis is still the pick number: got ${stored.strategy.budget_daily}`);
+      assert.equal(stored.resolvedAssets.creative?.productId, "6203", "the creative must still be Manyo");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] the live \"40\" case, derive path: a genuine unrelated revision on the \"40\" turn must not derive a PKR 40/day budget", async () => {
+    const userId = makeUser(`round63-derive-40-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      const picked = await pickManyo40PreLoop63(userId, conversationId, built.strategyId);
+      // With-description fixture: after the pick the budget question is
+      // the SOLE open question, so the bare-number fallback would fire
+      // on any successful revision this turn — the pick number must
+      // still never become the budget.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { age_max: 44 }, userMessage: "40",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.strategy.age_max, 44, "the genuine revision itself must still apply");
+      assert.ok(revised.strategy.budget_daily == null, `the derive fallback must not turn "40" into a budget: got ${revised.strategy.budget_daily}`);
+      assert.equal(revised.resolved.creative?.productId, "6203", "the creative must still be Manyo");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] preserved: a bare number answering the budget-only question still sets the budget, and \"change the budget to 750/day\" preserves the creative", async () => {
+    const userId = makeUser(`round63-budget-only-750-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      const picked = await pickManyo40PreLoop63(userId, conversationId, built.strategyId);
+      // The pick number is spent; a LATER bare number is the budget
+      // answer (the budget question is the only one open now).
+      const budgeted = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { budget_daily: 750, budget_basis: "USER_PROVIDED" }, userMessage: "750",
+      });
+      assert.equal(budgeted.ok, true, JSON.stringify(budgeted.unresolved));
+      assert.equal(budgeted.strategy.budget_daily, 750, "a bare \"750\" answering the budget-only question must set the budget");
+      assert.equal(budgeted.resolved.creative?.productId, "6203", "the creative must survive the budget answer");
+      assert.deepEqual(budgeted.strategy.unresolved_questions, [], "with product picked and budget set, nothing is left to re-ask");
+      // And the explicit change form still works on top of a settled pick.
+      const changed = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: budgeted.strategyId,
+        requestedChanges: { budget_daily: 800, budget_basis: "USER_PROVIDED" }, userMessage: "change the budget to 800/day",
+      });
+      assert.equal(changed.ok, true, JSON.stringify(changed.unresolved));
+      assert.equal(changed.strategy.budget_daily, 800, "an explicit budget change must apply");
+      assert.equal(changed.resolved.creative?.productId, "6203", "an explicit budget change must preserve the creative");
+      // Unambiguous money forms still derive without any flag.
+      assert.equal(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "Rs 750 per day").budget_daily, 750, "\"Rs 750 per day\" must set the budget");
+      assert.equal(deriveBudgetFromUserMessageIfMissing({ budget_daily: null }, "750/day").budget_daily, 750, "\"750/day\" must set the budget");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] preserved: a bare \"150\" beside an open creative list is still a budget — it cannot be a list position", async () => {
+    const userId = makeUser(`round63-bare-150-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      // The list has 50 candidates, so "150" names no position at all —
+      // the round-57 >=100 rule: it is a budget answer, and the creative
+      // question must stay open (nothing was picked).
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { budget_daily: 150, budget_basis: "USER_PROVIDED" }, userMessage: "150",
+      });
+      assert.equal(revised.ok, true, JSON.stringify(revised.unresolved));
+      assert.equal(revised.strategy.budget_daily, 150, "a bare \"150\" must set the budget — it cannot be a position in a 50-item list");
+      assert.ok(revised.strategy.unresolved_questions.some(isCreativeQuestion63), "the creative question must stay open — \"150\" picked nothing");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] end to end via orchestrate: the model calling revise_strategy with PKR 40/day on the \"40\" turn must not set it", async () => {
+    const userId = makeUser(`round63-orchestrate-40-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts63, wcSearchHandler: wcAndSearch59([manyo63Product]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId);
+      assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    } finally { restoreFetch(); }
+    // The live model's own call, scripted: after the pre-loop saves the
+    // pick, the model re-reads "40" as a budget and calls revise with it.
+    const storedCreativeLine = `Creative: Product image "Manyo Herb Green Cleansing Oil" (id 6203, 2700)`;
+    mockFetch(scriptedFetch({
+      wcProducts: wcProducts63, metaOpts: metaOpts62(), wcSearchHandler: wcAndSearch59([manyo63Product]),
+      chatResponses: [
+        toolCall("meta_expert_v2.revise_strategy", { requestedChanges: { budget_daily: 40, budget_basis: "USER_PROVIDED" } }),
+        finalText(`Got it — Manyo Herb Green Cleansing Oil it is.\n${storedCreativeLine}\nWhat daily budget would you like, in PKR per day?`),
+        finalText(`Got it — Manyo Herb Green Cleansing Oil it is.\n${storedCreativeLine}\nBudget: Not yet set — needs your input\nWhat daily budget would you like, in PKR per day?`),
+        finalText(`Got it — Manyo Herb Green Cleansing Oil it is.\n${storedCreativeLine}\nBudget: Not yet set — needs your input\nWhat daily budget would you like, in PKR per day?`),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId, userMessage: "40", history: [{ role: "user", content: "40" }], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      const updated = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(updated.resolvedAssets.creative?.productId, "6203", "must resolve to Manyo (id 6203), product #40");
+      assert.ok(updated.strategy.budget_daily == null, `budget must still be unset after the model's revise — "40" is a product pick, never PKR 40/day: got ${updated.strategy.budget_daily}`);
+      assert.ok(updated.strategy.unresolved_questions.includes("What daily budget would you like for this?"), "the budget question must stay open");
+      assert.ok(!/PKR 40\/day|budget.*\b40\b\/day/i.test(result.reply), "the reply must never present a PKR 40/day budget");
+    } finally { restoreFetch(); }
+  });
+
+  await check("[round 63] the exact live case end to end: \"40\" -> creative, budget stays unset; \"750/day\" -> budget 750; ad text once; approve once -> campaign created paused, nothing spent", async () => {
+    const userId = makeUser(`round63-full-flow-40-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(writes), wcProducts: wcProducts63NoDesc, wcSearchHandler: wcAndSearch59([manyo63NoDescProduct]) }));
+    try {
+      const built = await buildWith40Question63(userId, conversationId, wcProducts63NoDesc);
+      const picked = await pickManyo40PreLoop63(userId, conversationId, built.strategyId);
+      assert.ok(picked.strategy.unresolved_questions.some(isAdTextQuestion63), "sanity: the ad-text question must be open — this product has no description to pull from");
+      // The live misread, replayed: the model asserts PKR 40/day.
+      await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { budget_daily: 40, budget_basis: "USER_PROVIDED" }, userMessage: "40",
+      });
+      let stored = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(stored.strategy.budget_daily == null, `budget must still be unset after the misread attempt: got ${stored.strategy.budget_daily}`);
+      // The real budget, given explicitly.
+      const budgeted = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: stored.id,
+        requestedChanges: { budget_daily: 750, budget_basis: "USER_PROVIDED" }, userMessage: "750/day",
+      });
+      assert.equal(budgeted.ok, true, JSON.stringify(budgeted.unresolved));
+      assert.equal(budgeted.strategy.budget_daily, 750, "the explicit budget must be saved");
+      assert.equal(budgeted.strategy.content_selector?.confirmedId, "6203", "the creative pick must survive the budget answer");
+      assert.ok(budgeted.strategy.unresolved_questions.some(isAdTextQuestion63), "only the ad-text question must be left");
+      // The ad text, once.
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: budgeted.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: liveAdText63 } }, userMessage: liveAdText63,
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative?.primaryText, liveAdText63, "the exact ad text must be saved");
+      assert.equal(answered.resolved.creative?.productId, "6203", "the creative must survive the ad text");
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "nothing left to re-ask");
+      // Approve once — the campaign is created, paused, nothing spent.
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId, userMessage: "approve" });
+      assert.ok(executed.campaignId, "the campaign must actually be created");
+      assert.equal(executed.status, "PAUSED", "the campaign must be created paused — nothing spent");
+      assert.ok(writes.some((w) => w.path.endsWith("/campaigns")), "a real campaign creation must have reached Meta");
+      assert.ok(writes.some((w) => w.path.endsWith("/adsets")), "a real ad set creation must have reached Meta");
+      assert.ok(writes.some((w) => w.path.endsWith("/ads")), "a real ad creation must have reached Meta");
     } finally { restoreFetch(); }
   });
 
