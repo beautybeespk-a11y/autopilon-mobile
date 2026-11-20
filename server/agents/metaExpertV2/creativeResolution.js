@@ -569,10 +569,20 @@ export function messageRequestsCreativeOptionsList(userMessage) {
 //      message (same "never trust the model's own claim" principle as
 //      USER_PROVIDED budget) — asked for via a real unresolved_questions
 //      entry (see strategyBuilder.js) when neither source has anything.
-function resolvePrimaryText(product, strategy, userMessage) {
+// Round 62 — verifiedAnswer: an ad-text answer already verified on an
+// EARLIER turn (strategyBuilder.js's settled-pick trust: the carried
+// answer is byte-identical to the prior row's, which was verified against
+// the user's own words when it was given). It is trusted WITHOUT
+// re-checking it against the current message — a later unrelated message
+// can never contain it, and re-checking would resurrect the ad-text
+// question on every later revision. A DIFFERENT answer still goes through
+// the normal verification against this turn's message.
+function resolvePrimaryText(product, strategy, userMessage, verifiedAnswer = null) {
   if (product.shortDescription) return { primaryText: product.shortDescription, source: "product_short_description" };
   const answer = strategy.content_selector?.primaryTextAnswer;
-  if (typeof answer === "string" && answer.trim() && userMessageContainsText(userMessage, answer)) {
+  if (typeof answer === "string" && answer.trim()
+    && ((typeof verifiedAnswer === "string" && answer.trim() === verifiedAnswer.trim())
+      || userMessageContainsText(userMessage, answer))) {
     return { primaryText: answer.trim(), source: "user_supplied" };
   }
   return { primaryText: null, source: null };
@@ -592,10 +602,10 @@ function resolvePrimaryText(product, strategy, userMessage) {
 // as affirmation of it. The identifying facts (captionExcerpt / publishedDate /
 // productName) are stored with the creative so a later relabelling is detectable
 // by comparison, not by trust (see the reuse re-check in resolveCreativeSelection).
-function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, provenance }) {
+function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, provenance, verifiedPrimaryTextAnswer = null }) {
   const resolvedProvenance = provenance || { kind: "user_pick_verified", verifiedAgainstUserMessage: true };
   if (source === "PRODUCT_IMAGE") {
-    const { primaryText, source: primaryTextSource } = resolvePrimaryText(chosen, strategy, userMessage);
+    const { primaryText, source: primaryTextSource } = resolvePrimaryText(chosen, strategy, userMessage, verifiedPrimaryTextAnswer);
     if (!primaryText) {
       return { ...empty, needsPrimaryTextQuestion: true, resolvedProductForQuestion: chosen };
     }
@@ -676,7 +686,7 @@ function finalizeChosenCreative({ source, chosen, strategy, userMessage, empty, 
 // candidate list is itself the "a question was asked" evidence (the list
 // only exists because the question was asked), so verification still works
 // for legacy rows. Rows WITH a record use the record's candidateIds.
-export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction, claimedCreativeId, namedProductNotFound }) {
+export function resolveCreativeSelection({ strategy, snapshot, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, explicitAction, claimedCreativeId, namedProductNotFound, verifiedPrimaryTextAnswer = null }) {
   const source = strategy.creative_strategy?.source;
   const empty = { creative: null, ambiguousCandidates: [], creativeError: null, creativeNotFound: null, needsPrimaryTextQuestion: false, unsupportedSource: false, pendingCreative: null };
   if (strategy.mode === "explicit_action" || !source) return empty;
@@ -777,7 +787,7 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
     const claimedPendingCandidate = typeof claimedCreativeId === "string" && claimedCreativeId.length > 0
       && claimedCreativeId === priorPendingCreative.candidate.id;
     if (pendingCreativeQuestion === true && (messageAffirmsPendingCreative(userMessage, { pendingCreativeQuestion: true }) || claimedPendingCandidate)) {
-      return finalizeChosenCreative({ source, chosen: priorPendingCreative.candidate, strategy, userMessage, empty, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true } });
+      return finalizeChosenCreative({ source, chosen: priorPendingCreative.candidate, strategy, userMessage, empty, provenance: { kind: "pending_affirmed", verifiedAgainstUserMessage: true }, verifiedPrimaryTextAnswer });
     }
     return { ...empty, pendingCreative: priorPendingCreative };
   }
@@ -1020,7 +1030,7 @@ export function resolveCreativeSelection({ strategy, snapshot, priorCreative, pr
   }
 
   return finalizeChosenCreative({
-    source, chosen, strategy, userMessage, empty,
+    source, chosen, strategy, userMessage, empty, verifiedPrimaryTextAnswer,
     provenance: singleCandidateAuto
       ? { kind: "single_candidate_auto", verifiedAgainstUserMessage: false }
       : { kind: "user_pick_verified", verifiedAgainstUserMessage: true },

@@ -916,6 +916,20 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   // here — see the approval check below; this function never executes on
   // gate trust alone.
   if (Array.isArray(stored.strategy.unresolved_questions) && stored.strategy.unresolved_questions.length > 0) {
+    // Round 62 (Nov 20 2026, live approval loop): the user said "approve"
+    // while a question was still open, and the approval evaporated — this
+    // throw runs BEFORE the approval check below, so the approval was
+    // never recorded, and answering the question next turn wiped it for
+    // good. Record STRONG approval language ("approve"/"proceed"/"run
+    // it" — never a bare "yes", same bar as the executor's own check)
+    // against this row's exact fingerprint before refusing: the next
+    // revise carries it forward when only the questions changed (see
+    // strategyBuilder.js's carry-forward), so the user approves once and
+    // the answered strategy executes. The approval binds to THIS row's
+    // content — a later material change still invalidates it.
+    if (messageIndicatesStrongExecutionApproval(userMessage)) {
+      recordStrategyApproval(stored.id, fingerprintStrategy(stored.strategy), "chat-strong-blocked");
+    }
     const err = new Error(`This strategy still has an unresolved question: "${stored.strategy.unresolved_questions[0]}" — build a revised strategy answering it before executing.`);
     err.code = "META_V2_UNRESOLVED_QUESTION";
     throw err;

@@ -7853,6 +7853,319 @@ async function run() {
     }
   });
 
+  // --- Round 62 (approval / unresolved-question loop) --------------------
+  // Live bug (Nov 20 2026, ~21:53-21:58 PKT — the night PR #10 deployed):
+  // fresh Autopilon chat, Maybelline Moisturizing Serum Lipstick Matte
+  // (id 6015, Rs 899), Rs 550/day, beautybees.pk. The user named the
+  // product in the FIRST message and the agent still listed all 51
+  // products; the user answered "51" and gave the exact ad text twice
+  // and said "approve" twice — and no campaign was ever created. The
+  // loop alternated between two errors: the creative/ad-text question
+  // "never cleared" (each answer was auto-saved but the question was
+  // re-asked) and "The user has not explicitly approved the current
+  // strategy in their latest message" (approval only counted if it was
+  // in the very latest message, so answering a question wiped it).
+  // Three cooperating causes, all fixed in this round:
+  //   (a) mergeForRevision did a SHALLOW spread of content_selector, so
+  //       answering the ad text ({primaryTextAnswer}) silently wiped the
+  //       creative pick ({confirmedId}) saved one turn earlier — and vice
+  //       versa — so the corresponding question was re-injected every
+  //       turn. The merge is now a deep merge for content_selector.
+  //   (b) a pick already verified once was re-verified against every
+  //       later, unrelated message, so a settled pick could demote back
+  //       to pending (and a carried-forward ad-text answer was
+  //       re-checked against a message that never contained it). A pick
+  //       and an ad-text answer already settled on the prior row are now
+  //       trusted when carried forward unchanged.
+  //   (c) approval was bound to the FULL fingerprint (which round 59
+  //       made include unresolved_questions) and the orchestrator gate
+  //       only ever accepted approval language in the LATEST message —
+  //       so approving, then answering a question, invalidated the
+  //       approval. Approval is now carried forward across a revise
+  //       when only the open questions changed (material fingerprint),
+  //       recorded when an execute is blocked by an open question
+  //       despite strong approval in the message, and accepted by the
+  //       gate when it is persisted and still valid. A bare "yes" still
+  //       never approves, and a material change still invalidates.
+  // Fixture note: the round-59 case (product OUTSIDE the newest 50,
+  // found only by targeted search) is already covered there; these
+  // tests isolate the approval loop by putting Maybelline 50th in the
+  // newest list (the snapshot samples at most 50 — MAX_PRODUCTS), so
+  // the number-answer path reproduces without the search problem in
+  // the way. The Turn-1 test below keeps the exact live shape instead:
+  // Maybelline outside the newest 50, reaching the list only through
+  // the targeted search as candidate #51. The product has NO short
+  // description, exactly like the live shape — the agent must ask for
+  // ad text once the product is picked.
+  const maybelline62Product = {
+    id: 6015, name: "Maybelline Moisturizing Serum Lipstick Matte", price: "899", categories: [{ name: "Makeup" }],
+    // Image host is store.example.com, not beautybees.pk: the test mock
+    // only serves product-image bytes from store.example.com (see
+    // scriptedFetch's image block), and the execute tests below fetch the
+    // resolved image for real. Name, id, price and permalink stay exact.
+    images: [{ src: "https://store.example.com/wp-content/uploads/maybelline-serum-matte.jpg" }],
+    permalink: "https://beautybees.pk/product/maybelline-serum-matte-lipstick/",
+    short_description: "",
+  };
+  const liveAdText62 = "Maybelline Moisturizing Serum Lipstick Matte — Rs 899 — Shop now at beautybees.pk";
+  const wcProducts62 = [...filler59Products.slice(0, 49), maybelline62Product];
+  const metaOpts62 = (writes) => ({ adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "717559728109412", name: "Beautybeespk" }], pixels: [{ id: "px1", name: "Pixel" }], posts: [], postsPageSize: 5, writes });
+  const strategy62 = (overrides = {}) => baseStrategy({
+    business_goal: "Website Purchases", age_min: 18, age_max: 45, budget_daily: 550,
+    creative_strategy: { source: "PRODUCT_IMAGE", description: "Use a product image as the ad creative." },
+    destination_url: "https://beautybees.pk", ...overrides,
+  });
+  const isCreativeQuestion62 = (q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?");
+  const isAdTextQuestion62 = (q) => q.startsWith('What ad text would you like for the "');
+  // The number-answer flow: the user did NOT name a product in turn 1,
+  // so the agent lists the candidates and the user answers by number
+  // (Maybelline is #50 here; the live chat had it at #51 via the
+  // targeted search — same mechanism, same trap).
+  const buildWith50Question62 = async (userId, conversationId) => {
+    const built = await buildStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      strategy: strategy62(), userMessage: "I want more website sales, link it to https://beautybees.pk",
+    });
+    assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    const question = built.strategy.unresolved_questions.find(isCreativeQuestion62);
+    assert.ok(question, "sanity: the build must ask the 50-candidate creative question");
+    assert.ok(question.includes('50) "Maybelline'), "sanity: Maybelline must be candidate #50 in the list");
+    return built;
+  };
+  // The live Turn-1 flow: the user DID name the product in the first
+  // message, so the targeted search appends it as candidate #51 — and
+  // (after this round's fix) the build resolves it straight away, leaving
+  // only the ad-text question open.
+  const buildNamedMaybelline62 = async (userId, conversationId) => {
+    const built = await buildStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      strategy: strategy62(),
+      userMessage: "Create a Website Purchases campaign for Maybelline Serum Matte Lipstick, 550 per day, beautybees.pk",
+    });
+    assert.equal(built.ok, true, JSON.stringify(built.unresolved));
+    return built;
+  };
+
+  await check("[round 62] Turn 1: naming the product by name in the FIRST message uses it directly as the creative — no 51-item re-list (live Nov 20 case)", async () => {
+    const userId = makeUser(`round62-turn1-name-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts59, wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildNamedMaybelline62(userId, conversationId);
+      assert.deepEqual(built.strategy.unresolved_questions.filter(isCreativeQuestion62), [], "the 51-item creative question must never be asked — the named product is the creative");
+      assert.equal(built.strategy.content_selector?.confirmedId, "6015", "the named product must be stored as the pick");
+      assert.ok(built.strategy.unresolved_questions.some(isAdTextQuestion62), "the only open question must be the ad text — the product has no description to pull from");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] answering \"50\" clears the creative question for good — it is never re-asked (dispatcher claim path: content_selector pick + claimedBy, exactly as the orchestrator pre-loop sends it)", async () => {
+    const userId = makeUser(`round62-answer-50-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts62, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildWith50Question62(userId, conversationId);
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { confirmedId: "6015" } }, userMessage: "50", claimedBy: "creative",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.deepEqual(answered.strategy.unresolved_questions.filter(isCreativeQuestion62), [], "the creative question must clear once \"50\" is answered");
+      assert.equal(answered.strategy.content_selector?.confirmedId, "6015", "the pick must be stored");
+      assert.equal(answered.resolved.pendingCreative, null, "the pick must resolve outright, not sit pending");
+      assert.ok(answered.strategy.unresolved_questions.some(isAdTextQuestion62), "only the ad-text question stays open — the product has no description");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] giving the ad text clears the ad-text question WITHOUT wiping the \"50\" pick — the exact live ad text, model content_selector path", async () => {
+    const userId = makeUser(`round62-ad-text-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts62, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildWith50Question62(userId, conversationId);
+      const picked = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { confirmedId: "6015" } }, userMessage: "50",
+      });
+      assert.equal(picked.ok, true, JSON.stringify(picked.unresolved));
+      assert.deepEqual(picked.strategy.unresolved_questions.filter(isCreativeQuestion62), [], "sanity: the \"50\" pick must clear the creative question");
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: liveAdText62 } }, userMessage: liveAdText62,
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative?.productId, "6015", "the creative must still be Maybelline after the ad text is supplied");
+      assert.equal(answered.resolved.creative?.primaryText, liveAdText62, "the exact ad text must be saved as the primary text");
+      assert.equal(answered.strategy.content_selector?.confirmedId, "6015", "the pick must survive the ad-text revision (deep merge, not a wipe)");
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "with the product picked and the ad text given, NOTHING is left to re-ask");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] a generic ad text that never repeats the product name still keeps the settled \"50\" pick — a settled pick is trusted, not re-verified against every later message", async () => {
+    const userId = makeUser(`round62-generic-ad-text-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(), wcProducts: wcProducts62, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildWith50Question62(userId, conversationId);
+      const picked = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { confirmedId: "6015" } }, userMessage: "50",
+      });
+      assert.equal(picked.ok, true, JSON.stringify(picked.unresolved));
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: picked.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: "Get glowing skin today!" } }, userMessage: "Get glowing skin today!",
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative?.productId, "6015", "the creative must still be Maybelline — the ad text names no product, so only settled-pick trust can keep it");
+      assert.equal(answered.resolved.creative?.primaryText, "Get glowing skin today!", "the generic ad text must be saved as the primary text");
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "nothing is left to re-ask");
+      // And the settled answer survives a THIRD, unrelated revision that
+      // re-sends only the pick (the model restating the selector while
+      // answering something else must not resurrect the ad-text question).
+      const restated = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { content_selector: { confirmedId: "6015" } }, userMessage: "looks good, keep it",
+      });
+      assert.equal(restated.ok, true, JSON.stringify(restated.unresolved));
+      assert.equal(restated.resolved.creative?.productId, "6015", "the creative must survive a later restated pick");
+      assert.equal(restated.resolved.creative?.primaryText, "Get glowing skin today!", "the already-verified ad text must survive too — it is never re-checked against an unrelated message");
+      assert.deepEqual(restated.strategy.unresolved_questions, [], "the ad-text question must not come back");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] the exact live loop end to end: approve while a question is open, answer it, then execute with NO approval language in the latest message — the campaign is created, paused, nothing spent", async () => {
+    const userId = makeUser(`round62-full-loop-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(writes), wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      // Live Turn 1: the product is named in the first message, so the
+      // build resolves it straight away — only the ad-text question is open.
+      const built = await buildNamedMaybelline62(userId, conversationId);
+      assert.equal(built.strategy.content_selector?.confirmedId, "6015", "sanity: the named product must be the pick from Turn 1");
+      assert.ok(built.strategy.unresolved_questions.some(isAdTextQuestion62), "sanity: only the ad-text question must be open");
+      // Turn "approve": the ad-text question is still open, so execute
+      // must refuse — but the approval itself must be RECORDED, not lost.
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
+        (err) => err.code === "META_V2_UNRESOLVED_QUESTION",
+        "execute with an open question must still refuse",
+      );
+      const blocked = getStoredStrategy(userId, built.strategyId);
+      assert.equal(blocked.status, "approved", "the \"approve\" that hit the open question must be recorded on the strategy — otherwise answering the question wipes it");
+      // Turn "ad text": the last open question is answered.
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: liveAdText62 } }, userMessage: liveAdText62,
+      });
+      assert.equal(answered.ok, true, JSON.stringify(answered.unresolved));
+      assert.equal(answered.resolved.creative?.productId, "6015", "the creative must still be Maybelline after the ad text");
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "nothing left to re-ask");
+      // The orchestrator gate must ALSO accept the persisted approval —
+      // the live loop's second error came from the gate, not the executor.
+      const gate = checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "thanks, that looks good" });
+      assert.equal(gate, null, "the gate must accept the persisted approval — a latest message with no approval language must not wipe it");
+      // Turn "thanks": NO approval language in this message at all — the
+      // earlier "approve" must still carry the execution.
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId, userMessage: "thanks, that looks good" });
+      assert.ok(executed.campaignId, "the campaign must actually be created");
+      assert.equal(executed.status, "PAUSED", "the campaign must be created paused — nothing spent");
+      assert.ok(writes.some((w) => w.path.endsWith("/campaigns")), "a real campaign creation must have reached Meta");
+      assert.ok(writes.some((w) => w.path.endsWith("/adsets")), "a real ad set creation must have reached Meta");
+      assert.ok(writes.some((w) => w.path.endsWith("/ads")), "a real ad creation must have reached Meta");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] a bare \"yes\" still NEVER approves an execution — the PR #6 guard survives the approval-carry fix", async () => {
+    const userId = makeUser(`round62-bare-yes-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(writes), wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildNamedMaybelline62(userId, conversationId);
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: liveAdText62 } }, userMessage: liveAdText62,
+      });
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "sanity: the strategy must be fully ready — only the approval is missing");
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId, userMessage: "yes" }),
+        (err) => err.code === "META_V2_APPROVAL_REQUIRED",
+        "a bare \"yes\" must never execute — explicit approval language is still required",
+      );
+      assert.equal(writes.length, 0, "nothing may be created on a bare \"yes\"");
+      // No gate assertion here on purpose: the gate deliberately uses the
+      // WEAK approval check, so a bare "yes" passes it toward a
+      // confirmation card in chat — the card click is the approval, and
+      // the EXECUTOR above is the layer that refuses a bare "yes" with no
+      // card and no persisted approval behind it. That two-layer split is
+      // the PR #6 design, unchanged by this round.
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 62] a MATERIAL change after approval still invalidates it — the carry-forward covers answered questions only, never a changed budget", async () => {
+    const userId = makeUser(`round62-material-change-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: metaOpts62(writes), wcProducts: filler59Products, wcSearchHandler: wcAndSearch59([maybelline62Product]) }));
+    try {
+      const built = await buildNamedMaybelline62(userId, conversationId);
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "approve" }),
+        (err) => err.code === "META_V2_UNRESOLVED_QUESTION",
+      );
+      const answered = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { content_selector: { primaryTextAnswer: liveAdText62 } }, userMessage: liveAdText62,
+      });
+      assert.deepEqual(answered.strategy.unresolved_questions, [], "sanity: the approval must have carried across the answered question");
+      // Now CHANGE the deal: Rs 550/day becomes Rs 1,000/day.
+      const repriced = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: answered.strategyId,
+        requestedChanges: { budget_daily: 1000 }, userMessage: "change the budget to 1000 per day",
+      });
+      assert.equal(repriced.strategy.budget_daily, 1000, "sanity: the budget change must have applied");
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: repriced.strategyId, userMessage: "thanks" }),
+        (err) => err.code === "META_V2_APPROVAL_REQUIRED" && /changed since/i.test(err.message),
+        "a changed budget must void the earlier approval — the user must approve the NEW deal",
+      );
+      assert.equal(writes.length, 0, "nothing may be created on the stale approval");
+      // And a fresh, explicit approval on the new content still works.
+      const executed = await executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: repriced.strategyId, userMessage: "approve" });
+      assert.ok(executed.campaignId, "a fresh approval after the change must execute");
+      assert.equal(executed.status, "PAUSED", "still paused, nothing spent");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await check("[Stream A] a Patrick Ta post is NEVER accepted as the Maybelline creative — selector pick, single-candidate auto-pick, and stale reuse all refuse it", async () => {
     const userId = makeUser(`stream-a-patrick-ta-${stamp}@example.com`);
     connectMeta(userId);

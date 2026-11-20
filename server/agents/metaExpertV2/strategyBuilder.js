@@ -26,9 +26,9 @@ import {
   checkLiteralCreativeSourceSubstitutionPolicy, repairCreativeDescriptionForUnavailableLiteralSource,
   checkCreativeProductMatchPolicy,
   checkExplicitActionModeMisroutePolicy, userMessageContainsUrl,
-  fingerprintStrategy,
+  fingerprintStrategy, materialFingerprintStrategy,
 } from "./policy.js";
-import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES, insertFailedAttempt } from "./strategyStore.js";
+import { insertStrategy, getStoredStrategy, getMostRecentStrategyForConversation, EXECUTABLE_STATUSES, insertFailedAttempt, recordStrategyApproval, findNearestApprovedAncestor } from "./strategyStore.js";
 import { trace, traceEnabled } from "./diagnostics.js";
 import { cryptoRandom } from "../../middleware.js";
 import { getConnection, learnConnectionDefault } from "../../integrations/manager.js";
@@ -56,6 +56,20 @@ const ASSET_FIELDS = ["ad_account", "facebook_page", "pixel", "catalog", "instag
 function mergeForRevision(prior, requestedChanges, explicitAssetChanges) {
   const discarded = [];
   const merged = { ...prior.strategy, ...requestedChanges };
+  // Round 62 (Nov 20 2026, live approval loop): content_selector holds
+  // TWO independent answers — the creative pick (confirmedId/position)
+  // and the ad text (primaryTextAnswer) — and the plain spread above
+  // replaces the whole object, so answering the ad text silently wiped
+  // the pick saved one turn earlier (and vice versa), re-injecting the
+  // corresponding question every turn no matter how often the user
+  // answered it. Deep-merge the selector instead: each answer is kept
+  // until the user actually changes it. A field the user DOES change is
+  // still overridden by the new value; a null/non-object selector still
+  // replaces outright (an explicit clear, not a merge).
+  if (requestedChanges?.content_selector && typeof requestedChanges.content_selector === "object" && !Array.isArray(requestedChanges.content_selector)
+    && prior.strategy.content_selector && typeof prior.strategy.content_selector === "object" && !Array.isArray(prior.strategy.content_selector)) {
+    merged.content_selector = { ...prior.strategy.content_selector, ...requestedChanges.content_selector };
+  }
   for (const field of ASSET_FIELDS) {
     if (explicitAssetChanges.has(field)) continue;
     // Live bug (round 31): this protection exists to stop an ALREADY-
@@ -944,7 +958,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // model-called revise with no selector: resolve the name from the raw
   // message (sample first, then the targeted store search — same token
   // rule everywhere) and synthesise the pick + claim, exactly as the
-  // pre-loop does. A name that matches NO real product, on a message
+  // pre-loop does. Round 62 extends (a2) to a FRESH build too (no
+  // priorStored): PR #8 fixed name search at the snapshot level only, so
+  // a user naming the product in the FIRST message still got the full
+  // 51-item list re-asked at strategy level (live Nov 20 bug) — now the
+  // named product is the pick straight away and only the ad-text question
+  // (if any) stays open. A name that matches NO real product, on a message
   // that actually looks like a bare product name (2+ product keywords,
   // no question mark, no digits, short), becomes namedProductNotFound —
   // an honest not-found question instead of a silent re-list. A message
@@ -972,13 +991,20 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       }
     }
     if (!contentSelectorProvidedThisCall
-      && creativePendingQuestion?.kind === "creative_candidates"
+      && (creativePendingQuestion?.kind === "creative_candidates" || !priorStored)
       && !priorCreative && !priorPendingCreative) {
       const { product: named, matched } = await resolveNamedProductForCreativeAnswer(userId, userMessage, sampleProductsForCreative);
       if (named) {
         appendNamedProduct(named);
         normalized = { ...normalized, content_selector: { confirmedId: String(named.id) } };
         effectiveClaimedCreativeId = String(named.id);
+      } else if (!priorStored) {
+        // Round 62 — fresh build: a message that names no real product
+        // is just a goal statement ("I want more website sales"), never
+        // a failed product answer — the honest not-found line below is
+        // only meaningful when a creative question was actually open, so
+        // it never fires here; the call simply falls through to the
+        // normal ambiguity question naming the real candidates.
       } else if (!matched && typeof userMessage === "string"
         && targetedSearchKeywords(userMessage).length >= 2
         && !/[?]/.test(userMessage) && !/\d/.test(userMessage) && userMessage.trim().length <= 120) {
@@ -986,8 +1012,42 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       }
     }
   }
+  // Round 62 — a pick already settled on the prior row is trusted, not
+  // re-verified against every later, unrelated message. The live loop's
+  // second half: the user picked #51, then gave ad text that never
+  // repeated the product name — and the pick was re-verified against THAT
+  // message, failed, and demoted back to pending, re-opening the question
+  // it had already answered. A pick is "settled" when the prior row
+  // already carries the SAME confirmedId, no pick is pending confirmation
+  // there, and the candidate question is already closed on it — i.e. the
+  // pick was verified once, on the turn it was made, and nothing since
+  // has challenged it. Trusting it reuses the round-59 claim path (the
+  // claim is orchestrator-only, never model-settable — and here the
+  // "claim" is just the prior row's own stored pick, not a new assertion).
+  // The same settled state trusts a carried-forward ad-text answer:
+  // resolvePrimaryText re-checks the answer against the CURRENT message,
+  // so a later unrelated revision would otherwise resurrect the ad-text
+  // question even though the answer was already verified against the
+  // user's own words on the turn it was given. Only an UNCHANGED answer
+  // is trusted — a model-invented different answer still goes through
+  // the normal verification against this turn's message.
+  const priorSelector = priorStored?.strategy?.content_selector;
+  const priorHasCreativeQuestionOpen = (priorStored?.strategy?.unresolved_questions || [])
+    .some((q) => q.startsWith("Which ") && q.includes("should I use as the ad's creative?"));
+  const settledPickVerified = Boolean(priorSelector?.confirmedId)
+    && normalized.content_selector?.confirmedId === priorSelector.confirmedId
+    && !priorPendingCreative
+    && !priorHasCreativeQuestionOpen;
+  if (settledPickVerified && !effectiveClaimedCreativeId) {
+    effectiveClaimedCreativeId = String(priorSelector.confirmedId);
+  }
+  const verifiedPrimaryTextAnswer = settledPickVerified
+    && typeof priorSelector?.primaryTextAnswer === "string" && priorSelector.primaryTextAnswer.trim()
+    && normalized.content_selector?.primaryTextAnswer === priorSelector.primaryTextAnswer
+    ? priorSelector.primaryTextAnswer
+    : null;
   const creativeResolution = normalized.mode === "campaign"
-    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, claimedCreativeId: effectiveClaimedCreativeId, namedProductNotFound })
+    ? resolveCreativeSelection({ strategy: normalized, snapshot: snapshotForCreative, priorCreative, priorPendingCreative, contentSelectorProvidedThisCall, userMessage, pendingQuestion: creativePendingQuestion, pendingCreativeQuestion, priorCreativeCandidates, claimedCreativeId: effectiveClaimedCreativeId, namedProductNotFound, verifiedPrimaryTextAnswer })
     : explicitActionCreativeSource
       ? resolveCreativeSelection({
           strategy: { ...normalized, mode: "campaign", creative_strategy: { source: explicitActionCreativeSource, description: normalized.business_goal || "" } },
@@ -1522,10 +1582,30 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       };
     }
   }
+  // Round 62 (Nov 20 2026, live approval loop) — approval carry-forward.
+  // The approved ancestor is found BEFORE the insert (insertStrategy
+  // supersedes every proposed/approved row for the conversation first,
+  // so the ancestor's status is only still 'approved' here). Its
+  // approval must have been valid for its OWN stored content, and the
+  // new strategy must be materially identical to it (same budget,
+  // audience, creative pick, destination URL, assets — only the open
+  // questions and the user's own ad-text answer moved, see
+  // materialFingerprintStrategy, policy.js). When both hold, the new row
+  // inherits the approval bound to ITS OWN exact fingerprint, so
+  // hasValidApproval and the orchestrator gate accept it without the user
+  // having to approve the same deal twice. Any material change means no
+  // carry — the next execute asks for a fresh approval, exactly as before.
+  const approvedAncestor = priorStored ? findNearestApprovedAncestor(userId, priorStored) : null;
+  const approvalCarriesForward = Boolean(approvedAncestor)
+    && approvedAncestor.approvalFingerprint === fingerprintStrategy(approvedAncestor.strategy)
+    && materialFingerprintStrategy(approvedAncestor.strategy) === materialFingerprintStrategy(normalized);
   const stored = insertStrategy({
     id: newStrategyId, userId, conversationId, mode: normalized.mode || "campaign", strategy: normalized,
     resolved: resolvedForStorage, names, snapshotVersion: snapshot.version, snapshot, recommendationText, revisionOf,
   });
+  if (approvalCarriesForward) {
+    recordStrategyApproval(stored.id, fingerprintStrategy(normalized), "carried-forward");
+  }
 
   // Success — including a strategy with real unresolved_questions (a
   // genuine business decision left open, e.g. an ambiguous Pixel or a
