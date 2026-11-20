@@ -1024,6 +1024,14 @@ export function fingerprintStrategy(strategy = {}) {
   // Approval-relevant fields COMPARABLE_SCALAR_FIELDS deliberately omits.
   normalized.mode = strategy.mode ?? null;
   normalized.action_type = strategy.action_type ?? null;
+  // Round 64 (Nov 21 2026, live edit-approval loop): a campaign_edit
+  // row's identity IS its requestedChanges + target — without them, two
+  // different edits on the same campaign fingerprinted identically, so a
+  // persisted approval recorded for one edit would validate a different
+  // one. Campaign strategies never carry these fields (both null there),
+  // so their fingerprints are unchanged by this.
+  normalized.requestedChanges = strategy.requestedChanges ? stableJson(strategy.requestedChanges) : null;
+  normalized.targetStrategyId = strategy.targetStrategyId ?? null;
   normalized.creative_strategy = strategy.creative_strategy ? stableJson(strategy.creative_strategy) : null;
   normalized.content_selector = strategy.content_selector ? stableJson(strategy.content_selector) : null;
   normalized.destination_url = strategy.destination_url ?? null;
