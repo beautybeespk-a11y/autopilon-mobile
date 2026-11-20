@@ -18,7 +18,7 @@ import {
   deriveCountriesFromLocationsIfMissing, deriveEmptyArrayFieldsIfMissing, PURCHASE_LIKE_EVENTS,
 } from "./strategySchema.js";
 import {
-  checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget, verifyDestinationUrl,
+  checkBudgetPolicy, capHeuristicBudget, verifyUserProvidedBudget, verifyDestinationUrl, bareNumberAnswerFromMessage,
   checkGoalAlignmentPolicy, checkLiteralGoalSubstitutionPolicy, checkSalesConsistencyPolicy, checkAudienceQualityPolicy,
   checkRevisionSubstantive, buildUnresolvedIssue, MAX_SUGGESTED_DAILY_BUDGET,
   repairSalesReasoningSummary, checkCreativeGroundingPolicy, repairCreativeReasoningForMissingEvidence,
@@ -538,12 +538,77 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
   // verifyUserProvidedBudget below instead of verified.
   const effectiveClaimedBy = claimedBy ?? deriveClaimedByFromPriorStored(priorStored, userMessage);
 
+  // Round 63 (live bug, Nov 20 2026): a bare number answering a numbered
+  // product list ("40" for product #40, Manyo Herb Green Cleansing Oil)
+  // must never become the daily budget — but it did, via the model's OWN
+  // revise call later in the same turn. The dispatcher and the creative
+  // pre-loop already claim "40" for the creative question, and the
+  // pre-loop saves the pick — but by the time the model calls
+  // revise_strategy, the creative question is already cleared, so the
+  // budget question looks like the sole open question and the same raw
+  // "40" is re-read as a budget answer. Two facts about the PRIOR row
+  // tell this call the number is already spent, and both are consulted
+  // here, before anything downstream trusts a budget claim:
+  //   (a) a creative question is still open on the prior row (a stored
+  //       candidate list, or a pick awaiting confirmation) — a bare
+  //       number replying to it is a pick, never a budget;
+  //   (b) the prior row records that the number was already spent as a
+  //       pick (consumedBareNumberForCreative, written below when this
+  //       call itself resolves a pick from a bare number — the pre-loop's
+  //       revise does exactly that, so the model's later call in the
+  //       same turn finds the marker waiting for it).
+  // Both are scoped to a budget that was UNSET before this call, so a
+  // previously verified budget is never touched. A bare number in a LATER
+  // turn is a new message: the marker lives only on the row that set it
+  // (resolvedAssets is rebuilt fresh on every stored row, never carried
+  // forward), so it cannot block a genuine later budget answer.
+  const priorBudgetWasUnset = priorStored?.strategy?.budget_daily == null;
+  const creativeQuestionOpenOnPrior = Boolean(
+    (Array.isArray(priorStored?.resolvedAssets?.creativeCandidates) && priorStored.resolvedAssets.creativeCandidates.length > 0)
+    || priorStored?.resolvedAssets?.pendingCreative,
+  );
+  // The prior row's shown list size (1 while a single pick awaits
+  // confirmation): a bare number larger than this can never be a list
+  // position, so it stays a budget answer (the round-57 >=100 rule).
+  const creativeCandidateCount = Array.isArray(priorStored?.resolvedAssets?.creativeCandidates)
+    ? priorStored.resolvedAssets.creativeCandidates.length
+    : (priorStored?.resolvedAssets?.pendingCreative ? 1 : 0);
+  const bareAnswerThisMessage = bareNumberAnswerFromMessage(userMessage);
+  const markerNumber = priorStored?.resolvedAssets?.consumedBareNumberForCreative;
+  const blockedBareNumber = priorBudgetWasUnset
+    && typeof markerNumber === "number"
+    && bareAnswerThisMessage === markerNumber
+    ? markerNumber : null;
+  const bareAnswerIsPlausiblePick = bareAnswerThisMessage != null
+    && creativeCandidateCount > 0 && bareAnswerThisMessage <= creativeCandidateCount;
+  const bareNumberIsCreativePick = priorBudgetWasUnset && bareAnswerThisMessage != null
+    && (blockedBareNumber != null || (creativeQuestionOpenOnPrior && bareAnswerIsPlausiblePick));
+  // What this call itself spends as a creative pick, recorded for the
+  // next call in this turn (see (b) above). Only a bare-number pick
+  // sets it; a name-based pick ("Maybelline Serum Matte Lipstick") has
+  // no bare number to spend, so the marker stays null.
+  const consumedBareNumberForCreative = effectiveClaimedBy === "creative" && bareAnswerThisMessage != null
+    ? bareAnswerThisMessage : null;
+
   // Budget provenance verification (Step 4) — BEFORE anything downstream
   // trusts an USER_PROVIDED claim. Checked against the RAW requestedChanges
   // (this call's own assertion), not the merged object, so a revision that
   // silently carries forward an ALREADY-verified USER_PROVIDED budget
   // (this turn didn't even mention budget) isn't re-flagged.
-  merged = verifyUserProvidedBudget(requestedChanges, merged, userMessage, { claimedBy: effectiveClaimedBy });
+  merged = verifyUserProvidedBudget(requestedChanges, merged, userMessage, { claimedBy: effectiveClaimedBy, creativeQuestionOpen: creativeQuestionOpenOnPrior, creativeCandidateCount, blockedBareNumber });
+  // Round 63 (same block, non-USER_PROVIDED path): verifyUserProvidedBudget
+  // only ever sees USER_PROVIDED claims, but the model can assert the pick
+  // number as a budget with any basis — or none at all. A budget asserted
+  // in THIS call, from the spent pick number, while the budget was unset
+  // before, is cleared whatever basis it carries: a bare-number message
+  // can never set a budget. An explicit money form ("Rs 750 per day",
+  // "750/day", "change the budget to 750/day") is never a bare number,
+  // so it is untouched by this.
+  if (bareNumberIsCreativePick
+    && typeof requestedChanges?.budget_daily === "number"
+    && requestedChanges.budget_daily === bareAnswerThisMessage) {
+    merged = { ...merged, budget_daily: null };
+  }
 
   const { strategy: aliasNormalized, appliedAliases } = normalizeStrategyEnumAliases(merged);
   const ctaResolved = deriveCtaIfMissing(aliasNormalized);
@@ -574,7 +639,13 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
     && !priorStored.resolvedAssets?.pendingCreative
     && priorQuestions.length === 1
     && priorQuestions[0] === "What daily budget would you like for this?";
-  const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage, { allowBareNumber: budgetIsSoleOpenQuestion });
+  // Round 63: the bare-number fallback is off when this message's number
+  // is a creative pick (see the block above) — after the pick, the budget
+  // question may look like the sole open question, which is exactly how
+  // the fallback re-read "40" as PKR 40/day. Currency-prefixed and
+  // "/day"-suffixed forms still derive (the pattern branch inside
+  // deriveBudgetFromUserMessageIfMissing is unaffected by this flag).
+  const budgetFromMessageResolved = deriveBudgetFromUserMessageIfMissing(assetRefsResolved, userMessage, { allowBareNumber: budgetIsSoleOpenQuestion && !bareNumberIsCreativePick });
   // Live bug (round 22): "Missing required field 'countries'" hard-
   // rejected an otherwise-complete strategy — locations (e.g. "Pakistan")
   // was present, countries (the real ISO codes) was not. Only fires when
@@ -1519,7 +1590,12 @@ async function runBuildOrRevise({ userId, conversationId, accessToken, requested
       candidateIds, candidateLabels, source: questionSource,
     });
   }
-  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative, pendingQuestions: pendingQuestionsForStorage, discardedFields: mergeDiscarded };
+  // Round 63: the bare number this call spent as a creative pick (null
+  // when it spent none — a name-based pick, or no pick at all). Stored
+  // only on this row so the next revise in this same turn can tell the
+  // number is already spent; resolvedAssets is rebuilt fresh on every
+  // stored row, so the marker cannot leak into a later turn.
+  const resolvedForStorage = { ...resolved, contentId, creative: creativeResolution.creative, creativeCandidates: creativeCandidateRefs, pendingCreative: creativeResolution.pendingCreative, pendingQuestions: pendingQuestionsForStorage, discardedFields: mergeDiscarded, consumedBareNumberForCreative };
   const recommendationText = formatRecommendation(normalized, names, resolved, creativeResolution.creative, { discardedFields: mergeDiscarded, pixelState: { pixelName: names.pixelName, pixelId: resolved.pixelId, anyPixelExists, usablePixelForSelectedAdAccount, pixelAmbiguous } });
   // Stream B (P0, build-once): an identical rebuild must NOT insert a new
   // row. Before this, every successful build_strategy/revise_strategy call
