@@ -170,6 +170,18 @@ export function getMostRecentExecutedStrategyForConversation(userId, conversatio
   );
 }
 
+// Round 64 (sequential campaign edits, campaignEditor.js) — every
+// already-APPLIED edit for this conversation, oldest first, so the
+// effective ancestor can overlay them in order onto the original
+// executed campaign strategy. Only status 'executed' rows count: a
+// merely proposed / rejected / failed edit never changed anything live,
+// so it must never move the baseline a later edit is diffed and
+// drift-checked against.
+export function getExecutedCampaignEditRowsForConversation(userId, conversationId) {
+  if (!conversationId) return [];
+  return db.prepare("SELECT * FROM meta_v2_strategies WHERE userId = ? AND conversationId = ? AND mode = 'campaign_edit' AND status = 'executed' ORDER BY createdAt ASC, rowid ASC").all(userId, conversationId).map(row);
+}
+
 // Round 37 fix — a revision of an ALREADY-EXECUTED strategy is now
 // permitted (see reviseStrategy, strategyBuilder.js) specifically so the
 // creative/audience/budget already resolved on it survives an unrelated

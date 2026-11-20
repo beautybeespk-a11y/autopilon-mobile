@@ -12477,6 +12477,215 @@ async function run() {
     } finally { restoreFetch(); }
   });
 
+  // --- Campaign edit approval, card resume (round 64) --------------------
+  // LIVE Nov 21 2026, after PR #12: campaign created paused (Rs 550/day),
+  // budget edit 550 → 600/day proposed fine, then applying it looped
+  // forever. The user said "approve", then "yes, apply it", then "yes",
+  // then "yes", then "approve" again — AND tapped Approve on the approval
+  // card that popped up — and apply_campaign_edit still failed every time
+  // with "has not been explicitly approved in the user's latest message".
+  // Root cause, found by reading the resume path (not the gate): the
+  // orchestrator's approval gate and the tool's chat-language check both
+  // passed, runTool() stopped at awaiting_confirmation and showed the
+  // card, the user tapped Approve — and resumeAfterConfirmation()
+  // re-dispatched the tool with userMessage === undefined, recording the
+  // persisted approval ONLY for meta_expert_v2.execute_strategy. The edit
+  // tool's own defense-in-depth check accepted nothing but fresh chat
+  // language, so every card-approved edit was re-rejected with
+  // META_V2_EDIT_NOT_APPROVED. execute_strategy had been given the same
+  // persisted-approval recording for exactly this reason (Patch 5b); the
+  // edit tool was simply never added to it. These tests replay that exact
+  // live case through the REAL runTool() -> resumeAfterConfirmation()
+  // path, plus the direct-call resume shape (userMessage undefined).
+  function editMetaOpts64(writes) {
+    return { adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }], pages: [{ id: "111", name: "P" }], pixels: [{ id: "px1", name: "Pixel" }], writes };
+  }
+  async function buildExecuteAndProposeEdit64(userId, conversationId, writes, fromBudget = 550, toBudget = 600) {
+    const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: fromBudget });
+    const proposed = await proposeCampaignEdit({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      requestedChanges: { budget_daily: toBudget }, userMessage: `change the budget to ${toBudget}/day`,
+    });
+    assert.equal(proposed.ok, true, JSON.stringify(proposed.unresolved));
+    assert.match(proposed.recommendationText, new RegExp(`Budget: ${fromBudget}/day → ${toBudget}/day`));
+    return { executed, proposed };
+  }
+
+  await check("[round 64] the exact live case: \"yes, apply it\" in chat + Approve on the card actually applies the 550 → 600 edit", async () => {
+    const userId = makeUser(`v2-edit-card-approve-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const { executed, proposed } = await buildExecuteAndProposeEdit64(userId, conversationId, writes);
+      // The gate itself passes for the live approval language — the
+      // failure was never the gate, it was the resume after the card.
+      assert.equal(checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage: "yes, apply it" }), null);
+      assert.equal(checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage: "approve" }), null);
+
+      // The model calls apply_campaign_edit: production stops at the
+      // card, nothing is applied yet, and the card must name the real
+      // change (not the generic fallback) so the user can see what
+      // they are approving.
+      const attempt = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: proposed.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "yes, apply it" });
+      assert.equal(attempt.status, "awaiting_confirmation", JSON.stringify(attempt));
+      assert.ok(attempt.confirmationId, "a confirmation card must have been created");
+      assert.match(attempt.reason, /Budget: 600\/day/, "the card must name the real change, not the generic fallback");
+      assert.match(attempt.reason, new RegExp(`Campaign ID: ${executed.campaignId}`), "the card must name the campaign being edited");
+      assert.equal(writes.filter((w) => w.path === `/${executed.adSetId}`).length, 0, "nothing may be applied while awaiting confirmation");
+
+      // The user taps Approve on the card — the exact live step that
+      // used to fail with META_V2_EDIT_NOT_APPROVED.
+      const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: true });
+      assert.equal(resumed.status, "completed", `card approval must apply the edit, not re-reject it: ${JSON.stringify(resumed)}`);
+      assert.equal(resumed.result.appliedChanges.budget_daily, 600, "the budget must actually become 600/day");
+
+      const adSetWrite = writes.filter((w) => w.path === `/${executed.adSetId}`).pop();
+      assert.ok(adSetWrite, "an in-place update write to the real ad set's own id must have happened");
+      assert.equal(adSetWrite.body.daily_budget, 60000, "600 PKR/day must go through the same minor-unit conversion as creation (600 * 100)");
+      assert.equal(adSetWrite.body.status, undefined, "status must never be touched — the campaign stays paused, never resumed as a side effect");
+
+      const finalRow = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(finalRow.status, "executed");
+      assert.equal(finalRow.executionResult.appliedChanges.budget_daily, 600);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 64] the direct-call resume shape: a persisted card approval alone (userMessage undefined) applies the edit — and without it, it still refuses", async () => {
+    const userId = makeUser(`v2-edit-card-direct-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64([]) }));
+    try {
+      const { proposed } = await buildExecuteAndProposeEdit64(userId, conversationId, []);
+      // No approval recorded anywhere and no message at all — the
+      // resume path's shape — must still refuse, never silently apply.
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: undefined }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
+      );
+      // Simulate exactly what resumeAfterConfirmation() now records when
+      // the card is tapped: approval bound to this row's fingerprint
+      // (the stored row's strategy — propose returns only the id).
+      recordStrategyApproval(proposed.strategyId, fingerprintStrategyForTest(getStoredStrategy(userId, proposed.strategyId).strategy), "test-card");
+      const applied = await applyCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: undefined,
+      });
+      assert.equal(applied.appliedChanges.budget_daily, 600, "the persisted card approval must be enough — the resumed call carries no message");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 64] a bare \"yes\" still NEVER applies an edit — through the gate, the direct call, and a rejected card", async () => {
+    const userId = makeUser(`v2-edit-card-bare-yes-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const { executed, proposed } = await buildExecuteAndProposeEdit64(userId, conversationId, writes);
+      assert.ok(checkV2CampaignEditApprovalGate({ userId, conversationId, userMessage: "yes" }), "the gate must still block a bare yes");
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: "yes" }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
+      );
+      // Rejecting the card must still reject the edit — and must not
+      // apply anything, and must mark the proposal rejected.
+      const attempt = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: proposed.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "approve" });
+      assert.equal(attempt.status, "awaiting_confirmation");
+      const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: false });
+      assert.equal(resumed.status, "failed");
+      assert.match(resumed.error, /Rejected by user/);
+      assert.equal(writes.filter((w) => w.path === `/${executed.adSetId}`).length, 0, "a rejected edit must never touch the live ad set");
+      assert.equal(getStoredStrategy(userId, proposed.strategyId).status, "rejected");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 64] a persisted approval binds to the EXACT edit — it cannot validate a different edit, and fingerprints cover requestedChanges", async () => {
+    const userId = makeUser(`v2-edit-card-fingerprint-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64([]) }));
+    try {
+      const { proposed } = await buildExecuteAndProposeEdit64(userId, conversationId, [], 550, 600);
+      const storedStrategy = getStoredStrategy(userId, proposed.strategyId).strategy;
+      const other = { ...storedStrategy, requestedChanges: { budget_daily: 700 } };
+      assert.notEqual(
+        fingerprintStrategyForTest(storedStrategy), fingerprintStrategyForTest(other),
+        "two different edits on the same campaign must fingerprint differently — otherwise one approval would cover both"
+      );
+      // Approve the 600 edit (as a card tap would record it)…
+      recordStrategyApproval(proposed.strategyId, fingerprintStrategyForTest(storedStrategy), "test-card");
+      // …then propose a DIFFERENT edit instead. The new row carries no
+      // approval of its own, and the old approval must not leak across.
+      const proposed700 = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 700 }, userMessage: "change the budget to 700/day",
+      });
+      assert.equal(proposed700.ok, true, JSON.stringify(proposed700.unresolved));
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed700.strategyId, userMessage: undefined }),
+        (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
+      );
+      // Proposing the new edit also retires the old one (pre-existing
+      // insertStrategy rule: one live proposal per conversation), so the
+      // old approval cannot leak across even by naming the old row.
+      assert.equal(getStoredStrategy(userId, proposed.strategyId).status, "superseded");
+      await assert.rejects(
+        () => applyCampaignEdit({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: proposed.strategyId, userMessage: undefined }),
+        (err) => { assert.equal(err.code, "META_V2_STRATEGY_REQUIRED"); return true; }
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 64] a second edit after the first applies cleanly through the same card path", async () => {
+    const userId = makeUser(`v2-edit-card-second-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const { executed } = await buildExecuteAndProposeEdit64(userId, conversationId, writes, 550, 600);
+      const first = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: {}, userId, agentId: agent.id, conversationId, planId: null, userMessage: "approve" });
+      assert.equal(first.status, "awaiting_confirmation");
+      const firstResumed = await resumeAfterConfirmation({ executionId: first.executionId, approved: true });
+      assert.equal(firstResumed.status, "completed", JSON.stringify(firstResumed));
+      assert.equal(firstResumed.result.appliedChanges.budget_daily, 600);
+      // Propose the next change on the now-600 campaign and apply it the
+      // same way — the first edit's approval must not leak, and the
+      // second card tap must work just like the first.
+      const second = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 700 }, userMessage: "change the budget to 700/day",
+      });
+      assert.equal(second.ok, true, JSON.stringify(second.unresolved));
+      assert.match(second.recommendationText, /Budget: 600\/day → 700\/day/);
+      const attempt = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: second.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "yes, apply it" });
+      assert.equal(attempt.status, "awaiting_confirmation");
+      const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: true });
+      assert.equal(resumed.status, "completed", JSON.stringify(resumed));
+      assert.equal(resumed.result.appliedChanges.budget_daily, 700);
+      const lastWrite = writes.filter((w) => w.path === `/${executed.adSetId}`).pop();
+      assert.equal(lastWrite.body.daily_budget, 70000, "the second edit must write the new budget, not re-apply the first");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Creative auto-revise matcher forms (round 32) -----------------
   // Live report: the fix above only ever matched the full "(id 5814,
   // 2050)" string the question rendered — an id embedded in prose. But

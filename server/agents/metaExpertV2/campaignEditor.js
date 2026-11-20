@@ -36,10 +36,10 @@
 //      actually applied it before ever calling this a success.
 import * as meta from "../../integrations/meta/api.js";
 import { toMetaBudgetMinorUnits, buildV2Targeting } from "./executor.js";
-import { MAX_EXECUTABLE_DAILY_BUDGET, buildUnresolvedIssue, messageIndicatesStrongExecutionApproval } from "./policy.js";
+import { MAX_EXECUTABLE_DAILY_BUDGET, buildUnresolvedIssue, messageIndicatesStrongExecutionApproval, fingerprintStrategy } from "./policy.js";
 import {
   insertStrategy, getStoredStrategy, getActiveStrategyForConversation, getMostRecentExecutedStrategyForConversation,
-  getExecutedAncestorStrategy, EXECUTABLE_STATUSES, markStrategyApproved, setStrategyStatus, markStrategyExecuted, markStrategyFailed,
+  getExecutedAncestorStrategy, getExecutedCampaignEditRowsForConversation, EXECUTABLE_STATUSES, markStrategyApproved, recordStrategyApproval, hasValidApproval, setStrategyStatus, markStrategyExecuted, markStrategyFailed,
 } from "./strategyStore.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
 import { publishEvent } from "../../automation/triggers.js";
@@ -89,6 +89,40 @@ function resolveTargetExecutedStrategy(userId, conversationId, targetStrategyId)
     throw err;
   }
   return mostRecent;
+}
+
+// Round 64 (sequential edits): the "ancestor" an edit is proposed and
+// applied against must be the campaign's CURRENT known state — the
+// original executed campaign strategy overlaid with every already-applied
+// edit for that campaign, oldest first. Before this, resolving the target
+// returned the most recent executed row, which after a first applied edit
+// IS that edit row: its strategy has no budget_daily/audience fields, so
+// a second edit's proposal read "Budget: undefined/day → 700/day" and
+// the apply-time drift check compared live (600) against the original
+// (550) and refused with a bogus drift error. The returned object keeps
+// the original campaign row's shape (id, executionResult, resolvedAssets
+// — the real campaign identity); only its strategy values are merged, so
+// every existing caller works unchanged.
+function resolveEffectiveAncestor(userId, conversationId, targetStrategyId) {
+  const base = resolveTargetExecutedStrategy(userId, conversationId, targetStrategyId);
+  let campaignRow = base;
+  if (base.strategy?.mode === "campaign_edit") {
+    campaignRow = getExecutedAncestorStrategy(userId, base);
+    if (!campaignRow) {
+      const err = new Error("The original executed strategy for this edit could not be found.");
+      err.code = "META_V2_STRATEGY_REQUIRED";
+      throw err;
+    }
+  }
+  const mergedStrategy = { ...campaignRow.strategy };
+  const campaignId = campaignRow.executionResult?.campaignId;
+  if (campaignId) {
+    for (const editRow of getExecutedCampaignEditRowsForConversation(userId, conversationId)) {
+      if (editRow.resolvedAssets?.targetCampaignId !== campaignId) continue;
+      Object.assign(mergedStrategy, editRow.executionResult?.appliedChanges || {});
+    }
+  }
+  return { ...campaignRow, strategy: mergedStrategy };
 }
 
 function validateFieldValues(changes, ancestorStrategy) {
@@ -160,7 +194,7 @@ function formatCampaignEditSummary(genuineChanges, ancestor) {
 
 export async function proposeCampaignEdit({ userId, conversationId, accessToken, targetStrategyId, requestedChanges, userMessage }) {
   assertV2RuntimeEnabled(userId);
-  const ancestor = resolveTargetExecutedStrategy(userId, conversationId, targetStrategyId);
+  const ancestor = resolveEffectiveAncestor(userId, conversationId, targetStrategyId);
 
   const changes = requestedChanges && typeof requestedChanges === "object" ? requestedChanges : {};
   const keys = Object.keys(changes);
@@ -297,18 +331,39 @@ export async function applyCampaignEdit({ userId, conversationId, accessToken, s
   // "sure" is a consumable answer to another open question, never fresh
   // approval to change a live ad set. (Round 57: this used the weak
   // check, so a bare "yes" approved the edit here and at the gate.)
-  if (!messageIndicatesStrongExecutionApproval(userMessage)) {
+  // Round 64 (Nov 21 2026, live edit-approval loop): approval is
+  // accepted from exactly two sources, mirroring execute_strategy —
+  // (a) a PERSISTED approval: status 'approved' AND the fingerprint
+  // recorded at approval time still matches this row's current content.
+  // This is the ONLY signal available on the confirmation-card resume
+  // path — resumeAfterConfirmation() re-dispatches with userMessage ===
+  // undefined, so a message-only check rejects every card click. It is
+  // recorded by recordStrategyApproval() at card-click time
+  // (orchestrator/executor.js), never here. Before this, this check
+  // accepted ONLY fresh chat language, so a user who said "approve" /
+  // "yes, apply it" AND tapped Approve on the card was re-rejected with
+  // META_V2_EDIT_NOT_APPROVED on every single attempt — five approvals
+  // in a row live, budget 550 → 600 never applied. (b) Fresh strong
+  // approval in THIS message. A bare "yes" is deliberately NOT enough
+  // in either case.
+  const currentFingerprint = fingerprintStrategy(stored.strategy);
+  const hasPersistedApproval = hasValidApproval(stored);
+  const hasFreshStrongApproval = messageIndicatesStrongExecutionApproval(userMessage);
+  if (!hasPersistedApproval && !hasFreshStrongApproval) {
     const err = new Error("This campaign edit has not been explicitly approved in the user's latest message — ask for clear approval language (e.g. \"approve\" or \"yes, apply it\") before applying it.");
     err.code = "META_V2_EDIT_NOT_APPROVED";
     throw err;
   }
-
-  const ancestor = getStoredStrategy(userId, stored.strategy.targetStrategyId);
-  if (!ancestor) {
-    const err = new Error("The original executed strategy for this edit could not be found.");
-    err.code = "META_V2_STRATEGY_REQUIRED";
-    throw err;
+  if (hasFreshStrongApproval && !hasPersistedApproval) {
+    recordStrategyApproval(stored.id, currentFingerprint, "chat-strong");
   }
+
+  // Round 64: the ancestor is the EFFECTIVE one (original campaign
+  // strategy overlaid with already-applied edits), so a second edit's
+  // drift check compares live against what this app last knew (600),
+  // not the original campaign's long-superseded value (550). Throws
+  // META_V2_STRATEGY_REQUIRED itself when the campaign row is gone.
+  const ancestor = resolveEffectiveAncestor(userId, conversationId, stored.strategy.targetStrategyId);
   const { targetCampaignId, targetAdSetId, targetAdAccountId } = stored.resolvedAssets;
   const requestedChanges = stored.strategy.requestedChanges;
 

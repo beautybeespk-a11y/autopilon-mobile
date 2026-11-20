@@ -196,7 +196,16 @@ export async function resumeAfterConfirmation({ executionId, approved }) {
   // while the feature was off. When disabled, skip recording entirely
   // (the strategy stays "proposed"); executeNow below still fails at
   // executeStrategy's own gate with META_EXPERT_V2_DISABLED.
-  if (approved && execution.toolName === "meta_expert_v2.execute_strategy" && isV2RuntimeEnabled(execution.userId)) {
+  // Round 64 (Nov 21 2026, live edit-approval loop): applyCampaignEdit()
+  // re-runs with userMessage === undefined on this path too, and its own
+  // check accepts only a persisted approval or fresh strong language —
+  // so before this, a card-approved edit was ALWAYS re-rejected with
+  // META_V2_EDIT_NOT_APPROVED, no matter how many times the user said
+  // "approve" / "yes, apply it" in chat and tapped Approve on the card
+  // (five approvals in a row live, budget 550 → 600 never applied).
+  // The recording below is what makes a card click actually count for
+  // the edit tool, exactly as it already did for execute_strategy.
+  if (approved && (execution.toolName === "meta_expert_v2.execute_strategy" || execution.toolName === "meta_expert_v2.apply_campaign_edit") && isV2RuntimeEnabled(execution.userId)) {
     try {
       const target = parameters.strategyId
         ? getStoredStrategy(execution.userId, parameters.strategyId)
@@ -254,6 +263,30 @@ function confirmationReason(toolName, parameters, context = {}) {
       return `This creates a real Meta Campaign + Ad Set (PAUSED) for: "${s.business_goal || "your campaign"}" — Objective: ${s.recommended_objective}, Budget: ${budget}, Page: ${page}. Nothing spends until you separately resume it in Meta.`;
     } catch {
       return "This creates a real (paused) Meta Campaign and Ad Set. Approving this will create it — nothing spends until you separately resume it in Meta.";
+    }
+  }
+  if (toolName === "meta_expert_v2.apply_campaign_edit") {
+    // Round 64: the live edit card showed only the generic fallback
+    // ("This action requires your approval before it runs") — the user
+    // could not see WHAT they were approving, the exact failure the
+    // execute_strategy branch above already fixed for creation (round 3).
+    // Name the real change: campaign/ad set ids and the new values.
+    try {
+      const stored = parameters.strategyId
+        ? getStoredStrategy(context.userId, parameters.strategyId)
+        : getActiveStrategyForConversation(context.userId, context.conversationId);
+      if (!stored || stored.strategy?.mode !== "campaign_edit") return "This applies a change to a live Meta campaign — but no valid edit proposal was found. Approving this will fail.";
+      const s = stored.strategy;
+      const changes = [];
+      if (s.requestedChanges?.budget_daily != null) changes.push(`Budget: ${s.requestedChanges.budget_daily}/day`);
+      if (s.requestedChanges?.gender) changes.push(`Gender: ${s.requestedChanges.gender}`);
+      if (s.requestedChanges?.age_min != null || s.requestedChanges?.age_max != null) changes.push(`Age: ${s.requestedChanges.age_min ?? "?"}–${s.requestedChanges.age_max ?? "?"}`);
+      if (Array.isArray(s.requestedChanges?.countries)) changes.push(`Countries: ${s.requestedChanges.countries.join(", ")}`);
+      const campaignId = stored.resolvedAssets?.targetCampaignId || "unknown campaign";
+      const adSetId = stored.resolvedAssets?.targetAdSetId || "unknown ad set";
+      return `This applies a change to your live campaign (Campaign ID: ${campaignId}, Ad Set ID: ${adSetId})${changes.length ? `: ${changes.join("; ")}` : ""}. The campaign stays PAUSED — this only updates its settings.`;
+    } catch {
+      return "This applies a change to your live Meta campaign. The campaign stays paused — this only updates its settings.";
     }
   }
   if (toolName === "create_memory") {
