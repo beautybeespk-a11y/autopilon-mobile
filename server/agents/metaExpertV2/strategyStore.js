@@ -311,6 +311,29 @@ export function markStrategyRejected(strategyId) {
   setStrategyStatus(strategyId, "rejected");
 }
 
+// Round 65 (Nov 21 2026, live rejected-execution bug): rejecting the
+// execution confirmation card must NOT throw the strategy away. The old
+// behavior marked the row 'rejected', which is terminal for every
+// lookup that matters — getActiveStrategyForConversation only ever
+// returns 'proposed'/'approved' rows, and reviseStrategy refuses a
+// 'rejected' row outright — so the chat dead-ended: "No active strategy
+// exists", "No executed campaign was found", then "I wasn't able to
+// finalize a strategy". A rejection is a "don't create this (yet)",
+// not a "delete the plan": the row goes back to 'proposed' with every
+// approval column cleared, so the user can change something and
+// re-approve — while no stale approval can ever survive the rejection
+// and let a later execute slip through without fresh approval language.
+// Only a still-pending row is ever preserved this way: an 'executed'
+// row is never downgraded (a card can only be rejected before anything
+// runs, but the guard makes that structural, not assumed), and a
+// 'failed'/'superseded' row is left exactly as it was.
+export function preserveStrategyAfterRejection(strategyId) {
+  const now = new Date().toISOString();
+  db.prepare(
+    "UPDATE meta_v2_strategies SET status = 'proposed', approvalFingerprint = NULL, approvedVia = NULL, approvedAt = NULL, updatedAt = ? WHERE id = ? AND status IN ('proposed','approved','rejected')"
+  ).run(now, strategyId);
+}
+
 // Read-only diagnostic helper (live bug investigation) — deliberately
 // returns ONLY identifying columns, never strategyJson/resolvedAssetsJson/
 // snapshotJson (which can contain business data) — safe to print/share.

@@ -18,7 +18,7 @@ import { buildStrategy, reviseStrategy } from "../../agents/metaExpertV2/strateg
 import { executeStrategy, rejectStrategy } from "../../agents/metaExpertV2/executor.js";
 import { proposeCampaignEdit, applyCampaignEdit } from "../../agents/metaExpertV2/campaignEditor.js";
 import { gatherPerformanceBreakdown } from "../../agents/metaExpertV2/performanceBreakdown.js";
-import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, markStrategyRejected } from "../../agents/metaExpertV2/strategyStore.js";
+import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, preserveStrategyAfterRejection } from "../../agents/metaExpertV2/strategyStore.js";
 import { INTERNAL_STRATEGY_SCHEMA } from "../../agents/metaExpertV2/strategySchema.js";
 import { assertV2RuntimeEnabled } from "../../agents/metaExpertV2/runtimeGate.js";
 
@@ -287,10 +287,16 @@ registerTool({
   },
 });
 
+// Round 65 (Nov 21 2026, live rejected-execution bug): the same
+// preserve-instead-of-burn rule as execute_strategy's own handler
+// above. Rejecting an edit card must not apply anything (it doesn't —
+// the tool never ran) and must not throw the proposal away either: the
+// row stays 'proposed' with any approval cleared, so the user can
+// re-approve the same edit afterwards.
 registerOnRejectedHandler("meta_expert_v2.apply_campaign_edit", async (parameters, { userId, conversationId }) => {
   const active = parameters.strategyId ? null : getActiveStrategyForConversation(userId, conversationId);
   const strategyId = parameters.strategyId || active?.id;
-  if (strategyId) markStrategyRejected(strategyId);
+  if (strategyId) preserveStrategyAfterRejection(strategyId);
 });
 
 // Phase 3A (round 53, routing extended round 54) — read-only. No

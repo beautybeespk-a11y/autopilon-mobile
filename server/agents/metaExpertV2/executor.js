@@ -21,7 +21,7 @@ import { publishEvent } from "../../automation/triggers.js";
 import { MAX_EXECUTABLE_DAILY_BUDGET, messageAcknowledgesSeparateCampaign, messageIndicatesStrongExecutionApproval, fingerprintStrategy, checkCreativeProductMatchPolicy } from "./policy.js";
 import { MIN_CAROUSEL_CARDS, MAX_CAROUSEL_CARDS, postMatchesProduct } from "./creativeResolution.js";
 import { matchLinkedProduct } from "./businessSnapshot.js";
-import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, recordStrategyApproval, hasValidApproval, findStaleApprovalFingerprint, setStrategyStatus, markStrategyExecuted, markStrategyFailed, markStrategyRejected } from "./strategyStore.js";
+import { getStoredStrategy, getActiveStrategyForConversation, getExecutedAncestorStrategy, EXECUTABLE_STATUSES, recordStrategyApproval, hasValidApproval, findStaleApprovalFingerprint, setStrategyStatus, markStrategyExecuted, markStrategyFailed, preserveStrategyAfterRejection } from "./strategyStore.js";
 import { campaignNameForStrategy } from "./strategyBuilder.js";
 import { checkAccountHealthCached } from "./accountHealth.js";
 import { assertV2RuntimeEnabled } from "./runtimeGate.js";
@@ -1120,7 +1120,14 @@ export async function executeStrategy({ userId, conversationId, accessToken, str
   }
 }
 
+// Round 65 (Nov 21 2026, live rejected-execution bug): a rejected
+// execution card used to mark the strategy 'rejected' — terminal for
+// every lookup that matters — so the chat dead-ended and the agent gave
+// up. A rejection is a "don't create this (yet)", not a "delete the
+// plan": the row is preserved as 'proposed' with any approval cleared,
+// so the user can revise it and re-approve. Nothing is created in Meta
+// by this — the execution itself was already stopped by the caller.
 export function rejectStrategy(userId, conversationId, strategyId) {
   const stored = strategyId ? getStoredStrategy(userId, strategyId) : getActiveStrategyForConversation(userId, conversationId);
-  if (stored) markStrategyRejected(stored.id);
+  if (stored) preserveStrategyAfterRejection(stored.id);
 }
