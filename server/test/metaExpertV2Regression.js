@@ -35,11 +35,11 @@ const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = awai
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
 const { checkAccountHealth, checkAccountHealthCached, clearAccountHealthCache } = await import("../agents/metaExpertV2/accountHealth.js");
 const { gatherDailyCheckin, renderDailyCheckinReport, buildCheckinRecommendation } = await import("../agents/metaExpertV2/dailyCheckin.js");
-const { resolveCheckinWindows, resolveRelativeDatePhrase, weeklySlicesBackFrom } = await import("../agents/metaExpertV2/relativeDates.js");
+const { resolveCheckinWindows, resolveRelativeDatePhrase, weeklySlicesBackFrom, todayYmd, addDaysYmd } = await import("../agents/metaExpertV2/relativeDates.js");
 const { resolveMessageAgentId } = await import("../orchestrator/chatAgentResolution.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, checkRecommendationPriceMismatchGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, checkRecommendationPriceMismatchGate, checkDailyCheckinVerbatimGate, checkPerformanceDataClaimWithoutCallGate, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
@@ -13356,6 +13356,237 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // =====================================================================
+  // Round 68 — LIVE REPLAY Nov 21 2026 23:34 PKT: the daily check-in
+  // said "No activity in the last 7 days" for the ACTIVE campaign
+  // "New Sales Campaign" (ID 120253485989840717) while Meta's own
+  // mobile app showed it HAD spent PKR 623 (reach 1,242, impressions
+  // 1,516, 0 purchases). Two breaks, both in code:
+  //   (a) gatherDailyCheckin never fetched TODAY — every window ended
+  //       at yesterday, so a campaign that started Nov 20 and spent
+  //       Nov 21 was invisible to every period the report covers.
+  //   (b) the orchestrator's performance-data-claim gate did not know
+  //       get_daily_checkin backs a reply, so a VERBATIM copy of the
+  //       report tripped it and the model was nudged to call
+  //       get_performance_breakdown and write its own summary instead.
+  // These tests replay the exact live case: the Nov 20-21 spend must
+  // appear with its numbers, Oct 3-9 must still be found as the
+  // previous activity, and a verbatim report must reach the user.
+  // =====================================================================
+  const CHECKIN_NOW_LIVE = new Date("2026-11-21T18:34:00Z"); // 23:34 PKT, the live check-in run
+  const CHECKIN_NEW_CAMPAIGN = { id: "120253485989840717", name: "New Sales Campaign", status: "ACTIVE", objective: "OUTCOME_SALES" };
+  const CHECKIN_TODAY_ROW = {
+    adset_id: "as_new",
+    adset_name: "New Sales Ad Set",
+    campaign_id: "120253485989840717",
+    campaign_name: "New Sales Campaign",
+    spend: "623",
+    clicks: "40",
+    impressions: "1516",
+    reach: "1242",
+    actions: [],
+    action_values: [],
+  };
+  const CHECKIN_TODAY_ZERO_CONV_ROW = { ...CHECKIN_TODAY_ROW, clicks: "60" };
+  // The live case: today (Nov 21) has the spend; yesterday, last 7
+  // days and prior 7 days are silent; Oct 3-9 is the most recent older
+  // week with activity.
+  const CHECKIN_LIVE_RANGES = {
+    "2026-11-21|2026-11-21": [CHECKIN_TODAY_ROW],
+    "2026-11-20|2026-11-20": null,
+    "2026-11-14|2026-11-20": null,
+    "2026-11-07|2026-11-13": null,
+    ...CHECKIN_ZERO_SPEND_SLICES,
+    "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+  };
+  const CHECKIN_LIVE_OPTS = checkinMetaOpts({
+    campaigns: [CHECKIN_CAMPAIGN, CHECKIN_NEW_CAMPAIGN],
+    accountAdSetInsightsByRange: CHECKIN_LIVE_RANGES,
+  });
+
+  await check("[round 68] LIVE REPLAY Nov 21 23:34 PKT: the campaign spending TODAY (PKR 623) is shown — today is fetched, Oct 3-9 is the previous activity, never the most recent", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(CHECKIN_LIVE_OPTS));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW_LIVE });
+      assert.strictEqual(result.today.hasActivity, true, "today must have activity — the PKR 623 was spent today");
+      assert.strictEqual(result.today.totals.spend, 623, "today spend is PKR 623");
+      assert.strictEqual(result.today.totals.reach, 1242, "today reach is 1,242");
+      assert.strictEqual(result.today.totals.impressions, 1516, "today impressions are 1,516");
+      assert.strictEqual(result.today.totals.purchases, 0, "today has 0 orders");
+      assert.strictEqual(result.yesterday.hasActivity, false, "yesterday (Nov 20) genuinely had no spend");
+      assert.strictEqual(result.main.hasActivity, false, "the last 7 days (Nov 14-20) genuinely had no spend");
+      assert.strictEqual(result.recentActivity.since, "2026-10-03", "the scan still finds Oct 3-9 as the most recent older week");
+      assert.ok(result.reportText.includes("Today so far (21 Nov 2026):"), "the report has a today section");
+      assert.ok(result.reportText.includes("Spend PKR 623.00, 0 orders, revenue PKR 0.00, ROAS 0.00, cost per order not available (no orders). Reach 1,242, impressions 1,516."), "today's numbers are in the report, spend/reach/impressions included");
+      assert.ok(result.reportText.includes("Spending today: New Sales Ad Set (New Sales Campaign): spend PKR 623.00, 0 orders"), "today's spending ad set is named");
+      assert.ok(result.reportText.includes("Previous activity (3 Oct to 9 Oct 2026)"), "Oct 3-9 is labelled previous activity, not most recent");
+      assert.ok(!result.reportText.includes("Most recent activity (3 Oct"), "Oct 3-9 must never be called the most recent activity when today has activity");
+      assert.ok(!result.reportText.includes("No ads have run in the last 90 days."), "today's activity must not be contradicted by a 90-day no-activity line");
+      assert.ok(result.reportText.includes("Today I recommend no change"), "the recommendation says no change — 40 clicks is too early to judge");
+      assert.match(result.recommendation, /today so far/, "the recommendation rests on today's numbers");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 68] today with 60 clicks and 0 orders names the ad set as a zero-conversion pattern — the recommendation rests on today's numbers, not the silent week", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      campaigns: [CHECKIN_CAMPAIGN, CHECKIN_NEW_CAMPAIGN],
+      accountAdSetInsightsByRange: { ...CHECKIN_LIVE_RANGES, "2026-11-21|2026-11-21": [CHECKIN_TODAY_ZERO_CONV_ROW] },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW_LIVE });
+      assert.match(result.recommendation, /New Sales Ad Set/, "the zero-conversion ad set is named");
+      assert.match(result.recommendation, /60 clicks/, "its click count is in the recommendation");
+      assert.match(result.recommendation, /0 orders/, "its zero orders are in the recommendation");
+      assert.match(result.recommendation, /today so far/, "the recommendation says the pattern is today's");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 68] today is the ONLY activity in 90 days: the report shows today and never says 'no ads have run in the last 90 days'", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      campaigns: [CHECKIN_NEW_CAMPAIGN],
+      accountAdSetInsightsByRange: { "2026-11-21|2026-11-21": [CHECKIN_TODAY_ROW] },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW_LIVE });
+      assert.strictEqual(result.today.hasActivity, true, "today has activity");
+      assert.strictEqual(result.recentActivity, null, "nothing older in 90 days");
+      assert.ok(result.reportText.includes("Today so far (21 Nov 2026):"), "today is shown");
+      assert.ok(result.reportText.includes("Spend PKR 623.00"), "today's spend is shown");
+      assert.ok(!result.reportText.includes("No ads have run in the last 90 days."), "no false 90-day no-activity line when today has activity");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 68] orchestrate LIVE REPLAY: the model calls get_daily_checkin and replies with the report verbatim — the reply reaches the user unchanged, no detour to get_performance_breakdown", async () => {
+    // The tool resolves dates from the REAL current date, so the
+    // fixture is built from real "now" (not the pinned Nov 21) —
+    // otherwise the pre-computed report and the tool's own report
+    // would cover different windows and could never match.
+    const e2eNow = new Date();
+    const e2eToday = todayYmd(e2eNow);
+    const e2eYesterday = addDaysYmd(e2eToday, -1);
+    const e2eMainSince = addDaysYmd(e2eToday, -7);
+    const e2ePriorUntil = addDaysYmd(e2eToday, -8);
+    const e2ePriorSince = addDaysYmd(e2eToday, -14);
+    const e2eOpts = checkinMetaOpts({
+      campaigns: [CHECKIN_NEW_CAMPAIGN],
+      accountAdSetInsightsByRange: {
+        [`${e2eToday}|${e2eToday}`]: [CHECKIN_TODAY_ROW],
+        [`${e2eYesterday}|${e2eYesterday}`]: null,
+        [`${e2eMainSince}|${e2eYesterday}`]: null,
+        [`${e2ePriorSince}|${e2ePriorUntil}`]: null,
+      },
+    });
+    clearAccountHealthCache();
+    mockFetch(metaRouter(e2eOpts));
+    const expectedReport = (await gatherDailyCheckin("fake-token", { now: e2eNow })).reportText;
+    restoreFetch();
+    const userId = makeUser(`checkin-verbatim-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({
+      metaOpts: e2eOpts,
+      chatResponses: [
+        toolCall("meta_expert_v2.get_daily_checkin", {}),
+        // A verbatim copy of the report — exactly what the tool tells
+        // the model to do. Live, Nov 21 2026, this reply was pushed
+        // off: the performance-data-claim gate tripped on it and the
+        // model was nudged to call get_performance_breakdown and write
+        // its own summary instead.
+        finalText(expectedReport),
+        toolCall("meta_expert_v2.get_performance_breakdown", { campaignName: "New Sales Campaign" }),
+        finalText("New Sales Campaign is ACTIVE. No activity in the last 7 days — no spending or orders."),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId: "checkin-verbatim", userMessage: "daily check-in", history: [], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.strictEqual(result.reply, expectedReport, "the verbatim check-in report must reach the user unchanged — no detour to get_performance_breakdown, no self-written summary");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 68] orchestrate: the model paraphrases the check-in twice — the second paraphrase is replaced with the tool's report, never delivered", async () => {
+    const e2eNow = new Date();
+    const e2eToday = todayYmd(e2eNow);
+    const e2eYesterday = addDaysYmd(e2eToday, -1);
+    const e2eMainSince = addDaysYmd(e2eToday, -7);
+    const e2ePriorUntil = addDaysYmd(e2eToday, -8);
+    const e2ePriorSince = addDaysYmd(e2eToday, -14);
+    const e2eOpts = checkinMetaOpts({
+      campaigns: [CHECKIN_NEW_CAMPAIGN],
+      accountAdSetInsightsByRange: {
+        [`${e2eToday}|${e2eToday}`]: [CHECKIN_TODAY_ROW],
+        [`${e2eYesterday}|${e2eYesterday}`]: null,
+        [`${e2eMainSince}|${e2eYesterday}`]: null,
+        [`${e2ePriorSince}|${e2ePriorUntil}`]: null,
+      },
+    });
+    clearAccountHealthCache();
+    mockFetch(metaRouter(e2eOpts));
+    const expectedReport = (await gatherDailyCheckin("fake-token", { now: e2eNow })).reportText;
+    restoreFetch();
+    const userId = makeUser(`checkin-paraphrase-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    clearAccountHealthCache();
+    const paraphrase = "New Sales Campaign is ACTIVE. No activity in the last 7 days — no spending or orders.";
+    mockFetch(scriptedFetch({
+      metaOpts: e2eOpts,
+      chatResponses: [
+        toolCall("meta_expert_v2.get_daily_checkin", {}),
+        finalText(paraphrase),
+        finalText(paraphrase),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId: "checkin-paraphrase", userMessage: "daily check-in", history: [], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.strictEqual(result.reply, expectedReport, "a paraphrased check-in must never reach the user — after one nudge the tool's report is delivered instead");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 68] the performance-data gate treats a check-in-backed reply as backed — the live double-call trace (check-in, then breakdown) cannot start from a verbatim reply", async () => {
+    const verbatim = "Best ad set by cost per order: Website Sales – Broad: spend PKR 2,330.21, 4 orders, ROAS 11.23, cost per order PKR 582.55 per order.";
+    // No tool called at all: the gate still fires (nothing changed).
+    assert.ok(checkPerformanceDataClaimWithoutCallGate({
+      decision: { type: "final", message: verbatim },
+      hasV2Tools: true,
+      calledToolNames: new Set(),
+      priorAssistantFigures: [],
+    }), "with no backing tool the gate still blocks an unbacked ad-set claim");
+    // The check-in ran this turn: the same reply passes.
+    assert.strictEqual(checkPerformanceDataClaimWithoutCallGate({
+      decision: { type: "final", message: verbatim },
+      hasV2Tools: true,
+      calledToolNames: new Set(["meta_expert_v2.get_daily_checkin"]),
+      priorAssistantFigures: [],
+    }), null, "a check-in-backed reply must pass — the check-in IS a performance-backed tool");
+  });
+
+  await check("[round 68] the check-in verbatim gate: a verbatim copy passes, a paraphrase trips it, and anything else is untouched", async () => {
+    const reportText = "Daily check-in — 21 Nov 2026 (Asia/Karachi)\nScope: your whole ad account.\nToday I recommend: Today I recommend no change — PKR 623.00 spent for 0 orders today so far. Re-check tomorrow.";
+    const withCheckin = { hasV2Tools: true, latestCheckinResult: { reportText } };
+    assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: reportText }, ...withCheckin }), null, "a verbatim copy passes");
+    assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: reportText.replace(/\n/g, "  ") }, ...withCheckin }), null, "whitespace reflow still passes — only the words are enforced");
+    assert.ok(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: "New Sales Campaign is ACTIVE. No activity in the last 7 days — no spending or orders." }, ...withCheckin }), "a paraphrase trips the gate");
+    assert.ok(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: `${reportText}\nLet me know if you want more detail.` }, ...withCheckin }), "extra text after the report trips the gate");
+    assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: "No activity in the last 7 days." }, hasV2Tools: true, latestCheckinResult: null }), null, "no check-in ran this turn — untouched");
+    assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "tool_call", toolName: "meta_expert_v2.get_daily_checkin", parameters: {} }, ...withCheckin }), null, "non-final decisions are untouched");
   });
 
   // --- Creative auto-revise matcher forms (round 32) -----------------
