@@ -209,7 +209,7 @@ async function resolveHealthAssets(accessToken, adAccountId, userId) {
 // the best-vs-worst comparison is arithmetic on real CPAs, so the
 // inputs must never be pre-formatted money strings (formatting first
 // would make the ratio NaN and silently disable the rule).
-export function buildCheckinRecommendation({ health, main, recentActivity, currency }) {
+export function buildCheckinRecommendation({ health, main, recentActivity, today, currency }) {
   if (health && !health.ok && health.issues && health.issues.length) {
     return `Today I recommend fixing this first: ${health.issues[0].message} Until that is fixed, new campaigns cannot run reliably.`;
   }
@@ -226,6 +226,20 @@ export function buildCheckinRecommendation({ health, main, recentActivity, curre
       return `Today I recommend keeping the budget where it is and watching ${best.name} — it is your cheapest orders at ${formatMoney(best.rates.cpa, currency)} per order on ${formatNumber(best.totals.purchases)} orders, while ${worst.name} costs ${formatMoney(worst.rates.cpa, currency)} per order. No change needed today.`;
     }
     return `Today I recommend no change — ${formatMoney(main.totals.spend, currency)} spent for ${formatNumber(main.totals.purchases)} orders in ${main.label}. Re-check tomorrow.`;
+  }
+  // Round 68 — the main window is dead, so today is the freshest
+  // signal: a campaign that started yesterday and is spending TODAY is
+  // judged on today's numbers, never on the silent week. The
+  // zero-conversion rule applies to today exactly as it does to the
+  // main window (50+ clicks, 0 orders names the ad set).
+  if (today && today.hasActivity) {
+    const zeroConv = (today.adSets || [])
+      .filter((e) => e.totals.purchases === 0 && e.totals.clicks >= ZERO_CONVERSION_CLICKS_THRESHOLD)
+      .sort((a, b) => b.totals.clicks - a.totals.clicks)[0];
+    if (zeroConv) {
+      return `Today I recommend we look at ${zeroConv.name} — it spent ${formatMoney(zeroConv.totals.spend, currency)} on ${formatNumber(zeroConv.totals.clicks)} clicks with 0 orders today so far. Tell me and I will propose a fix for your approval.`;
+    }
+    return `Today I recommend no change — ${formatMoney(today.totals.spend, currency)} spent for ${formatNumber(today.totals.purchases)} orders today so far. Re-check tomorrow.`;
   }
   if (recentActivity) {
     return `Today I recommend no change — nothing ran in ${main.label}. Your most recent activity was ${recentActivity.label}: ${formatMoney(recentActivity.totals.spend, currency)} spent for ${formatNumber(recentActivity.totals.purchases)} orders. If you want to run ads again, tell me which campaign and I will propose it for your approval.`;
@@ -244,7 +258,11 @@ function renderPeriodLines(period, currency, title) {
   }
   const t = period.totals;
   const r = period.rates;
-  lines.push(`Spend ${formatMoney(t.spend, currency)}, ${formatNumber(t.purchases)} orders, revenue ${formatMoney(t.revenue, currency)}, ROAS ${r.roas == null ? "not available (no spend)" : r.roas.toFixed(2)}, cost per order ${r.cpa == null ? "not available (no orders)" : `${formatMoney(r.cpa, currency)} per order`}.`);
+  // Round 68 — reach and impressions ride on the same line: the live
+  // check-in had to show the Nov 20-21 spend WITH its reach/impressions,
+  // and the sentence is appended after the CPA clause so every earlier
+  // exact-match assertion on the spend/orders/revenue part still holds.
+  lines.push(`Spend ${formatMoney(t.spend, currency)}, ${formatNumber(t.purchases)} orders, revenue ${formatMoney(t.revenue, currency)}, ROAS ${r.roas == null ? "not available (no spend)" : r.roas.toFixed(2)}, cost per order ${r.cpa == null ? "not available (no orders)" : `${formatMoney(r.cpa, currency)} per order`}. Reach ${formatNumber(t.reach)}, impressions ${formatNumber(t.impressions)}.`);
   return lines;
 }
 
@@ -268,6 +286,18 @@ export function renderDailyCheckinReport(checkin) {
   if (health) {
     if (health.ok) lines.push("Account health: All healthy — ad account active, permissions granted.");
     else lines.push(`Account health: WARNING — ${health.issues.map((i) => i.message).join(" ")}`);
+  }
+  // Round 68 — today first: the freshest numbers lead the report. A
+  // campaign spending today is shown here with its spend, reach and
+  // impressions, even when yesterday and the last 7 days are silent.
+  // The section only renders when today actually has activity, so a
+  // quiet day changes nothing about the report below it.
+  if (checkin.today?.hasActivity) {
+    lines.push(...renderPeriodLines(checkin.today, currency, "Today so far"));
+    const todayTop = [...(checkin.today.adSets || [])].sort((a, b) => b.totals.spend - a.totals.spend)[0];
+    if (todayTop && todayTop.totals.spend > 0) {
+      lines.push(`Spending today: ${renderAdSetLine(todayTop, currency)}`);
+    }
   }
   lines.push(...renderPeriodLines(checkin.yesterday, currency, "Yesterday"));
   lines.push(...renderPeriodLines(checkin.main, currency, checkin.mainTitle));
@@ -299,8 +329,14 @@ export function renderDailyCheckinReport(checkin) {
   }
   if (!checkin.main.hasActivity && checkin.recentActivity) {
     const ra = checkin.recentActivity;
-    lines.push(`Most recent activity (${ra.label}) — this is the most recent week with activity, not yesterday and not the last 7 days:`);
-    lines.push(...renderPeriodLines(ra, currency, "Most recent activity"));
+    // Round 68 — when today has activity, today IS the most recent
+    // activity, so the older week is "previous activity", never "most
+    // recent". The title passed to renderPeriodLines changes with the
+    // heading, so no "Most recent activity (3 Oct…" line can leak into
+    // a report whose most recent activity is today.
+    const raTitle = checkin.today?.hasActivity ? "Previous activity" : "Most recent activity";
+    lines.push(`${raTitle} (${ra.label}) — ${checkin.today?.hasActivity ? "the most recent week with activity before today, for reference:" : "this is the most recent week with activity, not yesterday and not the last 7 days:"}`);
+    lines.push(...renderPeriodLines(ra, currency, raTitle));
     const raBest = ra.bestAdSetByCpa;
     const raWorst = ra.worstAdSetByCpa;
     if (raBest && raWorst && raBest.id !== raWorst.id) {
@@ -310,7 +346,10 @@ export function renderDailyCheckinReport(checkin) {
       lines.push(`Only one ad set had orders that week: ${renderAdSetLine(raBest, currency)}`);
     }
   }
-  if (!checkin.main.hasActivity && !checkin.recentActivity) {
+  // Round 68 — "no ads in 90 days" is only honest when TODAY is silent
+  // too: a campaign spending today has run in the last 90 days, and the
+  // line must never contradict the Today section above it.
+  if (!checkin.main.hasActivity && !checkin.recentActivity && !checkin.today?.hasActivity) {
     lines.push("No ads have run in the last 90 days.");
   }
   lines.push(`Today I recommend: ${checkin.recommendation}`);
@@ -365,19 +404,27 @@ export async function gatherDailyCheckin(accessToken, { userId, campaignName, pe
     hasActivity: false, totals: null, rates: null, adSets: [], topAdSetsBySpend: [], worstAdSetsByCpa: [], bestAdSetByCpa: null, worstAdSetByCpa: null,
   });
 
-  // Yesterday, main window, prior window — fetched in parallel; a single
-  // failed insights call fails the whole check-in loudly rather than
-  // returning a partial report that looks complete.
-  const [yesterdayRows, mainRows, priorRows] = await Promise.all([
+  // Yesterday, main window, prior window, and TODAY — fetched in
+  // parallel; a single failed insights call fails the whole check-in
+  // loudly rather than returning a partial report that looks complete.
+  // Round 68: today is fetched here, in the same parallel batch. The
+  // main window ends at yesterday by design (Meta's "last 7 days"
+  // never includes the partial today), so without this call a campaign
+  // that started yesterday and is spending today is invisible to the
+  // whole report — live, Nov 21 2026, PKR 623 spent today was reported
+  // as "no activity in the last 7 days".
+  const [yesterdayRows, mainRows, priorRows, todayRows] = await Promise.all([
     fetchRows(windows.yesterday.since, windows.yesterday.until),
     mainWindowValid ? fetchRows(mainWindow.since, mainWindow.until) : Promise.resolve([]),
     fetchRows(priorWindow.since, priorWindow.until),
+    fetchRows(windows.todayWindow.since, windows.todayWindow.until),
   ]);
   const yesterday = summarizePeriod(yesterdayRows, windows.yesterday);
   const main = mainWindowValid
     ? summarizePeriod(mainRows, mainWindow)
     : { ...emptySummary(mainWindow.since, mainWindow.until), label: mainResolution.label, note: "This period has not started yet." };
   const prior = summarizePeriod(priorRows, priorWindow);
+  const today = summarizePeriod(todayRows, windows.todayWindow);
 
   // No activity in the main window (and none in the prior window either
   // — otherwise the prior window IS the recent activity): scan back in
@@ -389,6 +436,9 @@ export async function gatherDailyCheckin(accessToken, { userId, campaignName, pe
       `${mainWindow.since}|${mainWindow.until}`,
       `${priorWindow.since}|${priorWindow.until}`,
       `${windows.yesterday.since}|${windows.yesterday.until}`,
+      // Round 68 — today is already fetched above; the scan must never
+      // re-fetch it, and must never mistake today for a scanned week.
+      `${windows.todayWindow.since}|${windows.todayWindow.until}`,
     ]);
     const slices = weeklySlicesBackFrom(mainWindow.since, MAX_SCAN_SLICES);
     for (const slice of slices) {
@@ -438,6 +488,7 @@ export async function gatherDailyCheckin(accessToken, { userId, campaignName, pe
     timezone: CHECKIN_TIMEZONE,
     generatedOn: windows.today,
     yesterday,
+    today,
     main: { ...main, title: mainTitle },
     mainTitle,
     prior,
@@ -451,7 +502,7 @@ export async function gatherDailyCheckin(accessToken, { userId, campaignName, pe
   // The recommendation reads the SAME summaries the report renders —
   // it can never rest on a number the report does not show. Raw numbers
   // go in; the builder formats them itself (see its note).
-  checkin.recommendation = buildCheckinRecommendation({ health, main, recentActivity, currency });
+  checkin.recommendation = buildCheckinRecommendation({ health, main, recentActivity, today, currency });
   checkin.reportText = renderDailyCheckinReport(checkin);
   return checkin;
 }

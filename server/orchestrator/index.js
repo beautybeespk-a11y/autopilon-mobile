@@ -206,8 +206,15 @@ const PERFORMANCE_BACKED_TOOLS = [
   "meta_expert_v2.propose_campaign_edit",
   "meta_expert_v2.apply_campaign_edit",
   "meta_expert_v2.execute_strategy",
+  // Round 68 — the daily check-in IS a performance-backed report
+  // (yesterday, last 7 days, best/worst ad sets, real numbers from
+  // live Meta). A reply that quotes it is backed, not unbacked: live,
+  // Nov 21 2026, its absence here made the performance-data-claim gate
+  // trip on a verbatim check-in reply and nudge the model to call
+  // get_performance_breakdown and write its own summary instead.
+  "meta_expert_v2.get_daily_checkin",
 ];
-const AD_SET_GRANULAR_TOOLS = ["meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.apply_campaign_edit"];
+const AD_SET_GRANULAR_TOOLS = ["meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.apply_campaign_edit", "meta_expert_v2.get_daily_checkin"];
 
 // priorAssistantFigures (built once per orchestrate() call from `history`
 // — see this gate's call site) is every performance figure the ASSISTANT
@@ -233,7 +240,9 @@ const AD_SET_GRANULAR_TOOLS = ["meta_expert_v2.get_performance_breakdown", "meta
 // started succeeding more often (round 53's campaignId requirement
 // previously meant most real calls to it failed anyway, which is why
 // this stayed latent through the first round-54 production reports).
-function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, calledToolNames, priorAssistantFigures }) {
+// Round 68 — exported so the regression suite can prove the backing
+// lists directly: a check-in-backed reply must pass this gate.
+export function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, calledToolNames, priorAssistantFigures }) {
   if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
   const message = decision.message;
   const claimedFigures = extractPerformanceFigures(message);
@@ -255,6 +264,32 @@ function checkPerformanceDataClaimWithoutCallGate({ decision, hasV2Tools, called
   }
   return null;
 }
+
+// Round 68 — the daily-check-in VERBATIM gate. The check-in tool
+// returns ONE verified answer (reportText) and its description tells the
+// model to copy it word for word — but a prompt instruction cannot
+// survive another gate: live, Nov 21 2026, the performance-data-claim
+// gate tripped on the verbatim reply and nudged the model to call
+// get_performance_breakdown and write its own summary instead, so the
+// user got "no activity in the last 7 days" with no numbers at all.
+// This gate runs BEFORE that one in the final-decision loop and enforces
+// the copy at the same layer as the delta and price gates: nudge once
+// (the model re-reads the tool result and copies it), then on a second
+// offense the turn is answered with the tool's reportText itself — a
+// paraphrased check-in can never reach the user. Whitespace is
+// normalised before comparing, so a reflowed copy still passes; any
+// rewording, added recommendation, or dropped line does not. It only
+// fires when the check-in tool actually ran this turn and returned a
+// report — a reply with no check-in behind it is untouched.
+export function checkDailyCheckinVerbatimGate({ decision, hasV2Tools, latestCheckinResult }) {
+  if (!hasV2Tools || decision.type !== "final" || typeof decision.message !== "string") return null;
+  const reportText = latestCheckinResult?.reportText;
+  if (typeof reportText !== "string" || reportText.length === 0) return null;
+  const normalize = (t) => String(t).replace(/\s+/g, " ").trim();
+  if (normalize(decision.message) === normalize(reportText)) return null;
+  return "Your reply is not the daily check-in report the tool returned. The tool's reportText is the verified answer — copy it word for word, nothing before it, nothing after it, no summary, no rewording, no extra recommendation of your own. Do not call another tool and do not write your own version of the numbers.";
+}
+const MAX_DAILY_CHECKIN_VERBATIM_NUDGES = 1;
 
 // Round 55 (Phase 3B — diagnosis). Sibling to
 // checkPerformanceDataClaimWithoutCallGate above, same discipline: a
@@ -2291,6 +2326,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let comparisonMissingNudges = 0;
   let comparisonDeltaNudges = 0;
   let recommendationPriceNudges = 0;
+  let dailyCheckinVerbatimNudges = 0;
   let diagnosisClaimNudges = 0;
   let falseActionClaimNudges = 0;
 
@@ -3145,6 +3181,42 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         .filter((r) => r.toolName === "meta_expert_v2.get_business_snapshot" && r.result)
         .map((r) => r.result)
         .pop() || null;
+      // Round 68 — the verbatim gate below reads the SAME turn's
+      // check-in report, hoisted here alongside the others. The tool
+      // returns { reportText, generatedOn, scopeLabel } (round 67), so
+      // reportText is what the gate compares against.
+      const latestCheckinResult = toolResults
+        .filter((r) => r.toolName === "meta_expert_v2.get_daily_checkin" && r.result)
+        .map((r) => r.result)
+        .pop() || null;
+      // Round 68 — the daily-check-in VERBATIM gate, BEFORE the
+      // performance-data-claim gate below: a verbatim copy of the
+      // check-in report states figures and names ad sets, so without
+      // this gate first the performance gate trips on it and nudges the
+      // model to call get_performance_breakdown and write its own
+      // summary — the exact live failure of Nov 21 2026.
+      const dailyCheckinVerbatimGateMessage = checkDailyCheckinVerbatimGate({
+        decision, hasV2Tools, latestCheckinResult,
+      });
+      if (dailyCheckinVerbatimGateMessage && dailyCheckinVerbatimNudges < MAX_DAILY_CHECKIN_VERBATIM_NUDGES) {
+        dailyCheckinVerbatimNudges += 1;
+        conversationForModel = [
+          ...conversationForModel,
+          { role: "assistant", content: JSON.stringify(decision) },
+          { role: "user", content: dailyCheckinVerbatimGateMessage },
+        ];
+        continue;
+      }
+      if (dailyCheckinVerbatimGateMessage) {
+        // Nudge already used and the reply is STILL not the report —
+        // never let a paraphrased check-in reach the user. The verified
+        // report is already in hand, so the turn is answered with it
+        // directly instead of another fetch.
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Blocked a paraphrased daily check-in — delivered the tool's report instead.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return { reply: latestCheckinResult.reportText, trace, toolResults, usage: usageTotals };
+      }
       const performanceDataClaimGateMessage = checkPerformanceDataClaimWithoutCallGate({
         decision, hasV2Tools, calledToolNames, priorAssistantFigures,
       });

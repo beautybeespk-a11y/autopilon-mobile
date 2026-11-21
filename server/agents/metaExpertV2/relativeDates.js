@@ -56,12 +56,18 @@ function spanDays(since, until) {
 // The check-in's own windows, always computed from the real current date:
 // yesterday is a single day; the main window is the 7 days ending
 // yesterday (Meta's "last 7 days" never includes the partial today); the
-// prior window is the 7 days before that, for the comparison.
+// prior window is the 7 days before that, for the comparison. Today is
+// its own window too — round 68: the check-in must fetch TODAY's rows,
+// not only up to yesterday. A campaign that started yesterday and is
+// spending today is invisible to every window above, and live, Nov 21
+// 2026, that is exactly what happened (PKR 623 spent Nov 21, the
+// check-in said "no activity in the last 7 days").
 export function resolveCheckinWindows(now = new Date(), timeZone = CHECKIN_TIMEZONE) {
   const today = todayYmd(now, timeZone);
   const yesterday = addDaysYmd(today, -1);
   return {
     today,
+    todayWindow: { since: today, until: today },
     yesterday: { since: yesterday, until: yesterday },
     last7Days: { since: addDaysYmd(today, -7), until: yesterday },
     prior7Days: { since: addDaysYmd(today, -14), until: addDaysYmd(today, -8) },
