@@ -12598,14 +12598,19 @@ async function run() {
         (err) => { assert.equal(err.code, "META_V2_EDIT_NOT_APPROVED"); return true; }
       );
       // Rejecting the card must still reject the edit — and must not
-      // apply anything, and must mark the proposal rejected.
+      // apply anything. Round 65 changed what the rejection does to the
+      // proposal itself: it used to burn the row to 'rejected'; now the
+      // proposal is preserved as 'proposed' (approval cleared) so the
+      // user can re-approve it — see the round-65 edit-preservation test.
       const attempt = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: proposed.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "approve" });
       assert.equal(attempt.status, "awaiting_confirmation");
       const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: false });
       assert.equal(resumed.status, "failed");
       assert.match(resumed.error, /Rejected by user/);
       assert.equal(writes.filter((w) => w.path === `/${executed.adSetId}`).length, 0, "a rejected edit must never touch the live ad set");
-      assert.equal(getStoredStrategy(userId, proposed.strategyId).status, "rejected");
+      const kept = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(kept.status, "proposed", "a rejected edit must keep its proposal live for re-approval, not burn it");
+      assert.equal(kept.approvalFingerprint, null, "no approval may survive a rejected edit card");
     } finally {
       restoreFetch();
     }
@@ -12681,6 +12686,250 @@ async function run() {
       assert.equal(resumed.result.appliedChanges.budget_daily, 700);
       const lastWrite = writes.filter((w) => w.path === `/${executed.adSetId}`).pop();
       assert.equal(lastWrite.body.daily_budget, 70000, "the second edit must write the new budget, not re-apply the first");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  // --- Rejected execution keeps the strategy (round 65) ----------------
+  // LIVE Nov 21 2026, after PR #13: Maybelline campaign (id 6015, Rs 899),
+  // Rs 550/day, ad text given. The strategy shown was correct and the user
+  // said "approve" — then the execution card popped up and the user tapped
+  // Reject. That rejection itself was correct (no campaign, nothing spent),
+  // but the strategy was then LOST: "change the budget to 600" failed with
+  // "No executed campaign was found", "ok" failed with "No active strategy
+  // exists", and "yes" ended with "I wasn't able to finalize a strategy".
+  // Root cause, named in PR #13's report: rejecting the card ran
+  // registerOnRejectedHandler -> markStrategyRejected, burning the row to
+  // status 'rejected' — and getActiveStrategyForConversation only ever
+  // returns 'proposed'/'approved' rows, while reviseStrategy refuses a
+  // 'rejected' row outright. These tests replay that exact live case
+  // through the REAL runTool() -> resumeAfterConfirmation() card path.
+  // The live model's own next step after the rejection was to call
+  // propose_campaign_edit for the budget change — which dead-ended on
+  // "No executed campaign was found" — so the edit path is tested here
+  // too: on a not-yet-executed strategy it must revise the pending plan
+  // instead of failing.
+  async function buildPendingStrategy65(userId, conversationId) {
+    const built = await buildStrategy({
+      userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+      strategy: baseStrategy({ budget_daily: 550 }), userMessage: "create a Website Purchases campaign for Maybelline Serum Matte Lipstick, Rs 550/day",
+    });
+    assert.equal(built.ok, true, `test setup: build failed — ${JSON.stringify(built.unresolved)}`);
+    assert.equal(built.strategy.budget_daily, 550);
+    return built;
+  }
+  async function rejectExecuteCard65({ userId, agentId, conversationId, strategyId }) {
+    const attempt = await runTool({ toolName: "meta_expert_v2.execute_strategy", parameters: { strategyId }, userId, agentId, conversationId, planId: null, userMessage: "approve" });
+    assert.equal(attempt.status, "awaiting_confirmation", `the execute call must stop at the card, not run: ${JSON.stringify(attempt)}`);
+    assert.ok(attempt.confirmationId, "a confirmation card must have been created");
+    const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: false });
+    assert.equal(resumed.status, "failed", JSON.stringify(resumed));
+    assert.match(resumed.error, /Rejected by user/);
+    return resumed;
+  }
+  async function approveExecuteCard65({ userId, agentId, conversationId, strategyId }) {
+    const attempt = await runTool({ toolName: "meta_expert_v2.execute_strategy", parameters: { strategyId }, userId, agentId, conversationId, planId: null, userMessage: "approve" });
+    assert.equal(attempt.status, "awaiting_confirmation", `the execute call must stop at the card, not run: ${JSON.stringify(attempt)}`);
+    const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: true });
+    assert.equal(resumed.status, "completed", `card approval must create the campaign: ${JSON.stringify(resumed)}`);
+    return resumed;
+  }
+
+  await check("[round 65] the exact live case: rejecting the execution card keeps the strategy — change the budget to 600, approve again, campaign created paused at 600", async () => {
+    const userId = makeUser(`v2-reject-preserve-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const built = await buildPendingStrategy65(userId, conversationId);
+      await rejectExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      // Nothing was created in Meta — the rejection itself must hold.
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 0, "a rejected execution must never create a campaign");
+      // …but the plan must still be there, live and revisable.
+      const kept = getStoredStrategy(userId, built.strategyId);
+      assert.equal(kept.status, "proposed", `rejecting the card must keep the strategy 'proposed', not burn it: got ${kept.status}`);
+      assert.equal(kept.approvalFingerprint, null, "no approval may survive a rejection");
+      const active = getActiveStrategyForConversation(userId, conversationId);
+      assert.ok(active, "the strategy must still be the conversation's active strategy after a rejection");
+      assert.equal(active.id, built.strategyId);
+      assert.equal(checkV2ExecutionApprovalGate({ userId, conversationId, userMessage: "approve" }), null, "the gate must still find the preserved strategy");
+      // The live model's own next step: "change the budget to 600" via
+      // propose_campaign_edit — it must revise the pending plan, not
+      // dead-end on "No executed campaign was found".
+      const proposed = await proposeCampaignEdit({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+        requestedChanges: { budget_daily: 600 }, userMessage: "change the budget to 600 please",
+      });
+      assert.equal(proposed.ok, true, `the budget change must revise the pending plan: ${JSON.stringify(proposed.unresolved)}`);
+      assert.doesNotMatch(proposed.recommendationText || "", /No executed campaign was found/);
+      const revised = getActiveStrategyForConversation(userId, conversationId);
+      assert.equal(revised.strategy.budget_daily, 600, "the revised budget must be 600/day");
+      assert.equal(revised.strategy.gender, "FEMALE", "the audience must survive the revision");
+      assert.equal(revised.strategy.age_min, 21, "the age range must survive the revision");
+      assert.equal(revised.strategy.age_max, 44, "the age range must survive the revision");
+      assert.equal(revised.strategy.creative_strategy.description, "Image ad using a photo the customer will attach", "the creative must survive the revision");
+      assert.equal(revised.status, "proposed", "the revised plan must still be awaiting approval, not executed");
+      // Approve again, card and all — the campaign is created paused at 600.
+      const resumed = await approveExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: revised.id });
+      assert.ok(resumed.result.campaignId, "the campaign must actually be created on the re-approval");
+      assert.equal(resumed.result.status, "PAUSED", "the campaign must be created paused — nothing spent");
+      const campaignWrite = writes.filter((w) => w.path.endsWith("/campaigns")).pop();
+      assert.ok(campaignWrite, "a real campaign creation must have reached Meta");
+      const adSetWrite = writes.filter((w) => w.path.endsWith("/adsets")).pop();
+      assert.ok(adSetWrite, "a real ad set creation must have reached Meta");
+      assert.equal(adSetWrite.body.daily_budget, 60000, "600 PKR/day must go through the same minor-unit conversion as creation (600 * 100)");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 65] rejecting the card, then approving again with no changes, creates the campaign at the original budget", async () => {
+    const userId = makeUser(`v2-reject-reapprove-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const built = await buildPendingStrategy65(userId, conversationId);
+      await rejectExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      const resumed = await approveExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      assert.ok(resumed.result.campaignId, "the re-approval must create the campaign");
+      assert.equal(resumed.result.status, "PAUSED");
+      const adSetWrite = writes.filter((w) => w.path.endsWith("/adsets")).pop();
+      assert.equal(adSetWrite.body.daily_budget, 55000, "the original 550/day budget must be the one created — the rejection changed nothing");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 65] rejecting the card twice in a row still creates nothing, and the strategy is still there afterwards", async () => {
+    const userId = makeUser(`v2-reject-twice-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const built = await buildPendingStrategy65(userId, conversationId);
+      await rejectExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      await rejectExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      assert.equal(writes.filter((w) => w.path.endsWith("/campaigns")).length, 0, "two rejections must still create nothing");
+      const kept = getStoredStrategy(userId, built.strategyId);
+      assert.equal(kept.status, "proposed", `the strategy must survive two rejections: got ${kept.status}`);
+      assert.ok(getActiveStrategyForConversation(userId, conversationId), "the strategy must still be active after two rejections");
+      // And the user can still say "ok" / revise afterwards — the live
+      // "ok" turn died on "No active strategy exists" before this fix.
+      const revised = await reviseStrategy({
+        userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId,
+        requestedChanges: { budget_daily: 600, budget_basis: "USER_PROVIDED" }, userMessage: "change the budget to 600/day",
+      });
+      assert.equal(revised.ok, true, `a revision after two rejections must work: ${JSON.stringify(revised.unresolved)}`);
+      assert.equal(revised.strategy.budget_daily, 600);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 65] a rejection clears any persisted approval — a later execute with no fresh approval must still be refused", async () => {
+    const userId = makeUser(`v2-reject-clears-approval-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64([]) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const built = await buildPendingStrategy65(userId, conversationId);
+      // Simulate the gate recording an approval while a question was
+      // open (round 62 "gate-approve-blocked"): the row carries a valid
+      // persisted approval at the moment the card is rejected.
+      recordStrategyApproval(built.strategyId, fingerprintStrategyForTest(getStoredStrategy(userId, built.strategyId).strategy), "test-gate");
+      assert.equal(getStoredStrategy(userId, built.strategyId).status, "approved");
+      await rejectExecuteCard65({ userId, agentId: agent.id, conversationId, strategyId: built.strategyId });
+      const kept = getStoredStrategy(userId, built.strategyId);
+      assert.equal(kept.status, "proposed", `the row must come back to 'proposed', not stay 'approved': got ${kept.status}`);
+      assert.equal(kept.approvalFingerprint, null, "the persisted approval must be cleared by the rejection — it must never be reused");
+      assert.equal(kept.approvedVia, null, "the approval source must be cleared too");
+      // Without fresh approval language, execution must still refuse.
+      await assert.rejects(
+        () => executeStrategy({ userId, conversationId, accessToken: `fake-meta-token-${userId}`, strategyId: built.strategyId, userMessage: "ok" }),
+        (err) => { assert.equal(err.code, "META_V2_APPROVAL_REQUIRED"); return true; }
+      );
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 65] a rejected edit card keeps the edit proposal — it can be re-approved and applied afterwards", async () => {
+    const userId = makeUser(`v2-reject-edit-preserve-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64(writes) }));
+    try {
+      const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+      const { executed, proposed } = await buildExecuteAndProposeEdit64(userId, conversationId, writes);
+      const attempt = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: proposed.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "approve" });
+      assert.equal(attempt.status, "awaiting_confirmation");
+      const resumed = await resumeAfterConfirmation({ executionId: attempt.executionId, approved: false });
+      assert.equal(resumed.status, "failed");
+      assert.match(resumed.error, /Rejected by user/);
+      assert.equal(writes.filter((w) => w.path === `/${executed.adSetId}`).length, 0, "a rejected edit must never touch the live ad set");
+      const kept = getStoredStrategy(userId, proposed.strategyId);
+      assert.equal(kept.status, "proposed", `rejecting the edit card must keep the proposal live, not burn it: got ${kept.status}`);
+      assert.equal(kept.approvalFingerprint, null, "no approval may survive an edit rejection");
+      // Re-approve the same proposal — chat approval + card tap — and
+      // it must apply now.
+      const retry = await runTool({ toolName: "meta_expert_v2.apply_campaign_edit", parameters: { strategyId: proposed.strategyId }, userId, agentId: agent.id, conversationId, planId: null, userMessage: "yes, apply it" });
+      assert.equal(retry.status, "awaiting_confirmation", JSON.stringify(retry));
+      const applied = await resumeAfterConfirmation({ executionId: retry.executionId, approved: true });
+      assert.equal(applied.status, "completed", `the re-approved edit must apply: ${JSON.stringify(applied)}`);
+      assert.equal(applied.result.appliedChanges.budget_daily, 600);
+      const adSetWrite = writes.filter((w) => w.path === `/${executed.adSetId}`).pop();
+      assert.equal(adSetWrite.body.daily_budget, 60000);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 65] propose_campaign_edit with truly no strategy at all still fails honestly — and naming a never-executed strategy never silently falls back", async () => {
+    const userId = makeUser(`v2-reject-edit-no-strategy-${stamp}@example.com`);
+    connectMeta(userId);
+    const conversationId = `conv-${cryptoRandom()}`;
+    mockFetch(scriptedFetch({ chatResponses: [], metaOpts: editMetaOpts64([]) }));
+    try {
+      // No strategy was ever built in this conversation: the original
+      // error is the honest answer, and the fallback must not invent one.
+      // (proposeCampaignEdit throws here — it returns ok:false only for
+      // validation failures — so this is asserted as a rejection.)
+      await assert.rejects(
+        () => proposeCampaignEdit({
+          userId, conversationId, accessToken: `fake-meta-token-${userId}`,
+          requestedChanges: { budget_daily: 600 }, userMessage: "change the budget to 600/day",
+        }),
+        (err) => { assert.equal(err.code, "META_V2_STRATEGY_NOT_EXECUTED"); assert.match(err.message, /No executed campaign was found/); return true; }
+      );
+      // A never-executed strategy named explicitly must still be
+      // refused — the fallback only ever applies to the conversation's
+      // own active pending plan, never to a named row.
+      const built = await buildPendingStrategy65(userId, conversationId);
+      await assert.rejects(
+        () => proposeCampaignEdit({
+          userId, conversationId, accessToken: `fake-meta-token-${userId}`, targetStrategyId: built.strategyId,
+          requestedChanges: { budget_daily: 600 }, userMessage: "change the budget to 600/day",
+        }),
+        (err) => { assert.equal(err.code, "META_V2_STRATEGY_NOT_EXECUTED"); assert.match(err.message, /never executed/); return true; }
+      );
+      // And the pending plan itself is untouched by both failures.
+      assert.equal(getStoredStrategy(userId, built.strategyId).status, "proposed");
+      assert.equal(getActiveStrategyForConversation(userId, conversationId).id, built.strategyId);
     } finally {
       restoreFetch();
     }

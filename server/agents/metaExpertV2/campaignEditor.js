@@ -36,6 +36,7 @@
 //      actually applied it before ever calling this a success.
 import * as meta from "../../integrations/meta/api.js";
 import { toMetaBudgetMinorUnits, buildV2Targeting } from "./executor.js";
+import { reviseStrategy } from "./strategyBuilder.js";
 import { MAX_EXECUTABLE_DAILY_BUDGET, buildUnresolvedIssue, messageIndicatesStrongExecutionApproval, fingerprintStrategy } from "./policy.js";
 import {
   insertStrategy, getStoredStrategy, getActiveStrategyForConversation, getMostRecentExecutedStrategyForConversation,
@@ -194,8 +195,6 @@ function formatCampaignEditSummary(genuineChanges, ancestor) {
 
 export async function proposeCampaignEdit({ userId, conversationId, accessToken, targetStrategyId, requestedChanges, userMessage }) {
   assertV2RuntimeEnabled(userId);
-  const ancestor = resolveEffectiveAncestor(userId, conversationId, targetStrategyId);
-
   const changes = requestedChanges && typeof requestedChanges === "object" ? requestedChanges : {};
   const keys = Object.keys(changes);
   const errors = [];
@@ -214,12 +213,55 @@ export async function proposeCampaignEdit({ userId, conversationId, accessToken,
   if (!keys.length) {
     errors.push({ field: "requestedChanges", message: "No changes were specified — nothing to edit." });
   }
-  errors.push(...validateFieldValues(changes, ancestor.strategy));
+
+  // Round 65 (Nov 21 2026, live rejected-execution bug): the model asked
+  // for a budget change on a plan whose campaign was never created — the
+  // user had rejected the execution card, then said "change the budget to
+  // 600/day" — and this function dead-ended on "No executed campaign was
+  // found". When no campaign exists in Meta yet but the conversation DOES
+  // have a live pending plan, the honest behavior is to revise that plan,
+  // not to fail: the change is to something not yet created, so revising
+  // the plan IS the edit. The fallback only ever applies when no specific
+  // strategy was named (an explicit targetStrategyId naming a
+  // never-executed row is still refused outright, exactly as before) and
+  // only to a real campaign plan — never to a campaign_edit proposal row
+  // (that row's own re-approval path is apply_campaign_edit). When there
+  // is truly no strategy at all, the original error is rethrown unchanged.
+  let ancestor = null;
+  let pending = null;
+  try {
+    ancestor = resolveEffectiveAncestor(userId, conversationId, targetStrategyId);
+  } catch (err) {
+    if (err.code !== "META_V2_STRATEGY_NOT_EXECUTED" || targetStrategyId) throw err;
+    pending = getActiveStrategyForConversation(userId, conversationId);
+    if (!pending || pending.strategy?.mode === "campaign_edit") throw err;
+  }
+
+  const baseStrategy = ancestor ? ancestor.strategy : pending.strategy;
+  errors.push(...validateFieldValues(changes, baseStrategy));
   if (errors.length) return { ok: false, unresolved: buildUnresolvedIssue(errors) };
 
-  const genuineChanges = computeGenuineChanges(changes, ancestor.strategy);
+  const genuineChanges = computeGenuineChanges(changes, baseStrategy);
   if (!Object.keys(genuineChanges).length) {
     return { ok: false, unresolved: buildUnresolvedIssue([{ field: "requestedChanges", message: "These values already match the campaign's current settings — there's nothing to change." }]) };
+  }
+
+  if (pending) {
+    // The pending plan is revised in place (as a new revision row, the
+    // same as any revise_strategy call) — the budget/audience change the
+    // user asked for, with the rest of the plan carried forward
+    // untouched. The budget is genuinely user-provided here (the user
+    // said the number in their own message), so its basis is recorded as
+    // such instead of being downgraded by the revise pipeline.
+    const reviseChanges = { ...genuineChanges };
+    if ("budget_daily" in reviseChanges) reviseChanges.budget_basis = "USER_PROVIDED";
+    const revised = await reviseStrategy({ userId, conversationId, accessToken, strategyId: pending.id, requestedChanges: reviseChanges, userMessage });
+    if (!revised.ok) return revised;
+    return {
+      ok: true, strategyId: revised.strategyId,
+      recommendationText: revised.recommendationText
+        + `\n\nThis campaign hasn't been created in Meta yet, so I changed the plan itself instead of a live campaign. Say "approve" and I'll create it paused with these settings.`,
+    };
   }
 
   const recommendationText = formatCampaignEditSummary(genuineChanges, ancestor);
