@@ -34,6 +34,8 @@ const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } =
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
 const { checkCreativeProductMatchPolicy } = await import("../agents/metaExpertV2/policy.js");
 const { checkAccountHealth, checkAccountHealthCached, clearAccountHealthCache } = await import("../agents/metaExpertV2/accountHealth.js");
+const { gatherDailyCheckin, renderDailyCheckinReport, buildCheckinRecommendation } = await import("../agents/metaExpertV2/dailyCheckin.js");
+const { resolveCheckinWindows, resolveRelativeDatePhrase, weeklySlicesBackFrom } = await import("../agents/metaExpertV2/relativeDates.js");
 const { resolveMessageAgentId } = await import("../orchestrator/chatAgentResolution.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
@@ -137,6 +139,18 @@ function metaRouter({
   // caption (e.g. "caption changed since build") without touching the
   // list fixture.
   postDetails = {},
+  // Round 66 (Phase 2 daily check-in) — range-aware ad-set insight rows,
+  // the same pattern as campaignInsightsByRange above but for the level=
+  // adset calls gatherDailyCheckin makes. accountAdSetInsightsByRange:
+  // key `${since}|${until}` -> array of real per-ad-set rows (or null for
+  // no activity) for the account-wide call (/{adAccountId}/insights?
+  // level=adset). adSetLevelInsightsByRange: key
+  // `${campaignId}|${since}|${until}` -> same, for the campaign-scoped
+  // call. Keys not present fall through to the plain adSetLevelInsights
+  // fixture (which is [] by default — Meta returns no row at all for a
+  // range with no activity, and neither does this mock).
+  accountAdSetInsightsByRange = {},
+  adSetLevelInsightsByRange = {},
 } = {}) {
   let nextId = 900000000000001n;
   // Tracks every successfully-created object by its real assigned id, so a
@@ -311,7 +325,27 @@ function metaRouter({
       // (every pre-existing caller/test) keeps the original single-row
       // behavior untouched.
       const level = u.searchParams.get("level");
-      if (level === "adset") return jsonResponse({ data: adSetLevelInsights[campaignId] || [] });
+      if (level === "adset") {
+        // Round 66 (Phase 2 daily check-in) — range-specific ad-set rows
+        // first, exactly like campaignInsightsByRange below: a check-in
+        // test needs different numbers for different weeks (yesterday vs
+        // last 7 days vs the Oct 3–9 activity window), not one row for
+        // every range.
+        const adsetTimeRange = u.searchParams.get("time_range") ? JSON.parse(u.searchParams.get("time_range")) : null;
+        if (adsetTimeRange) {
+          const accountKey = `${adsetTimeRange.since}|${adsetTimeRange.until}`;
+          if (Object.prototype.hasOwnProperty.call(accountAdSetInsightsByRange, accountKey)) {
+            const rows = accountAdSetInsightsByRange[accountKey];
+            return jsonResponse({ data: rows || [] });
+          }
+          const campaignKey = `${campaignId}|${adsetTimeRange.since}|${adsetTimeRange.until}`;
+          if (Object.prototype.hasOwnProperty.call(adSetLevelInsightsByRange, campaignKey)) {
+            const rows = adSetLevelInsightsByRange[campaignKey];
+            return jsonResponse({ data: rows || [] });
+          }
+        }
+        return jsonResponse({ data: adSetLevelInsights[campaignId] || [] });
+      }
       if (level === "ad") return jsonResponse({ data: adLevelInsights[campaignId] || [] });
       // Test stage (Stream D §5) — range-specific rows first: a test that
       // asserts different numbers for different windows needs the mock to
@@ -497,11 +531,11 @@ async function run() {
   // The actual isolation property this test protects (no raw meta.*
   // mutation tool ever reaches a V2-only agent) is unchanged; only the
   // real, intended V2 tool count grew.
-  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 7 V2 tools — no raw meta.* mutation tools", () => {
+  await check("[isolation] listToolsForSkills(['meta_expert_v2']) exposes ONLY the 8 V2 tools — no raw meta.* mutation tools", () => {
     const names = listToolsForSkills(["meta_expert_v2"]).map((t) => t.name);
     assert.deepEqual(names.sort(), [
       "meta_expert_v2.apply_campaign_edit", "meta_expert_v2.build_strategy", "meta_expert_v2.execute_strategy",
-      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.revise_strategy",
+      "meta_expert_v2.get_business_snapshot", "meta_expert_v2.get_daily_checkin", "meta_expert_v2.get_performance_breakdown", "meta_expert_v2.propose_campaign_edit", "meta_expert_v2.revise_strategy",
     ]);
   });
 
@@ -12933,6 +12967,241 @@ async function run() {
     } finally {
       restoreFetch();
     }
+  });
+
+  // --- Daily check-in (Phase 2, roadmap p.3 — round 66) --------------
+  // The live reality behind every fixture here: Moazzam has NOT run any
+  // ads in the last 2 weeks (confirmed Nov 21 2026 ~00:28 PKT), so a
+  // check-in on 21 Nov 2026 must say "no activity" for yesterday and
+  // the last 7 days — and the only real numbers it may show are the
+  // recently run campaign's, found by scanning back: BeautyBees –
+  // Website Sales, Oct 3–9 2026 — Spend PKR 4,660.42, Orders 8,
+  // Revenue PKR 52,341, ROAS 11.23, CPA PKR 582.55 — verified live Nov
+  // 21 ~00:27 PKT via get_performance_breakdown with explicit dates.
+  // The two ad sets below are TEST FIXTURES that sum EXACTLY to those
+  // verified totals (the live campaign's real ad-set split is not in
+  // the record); only the totals are the live-verified figures.
+  const CHECKIN_NOW = new Date("2026-11-21T04:00:00Z"); // 09:00 PKT, 21 Nov 2026
+  const CHECKIN_CAMPAIGN = { id: "120252639174780717", name: "BeautyBees – Website Sales", status: "PAUSED", objective: "OUTCOME_SALES" };
+  const CHECKIN_ADSET_A = { adset_id: "as_a", adset_name: "Website Sales – Broad", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "3000", clicks: "150", impressions: "30000", reach: "25000", actions: [{ action_type: "purchase", value: "6" }], action_values: [{ action_type: "purchase", value: "40000" }] };
+  const CHECKIN_ADSET_B = { adset_id: "as_b", adset_name: "Website Sales – Retargeting", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "1660.42", clicks: "84", impressions: "20000", reach: "15000", actions: [{ action_type: "purchase", value: "2" }], action_values: [{ action_type: "purchase", value: "12341" }] };
+  const checkinMetaOpts = (extra = {}) => ({
+    adAccounts: [{ id: "act_1", name: "A", currency: "PKR" }],
+    campaigns: [CHECKIN_CAMPAIGN],
+    pages: [{ id: "111", name: "Beautybeespk" }],
+    pixels: [{ id: "1241102478031429", name: "BeautyBees Pixel" }],
+    ...extra,
+  });
+  // The dead weeks between "now" (21 Nov 2026) and the last real
+  // activity (Oct 3–9): every slice the scan walks through on its way
+  // back must answer "no rows", exactly like Meta does for a range
+  // with no activity.
+  const CHECKIN_DEAD_SLICES = {
+    "2026-11-20|2026-11-20": null,
+    "2026-11-14|2026-11-20": null,
+    "2026-11-07|2026-11-13": null,
+    "2026-10-31|2026-11-06": null,
+    "2026-10-24|2026-10-30": null,
+    "2026-10-17|2026-10-23": null,
+    "2026-10-10|2026-10-16": null,
+  };
+
+  await check("[round 66] check-in with the real Oct 3–9 2026 data: no activity yesterday/last 7 days, the Oct 3–9 numbers found by scanning back and labelled as most recent — never as current", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: { ...CHECKIN_DEAD_SLICES, "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B] },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.currency, "PKR");
+      assert.equal(result.generatedOn, "2026-11-21");
+      assert.equal(result.timezone, "Asia/Karachi");
+      assert.equal(result.yesterday.since, "2026-11-20");
+      assert.equal(result.yesterday.hasActivity, false);
+      assert.equal(result.main.since, "2026-11-14");
+      assert.equal(result.main.until, "2026-11-20");
+      assert.equal(result.main.hasActivity, false, "nothing ran in the last 7 days — the check-in must say so, not fill the gap");
+      assert.equal(result.prior.since, "2026-11-07");
+      assert.equal(result.prior.until, "2026-11-13");
+      assert.equal(result.prior.hasActivity, false);
+      assert.ok(result.recentActivity, "the scan must find the most recent week with activity");
+      assert.equal(result.recentActivity.since, "2026-10-03");
+      assert.equal(result.recentActivity.until, "2026-10-09");
+      assert.equal(result.recentActivity.totals.spend, 4660.42, "the live-verified Oct 3–9 spend, to the paisa");
+      assert.equal(result.recentActivity.totals.purchases, 8);
+      assert.equal(result.recentActivity.totals.revenue, 52341);
+      assert.equal(Math.round(result.recentActivity.rates.roas * 100) / 100, 11.23, "ROAS is blended from summed totals, never an average of ad-set rates");
+      assert.equal(Math.round(result.recentActivity.rates.cpa * 100) / 100, 582.55, "CPA 4660.42/8");
+      assert.equal(result.recentActivity.bestAdSetByCpa.name, "Website Sales – Broad", "best by CPA: 3000/6 = 500.00");
+      assert.equal(result.recentActivity.worstAdSetsByCpa[0].name, "Website Sales – Retargeting", "worst by CPA: 1660.42/2 = 830.21");
+      assert.equal(result.health.ok, true, "the healthy fixture must stay healthy");
+      assert.match(result.recommendation, /no change/, "nothing ran recently, so the recommendation is no change — never an action");
+      const text = result.reportText;
+      assert.ok(text.includes("Daily check-in — 21 Nov 2026 (Asia/Karachi)"), "the report names its own date and timezone");
+      assert.ok(text.includes("Last 7 days (14 Nov to 20 Nov 2026):\nNo activity — no spend, no orders."), "the last-7-days section must say no activity, plainly");
+      assert.ok(text.includes("Yesterday (20 Nov 2026):\nNo activity — no spend, no orders."));
+      assert.ok(text.includes("Most recent activity (3 Oct to 9 Oct 2026)"), "the Oct 3–9 numbers are labelled as most recent activity");
+      assert.ok(text.includes("Spend PKR 4,660.42, 8 orders, revenue PKR 52,341.00, ROAS 11.23, cost per order PKR 582.55 per order."), "every live-verified number, exactly (money in the codebase's 2-decimal format)");
+      assert.ok(text.indexOf("PKR 4,660.42") > text.indexOf("Most recent activity"), "the Oct 3–9 numbers appear ONLY under the most-recent-activity heading, never before it as if they were current");
+      assert.ok(text.includes("Website Sales – Broad"), "the best ad set is named");
+      assert.ok(text.includes("Website Sales – Retargeting"), "the worst ad set is named");
+      assert.ok(text.includes("Today I recommend: Today I recommend no change"), "exactly one recommendation line");
+      assert.ok(!text.includes("**") && !text.includes("##"), "the report is plain words, no markdown");
+      assert.ok(!/I (paused|resumed|changed|scaled|increased|decreased)/.test(text), "the report never claims an action was taken");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] check-in with zero spend in the last 7 days AND no activity in 90 days: says so plainly and invents nothing", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({ accountAdSetInsightsByRange: {} })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.main.hasActivity, false);
+      assert.equal(result.recentActivity, null, "no slice in 90 days had activity");
+      assert.match(result.recommendation, /no ads have run in the last 90 days/);
+      const text = result.reportText;
+      assert.ok(text.includes("No ads have run in the last 90 days."));
+      assert.ok(!text.includes("4,660.42"), "no Oct 3–9 number may appear when there is no recent activity to report");
+      assert.ok(!text.includes("52,341"), "no revenue figure may be invented or carried over");
+      assert.ok(!text.includes("3 Oct"), "no old window may be named at all");
+      assert.ok(text.includes("Last 7 days (14 Nov to 20 Nov 2026):\nNo activity — no spend, no orders."));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] vague date phrases resolve to explicit 2026 dates server-side — the live #3018 failure (a guessed 2023 year) cannot happen in the check-in", async () => {
+    // Pure resolution first: every phrase is anchored to the real
+    // current date, so the year always comes from `now`, never from
+    // the phrase — a phrase carries no year at all to guess from.
+    assert.deepEqual(resolveRelativeDatePhrase("yesterday", CHECKIN_NOW), { since: "2026-11-20", until: "2026-11-20", label: "yesterday (20 Nov 2026)", recognized: true });
+    const lastWeek = resolveRelativeDatePhrase("last week", CHECKIN_NOW);
+    assert.equal(lastWeek.since, "2026-11-14");
+    assert.equal(lastWeek.until, "2026-11-20");
+    assert.equal(lastWeek.recognized, true);
+    assert.equal(resolveRelativeDatePhrase("today", CHECKIN_NOW).since, "2026-11-21");
+    assert.equal(resolveRelativeDatePhrase("last month", CHECKIN_NOW).since, "2026-10-01");
+    assert.equal(resolveRelativeDatePhrase("last month", CHECKIN_NOW).until, "2026-10-31");
+    assert.equal(resolveRelativeDatePhrase("this month", CHECKIN_NOW).since, "2026-11-01");
+    const unknown = resolveRelativeDatePhrase("sometime in spring", CHECKIN_NOW);
+    assert.equal(unknown.recognized, false, "an unrecognized phrase falls back, never errors");
+    assert.equal(unknown.since, "2026-11-14", "the fallback is the last 7 days");
+    assert.ok(unknown.fallbackNote, "the fallback is reported, never silent");
+    const windows = resolveCheckinWindows(CHECKIN_NOW);
+    assert.equal(windows.today, "2026-11-21");
+    assert.equal(windows.yesterday.since, "2026-11-20");
+    assert.deepEqual([windows.last7Days.since, windows.last7Days.until], ["2026-11-14", "2026-11-20"]);
+    assert.deepEqual([windows.prior7Days.since, windows.prior7Days.until], ["2026-11-07", "2026-11-13"]);
+    assert.deepEqual(weeklySlicesBackFrom("2026-11-21", 7)[6], { since: "2026-10-03", until: "2026-10-09" }, "the scan reaches the Oct 3–9 slice as its 7th week back");
+    // Gather level: the phrase "last week" reaches Meta as explicit
+    // 2026 dates — the mock only returns the Oct 3–9 rows for the
+    // 2026-11-14..2026-11-20 range, so a wrong year would return
+    // nothing and this assertion would fail.
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: { "2026-11-14|2026-11-20": [CHECKIN_ADSET_A, CHECKIN_ADSET_B] },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { period: "last week", now: CHECKIN_NOW });
+      assert.equal(result.main.since, "2026-11-14", "no 2023, no 37-months error: the server resolved the phrase to 2026");
+      assert.equal(result.main.until, "2026-11-20");
+      assert.equal(result.main.totals.spend, 4660.42);
+      assert.equal(result.main.totals.purchases, 8);
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] a check-in never pauses, resumes, or changes a budget — zero Meta mutate calls, even with live activity in the main window", async () => {
+    clearAccountHealthCache();
+    const writes = [];
+    const yesterdayRow = { adset_id: "as_a", adset_name: "Website Sales – Broad", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "100", clicks: "10", impressions: "1000", reach: "800", actions: [], action_values: [] };
+    mockFetch(metaRouter(checkinMetaOpts({
+      writes,
+      accountAdSetInsightsByRange: {
+        "2026-11-20|2026-11-20": [yesterdayRow],
+        "2026-11-14|2026-11-20": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+        "2026-11-07|2026-11-13": null,
+      },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(writes.length, 0, "the check-in is read-only: not one POST to Meta, even when the report has real numbers to act on");
+      assert.equal(result.main.hasActivity, true);
+      assert.equal(result.main.totals.spend, 4660.42);
+      assert.equal(result.main.bestAdSetByCpa.name, "Website Sales – Broad");
+      assert.equal(result.main.worstAdSetsByCpa[0].name, "Website Sales – Retargeting");
+      assert.match(result.recommendation, /keeping the budget where it is/, "a genuine efficiency gap (500 vs 830.21 per order) recommends watching, never acting");
+      assert.match(result.recommendation, /Website Sales – Broad/);
+      assert.ok(result.reportText.includes("Spend PKR 4,660.42, 8 orders, revenue PKR 52,341.00, ROAS 11.23, cost per order PKR 582.55 per order."));
+      assert.ok(result.reportText.includes("The 7 days before that (7 Nov to 13 Nov 2026) had no activity, so there is no prior period to compare against."));
+      assert.ok(result.reportText.includes("Best ad set by cost per order: Website Sales – Broad (BeautyBees – Website Sales): spend PKR 3,000.00, 6 orders, cost per order PKR 500.00 per order."));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] campaign-scoped check-in: a zero-conversion ad set with 60 clicks is named and recommended for a look — never silently, never as an action", async () => {
+    clearAccountHealthCache();
+    const zeroConvRow = { adset_id: "as_a", adset_name: "Website Sales – Broad", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "250", clicks: "60", impressions: "5000", reach: "4000", actions: [], action_values: [] };
+    mockFetch(metaRouter(checkinMetaOpts({
+      adSetLevelInsightsByRange: {
+        [`${CHECKIN_CAMPAIGN.id}|2026-11-20|2026-11-20`]: [],
+        [`${CHECKIN_CAMPAIGN.id}|2026-11-14|2026-11-20`]: [zeroConvRow],
+        [`${CHECKIN_CAMPAIGN.id}|2026-11-07|2026-11-13`]: [],
+      },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { campaignName: "BeautyBees – Website Sales", now: CHECKIN_NOW });
+      assert.equal(result.scope.type, "campaign");
+      assert.equal(result.scope.name, "BeautyBees – Website Sales");
+      assert.equal(result.scopeLabel, "BeautyBees – Website Sales");
+      assert.equal(result.main.totals.spend, 250);
+      assert.equal(result.main.totals.purchases, 0);
+      assert.equal(result.main.bestAdSetByCpa, null, "no orders anywhere means no best ad set exists to name");
+      assert.match(result.recommendation, /we look at Website Sales – Broad/, "the zero-conversion pattern is the recommendation");
+      assert.match(result.recommendation, /PKR 250.00/);
+      assert.match(result.recommendation, /60 clicks/);
+      assert.match(result.recommendation, /0 orders/);
+      assert.match(result.recommendation, /propose a fix for your approval/, "a fix is proposed, never taken");
+      assert.ok(result.reportText.includes("No ad set had any orders in this period, so there is no best or worst ad set by cost per order to name."));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] a disabled ad account is reported at the top of the check-in and outranks every performance recommendation", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      adAccounts: [{ id: "act_1", name: "A", currency: "PKR", account_status: 2 }],
+      accountAdSetInsightsByRange: { ...CHECKIN_DEAD_SLICES, "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B] },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.health.ok, false);
+      assert.equal(result.health.issues[0].code, "META_V2_ACCOUNT_DISABLED");
+      assert.ok(result.reportText.includes("Account health: WARNING — Your ad account is disabled — this is usually a past-due payment."), "the health warning is the first thing in the report, before any numbers");
+      assert.match(result.recommendation, /fixing this first/, "a broken account outranks performance");
+      assert.match(result.recommendation, /past-due payment/);
+      assert.ok(result.reportText.includes("Spend PKR 4,660.42"), "the real numbers are still reported — the health warning does not hide them");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 66] the check-in tool is registered read-only: meta.read, no confirmation, and its description forbids the model from re-deriving numbers or passing dates", async () => {
+    const tool = getTool("meta_expert_v2.get_daily_checkin");
+    assert.ok(tool, "the tool must be registered");
+    assert.equal(tool.category, "meta_expert_v2");
+    assert.equal(tool.requiresConfirmation, false, "a read-only report needs no approval card");
+    assert.ok(tool.requiredPermissions?.includes("meta.read"));
+    assert.ok(!("since" in (tool.parameters?.properties || {})), "no date parameters at all — the model can never send a guessed year");
+    assert.ok(!("until" in (tool.parameters?.properties || {})), "no date parameters at all — the model can never send a guessed year");
+    assert.ok(tool.description.includes("Present the returned reportText to the user exactly as it is"), "the model must present the verified numbers verbatim");
+    assert.ok(tool.description.includes("never pauses, resumes, scales, spends"), "the description states the read-only boundary");
+    assert.ok(listToolsForSkills(["meta_expert_v2"]).some((t) => t.name === "meta_expert_v2.get_daily_checkin"), "the tool is visible to the Meta Ads agent");
   });
 
   // --- Creative auto-revise matcher forms (round 32) -----------------
