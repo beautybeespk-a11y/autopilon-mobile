@@ -131,11 +131,25 @@ function worstByCpaEntity(entities) {
 function summarizePeriod(rows, { since, until }) {
   const entities = (rows || []).map(entityFromInsightRow);
   const summary = summarizeEntities(entities);
+  // "Activity" means REAL activity — money moved (spend > 0) or real
+  // orders happened (purchases > 0). A row merely EXISTING does not
+  // count. Live failure, Nov 21 2026: Meta returned rows for a
+  // mid-October week with zero spend, and the old `entities.length > 0`
+  // rule reported that dead week as the "most recent activity" ("16 to
+  // 22 October 2026, where there was also zero spend") instead of
+  // scanning on to Oct 3–9, where the real spend was (PKR 4,660.42, 8
+  // orders). A zero-spend, zero-order week is silence, not activity —
+  // it must be skipped by the scan and rendered as "no activity", never
+  // reported as a measured result. Clicks or impressions alone do not
+  // count either: clicks without spend or orders are not a week of ads
+  // running, they are a row Meta returned for an ad set that did not
+  // deliver.
+  const hasActivity = summary ? summary.totals.spend > 0 || summary.totals.purchases > 0 : false;
   return {
     since,
     until,
     label: formatRangeHuman(since, until),
-    hasActivity: entities.length > 0,
+    hasActivity,
     totals: summary ? summary.totals : null,
     rates: summary ? summary.rates : null,
     adSets: entities,
@@ -382,8 +396,15 @@ export async function gatherDailyCheckin(accessToken, { userId, campaignName, pe
       if (fetchedKeys.has(key)) continue;
       fetchedKeys.add(key);
       const rows = await fetchRows(slice.since, slice.until);
-      if (rows && rows.length) {
-        recentActivity = summarizePeriod(rows, slice);
+      // Only a slice with REAL activity counts — summarize first, then
+      // ask the summary. The old code stopped at the first slice that
+      // returned ANY rows, and live Meta does return rows for weeks with
+      // zero spend (Nov 21 2026: a dead mid-October week stopped the
+      // scan, so Oct 3–9 was never reached). A zero-spend slice is
+      // skipped here, never reported as "most recent activity".
+      const summary = summarizePeriod(rows, slice);
+      if (summary.hasActivity) {
+        recentActivity = summary;
         break;
       }
     }

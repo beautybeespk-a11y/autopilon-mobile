@@ -362,11 +362,14 @@ registerTool({
 // EXACTLY as returned — never re-derive, round, or reword its numbers,
 // and never add a recommendation of your own beyond it. If the report
 // says there was no activity, say that plainly — never fill the gap
-// with older numbers as if they were current.
+// with older numbers as if they were current. Round 67: the tool
+// returns ONLY the report (reportText first) — live, Nov 21 2026, the
+// full structured object was paraphrased into a summary with no
+// numbers, so the model now has nothing else to summarize from.
 registerTool({
   name: "meta_expert_v2.get_daily_checkin",
   description:
-    "Returns the daily check-in report for the user's Meta ads: yesterday, the last 7 days (explicit dates, Asia/Karachi), best and worst ad sets named, one 'today I recommend...' line, and an account-health line. Call it when the user asks for a daily check-in, a morning report, or 'how are my ads doing'. READ-ONLY: it never pauses, resumes, scales, spends, or changes anything — the recommendation line is words only. All dates are resolved server-side, so never pass dates yourself; if the user named a vague period ('last week', 'yesterday', 'today', 'this month'), pass their exact phrase as period and let the server resolve it — never convert a phrase into dates yourself. For an explicit date range ('Oct 3 to Oct 9'), use get_performance_breakdown instead. Pass campaignName only when the user names one campaign; omit it for the whole ad account. Present the returned reportText to the user exactly as it is — do not re-derive, round, or reword its numbers, and do not add recommendations of your own. If the report says there was no activity, say that plainly and never fill the gap with older numbers as if they were current.",
+    "Your reply to the user must be the returned reportText, copied word for word — nothing before it, nothing after it, no summary, no rewording, no extra recommendation of your own. Do not call get_business_snapshot or any other tool after this one; the report is complete. Returns the daily check-in report for the user's Meta ads: yesterday, the last 7 days (explicit dates, Asia/Karachi), best and worst ad sets named, one 'today I recommend...' line, and an account-health line. Call it when the user asks for a daily check-in, a morning report, or 'how are my ads doing'. READ-ONLY: it never pauses, resumes, scales, spends, or changes anything — the recommendation line is words only. All dates are resolved server-side, so never pass dates yourself; if the user named a vague period ('last week', 'yesterday', 'today', 'this month'), pass their exact phrase as period and let the server resolve it — never convert a phrase into dates yourself. For an explicit date range ('Oct 3 to Oct 9'), use get_performance_breakdown instead. Pass campaignName only when the user names one campaign; omit it for the whole ad account. Present the returned reportText to the user exactly as it is — do not re-derive, round, or reword its numbers, and do not add recommendations of your own. If the report says there was no activity, say that plainly and never fill the gap with older numbers as if they were current.",
   category: "meta_expert_v2",
   parameters: {
     type: "object",
@@ -380,10 +383,25 @@ registerTool({
   requiresConfirmation: false,
   async execute(parameters, context) {
     assertV2RuntimeEnabled(context.userId);
-    return gatherDailyCheckin(token(context), {
+    const checkin = await gatherDailyCheckin(token(context), {
       userId: context.userId,
       campaignName: parameters.campaignName,
       period: parameters.period,
     });
+    // The model is given the report text FIRST and nothing else to
+    // summarize from. Live, Nov 21 2026: the tool returned the whole
+    // structured check-in object (every ad set, every period, the full
+    // campaign roster), and the model paraphrased it into a vague
+    // summary with no numbers at all, then called get_business_snapshot
+    // and wrote its own version. reportText IS the verified answer —
+    // the model must quote it, not re-derive it — so the tool result
+    // the model sees is trimmed to the report itself. The full
+    // structured check-in is unchanged for gatherDailyCheckin callers
+    // (tests, future tools); only the model's view is report-first.
+    return {
+      reportText: checkin.reportText,
+      generatedOn: checkin.generatedOn,
+      scopeLabel: checkin.scopeLabel,
+    };
   },
 });
