@@ -53,6 +53,15 @@ const MAX_STEPS = 8; // raised from 5 in Phase 2 — research flows chain search
 // whereas a real unfulfilled action silently returned as done does not
 // recover on its own. "let me know" is excluded — it's asking the user
 // something, not promising an action.
+// Round 69 (live, Nov 22 2026) — that "survives" claim is FALSE for a
+// daily-check-in report: its recommendation says "Tell me and I will
+// propose a fix for your approval", "I will" matches this pattern, and
+// the nudge below told the model to "call the right tool now" — so it
+// called propose_campaign_edit, the tool its recommendation named. The
+// check-in report is a complete verified answer (its recommendation is
+// an invitation for the user to reply, not an action the model owes
+// now), so a final backed by a check-in this turn is exempt from this
+// nudge — see the soundsLikeUnfulfilledAction check in the loop.
 const NARRATION_WITHOUT_ACTION = /\b(let me(?!\s+know)|let's|i'll|i will|i'm going to|i am going to|i plan to|i need to|i'm about to|i am about to|hold on|one moment|give me a moment|please wait)\b/i;
 // Exactly one retry — this must never become a second way to loop
 // indefinitely alongside MAX_STEPS/stepsRun (which this doesn't touch,
@@ -290,6 +299,39 @@ export function checkDailyCheckinVerbatimGate({ decision, hasV2Tools, latestChec
   return "Your reply is not the daily check-in report the tool returned. The tool's reportText is the verified answer — copy it word for word, nothing before it, nothing after it, no summary, no rewording, no extra recommendation of your own. Do not call another tool and do not write your own version of the numbers.";
 }
 const MAX_DAILY_CHECKIN_VERBATIM_NUDGES = 1;
+
+// Round 69 (live, Nov 22 2026) — the tools a daily check-in must never
+// lead to in the same turn. A check-in is a REPORT plus an invitation
+// ("tell me and I will propose a fix"): the turn's job is to deliver
+// it and wait for the user. Any edit/execute/propose call after it is
+// unprompted by definition — nobody asked for a change in this turn —
+// and it is exactly what happened live: the model called
+// propose_campaign_edit right after the check-in and the call failed
+// only because that conversation had no executed campaign; in a
+// conversation where the agent DID create the campaign it would have
+// started an edit flow the customer never asked for. Read-only tools
+// are deliberately NOT in this set: the check-in tool's own
+// description already tells the model not to call anything after it,
+// and a read-only follow-up cannot start an action flow.
+const CHECKIN_BLOCKED_ACTION_TOOLS = new Set([
+  "meta_expert_v2.propose_campaign_edit",
+  "meta_expert_v2.apply_campaign_edit",
+  "meta_expert_v2.execute_strategy",
+  "meta_expert_v2.build_strategy",
+  "meta_expert_v2.revise_strategy",
+]);
+const MAX_CHECKIN_ACTION_BLOCK_NUDGES = 1;
+// Round 69 — exported so the regression suite can prove the block
+// directly, same discipline as checkDailyCheckinVerbatimGate above.
+// Returns the nudge text when the call must be blocked, null when it
+// may proceed: only an action tool selected AFTER get_daily_checkin
+// already ran this turn is blocked. A later turn (new user message)
+// is unaffected — the check is per-turn, from toolResults.
+export function checkCheckinActionBlock({ toolName, checkinRanThisTurn }) {
+  if (!checkinRanThisTurn) return null;
+  if (!CHECKIN_BLOCKED_ACTION_TOOLS.has(toolName)) return null;
+  return `"${toolName}" cannot be called after a daily check-in in the same turn. The check-in is a report — its recommendation is an invitation for the user to reply, not an instruction to act now. Respond with type "final" using the check-in report text, and wait for the user to ask for a change before proposing or applying one.`;
+}
 
 // Round 55 (Phase 3B — diagnosis). Sibling to
 // checkPerformanceDataClaimWithoutCallGate above, same discipline: a
@@ -2327,6 +2369,7 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
   let comparisonDeltaNudges = 0;
   let recommendationPriceNudges = 0;
   let dailyCheckinVerbatimNudges = 0;
+  let checkinActionBlockNudges = 0;
   let diagnosisClaimNudges = 0;
   let falseActionClaimNudges = 0;
 
@@ -3110,9 +3153,21 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         if (planId) setPlanStatus(planId, "completed");
         return { reply: "I've put together a recommendation, but I'm having trouble phrasing it cleanly — could you ask me to summarize it again?", trace, toolResults, usage: usageTotals };
       }
+      // Round 69 — hoisted above the narration check below: whether a
+      // daily check-in ran this turn decides whether the narration
+      // nudge may fire at all (see the comment on
+      // NARRATION_WITHOUT_ACTION). The verbatim gate further down
+      // reads the SAME result — one computation serves both. The tool
+      // returns { reportText, generatedOn, scopeLabel } (round 67), so
+      // reportText is what the gate compares against.
+      const latestCheckinResult = toolResults
+        .filter((r) => r.toolName === "meta_expert_v2.get_daily_checkin" && r.result)
+        .map((r) => r.result)
+        .pop() || null;
       const soundsLikeUnfulfilledAction =
         availableTools.length > 0 &&
         typeof decision.message === "string" &&
+        !latestCheckinResult &&
         NARRATION_WITHOUT_ACTION.test(decision.message);
       if (soundsLikeUnfulfilledAction && narrationNudges < MAX_NARRATION_NUDGES) {
         narrationNudges += 1;
@@ -3181,16 +3236,9 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         .filter((r) => r.toolName === "meta_expert_v2.get_business_snapshot" && r.result)
         .map((r) => r.result)
         .pop() || null;
-      // Round 68 — the verbatim gate below reads the SAME turn's
-      // check-in report, hoisted here alongside the others. The tool
-      // returns { reportText, generatedOn, scopeLabel } (round 67), so
-      // reportText is what the gate compares against.
-      const latestCheckinResult = toolResults
-        .filter((r) => r.toolName === "meta_expert_v2.get_daily_checkin" && r.result)
-        .map((r) => r.result)
-        .pop() || null;
-      // Round 68 — the daily-check-in VERBATIM gate, BEFORE the
-      // performance-data-claim gate below: a verbatim copy of the
+      // Round 68 — the verbatim gate below reads the check-in report
+      // hoisted above the narration check (round 69 moved it there so
+      // the narration nudge can see it too). A verbatim copy of the
       // check-in report states figures and names ad sets, so without
       // this gate first the performance gate trips on it and nudges the
       // model to call get_performance_breakdown and write its own
@@ -3818,6 +3866,51 @@ export async function orchestrate({ userId, agentId, conversationId, userMessage
         trace.push(traceStep("integration", INTEGRATION_LABELS[toolDef.category], "done"));
       }
       trace.push(traceStep("tool", `Selected: ${call.toolName}`, "active"));
+
+      // Round 69 — a daily check-in is a report, not a prelude to
+      // acting: once it has run this turn, no edit/execute/propose
+      // tool may be dispatched — the turn's job is to deliver the
+      // report and wait for the user. Checked BEFORE any dispatch
+      // attempt, same position as the V2 single-call gate below. First
+      // offense nudges the model to deliver the report; a second
+      // attempt even after being told ends the turn with the report
+      // itself — the model never gets a third chance to start an
+      // unprompted action flow. The tool description alone ("do not
+      // call any other tool after this one") is a prompt instruction
+      // and a model can ignore one; this is the deterministic backstop
+      // for it, and for the narration-nudge path above (the exemption
+      // there stops the push, this stops the call itself).
+      const checkinRanThisTurn = toolResults.some((r) => r.toolName === "meta_expert_v2.get_daily_checkin" && r.result);
+      const checkinActionBlockMessage = checkCheckinActionBlock({ toolName: call.toolName, checkinRanThisTurn });
+      if (checkinActionBlockMessage) {
+        if (checkinActionBlockNudges < MAX_CHECKIN_ACTION_BLOCK_NUDGES) {
+          checkinActionBlockNudges += 1;
+          trace[trace.length - 1].state = "done";
+          trace.push(traceStep("error", `${call.toolName} blocked after a daily check-in — delivering the report instead.`, "done"));
+          toolResults.push({ toolName: call.toolName, error: `Blocked after a daily check-in — ${checkinActionBlockMessage}` });
+          conversationForModel = [
+            ...conversationForModel,
+            { role: "assistant", content: JSON.stringify(decision) },
+            { role: "user", content: checkinActionBlockMessage },
+          ];
+          continue;
+        }
+        // Second attempt even after being told — never dispatch it.
+        // The verified report is already in hand, so end the turn
+        // with it directly, like the verbatim gate's second-offense
+        // fallback in the final branch above.
+        const checkinReportText = toolResults
+          .filter((r) => r.toolName === "meta_expert_v2.get_daily_checkin" && r.result)
+          .map((r) => r.result.reportText)
+          .pop();
+        trace[trace.length - 1].state = "done";
+        trace.push(traceStep("completed", "Blocked an unprompted action after a daily check-in — delivered the tool's report instead.", "done"));
+        if (planId) setPlanStatus(planId, "failed");
+        return {
+          reply: checkinReportText || "Here's your daily check-in — let me know if you'd like me to look at anything in it.",
+          trace, toolResults, usage: usageTotals,
+        };
+      }
 
       // V2 single-call gate — checked BEFORE any dispatch attempt, so a
       // repeat call for a tool already really-dispatched this turn NEVER
