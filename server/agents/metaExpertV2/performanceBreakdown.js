@@ -57,7 +57,10 @@ function blendedRate(numerator, denominator, multiplier = 1) {
   return denominator > 0 ? (numerator / denominator) * multiplier : null;
 }
 
-function ratesFromTotals(totals) {
+// Exported for dailyCheckin.js (Phase 2) — the same blended-rate rules,
+// reused rather than reimplemented, so a rate can never again be an
+// average of per-entity rates with different denominators (round 49).
+export function ratesFromTotals(totals) {
   return {
     cpa: blendedRate(totals.spend, totals.purchases),
     roas: blendedRate(totals.revenue, totals.spend),
@@ -181,11 +184,13 @@ export function formatRangeLabel(since, until) {
 // account-wide alike) — "ad set X is spending the most" is not a useful
 // fact without knowing which campaign it belongs to, the exact thing
 // missing from the live bug this round fixes.
-function topBySpend(entities, n = 3) {
+// Exported for dailyCheckin.js (Phase 2) — plain sorts of real numbers,
+// reused rather than re-sorted with different rules in a second place.
+export function topBySpend(entities, n = 3) {
   return [...entities].sort((a, b) => b.totals.spend - a.totals.spend).slice(0, n)
     .map((e) => ({ id: e.id, name: e.name, spend: e.totals.spend, campaignId: e.campaignId ?? null, campaignName: e.campaignName ?? null }));
 }
-function worstByCpa(entities, n = 3) {
+export function worstByCpa(entities, n = 3) {
   return entities.filter((e) => e.rates.cpa != null).sort((a, b) => b.rates.cpa - a.rates.cpa).slice(0, n)
     .map((e) => ({ id: e.id, name: e.name, cpa: e.rates.cpa, campaignId: e.campaignId ?? null, campaignName: e.campaignName ?? null }));
 }
@@ -608,7 +613,10 @@ function normalizeCampaignName(name) {
   return String(name || "").trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-async function resolveCampaignByName(accessToken, { userId, campaignName }) {
+// Exported for dailyCheckin.js (Phase 2) — the same deterministic
+// name resolution (exact, then unique substring, never a silent
+// first-match pick), reused rather than reimplemented.
+export async function resolveCampaignByName(accessToken, { userId, campaignName }) {
   const adAccountId = await resolveAdAccountId({ userId, accessToken, providedAdAccountId: undefined });
   const campaigns = await meta.listCampaigns(accessToken, adAccountId);
   const wanted = normalizeCampaignName(campaignName);

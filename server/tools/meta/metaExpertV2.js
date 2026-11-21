@@ -18,6 +18,7 @@ import { buildStrategy, reviseStrategy } from "../../agents/metaExpertV2/strateg
 import { executeStrategy, rejectStrategy } from "../../agents/metaExpertV2/executor.js";
 import { proposeCampaignEdit, applyCampaignEdit } from "../../agents/metaExpertV2/campaignEditor.js";
 import { gatherPerformanceBreakdown } from "../../agents/metaExpertV2/performanceBreakdown.js";
+import { gatherDailyCheckin } from "../../agents/metaExpertV2/dailyCheckin.js";
 import { getActiveStrategyForConversation, getMostRecentStrategyForConversation, preserveStrategyAfterRejection } from "../../agents/metaExpertV2/strategyStore.js";
 import { INTERNAL_STRATEGY_SCHEMA } from "../../agents/metaExpertV2/strategySchema.js";
 import { assertV2RuntimeEnabled } from "../../agents/metaExpertV2/runtimeGate.js";
@@ -339,6 +340,50 @@ registerTool({
       since: parameters.since,
       until: parameters.until,
       compareToPriorPeriod: Boolean(parameters.compareToPriorPeriod),
+    });
+  },
+});
+
+// Phase 2 (daily check-in, roadmap p.3) — read-only, like
+// get_performance_breakdown. The user asks "daily check-in" / "morning
+// report" / "how are my ads doing" and gets a short report in plain
+// words: yesterday, the last 7 days with explicit dates, the best and
+// worst ad sets named, and one "today I recommend..." line. That line
+// is a RECOMMENDATION only — this tool never pauses, resumes, scales,
+// or changes a budget, and it never creates or approves anything; a
+// fix it mentions still needs the user to ask for it and approve it.
+// Dates are resolved server-side in Asia/Karachi from the real current
+// date — there are NO date parameters on this tool, so the model can
+// never send a guessed year to Meta (the confirmed live #3018 failure
+// from "Oct 3 to Oct 9" with no year). "period" is only ever the user's
+// own vague phrase ("last week", "yesterday"), passed through verbatim
+// and resolved by the server; for an explicit date range, use
+// get_performance_breakdown instead. Present reportText to the user
+// EXACTLY as returned — never re-derive, round, or reword its numbers,
+// and never add a recommendation of your own beyond it. If the report
+// says there was no activity, say that plainly — never fill the gap
+// with older numbers as if they were current.
+registerTool({
+  name: "meta_expert_v2.get_daily_checkin",
+  description:
+    "Returns the daily check-in report for the user's Meta ads: yesterday, the last 7 days (explicit dates, Asia/Karachi), best and worst ad sets named, one 'today I recommend...' line, and an account-health line. Call it when the user asks for a daily check-in, a morning report, or 'how are my ads doing'. READ-ONLY: it never pauses, resumes, scales, spends, or changes anything — the recommendation line is words only. All dates are resolved server-side, so never pass dates yourself; if the user named a vague period ('last week', 'yesterday', 'today', 'this month'), pass their exact phrase as period and let the server resolve it — never convert a phrase into dates yourself. For an explicit date range ('Oct 3 to Oct 9'), use get_performance_breakdown instead. Pass campaignName only when the user names one campaign; omit it for the whole ad account. Present the returned reportText to the user exactly as it is — do not re-derive, round, or reword its numbers, and do not add recommendations of your own. If the report says there was no activity, say that plainly and never fill the gap with older numbers as if they were current.",
+  category: "meta_expert_v2",
+  parameters: {
+    type: "object",
+    properties: {
+      campaignName: { type: "string", description: "Optional — one specific campaign's real NAME as the user wrote it (e.g. \"BeautyBees – Website Sales\"). Omit it for the whole ad account." },
+      period: { type: "string", description: "Optional — the user's own vague period phrase, verbatim (e.g. \"last week\", \"yesterday\", \"today\", \"this month\", \"last 30 days\"). Omit it for the default last 7 days. Never convert it into dates yourself, and never pass an explicit date range here." },
+    },
+    required: [],
+  },
+  requiredPermissions: ["meta.read"],
+  requiresConfirmation: false,
+  async execute(parameters, context) {
+    assertV2RuntimeEnabled(context.userId);
+    return gatherDailyCheckin(token(context), {
+      userId: context.userId,
+      campaignName: parameters.campaignName,
+      period: parameters.period,
     });
   },
 });
