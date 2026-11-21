@@ -28,7 +28,7 @@ const { buildStrategy, reviseStrategy, pixelSummaryValue, campaignNameForStrateg
 const { executeStrategy } = await import("../agents/metaExpertV2/executor.js");
 const { proposeCampaignEdit, applyCampaignEdit } = await import("../agents/metaExpertV2/campaignEditor.js");
 const { messageIndicatesExecutionApproval, messageIndicatesStrongExecutionApproval, extractUrlFromMessage, fingerprintStrategy: fingerprintStrategyForTest, verifyUserProvidedBudget } = await import("../agents/metaExpertV2/policy.js");
-const { getStoredStrategy, getActiveStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
+const { getStoredStrategy, getActiveStrategyForConversation, getMostRecentStrategyForConversation, listRecentStrategiesForUser, recordStrategyApproval, listFailedAttemptsForConversation } = await import("../agents/metaExpertV2/strategyStore.js");
 const { resolveCreativeSelection, messageRequestsCreativeOptionsList, formatCreativeConfirmationQuestion, messageAffirmsPendingCreative, matchCreativeCandidateId } = await import("../agents/metaExpertV2/creativeResolution.js");
 const { productNameMatchesText, findBestProductMatch, expandHashtagCompounds } = await import("../agents/metaExpertV2/productMatching.js");
 const { validateStrategyStructure, deriveBudgetFromUserMessageIfMissing } = await import("../agents/metaExpertV2/strategySchema.js");
@@ -39,7 +39,7 @@ const { resolveCheckinWindows, resolveRelativeDatePhrase, weeklySlicesBackFrom, 
 const { resolveMessageAgentId } = await import("../orchestrator/chatAgentResolution.js");
 const { resolvePendingQuestionAnswer } = await import("../orchestrator/index.js");
 const { logger } = await import("../config/logger.js");
-const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, checkRecommendationPriceMismatchGate, checkDailyCheckinVerbatimGate, checkPerformanceDataClaimWithoutCallGate, orchestrate } = await import("../orchestrator/index.js");
+const { checkV2ExecutionApprovalGate, checkV2CampaignEditApprovalGate, checkCreativeRevisionRequiredGate, checkComparisonDeltaMismatchGate, checkRecommendationPriceMismatchGate, checkDailyCheckinVerbatimGate, checkPerformanceDataClaimWithoutCallGate, checkCheckinActionBlock, orchestrate } = await import("../orchestrator/index.js");
 const { getTool, listToolsForSkills } = await import("../tools/registry.js");
 const { runTool, resumeAfterConfirmation } = await import("../orchestrator/executor.js");
 const { listTemplates, installTemplate, AGENT_TEMPLATES } = await import("../orchestrator/agentLibrary.js");
@@ -13587,6 +13587,204 @@ async function run() {
     assert.ok(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: `${reportText}\nLet me know if you want more detail.` }, ...withCheckin }), "extra text after the report trips the gate");
     assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "final", message: "No activity in the last 7 days." }, hasV2Tools: true, latestCheckinResult: null }), null, "no check-in ran this turn — untouched");
     assert.strictEqual(checkDailyCheckinVerbatimGate({ decision: { type: "tool_call", toolName: "meta_expert_v2.get_daily_checkin", parameters: {} }, ...withCheckin }), null, "non-final decisions are untouched");
+  });
+
+  // =====================================================================
+  // Round 69 — LIVE Nov 22 2026 00:10 PKT: the daily check-in itself
+  // was finally correct (Yesterday 21 Nov: Spend PKR 623.06, 0 orders,
+  // Reach 1,242, Impressions 1,517, and the recommendation "we look at
+  // New Sales Ad Set — it spent PKR 623.06 on 76 clicks with 0 orders.
+  // Tell me and I will propose a fix for your approval.") — but the
+  // agent trace showed it then selected
+  // meta_expert_v2.propose_campaign_edit ON ITS OWN, nobody asked it
+  // to, and the call failed only because this conversation's real
+  // campaign was created outside the agent ("No executed campaign was
+  // found for this conversation to edit"). In a conversation where the
+  // agent DID create the campaign, the same call would have found one
+  // and started an edit flow the customer never asked for.
+  //
+  // Root cause, found by reading the final-decision loop (not the tool
+  // description — get_daily_checkin already says "do not call any other
+  // tool after this one"): the loop's own NARRATION_WITHOUT_ACTION
+  // gate matches the recommendation's words "I will propose a fix"
+  // and its nudge tells the model to "call the right tool now" — so
+  // the model obeys and calls exactly the tool its recommendation
+  // named. The round-68 verbatim test never caught this because its
+  // fixture had 40 clicks ("no change" recommendation, no "I will"
+  // in it); the live case had 76 clicks, which trips the
+  // zero-conversion rule (50+ clicks, 0 orders) and its "I will
+  // propose" wording.
+  //
+  // These tests replay the exact live case: 76 clicks, 0 orders,
+  // PKR 623.06 yesterday. The turn must end with the report and NO
+  // propose_campaign_edit dispatch — whether the model is pushed
+  // there by the narration nudge, or tries it directly after the
+  // check-in, and whether or not this conversation has an executed
+  // campaign.
+  // =====================================================================
+  const CHECKIN_69_YESTERDAY_ROW = {
+    adset_id: "as_new",
+    adset_name: "New Sales Ad Set",
+    campaign_id: "120253485989840717",
+    campaign_name: "New Sales Campaign",
+    spend: "623.06",
+    clicks: "76",
+    impressions: "1517",
+    reach: "1242",
+    actions: [],
+    action_values: [],
+  };
+
+  // The live Nov 22 00:10 PKT fixture, built from real "now" like the
+  // round-68 end-to-end tests (the tool resolves dates from the real
+  // current date): today is silent, yesterday holds the 76-click
+  // zero-conversion spend, the last 7 days contain it, the prior 7
+  // days are silent.
+  async function checkin69Fixture() {
+    const e2eNow = new Date();
+    const e2eToday = todayYmd(e2eNow);
+    const e2eYesterday = addDaysYmd(e2eToday, -1);
+    const e2eMainSince = addDaysYmd(e2eToday, -7);
+    const e2ePriorUntil = addDaysYmd(e2eToday, -8);
+    const e2ePriorSince = addDaysYmd(e2eToday, -14);
+    const e2eOpts = checkinMetaOpts({
+      campaigns: [CHECKIN_NEW_CAMPAIGN],
+      accountAdSetInsightsByRange: {
+        [`${e2eToday}|${e2eToday}`]: null,
+        [`${e2eYesterday}|${e2eYesterday}`]: [CHECKIN_69_YESTERDAY_ROW],
+        [`${e2eMainSince}|${e2eYesterday}`]: [CHECKIN_69_YESTERDAY_ROW],
+        [`${e2ePriorSince}|${e2ePriorUntil}`]: null,
+      },
+    });
+    clearAccountHealthCache();
+    mockFetch(metaRouter(e2eOpts));
+    const expectedReport = (await gatherDailyCheckin("fake-token", { now: e2eNow })).reportText;
+    restoreFetch();
+    // The fixture must actually carry the live trigger: the
+    // zero-conversion recommendation with the "I will propose" wording
+    // that the narration gate matches on. Without it the test would
+    // pass vacuously, exactly like the round-68 verbatim test did.
+    assert.ok(expectedReport.includes("76 clicks"), "fixture: the report must name the 76 clicks");
+    assert.ok(expectedReport.includes("Tell me and I will propose a fix for your approval."), "fixture: the report's recommendation must carry the 'I will propose' wording the narration gate trips on");
+    return { e2eOpts, expectedReport };
+  }
+
+  await check("[round 69] LIVE REPLAY Nov 22 00:10 PKT: the narration nudge must not push a verbatim check-in reply into propose_campaign_edit — the turn ends with the report", async () => {
+    const { e2eOpts, expectedReport } = await checkin69Fixture();
+    const userId = makeUser(`checkin-no-nudge-edit-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({
+      metaOpts: e2eOpts,
+      chatResponses: [
+        toolCall("meta_expert_v2.get_daily_checkin", {}),
+        // A verbatim copy of the report — exactly what the tool tells
+        // the model to do. Live, Nov 22 2026, this reply was pushed
+        // off it: the narration gate matched "I will propose a fix"
+        // and nudged the model to "call the right tool now", so the
+        // model called propose_campaign_edit next.
+        finalText(expectedReport),
+        toolCall("meta_expert_v2.propose_campaign_edit", { requestedChanges: { budget_daily: 600 } }),
+        finalText(expectedReport),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId: "checkin-no-nudge-edit", userMessage: "daily check-in", history: [], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.strictEqual(result.reply, expectedReport, "the check-in report must reach the user unchanged");
+      assert.ok(!result.toolResults.some((r) => r.toolName === "meta_expert_v2.propose_campaign_edit"), "no propose_campaign_edit call may be dispatched after a check-in in the same turn — the model was pushed there by the narration nudge, not asked by the user");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 69] the model tries propose_campaign_edit directly after the check-in (no final first) — the call is blocked, never dispatched, and the report is delivered", async () => {
+    const { e2eOpts, expectedReport } = await checkin69Fixture();
+    const userId = makeUser(`checkin-no-direct-edit-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({
+      metaOpts: e2eOpts,
+      chatResponses: [
+        toolCall("meta_expert_v2.get_daily_checkin", {}),
+        // No final first: the model goes straight for the edit on its
+        // own recommendation. The dispatch guard must stop it — the
+        // tool description alone ("do not call any other tool") is a
+        // prompt instruction, and a model can ignore one.
+        toolCall("meta_expert_v2.propose_campaign_edit", { requestedChanges: { budget_daily: 600 } }),
+        finalText(expectedReport),
+        finalText(expectedReport),
+      ],
+    }));
+    try {
+      const result = await orchestrate({ userId, agentId, conversationId: "checkin-no-direct-edit", userMessage: "daily check-in", history: [], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.strictEqual(result.reply, expectedReport, "the check-in report must reach the user unchanged");
+      const proposeEntries = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.propose_campaign_edit");
+      // The attempt must be recorded as a BLOCK, not as a real call: on
+      // the old code the dispatch ran and failed with the tool's own
+      // "No executed campaign was found" error — an error-only entry
+      // that must not be confused with a block. Only the block's own
+      // marker proves the guard stopped it.
+      assert.ok(proposeEntries.length > 0, "the attempted call must be recorded as a blocked error entry, so the trace shows it was stopped, not silently dropped");
+      assert.ok(proposeEntries.every((r) => typeof r.error === "string" && r.error.startsWith("Blocked after a daily check-in")), "every propose entry must be the guard's block error — never a real dispatch (a result) or the tool's own failure");
+      assert.ok(proposeEntries.every((r) => !("result" in r)), "a blocked call must never produce a real tool result");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 69] the conversation DOES have an executed campaign — the unprompted edit must still never start: no proposal row, report delivered", async () => {
+    const { e2eOpts, expectedReport } = await checkin69Fixture();
+    const userId = makeUser(`checkin-no-edit-executed-${stamp}@example.com`);
+    connectMeta(userId);
+    connectWooCommerce(userId);
+    const agentId = makeAgentWithSkills(userId, ["meta_expert_v2"]);
+    const conversationId = `conv-${cryptoRandom()}`;
+    const writes = [];
+    updateFlag("meta_expert_v2", { enabled: true, rolloutPercent: 100 });
+    const agent = installTemplate(userId, "meta-ads-manager-v2", null, null);
+    clearAccountHealthCache();
+    mockFetch(scriptedFetch({
+      metaOpts: { ...e2eOpts, writes },
+      chatResponses: [
+        toolCall("meta_expert_v2.get_daily_checkin", {}),
+        toolCall("meta_expert_v2.propose_campaign_edit", { requestedChanges: { budget_daily: 600 } }),
+        finalText(expectedReport),
+        finalText(expectedReport),
+      ],
+    }));
+    try {
+      // The dangerous half of the live case: this conversation's
+      // campaign WAS created by the agent, so an unprompted propose
+      // call would SUCCEED here — the "no executed campaign" failure
+      // that saved the live run does not exist.
+      const { executed } = await buildAndExecuteCampaign(userId, conversationId, { budget_daily: 550 });
+      assert.equal(executed.status, "PAUSED", "test setup: the campaign must be executed first");
+      assert.strictEqual(getMostRecentStrategyForConversation(userId, conversationId).status, "executed", "test setup: the most recent row must be the executed campaign");
+
+      const result = await orchestrate({ userId, agentId: agent.id, conversationId, userMessage: "daily check-in", history: [], agentSystemPrompt: "You are the Meta Ads Manager V2." });
+      assert.strictEqual(result.reply, expectedReport, "the check-in report must reach the user unchanged");
+      const proposeEntries = result.toolResults.filter((r) => r.toolName === "meta_expert_v2.propose_campaign_edit");
+      assert.ok(proposeEntries.length > 0, "the attempted call must be recorded as a blocked error entry, so the trace shows it was stopped, not silently dropped");
+      assert.ok(proposeEntries.every((r) => typeof r.error === "string" && r.error.startsWith("Blocked after a daily check-in")), "every propose entry must be the guard's block error — never a real dispatch (a result) or the tool's own failure");
+      assert.ok(proposeEntries.every((r) => !("result" in r)), "a blocked call must never produce a real tool result — with an executed campaign behind it, a real dispatch would have created a proposal");
+      assert.strictEqual(getMostRecentStrategyForConversation(userId, conversationId).status, "executed", "no edit proposal row may be created — the most recent row must still be the executed campaign, not a new 'proposed' edit");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 69] the check-in action block: every edit/execute/propose tool is blocked after a check-in, read-only tools and other turns are untouched", async () => {
+    for (const tool of ["meta_expert_v2.propose_campaign_edit", "meta_expert_v2.apply_campaign_edit", "meta_expert_v2.execute_strategy", "meta_expert_v2.build_strategy", "meta_expert_v2.revise_strategy"]) {
+      assert.ok(checkCheckinActionBlock({ toolName: tool, checkinRanThisTurn: true }), `${tool} must be blocked after a check-in in the same turn`);
+      assert.strictEqual(checkCheckinActionBlock({ toolName: tool, checkinRanThisTurn: false }), null, `${tool} must be allowed when no check-in ran this turn`);
+    }
+    assert.strictEqual(checkCheckinActionBlock({ toolName: "meta_expert_v2.get_performance_breakdown", checkinRanThisTurn: true }), null, "read-only tools are untouched by the block");
+    assert.strictEqual(checkCheckinActionBlock({ toolName: "meta_expert_v2.get_business_snapshot", checkinRanThisTurn: true }), null, "read-only tools are untouched by the block");
+    assert.strictEqual(checkCheckinActionBlock({ toolName: "meta_expert_v2.get_daily_checkin", checkinRanThisTurn: true }), null, "the check-in itself is untouched by the block");
   });
 
   // --- Creative auto-revise matcher forms (round 32) -----------------
