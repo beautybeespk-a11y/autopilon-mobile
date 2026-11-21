@@ -13204,6 +13204,160 @@ async function run() {
     assert.ok(listToolsForSkills(["meta_expert_v2"]).some((t) => t.name === "meta_expert_v2.get_daily_checkin"), "the tool is visible to the Meta Ads agent");
   });
 
+  // --- Daily check-in scan fix (round 67) ------------------------------
+  // LIVE FAILURE, Nov 21 2026 ~23:16 PKT, on the deployed PR #15 code:
+  // fresh chat, "daily check-in" → the agent said "The most recent
+  // activity was from 16 to 22 October 2026, where there was also zero
+  // spend." — the WRONG week, with NO numbers, NO best/worst ad sets,
+  // and NO "Today I recommend..." line. The real most recent week with
+  // spend was Oct 3–9 2026 (Spend PKR 4,660.42, Orders 8, Revenue
+  // PKR 52,341, ROAS 11.23, CPA PKR 582.55). The scan stopped at the
+  // first slice that returned ANY rows — and live Meta DOES return rows
+  // for weeks with zero spend — instead of the first slice with REAL
+  // activity. And the model paraphrased the whole structured tool
+  // result into a vague summary with no numbers at all. Both layers
+  // are fixed here: a row existing is not activity (only spend > 0 or
+  // orders > 0 is), and the tool now returns the report first and
+  // nothing else to summarize from.
+  // Zero-spend rows, exactly what live Meta returned for the dead
+  // weeks: one pure-zero row, and one row with real delivery numbers
+  // (34 clicks, 5,000 impressions) but still zero spend and zero
+  // orders — clicks alone are not activity either.
+  const CHECKIN_ZERO_ROW = { adset_id: "as_zero", adset_name: "Website Sales – Broad", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "0", clicks: "0", impressions: "0", reach: "0", actions: [], action_values: [] };
+  const CHECKIN_ZERO_SPEND_WITH_CLICKS_ROW = { adset_id: "as_zero_clicks", adset_name: "Website Sales – Broad", campaign_id: CHECKIN_CAMPAIGN.id, campaign_name: CHECKIN_CAMPAIGN.name, spend: "0", clicks: "34", impressions: "5000", reach: "4000", actions: [], action_values: [] };
+  const CHECKIN_ZERO_SPEND_SLICES = {
+    "2026-10-31|2026-11-06": [CHECKIN_ZERO_ROW],
+    "2026-10-24|2026-10-30": [CHECKIN_ZERO_ROW],
+    "2026-10-17|2026-10-23": [CHECKIN_ZERO_SPEND_WITH_CLICKS_ROW],
+    "2026-10-10|2026-10-16": [CHECKIN_ZERO_ROW],
+  };
+
+  await check("[round 67] LIVE REPLAY Nov 21 2026: zero-spend rows in the dead weeks are skipped — the scan reports Oct 3–9, never a zero-spend week", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: {
+        "2026-11-20|2026-11-20": null,
+        "2026-11-14|2026-11-20": null,
+        "2026-11-07|2026-11-13": null,
+        ...CHECKIN_ZERO_SPEND_SLICES,
+        "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+      },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.main.hasActivity, false);
+      assert.ok(result.recentActivity, "the scan must keep going past zero-spend weeks until it finds real spend");
+      assert.equal(result.recentActivity.since, "2026-10-03", "the Oct 3–9 window, exactly — the live failure's scan never reached it");
+      assert.equal(result.recentActivity.until, "2026-10-09");
+      assert.equal(result.recentActivity.totals.spend, 4660.42);
+      assert.equal(result.recentActivity.totals.purchases, 8);
+      assert.equal(result.recentActivity.totals.revenue, 52341);
+      assert.equal(Math.round(result.recentActivity.rates.roas * 100) / 100, 11.23);
+      assert.equal(Math.round(result.recentActivity.rates.cpa * 100) / 100, 582.55);
+      const text = result.reportText;
+      assert.ok(text.includes("Most recent activity (3 Oct to 9 Oct 2026)"), "the Oct 3–9 numbers are labelled as most recent activity");
+      assert.ok(text.includes("Spend PKR 4,660.42, 8 orders, revenue PKR 52,341.00, ROAS 11.23, cost per order PKR 582.55 per order."), "every live-verified number, exactly");
+      assert.ok(!text.includes("17 Oct"), "no zero-spend week may be named as most recent activity");
+      assert.ok(!text.includes("16 Oct"), "the live failure's wrong week (16–22 Oct) must never appear");
+      assert.ok(!text.includes("10 Oct to 16 Oct"), "no other zero-spend slice may appear either");
+      assert.ok(text.includes("Website Sales – Broad"), "the best ad set is named");
+      assert.ok(text.includes("Website Sales – Retargeting"), "the worst ad set is named");
+      assert.ok(text.includes("Today I recommend: Today I recommend no change"), "exactly one recommendation line");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 67] zero-spend rows in the last 7 days AND the prior 7 days still count as 'no activity' — the scan runs and finds Oct 3–9", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: {
+        "2026-11-20|2026-11-20": [CHECKIN_ZERO_ROW],
+        "2026-11-14|2026-11-20": [CHECKIN_ZERO_SPEND_WITH_CLICKS_ROW],
+        "2026-11-07|2026-11-13": [CHECKIN_ZERO_ROW],
+        ...CHECKIN_ZERO_SPEND_SLICES,
+        "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+      },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.main.hasActivity, false, "rows with zero spend and zero orders are not activity — the main window must say so, not 'Spend PKR 0.00'");
+      assert.equal(result.prior.hasActivity, false, "the prior window is dead too, so the scan must run");
+      assert.ok(result.recentActivity, "the scan must run even when the main window returns rows — as long as none of them spent anything");
+      assert.equal(result.recentActivity.since, "2026-10-03");
+      const text = result.reportText;
+      assert.ok(text.includes("Last 7 days (14 Nov to 20 Nov 2026):\nNo activity — no spend, no orders."), "the last-7-days section says no activity, plainly, even though Meta returned rows for it");
+      assert.ok(!text.includes("Spend PKR 0.00"), "a zero-spend week is never reported as a measured result");
+      assert.ok(text.includes("Most recent activity (3 Oct to 9 Oct 2026)"));
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 67] a prior week with only zero-spend rows is not 'most recent activity' — the scan keeps going to Oct 3–9", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: {
+        "2026-11-20|2026-11-20": null,
+        "2026-11-14|2026-11-20": null,
+        "2026-11-07|2026-11-13": [CHECKIN_ZERO_SPEND_WITH_CLICKS_ROW],
+        ...CHECKIN_ZERO_SPEND_SLICES,
+        "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+      },
+    })));
+    try {
+      const result = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(result.prior.hasActivity, false, "34 clicks with zero spend and zero orders is not activity");
+      assert.ok(result.recentActivity, "the scan must not stop at the prior window when the prior window spent nothing");
+      assert.equal(result.recentActivity.since, "2026-10-03", "Oct 3–9, not the prior week");
+      assert.ok(!result.reportText.includes("7 Nov to 13 Nov 2026) — this is the most recent week"), "the prior week must never be dressed up as the most recent activity");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 67] calling the check-in twice (the live double get_daily_checkin call) returns the identical report — a second call cannot overwrite the first", async () => {
+    clearAccountHealthCache();
+    mockFetch(metaRouter(checkinMetaOpts({
+      accountAdSetInsightsByRange: {
+        "2026-11-20|2026-11-20": null,
+        "2026-11-14|2026-11-20": null,
+        "2026-11-07|2026-11-13": null,
+        ...CHECKIN_ZERO_SPEND_SLICES,
+        "2026-10-03|2026-10-09": [CHECKIN_ADSET_A, CHECKIN_ADSET_B],
+      },
+    })));
+    try {
+      const first = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      const second = await gatherDailyCheckin("fake-token", { now: CHECKIN_NOW });
+      assert.equal(second.reportText, first.reportText, "the check-in is a pure read — two calls give the same report, so the live double call cannot explain the wrong numbers");
+      assert.deepEqual(second.recentActivity.totals, first.recentActivity.totals);
+      assert.equal(second.recentActivity.since, "2026-10-03");
+    } finally {
+      restoreFetch();
+    }
+  });
+
+  await check("[round 67] the check-in tool returns the report first and nothing else to summarize from — no giant structured payload for the model to paraphrase", async () => {
+    clearAccountHealthCache();
+    const userId = makeUser(`v2-checkin-tool-${stamp}@example.com`);
+    connectMeta(userId);
+    mockFetch(metaRouter(checkinMetaOpts({ accountAdSetInsightsByRange: {} })));
+    try {
+      const result = await getTool("meta_expert_v2.get_daily_checkin").execute({}, { userId });
+      assert.equal(Object.keys(result)[0], "reportText", "reportText is the first field the model sees");
+      assert.equal(typeof result.reportText, "string");
+      assert.ok(result.reportText.includes("No ads have run in the last 90 days."), "the report itself is unchanged — only the wrapper around it is smaller");
+      assert.equal(result.campaignsKnown, undefined, "no full campaign roster in the tool result for the model to summarize instead of quoting");
+      assert.equal(result.main, undefined, "no structured period objects in the tool result");
+      assert.equal(result.adSets, undefined, "no ad-set entities in the tool result");
+      assert.ok(getTool("meta_expert_v2.get_daily_checkin").description.startsWith("Your reply to the user must be the returned reportText, copied word for word"), "the verbatim instruction leads the description, not buried at the end");
+      assert.ok(getTool("meta_expert_v2.get_daily_checkin").description.includes("Do not call get_business_snapshot or any other tool after this one"), "the live failure also called get_business_snapshot after the check-in and wrote its own summary from it");
+    } finally {
+      restoreFetch();
+    }
+  });
+
   // --- Creative auto-revise matcher forms (round 32) -----------------
   // Live report: the fix above only ever matched the full "(id 5814,
   // 2050)" string the question rendered — an id embedded in prose. But
